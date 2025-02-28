@@ -47,3 +47,34 @@ def extract_stage_positions(data):
     sorted_positions = positions[unique_indices]
 
     return sorted_positions
+
+def extract_channels(data, channels=None):
+    if channels is None:
+        channels = set()
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if key == "current_channel":
+                channels.add(value)
+            else:
+                extract_channels(value, channels)
+    elif isinstance(data, list):
+        for item in data:
+            extract_channels(item, channels)
+    return channels
+
+
+def find_key(data, target_key):
+    """Recursively find the first occurrence of target_key in a nested structure."""
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if key == target_key:
+                return value
+            found = find_key(value, target_key)
+            if found is not None:
+                return found
+    elif isinstance(data, list):
+        for item in data:
+            found = find_key(item, target_key)
+            if found is not None:
+                return found
+    return None

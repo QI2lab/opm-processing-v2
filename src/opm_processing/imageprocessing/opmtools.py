@@ -71,6 +71,7 @@ def deskew(
     theta: float = 30.0,
     distance: float = 0.4,
     pixel_size: float = 0.115,
+    flip_scan = False
 ):
     """Numba accelerated orthogonal interpolation for oblique data.
 
@@ -84,12 +85,17 @@ def deskew(
         step between image planes along coverslip
     pixel_size: float
         in-plane camera pixel size in OPM coordinates
+    flip_scan: bool
+        flip direction of scan stack w.r.t deskew direction
 
     Returns
     -------
     output: ArrayLike
         image stack of deskewed OPM planes on uniform grid
     """
+    
+    if flip_scan:
+        data = np.flipud(data)
 
     # unwrap parameters
     [num_images, ny, nx] = data.shape  # (pixels)
