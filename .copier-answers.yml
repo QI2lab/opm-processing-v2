@@ -1,0 +1,11 @@
+# Do not edit - changes here will be overwritten by Copier
+_commit: v1
+_src_path: gh:pydev-guide/pyrepo-copier
+author_email: douglas.shepherd@asu.edu
+author_name: Douglas Shepherd
+github_username: qi2lab
+mode: simple
+module_name: opm_processing
+project_name: opm-processing-v2
+project_short_description: qi2lab OPM post-processing package v2
+
