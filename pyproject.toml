@@ -9,35 +9,48 @@ build-backend = "hatchling.build"
 only-include = ["src"]
 sources = ["src"]
 
+[tool.hatch.metadata]
+allow-direct-references = true
+
 # https://peps.python.org/pep-0621/
 [project]
 name = "opm-processing-v2"
 version = "0.1.0"
 description = "qi2lab OPM post-processing package v2"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 license = { text = "BSD-3-Clause" }
 authors = [{ name = "Douglas Shepherd", email = "douglas.shepherd@asu.edu" }]
 # https://pypi.org/classifiers/
 classifiers = [
     "Development Status :: 3 - Alpha",
     "License :: OSI Approved :: BSD License",
-    "Programming Language :: Python :: 3",    
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Typing :: Typed",
 ]
 # add your package dependencies here
-dependencies = []
+dependencies = [
+    "numpy",
+    "numba",
+    "tbb",
+    "tqdm",
+    "tifffile",
+    "ryomen",
+    "tensorstore",
+    "ndv[pygfx,pyqt]",
+    "acquire-zarr",
+    "multiview-stitcher @ git+https://github.com/multiview-stitcher/multiview-stitcher@main"
+]
 
 # https://peps.python.org/pep-0621/#dependencies-optional-dependencies
 # "extras" (e.g. for `pip install .[test]`)
 [project.optional-dependencies]
 # add dependencies used for testing here
 test = ["pytest", "pytest-cov"]
+flatfield = ["basicpy"]
 # add anything else you like to have in your dev environment here
 dev = [
     "ipython",
