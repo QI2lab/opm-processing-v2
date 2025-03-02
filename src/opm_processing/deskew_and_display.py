@@ -84,8 +84,8 @@ def deskew_and_display(root_path: Path,z_downsample_level=2):
     # loop over all components and stream to zarr using tensorstore
     ts_writes = []
     for t_idx in tqdm(range(datastore.shape[0]),desc="time"):
-        for pos_idx in tqdm(range(datastore.shape[1]),dec="pos",leave=False):
-            for chan_idx in tqdm(range(datastore.shape[2],dec="chan",leave=False)):
+        for pos_idx in tqdm(range(datastore.shape[1]),desc="pos",leave=False):
+            for chan_idx in tqdm(range(datastore.shape[2]),desc="chan",leave=False):
                 camera_corrected_data = ((np.squeeze(datastore[t_idx,pos_idx,chan_idx,:].read().result()).astype(np.float32)-camera_offset)*camera_conversion).clip(0,2**16-1).astype(np.uint16)
                 deskewed = downsample_axis(
                     deskew(

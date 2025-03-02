@@ -128,8 +128,8 @@ def deskew(
     final_nx = np.int64(nx)  # (pixels)
     
     # pad YX array to make sure it is divisble by 4
-    pad_y = (4 - (final_ny % 4)) % 4  
-    pad_x = (4 - (final_nx % 4)) % 4
+    pad_y = (4 - (final_ny % 4)) % 4
+    pad_x = (4- (final_nx % 4)) % 4
     padded_final_ny = final_ny + pad_y 
     padded_final_nx = final_nx + pad_x
 
@@ -192,7 +192,7 @@ def deskew(
                     dz_after = virtual_pos_after - pos_after
 
                     # compute final image plane using orthogonal interpolation
-                    output[z, y, :] = (
+                    output[z, y, :final_nx] = (
                         l_before * dz_after * data[plane_after, pos_after + 1, :]
                         + l_before * (1 - dz_after) * data[plane_after, pos_after, :]
                         + l_after * dz_before * data[plane_before, pos_before + 1, :]
