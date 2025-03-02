@@ -29,6 +29,8 @@ def deskew_shape_estimator(
     pixel_size: float = 0.115,
 ):
     """Generate shape of orthogonal interpolation output array.
+    
+    This function automatically pads the YX dimensions to be integer divisble by 4.
 
     Parameters
     ----------
@@ -81,6 +83,9 @@ def deskew(
     reverse_deskewed_z = False
 ):
     """Numba accelerated orthogonal interpolation for oblique data.
+    
+    This function automatically pads the YX array dimensions to be 
+    integer divisble by 4.
 
     Parameters
     ----------

@@ -201,24 +201,25 @@ def create_multiscale_dict(
     }
 
 def create_via_tensorstore(output_path: Path | str, data_shape: list[int]):
-    """Create a TensorStore Zarr v3 driver with a 5D array.
+    """Create a TensorStore Zarr v3 driver with a 6D array.
 
     The configuration specifies:
-      - A 5D array of shape `data_shape`.
-      - Chunk sizes computed as [1, 1, 1, data_shape[3] // 4, data_shape[4] // 4].
-      - Compression using Blosc with zstd, compression level 5, and shuffle mode 2.
-      - Shards defined as [1, 1, data_shape[2], 4, 4].
+      - A 6D array of shape `data_shape`.
+      - Chunk sizes computed as [1, 1, 1, 1, data_shape[4] // 4, data_shape[5] // 4].
+      - Compression using Blosc with zstd, compression level 5, and bitshuffle.
+      - Shards defined as [1, 1, 1, data_shape[2], data_shape[3], data_shape[4]].
 
     Parameters
     ----------
     output_path : str or Path
         store location on disk
     data_shape : tuple or list of int
-        A 5-element tuple or list representing the size of the 5D array (e.g., (time, channel, z, y, x)).
+        A 6-element tuple or list representing the size of the 6D array (e.g., (time, pos, channel, z, y, x)).
 
     Returns
     -------
     ts_store
+        tensorstore object
     """
     
     # Define chunk shape
@@ -271,7 +272,7 @@ def write_via_tensorstore(ts_store, data, data_location):
     """Write a 3D data block to a tensorstore at a specific location in the first three dimensions.
 
     The tensorstore is assumed to be a 6D array (for example, with dimensions 
-    [A, B, C, D, E, F]), where the first three dimensions (indices 0, 1, 2) are specified 
+    [time, pos, channel, z, y, x]), where the first three dimensions (indices 0, 1, 2) are specified 
     by data_location and the data block corresponds to the last three dimensions (indices 3, 4, 5).
 
     Parameters
