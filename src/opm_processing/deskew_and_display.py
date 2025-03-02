@@ -6,9 +6,9 @@ This file is meant for quick deskew and display of qi2lab OPM results. No deconv
 
 from pathlib import Path
 import tensorstore as ts
-import ndv
+import napari
 from opm_processing.imageprocessing.opmtools import deskew, downsample_axis, deskew_shape_estimator
-from opm_processing.dataio.metadata import extract_channels, find_key
+from opm_processing.dataio.metadata import extract_channels, find_key, extract_stage_positions
 from opm_processing.dataio.ngffzarr import create_via_tensorstore, write_via_tensorstore
 import json
 import numpy as np
@@ -49,6 +49,9 @@ def deskew_and_display(root_path: Path,z_downsample_level=2):
     
     camera_offset = float(find_key(zattrs,"offset"))
     camera_conversion = float(find_key(zattrs,"e_to_ADU"))
+    
+    channels = extract_channels(zattrs)
+    stage_positions = extract_stage_positions(zattrs)
     
     # estimate shape of one deskewed volume
     deskewed_shape = deskew_shape_estimator(
@@ -110,7 +113,18 @@ def deskew_and_display(root_path: Path,z_downsample_level=2):
         
     del deskewed
     
-    ndv.imshow(ts_store)
+    viewer = napari.Viewer()
+    for time_idx in range(datastore.shape[0]):
+        for pos_idx in range(datastore.shape[1]):
+            viewer.add_image(
+                ts_write[:,pos_idx,:,:],
+                scale=[2*pixel_size_um,pixel_size_um,pixel_size_um],
+                translate=stage_positions[pos_idx],
+                name = "t"+str(time_idx).zfill(2)+"_p"+str(pos_idx).zfill(3),
+                blending="additive"
+            )
+            
+    napari.run()
     
     del ts_store
 

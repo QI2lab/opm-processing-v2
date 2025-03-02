@@ -37,12 +37,9 @@ dependencies = [
     "numba",
     "tbb",
     "tqdm",
-    "tifffile",
     "ryomen",
     "tensorstore",
-    "ndv[pygfx,pyqt]",
-    "acquire-zarr",
-    "multiview-stitcher @ git+https://github.com/multiview-stitcher/multiview-stitcher@main"
+    "napari[pyqt6]",
 ]
 
 # https://peps.python.org/pep-0621/#dependencies-optional-dependencies
