@@ -12,6 +12,7 @@ from opm_processing.dataio.metadata import extract_channels, find_key, extract_s
 from opm_processing.dataio.ngffzarr import create_via_tensorstore, write_via_tensorstore
 import json
 import numpy as np
+from tqdm import tqdm
 
 def deskew_and_display(root_path: Path,z_downsample_level=2):
     """Deskew, downsample by 2x in Z, and display OPM data.
@@ -52,6 +53,7 @@ def deskew_and_display(root_path: Path,z_downsample_level=2):
     
     channels = extract_channels(zattrs)
     stage_positions = extract_stage_positions(zattrs)
+    stage_y_flipped = True
     
     # estimate shape of one deskewed volume
     deskewed_shape = deskew_shape_estimator(
@@ -81,9 +83,9 @@ def deskew_and_display(root_path: Path,z_downsample_level=2):
     
     # loop over all components and stream to zarr using tensorstore
     ts_writes = []
-    for t_idx in range(datastore.shape[0]):
-        for pos_idx in range(datastore.shape[1]):
-            for chan_idx in range(datastore.shape[2]):
+    for t_idx in tqdm(range(datastore.shape[0]),desc="time"):
+        for pos_idx in tqdm(range(datastore.shape[1]),dec="pos",leave=False):
+            for chan_idx in tqdm(range(datastore.shape[2],dec="chan",leave=False)):
                 camera_corrected_data = ((np.squeeze(datastore[t_idx,pos_idx,chan_idx,:].read().result()).astype(np.float32)-camera_offset)*camera_conversion).clip(0,2**16-1).astype(np.uint16)
                 deskewed = downsample_axis(
                     deskew(
@@ -111,13 +113,27 @@ def deskew_and_display(root_path: Path,z_downsample_level=2):
     for ts_write in ts_writes:
         ts_write.result()
         
-    del deskewed
+    del deskewed, ts_write, ts_store
+    
+    if stage_y_flipped:
+        stage_y_max = np.max(stage_positions[:,1])
+        for pos_idx, _ in enumerate(stage_positions):
+            stage_positions[pos_idx,1] = stage_y_max - stage_positions[pos_idx,1]
+    
+    spec = {
+            "driver" : "zarr3",
+            "kvstore" : {
+                "driver" : "file",
+                "path" : str(output_path)
+            }
+        }
+    datastore = ts.open(spec).result()
     
     viewer = napari.Viewer()
     for time_idx in range(datastore.shape[0]):
         for pos_idx in range(datastore.shape[1]):
             viewer.add_image(
-                ts_write[:,pos_idx,:,:],
+                datastore[:,pos_idx,:,:],
                 scale=[2*pixel_size_um,pixel_size_um,pixel_size_um],
                 translate=stage_positions[pos_idx],
                 name = "t"+str(time_idx).zfill(2)+"_p"+str(pos_idx).zfill(3),
@@ -125,9 +141,7 @@ def deskew_and_display(root_path: Path,z_downsample_level=2):
             )
             
     napari.run()
-    
-    del ts_store
 
 if __name__ == "__main__":
-    root_path = Path(r"/mnt/opm3/20250225_opm/isolated_beads_002.zarr")
+    root_path = Path(r"G:\20250226_merfish_test\merfish_test.zarr")
     deskew_and_display(root_path,z_downsample_level=2)
