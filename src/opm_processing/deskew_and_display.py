@@ -9,7 +9,7 @@ import tensorstore as ts
 import ndv
 from opm_processing.imageprocessing.opmtools import deskew, downsample_axis, deskew_shape_estimator
 from opm_processing.dataio.metadata import extract_channels, find_key
-from opm_processing.dataio.ngffzarr import create_via_acquire, write_via_acquire
+from opm_processing.dataio.ngffzarr import create_via_tensorstore, write_via_tensorstore
 import json
 import numpy as np
 
@@ -47,6 +47,9 @@ def deskew_and_display(root_path: Path,z_downsample_level=2):
     pixel_size_um = float(find_key(zattrs,"pixel_size_um"))
     opm_tilt_deg = float(find_key(zattrs,"angle_deg"))
     
+    camera_offset = float(find_key(zattrs,"offset"))
+    camera_conversion = float(find_key(zattrs,"e_to_ADU"))
+    
     # estimate shape of one deskewed volume
     deskewed_shape = deskew_shape_estimator(
         [datastore.shape[-3],datastore.shape[-2],datastore.shape[-1]],
@@ -54,50 +57,62 @@ def deskew_and_display(root_path: Path,z_downsample_level=2):
         distance=image_mirror_step_um,
         pixel_size=pixel_size_um
     )
+    datastore_shape = [
+        datastore.shape[0],
+        datastore.shape[1],
+        datastore.shape[2],
+        deskewed_shape[0]//z_downsample_level,
+        deskewed_shape[1],
+        deskewed_shape[2]
+    ]
+
     # create array to hold one deskewed volume 
     deskewed = np.zeros(
-        (datastore.shape[0],datastore.shape[1],datastore.shape[2],deskewed_shape[0]//z_downsample_level,deskewed_shape[1],deskewed_shape[2]),
+        (deskewed_shape[0]//z_downsample_level,deskewed_shape[1],deskewed_shape[2]),
         dtype=np.uint16
     )
     
-    # create acquire-zarr object for file writing
-    # the reason to use acquire-zarr is eventually it will be ome-ngff zarr3 compliant and the files can be read by Fiji
-    # tensorstore has some technical issues that will make it annoying to build ome-ngff compliant zarr3 files.
-    output_path = root_path.parents[0] / Path(str(root_path.stem)+"_deskewed.ome.zarr")
-    acq_stream = create_via_acquire(
-        output_path=output_path,
-        dimension_shape=[datastore.shape[0],datastore.shape[1],datastore.shape[2],deskewed_shape[0]//z_downsample_level,deskewed_shape[1],deskewed_shape[2]]
-    )
+    # create tensorstore object for writing. This is NOT compatible with OME-NGFF!
+    output_path = root_path.parents[0] / Path(str(root_path.stem)+"_deskewed.zarr")
+    ts_store = create_via_tensorstore(output_path,datastore_shape)
     
-    # loop over all components and stream to zarr using acquire-zarr
+    # loop over all components and stream to zarr using tensorstore
+    ts_writes = []
     for t_idx in range(datastore.shape[0]):
         for pos_idx in range(datastore.shape[1]):
             for chan_idx in range(datastore.shape[2]):
-                deskewed[t_idx,pos_idx,chan_idx,:] = downsample_axis(
+                camera_corrected_data = ((np.squeeze(datastore[t_idx,pos_idx,chan_idx,:].read().result()).astype(np.float32)-camera_offset)*camera_conversion).clip(0,2**16-1).astype(np.uint16)
+                deskewed = downsample_axis(
                     deskew(
-                        np.squeeze(datastore[t_idx,pos_idx,chan_idx,:].read().result()),
-                        theta=opm_tilt_deg,
-                        distance=image_mirror_step_um,
-                        pixel_size=pixel_size_um,
-                        flip_scan=False
+                        camera_corrected_data,
+                        theta = opm_tilt_deg,
+                        distance = image_mirror_step_um,
+                        pixel_size = pixel_size_um,
+                        flip_scan = False,
+                        reverse_deskewed_z = True
                     ),
                     level = z_downsample_level,
                     axis = 0
                 )
-                write_via_acquire(acq_stream,deskewed)
                 
-    del datastore, deskewed
+                # create future objects for async data writing
+                ts_writes.append(
+                    write_via_tensorstore(
+                        ts_store = ts_store,
+                        data = deskewed,
+                        data_location = [t_idx,pos_idx,chan_idx]
+                    )
+                )
+                
+    # wait for writes to finish
+    for ts_write in ts_writes:
+        ts_write.result()
+        
+    del deskewed
     
-    # reload highest-resolution data using tensorstore and display via ndv
-    spec = {
-        "driver" : "zarr3",
-        "kvstore" : {
-            "driver" : "file",
-            "path" : str(output_path / Path("0"))
-        }
-    }
-    datastore = ts.open(spec).result()
-    ndv.imshow(datastore)
+    ndv.imshow(ts_store)
+    
+    del ts_store
 
 if __name__ == "__main__":
     root_path = Path(r"/mnt/opm3/20250225_opm/isolated_beads_002.zarr")

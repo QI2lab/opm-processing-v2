@@ -61,8 +61,14 @@ def deskew_shape_estimator(
         np.ceil(input_shape[1] * np.sin(theta * np.pi / 180))
     )  # (pixels)
     final_nx = np.int64(input_shape[2])
+    
+    # pad YX array size to make sure it is divisble by 4
+    pad_y = (4 - (final_ny % 4)) % 4  
+    pad_x = (4 - (final_nx % 4)) % 4
+    padded_final_ny = final_ny + pad_y 
+    padded_final_nx = final_nx + pad_x
 
-    return [final_nz, final_ny, final_nx]
+    return [final_nz, padded_final_ny, padded_final_nx]
 
 
 @njit(parallel=True)
@@ -71,7 +77,8 @@ def deskew(
     theta: float = 30.0,
     distance: float = 0.4,
     pixel_size: float = 0.115,
-    flip_scan = False
+    flip_scan = False,
+    reverse_deskewed_z = False
 ):
     """Numba accelerated orthogonal interpolation for oblique data.
 
@@ -79,14 +86,16 @@ def deskew(
     ----------
     data: ArrayLike
         image stack of uniformly spaced OPM planes
-    theta: float
-        angle relative to coverslip
-    distance: float
-        step between image planes along coverslip
-    pixel_size: float
-        in-plane camera pixel size in OPM coordinates
-    flip_scan: bool
+    theta: float, default = 30
+        angle relative to coverslip in degrees
+    distance: float, default = 0.4
+        step between image planes along coverslip in microns
+    pixel_size: float, default = 0.115
+        in-plane camera pixel size in OPM coordinates in microns
+    flip_scan: bool, default = False
         flip direction of scan stack w.r.t deskew direction
+    reverse_deskewed_z: bool, default = False
+        flip output z direction to match camera <-> stage orientation 
 
     Returns
     -------
@@ -112,11 +121,18 @@ def deskew(
     )  # (pixels)
     final_nz = np.int64(np.ceil(ny * np.sin(theta * np.pi / 180)))  # (pixels)
     final_nx = np.int64(nx)  # (pixels)
+    
+    # pad YX array to make sure it is divisble by 4
+    pad_y = (4 - (final_ny % 4)) % 4  
+    pad_x = (4 - (final_nx % 4)) % 4
+    padded_final_ny = final_ny + pad_y 
+    padded_final_nx = final_nx + pad_x
+
 
     # create final image
     output = np.zeros(
-        (final_nz, final_ny, final_nx), dtype=np.float32
-    )  # (time, pixels,pixels,pixels - data is float32)
+        (final_nz, padded_final_ny, padded_final_nx), dtype=np.float32
+    ) 
 
     # precalculate trig functions for scan angle
     tantheta = np.float32(np.tan(theta * np.pi / 180))  # (float32)
@@ -177,8 +193,11 @@ def deskew(
                         + l_after * dz_before * data[plane_before, pos_before + 1, :]
                         + l_after * (1 - dz_before) * data[plane_before, pos_before, :]
                     ) / pixel_step
-
-    return output
+                    
+    if reverse_deskewed_z:
+        return np.flipud(output).astype(np.uint16)
+    else:
+        return output.astype(np.uint16)
 
 
 def lab2cam(
