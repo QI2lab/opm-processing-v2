@@ -27,10 +27,12 @@ def deskew_shape_estimator(
     theta: float = 30.0,
     distance: float = 0.4,
     pixel_size: float = 0.115,
+    divisble_by: int = 4
 ):
     """Generate shape of orthogonal interpolation output array.
     
-    This function automatically pads the YX dimensions to be integer divisble by 4.
+    This function automatically pads the YX dimensions to be 
+    an integer divisble by `divisble_by`.
 
     Parameters
     ----------
@@ -65,8 +67,8 @@ def deskew_shape_estimator(
     final_nx = np.int64(input_shape[2])
     
     # pad YX array size to make sure it is divisble by 4
-    pad_y = (4 - (final_ny % 4)) % 4  
-    pad_x = (4 - (final_nx % 4)) % 4
+    pad_y = (divisble_by - (final_ny % divisble_by)) % divisble_by  
+    pad_x = (divisble_by - (final_nx % divisble_by)) % divisble_by
     padded_final_ny = final_ny + pad_y 
     padded_final_nx = final_nx + pad_x
 
@@ -80,12 +82,13 @@ def deskew(
     distance: float = 0.4,
     pixel_size: float = 0.115,
     flip_scan = False,
-    reverse_deskewed_z = False
+    reverse_deskewed_z = False,
+    divisble_by: int = 4
 ):
     """Numba accelerated orthogonal interpolation for oblique data.
     
     This function automatically pads the YX array dimensions to be 
-    integer divisble by 4.
+    integer divisble by `divisble_by`.
 
     Parameters
     ----------
@@ -128,8 +131,8 @@ def deskew(
     final_nx = np.int64(nx)  # (pixels)
     
     # pad YX array to make sure it is divisble by 4
-    pad_y = (4 - (final_ny % 4)) % 4
-    pad_x = (4- (final_nx % 4)) % 4
+    pad_y = (divisble_by - (final_ny % divisble_by)) % divisble_by
+    pad_x = (divisble_by- (final_nx % divisble_by)) % divisble_by
     padded_final_ny = final_ny + pad_y 
     padded_final_nx = final_nx + pad_x
 

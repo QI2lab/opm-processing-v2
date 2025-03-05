@@ -200,12 +200,12 @@ def create_multiscale_dict(
         }
     }
 
-def create_via_tensorstore(output_path: Path | str, data_shape: list[int]):
+def create_via_tensorstore(output_path: Path | str, data_shape: list[int], divisble_by: int = 4):
     """Create a TensorStore Zarr v3 driver with a 6D array.
 
     The configuration specifies:
       - A 6D array of shape `data_shape`.
-      - Chunk sizes computed as [1, 1, 1, 1, data_shape[4] // 4, data_shape[5] // 4].
+      - Chunk sizes computed as [1, 1, 1, 1, data_shape[4] // divisble_by, data_shape[5] // divisble_by].
       - Compression using Blosc with zstd, compression level 5, and bitshuffle.
       - Shards defined as [1, 1, 1, data_shape[2], data_shape[3], data_shape[4]].
 
@@ -215,6 +215,8 @@ def create_via_tensorstore(output_path: Path | str, data_shape: list[int]):
         store location on disk
     data_shape : tuple or list of int
         A 6-element tuple or list representing the size of the 6D array (e.g., (time, pos, channel, z, y, x)).
+    divisble_by: int
+        Amount to chunk along YX dimensions
 
     Returns
     -------
@@ -223,7 +225,7 @@ def create_via_tensorstore(output_path: Path | str, data_shape: list[int]):
     """
     
     # Define chunk shape
-    chunk_shape = [1, 1, 1, 1, data_shape[4]//4, data_shape[5]//4]
+    chunk_shape = [1, 1, 1, 1, data_shape[4]//divisble_by, data_shape[5]//divisble_by]
 
     # Define shard shape (each shard contains all of `y, x`)
     shard_shape = [1, 1, 1, data_shape[3], data_shape[4], data_shape[5]]  

@@ -5,8 +5,11 @@ This file is meant for quick deskew and display of qi2lab OPM results. No deconv
 """
 
 from pathlib import Path
+import napari.utils
 import tensorstore as ts
 import napari
+from napari.experimental import link_layers
+from cmap import Colormap
 from opm_processing.imageprocessing.opmtools import deskew, downsample_axis, deskew_shape_estimator
 from opm_processing.dataio.metadata import extract_channels, find_key, extract_stage_positions
 from opm_processing.dataio.ngffzarr import create_via_tensorstore, write_via_tensorstore
@@ -29,7 +32,7 @@ def deskew_and_display(root_path: Path,z_downsample_level=2):
         Amount to downsample deskewed data in z.
     """
     
-    # open datastore
+    # open raw datastore
     spec = {
         "driver" : "zarr",
         "kvstore" : {
@@ -54,6 +57,7 @@ def deskew_and_display(root_path: Path,z_downsample_level=2):
     channels = extract_channels(zattrs)
     stage_positions = extract_stage_positions(zattrs)
     stage_y_flipped = True
+    stage_z_flipped = True
     
     # estimate shape of one deskewed volume
     deskewed_shape = deskew_shape_estimator(
@@ -83,9 +87,9 @@ def deskew_and_display(root_path: Path,z_downsample_level=2):
     
     # loop over all components and stream to zarr using tensorstore
     ts_writes = []
-    for t_idx in tqdm(range(datastore.shape[0]),desc="time"):
-        for pos_idx in tqdm(range(datastore.shape[1]),desc="pos",leave=False):
-            for chan_idx in tqdm(range(datastore.shape[2]),desc="chan",leave=False):
+    for t_idx in tqdm(range(datastore.shape[0]),desc="t"):
+        for pos_idx in tqdm(range(datastore.shape[1]),desc="p",leave=False):
+            for chan_idx in tqdm(range(datastore.shape[2]),desc="c",leave=False):
                 camera_corrected_data = ((np.squeeze(datastore[t_idx,pos_idx,chan_idx,:].read().result()).astype(np.float32)-camera_offset)*camera_conversion).clip(0,2**16-1).astype(np.uint16)
                 deskewed = downsample_axis(
                     deskew(
@@ -93,8 +97,6 @@ def deskew_and_display(root_path: Path,z_downsample_level=2):
                         theta = opm_tilt_deg,
                         distance = image_mirror_step_um,
                         pixel_size = pixel_size_um,
-                        flip_scan = False,
-                        reverse_deskewed_z = True
                     ),
                     level = z_downsample_level,
                     axis = 0
@@ -110,16 +112,23 @@ def deskew_and_display(root_path: Path,z_downsample_level=2):
                 )
                 
     # wait for writes to finish
-    for ts_write in ts_writes:
+    for ts_write in tqdm(ts_writes,desc='writes'):
         ts_write.result()
         
     del deskewed, ts_write, ts_store
     
+    # flip y positions w.r.t. camera <-> stage orientation
     if stage_y_flipped:
         stage_y_max = np.max(stage_positions[:,1])
         for pos_idx, _ in enumerate(stage_positions):
             stage_positions[pos_idx,1] = stage_y_max - stage_positions[pos_idx,1]
+            
+    if stage_z_flipped:
+        stage_z_max = np.max(stage_positions[:,0])
+        for pos_idx, _ in enumerate(stage_positions):
+            stage_positions[pos_idx,0] = stage_z_max - stage_positions[pos_idx,0]
     
+    # open deskewed datastore
     spec = {
             "driver" : "zarr3",
             "kvstore" : {
@@ -129,19 +138,33 @@ def deskew_and_display(root_path: Path,z_downsample_level=2):
         }
     datastore = ts.open(spec).result()
     
+    channel_layers = {ch: [] for ch in range(datastore.shape[2])}
+    colormaps = [
+        Colormap("chrisluts:bop_purple").to_napari(),
+        Colormap("chrisluts:bop_blue").to_napari(),
+        Colormap("chrisluts:bop_orange").to_napari(),
+    ]
     viewer = napari.Viewer()
     for time_idx in range(datastore.shape[0]):
         for pos_idx in range(datastore.shape[1]):
-            viewer.add_image(
-                datastore[:,pos_idx,:,:],
-                scale=[2*pixel_size_um,pixel_size_um,pixel_size_um],
-                translate=stage_positions[pos_idx],
-                name = "t"+str(time_idx).zfill(2)+"_p"+str(pos_idx).zfill(3),
-                blending="additive"
-            )
+            for chan_idx in range(datastore.shape[2]):
+                layer = viewer.add_image(
+                    datastore[:,pos_idx,chan_idx,:],
+                    scale=[2*pixel_size_um,pixel_size_um,pixel_size_um],
+                    translate=stage_positions[pos_idx],
+                    name = "p"+str(pos_idx).zfill(3)+"_c"+str(chan_idx),
+                    blending="additive",
+                    colormap=colormaps[chan_idx],
+                    contrast_limits = [50,2000]
+                )
+                
+                channel_layers[chan_idx].append(layer)
+                
+    for chan_idx in range(datastore.shape[2]):
+        link_layers(channel_layers[chan_idx],("contrast_limits","gamma"))
             
     napari.run()
 
 if __name__ == "__main__":
-    root_path = Path(r"G:\20250226_merfish_test\merfish_test.zarr")
+    root_path = Path(r"G:\20250304_bulbc_brain_control\test_buffer_010.zarr")
     deskew_and_display(root_path,z_downsample_level=2)

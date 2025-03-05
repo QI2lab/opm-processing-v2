@@ -10,6 +10,8 @@ import napari
 import json
 from opm_processing.dataio.metadata import find_key, extract_stage_positions
 import numpy as np
+from napari.experimental import link_layers
+from cmap import Colormap
 
 def display(root_path: Path):
     """Display deskewed OPM data.
@@ -25,6 +27,7 @@ def display(root_path: Path):
     
     # account for flip between camera and stage in y direction
     stage_y_flipped = True
+    stage_z_flipped = True
     
     # Read metadata
     zattrs_path = root_path / Path(".zattrs")
@@ -39,6 +42,11 @@ def display(root_path: Path):
         stage_y_max = np.max(stage_positions[:,1])
         for pos_idx, _ in enumerate(stage_positions):
             stage_positions[pos_idx,1] = stage_y_max - stage_positions[pos_idx,1]
+
+    if stage_z_flipped:
+        stage_z_max = np.max(stage_positions[:,0])
+        for pos_idx, _ in enumerate(stage_positions):
+            stage_positions[pos_idx,0] = stage_z_max - stage_positions[pos_idx,0]
     
     # open datastore on disk
     spec = {
@@ -50,21 +58,34 @@ def display(root_path: Path):
         }
     datastore = ts.open(spec).result()
     
-    # populate napari viewer using lazy loading
+    channel_layers = {ch: [] for ch in range(datastore.shape[2])}
+    colormaps = [
+        Colormap("chrisluts:bop_purple").to_napari(),
+        Colormap("chrisluts:bop_blue").to_napari(),
+        Colormap("chrisluts:bop_orange").to_napari(),
+    ]
     viewer = napari.Viewer()
     for time_idx in range(datastore.shape[0]):
         for pos_idx in range(datastore.shape[1]):
-            viewer.add_image(
-                datastore[:,pos_idx,:,:],
-                scale=[2*pixel_size_um,pixel_size_um,pixel_size_um],
-                translate=stage_positions[pos_idx],
-                name = "t"+str(time_idx).zfill(2)+"_p"+str(pos_idx).zfill(3),
-                blending="additive"
-            )
+            for chan_idx in range(datastore.shape[2]):
+                layer = viewer.add_image(
+                    datastore[:,pos_idx,chan_idx,:],
+                    scale=[2*pixel_size_um,pixel_size_um,pixel_size_um],
+                    translate=stage_positions[pos_idx],
+                    name = "p"+str(pos_idx).zfill(3)+"_c"+str(chan_idx),
+                    blending="additive",
+                    colormap=colormaps[chan_idx],
+                    contrast_limits = [50,2000]
+                )
+                
+                channel_layers[chan_idx].append(layer)
+                
+    for chan_idx in range(datastore.shape[2]):
+        link_layers(channel_layers[chan_idx],("contrast_limits","gamma"))
             
     napari.run()
     
 
 if __name__ == "__main__":
-    root_path = Path(r"G:\20250226_merfish_test\merfish_test.zarr")
+    root_path = Path(r"G:\20250304_bulbc_brain_control\test_buffer_010.zarr")
     display(root_path)
