@@ -1,5 +1,5 @@
 """
-Deskew and display OPM data
+Display OPM data
 
 This file is meant for quick deskew and display of qi2lab OPM results. No deconvolution and it assumes everything fits in memory.
 """
@@ -50,12 +50,12 @@ def display(root_path: Path):
     
     # open datastore on disk
     spec = {
-            "driver" : "zarr3",
-            "kvstore" : {
-                "driver" : "file",
-                "path" : str(output_path)
-            }
+        "driver" : "zarr3",
+        "kvstore" : {
+            "driver" : "file",
+            "path" : str(output_path)
         }
+    }
     datastore = ts.open(spec).result()
     
     channel_layers = {ch: [] for ch in range(datastore.shape[2])}
