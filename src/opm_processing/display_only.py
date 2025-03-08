@@ -87,5 +87,5 @@ def display(root_path: Path):
     
 
 if __name__ == "__main__":
-    root_path = Path(r"G:\20250304_bulbc_brain_control\test_buffer_010.zarr")
+    root_path = Path(r"G:\20250305_bulbc_brain_control\full_run_001.zarr")
     display(root_path)

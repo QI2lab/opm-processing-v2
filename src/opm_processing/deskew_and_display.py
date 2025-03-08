@@ -166,5 +166,5 @@ def deskew_and_display(root_path: Path,z_downsample_level=2):
     napari.run()
 
 if __name__ == "__main__":
-    root_path = Path(r"G:\20250304_bulbc_brain_control\test_buffer_010.zarr")
+    root_path = Path(r"G:\20250305_bulbc_brain_control\full_run_006.zarr")
     deskew_and_display(root_path,z_downsample_level=2)
