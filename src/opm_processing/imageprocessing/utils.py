@@ -77,11 +77,9 @@ def replace_hot_pixels(
 
     return data
 
-@njit(parallel=True)
 def flatfield_correction(
     shading_image: NDArray, 
     data: NDArray,
-    z_axis: int = 0
 ) -> NDArray:
     """Perform illumination shading correction.
 
@@ -94,27 +92,23 @@ def flatfield_correction(
         illumination shading correction
     data: NDArray
         ND data [broadcast_dim,z,y,x]
-    z_axis: int, default = 0
-        Axis along which to correct shading
 
     Returns
     -------
-    data: NDArray
+    corrected_data: NDArray
         shading corrected data
     """
 
-    shading_image = np.squeeze(np.asarray(shading_image, dtype=np.float32))
-    shading_image /= np.max(shading_image, axis=(0, 1))
-    data = np.asarray(data, dtype=np.float32)
-    data = np.moveaxis(data, z_axis, 0)
-    
-    for z_idx in prange(data.shape[z_axis]):
-        data[z_idx] /= shading_image
+    shading_image = shading_image.astype(np.float32)
+    shading_image /= np.max(shading_image) 
+    data = data.astype(np.float32)
 
-    return np.moveaxis(data, 0, z_axis).astype(np.uint16)
+    corrected_data = (data / shading_image[None, :, :]).clip(0,2**16-1).astype(np.uint16)
+
+    return corrected_data
 
 def downsample_image_yx(image: NDArray, level: int = 2) -> NDArray:
-    """Numba accelerated 2D plane downsampling
+    """2D plane downsampling
 
     Parameters
     ----------
@@ -137,7 +131,7 @@ def downsample_image_yx(image: NDArray, level: int = 2) -> NDArray:
     return downsampled_image
 
 def downsample_image_isotropic(image: NDArray, level: int = 2) -> NDArray:
-    """Numba accelerated isotropic downsampling
+    """3D isotropic downsampling
 
     Parameters
     ----------
@@ -161,84 +155,41 @@ def downsample_image_isotropic(image: NDArray, level: int = 2) -> NDArray:
 
     return downsampled_image
 
-@njit(parallel=True)
-def downsample_axis(
-    image: NDArray, 
-    level: int = 2, 
-    axis: int = 0
-) -> NDArray:
-    """Numba accelerated downsampling for 3D images along a specified axis.
-
+def downsample_axis(image: NDArray, level: int = 2, axis: int = 0) -> NDArray:
+    """Optimized NumPy implementation of downsampling along a specified axis.
+    
     Parameters
     ----------
     image: NDArray
-        3D image to be downsampled.
+        image to downsample.
     level: int
-        Amount of downsampling.
+        integer amount to downsample.
     axis: int
-        Axis along which to downsample (0, 1, or 2).
-
+        axis to apply to.
+    
     Returns
     -------
     downsampled_image: NDArray
-        3D downsampled image.
-
+        downsampled image.    
     """
-    if axis == 0:
-        new_length = image.shape[0] // level + (1 if image.shape[0] % level != 0 else 0)
-        downsampled_image = np.zeros(
-            (new_length, image.shape[1], image.shape[2]), dtype=image.dtype
-        )
+    
+    # Compute new shape
+    original_shape = image.shape
+    new_size = original_shape[axis] // level
+    new_shape = list(original_shape)
+    new_shape[axis] = new_size
 
-        for y in prange(image.shape[1]):
-            for x in range(image.shape[2]):
-                for z in range(new_length):
-                    sum_value = 0.0
-                    count = 0
-                    for j in range(level):
-                        original_index = z * level + j
-                        if original_index < image.shape[0]:
-                            sum_value += image[original_index, y, x]
-                            count += 1
-                    if count > 0:
-                        downsampled_image[z, y, x] = sum_value / count
+    # Trim excess values to ensure reshape works properly
+    trim_size = new_size * level
+    slicing = [slice(0, trim_size) if i == axis else slice(None) for i in range(image.ndim)]
+    image_trimmed = image[tuple(slicing)]
 
-    elif axis == 1:
-        new_length = image.shape[1] // level + (1 if image.shape[1] % level != 0 else 0)
-        downsampled_image = np.zeros(
-            (image.shape[0], new_length, image.shape[2]), dtype=image.dtype
-        )
+    # Reshape and compute mean along the downsampled axis
+    reshaped_shape = list(image_trimmed.shape)
+    reshaped_shape[axis] = new_size
+    reshaped_shape.insert(axis + 1, level)
 
-        for z in prange(image.shape[0]):
-            for x in range(image.shape[2]):
-                for y in range(new_length):
-                    sum_value = 0.0
-                    count = 0
-                    for j in range(level):
-                        original_index = y * level + j
-                        if original_index < image.shape[1]:
-                            sum_value += image[z, original_index, x]
-                            count += 1
-                    if count > 0:
-                        downsampled_image[z, y, x] = sum_value / count
+    image_reshaped = image_trimmed.reshape(reshaped_shape)
+    downsampled_image = image_reshaped.mean(axis=axis + 1)
 
-    elif axis == 2:
-        new_length = image.shape[2] // level + (1 if image.shape[2] % level != 0 else 0)
-        downsampled_image = np.zeros(
-            (image.shape[0], image.shape[1], new_length), dtype=image.dtype
-        )
-
-        for z in prange(image.shape[0]):
-            for y in range(image.shape[1]):
-                for x in range(new_length):
-                    sum_value = 0.0
-                    count = 0
-                    for j in range(level):
-                        original_index = x * level + j
-                        if original_index < image.shape[2]:
-                            sum_value += image[z, y, original_index]
-                            count += 1
-                    if count > 0:
-                        downsampled_image[z, y, x] = sum_value / count
-
-    return downsampled_image
+    return downsampled_image.astype(image.dtype)
