@@ -36,7 +36,7 @@ def display(root_path: Path):
 
     pixel_size_um = float(find_key(zattrs,"pixel_size_um"))
     stage_positions = extract_stage_positions(zattrs)
-    output_path = root_path.parents[0] / Path(str(root_path.stem)+"_deskewed.zarr")
+    max_z_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_z_deskewed.zarr")
 
     if stage_y_flipped:
         stage_y_max = np.max(stage_positions[:,1])
@@ -53,7 +53,7 @@ def display(root_path: Path):
         "driver" : "zarr3",
         "kvstore" : {
             "driver" : "file",
-            "path" : str(output_path)
+            "path" : str(max_z_output_path)
         }
     }
     datastore = ts.open(spec).result()
@@ -69,9 +69,9 @@ def display(root_path: Path):
         for pos_idx in range(datastore.shape[1]):
             for chan_idx in range(datastore.shape[2]):
                 layer = viewer.add_image(
-                    datastore[:,pos_idx,chan_idx,:],
-                    scale=[2*pixel_size_um,pixel_size_um,pixel_size_um],
-                    translate=stage_positions[pos_idx],
+                    np.squeeze((datastore[time_idx,pos_idx,chan_idx,:]).read().result()),
+                    scale=[pixel_size_um,pixel_size_um],
+                    translate=[stage_positions[pos_idx,1],stage_positions[pos_idx,2]],
                     name = "p"+str(pos_idx).zfill(3)+"_c"+str(chan_idx),
                     blending="additive",
                     colormap=colormaps[chan_idx],
@@ -87,5 +87,5 @@ def display(root_path: Path):
     
 
 if __name__ == "__main__":
-    root_path = Path(r"G:\20250305_bulbc_brain_control\full_run_001.zarr")
+    root_path = Path(r"G:\20250305_bulbc_brain_control\full_run_006.zarr")
     display(root_path)

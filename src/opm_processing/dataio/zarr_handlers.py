@@ -139,7 +139,7 @@ def create_multiscale_dict(
         }
     }
 
-def create_via_tensorstore(output_path: Path | str, data_shape: list[int], divisble_by: int = 4):
+def create_via_tensorstore(output_path: Path | str, data_shape: list[int], data_type = "uint16", divisble_by: int = 4):
     """Create a TensorStore Zarr v3 driver with a 6D array.
 
     The configuration specifies:
@@ -154,6 +154,8 @@ def create_via_tensorstore(output_path: Path | str, data_shape: list[int], divis
         store location on disk
     data_shape : tuple or list of int
         A 6-element tuple or list representing the size of the 6D array (e.g., (time, pos, channel, z, y, x)).
+    data_type: str
+        "uint16" or "float32"
     divisble_by: int
         Amount to chunk along YX dimensions
 
@@ -201,7 +203,7 @@ def create_via_tensorstore(output_path: Path | str, data_shape: list[int], divis
                     }
                 }
             ],
-            "data_type": "uint16"
+            "data_type": str(data_type)
         }
     }
 
