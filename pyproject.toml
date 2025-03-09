@@ -64,8 +64,8 @@ repository = "https://github.com/qi2lab/opm-processing-v2"
 # Entry points
 # https://peps.python.org/pep-0621/#entry-points
 # same as console_scripts entry point
-# [project.scripts]
-# opm-processing-v2-cli = "opm_processing:main_cli"
+[project.scripts]
+postprocess = "opm_processing.postprocess:main"
 
 # [project.entry-points."some.group"]
 # tomatoes = "opm_processing:main_tomatoes"

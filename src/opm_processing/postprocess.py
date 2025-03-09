@@ -23,6 +23,7 @@ from basicpy import BaSiC
 import typer
 
 app = typer.Typer()
+app.pretty_exceptions_enable = False
 
 @app.command()
 def postprocess(
@@ -121,8 +122,6 @@ def postprocess(
     ts_store = create_via_tensorstore(output_path,datastore_shape)
 
     if max_projection:
-        z_axis = 3
-
         max_z_datastore_shape = [
             datastore.shape[0],
             datastore.shape[1],
@@ -139,7 +138,7 @@ def postprocess(
         )
 
         # create tensorstore object for writing. This is NOT compatible with OME-NGFF!
-        max_z_output_path = root_path.parents[0] / Path(str(root_path.stem)+"max_z_deskewed.zarr")
+        max_z_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_z_deskewed.zarr")
         max_z_ts_store = create_via_tensorstore(max_z_output_path,max_z_datastore_shape)
     
     # loop over all components and stream to zarr using tensorstore
@@ -169,7 +168,7 @@ def postprocess(
                 )
                 
                 if max_projection:
-                    max_z_deskewed = max_z_projection(deskewed,axis=z_axis)
+                    max_z_deskewed = np.expand_dims(max_z_projection(deskewed),axis=0)
                     update_per_index_metadata(
                         ts_store = max_z_ts_store, 
                         metadata = {"stage_position": stage_positions[pos_idx], 'channel': channels[chan_idx]}, 
@@ -276,7 +275,7 @@ def postprocess(
             flatfields.shape[2]
         ]
 
-        flatfields_output_path = root_path.parents[0] / Path(str(root_path.stem)+"flatfields.zarr")
+        flatfields_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_flatfields.zarr")
         flatfields_ts_store = create_via_tensorstore(flatfields_output_path,flatfields_6d_shape)
         flatfields_ts_store[0,0,:,0,:].write(flatfields).result()
 
@@ -358,5 +357,9 @@ def postprocess(
             
         napari.run()
 
+# entry for point for CLI        
+def main():
+    app()
+
 if __name__ == "__main__":
-    app(pretty_exceptions_enable=False)
+    main()

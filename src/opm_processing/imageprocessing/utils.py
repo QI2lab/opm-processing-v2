@@ -78,7 +78,7 @@ def replace_hot_pixels(
     return data
 
 @njit(parallel=True)
-def correct_shading(
+def flatfield_correction(
     shading_image: NDArray, 
     data: NDArray,
     z_axis: int = 0
@@ -244,7 +244,7 @@ def downsample_axis(
     return downsampled_image
 
 @njit(parallel=True)
-def max_z_projection(data: NDArray, z_axis: int = 0) -> NDArray:
+def max_z_projection(data: NDArray) -> NDArray:
     """Numba accelerated max z projection of 3D image.
 
     Parameters
@@ -258,6 +258,12 @@ def max_z_projection(data: NDArray, z_axis: int = 0) -> NDArray:
         2D max projection of 3D image.
     """
 
-    max_projection = np.max(data,axis=z_axis,keepdims=True)
+    # Get output shape (remove first axis)
+    max_projection = np.empty((data.shape[1], data.shape[2]), dtype=np.uint16)
+
+    # Compute max projection manually (Numba-compatible)
+    for i in prange(data.shape[1]):  # Y-dimension
+        for j in prange(data.shape[2]):  # X-dimension
+            max_projection[i, j] = np.max(data[:, i, j])  # Max over Z-axis
 
     return max_projection

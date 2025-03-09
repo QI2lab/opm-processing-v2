@@ -1,5 +1,6 @@
 import numpy as np
 import tensorstore as ts
+import json
 
 def extract_stage_positions(data):
     """Extract stage positions from qi2lab tensostore.
@@ -48,7 +49,7 @@ def extract_stage_positions(data):
 
     return sorted_positions
 
-def extract_channels(data: dict) -> set:
+def extract_channels(data: dict, channels=None) -> list:
     """Extract channel names from qi2lab tensorstore metadata.
 
     Parameters
@@ -59,11 +60,13 @@ def extract_channels(data: dict) -> set:
 
     Returns
     -------
-    channels : set
+    channels : list
         Set of channel names.
     """
 
-    channels = set()
+    if channels is None:
+        channels = set()
+        
     if isinstance(data, dict):
         for key, value in data.items():
             if key == "current_channel":
@@ -73,7 +76,7 @@ def extract_channels(data: dict) -> set:
     elif isinstance(data, list):
         for item in data:
             extract_channels(item, channels)
-    return channels
+    return list(channels)
 
 
 def find_key(data: dict, target_key: str) -> dict | list | None:
@@ -106,42 +109,80 @@ def find_key(data: dict, target_key: str) -> dict | list | None:
                 return found
     return None
 
-
 def update_global_metadata(ts_store, global_metadata):
-    """Update global metadata in the root Zarr metadata.
+    """Update global metadata inside a Zarr v3 array/group.
     
     Parameters
     ----------
     ts_store : tensorstore.TensorStore
         TensorStore object to update.
     global_metadata : dict
-        New global metadata to add or update.
+        Global metadata dictionary.
     """
+    
+    # Read existing metadata
+    read_result = ts_store.kvstore.read("zarr.json").result()
+    if read_result.state == 'missing':
+        existing_metadata = {}
+    else:
+        existing_metadata = json.loads(read_result.value.decode("utf-8"))
 
-    spec = ts_store.spec()
-    spec.update({"metadata": global_metadata})
-    ts_store = ts.open(spec).result()  # Apply the update
+    # Update global metadata
+    global_metadata = convert_metadata(global_metadata)
+    existing_metadata.setdefault("attributes", {}).update(global_metadata)
+
+    # Write updated metadata back to zarr.json
+    ts_store.kvstore.write("zarr.json", json.dumps(existing_metadata).encode("utf-8")).result()
 
 def update_per_index_metadata(ts_store, metadata, index_location):
-    """Update metadata for a specific (t_idx, pos_idx, chan_idx).
+    """Update per-index metadata inside a Zarr v3 array/group.
     
     Parameters
     ----------
     ts_store : tensorstore.TensorStore
         TensorStore object to update.
     metadata : dict
-        New metadata to add or update.
+        Metadata dictionary for this specific (t_idx, pos_idx, chan_idx).
     index_location : tuple
-        Tuple of (t_idx, pos_idx, chan_idx) to update.
+        Tuple of (t_idx, pos_idx, chan_idx).
     """
-    
-    spec = ts_store.spec().to_json()
-    existing_metadata = spec.get("metadata", {})
 
-    per_index_metadata = existing_metadata.setdefault("per_index_metadata", {})
+    # Read existing metadata
+    read_result = ts_store.kvstore.read("zarr.json").result()
+    if read_result.state == 'missing':
+        existing_metadata = {}
+    else:
+        existing_metadata = json.loads(read_result.value.decode("utf-8"))
+
+    # Ensure per-index metadata structure inside attributes
+    attributes = existing_metadata.setdefault("attributes", {})
+    per_index_metadata = attributes.setdefault("per_index_metadata", {})
+
     t_dict = per_index_metadata.setdefault(str(index_location[0]), {})
     pos_dict = t_dict.setdefault(str(index_location[1]), {})
+    metadata = convert_metadata(metadata)
     pos_dict[str(index_location[2])] = metadata
+
+    # Write updated metadata back to zarr.json
+    ts_store.kvstore.write("zarr.json", json.dumps(existing_metadata).encode("utf-8")).result()
+
+def convert_metadata(obj):
+    """Ensure all metadata entries can be serialized.
     
-    spec.update({"metadata": existing_metadata})
-    ts_store = ts.open(spec).result()  # Apply the update
+    Parameters
+    ----------
+    obj: dict
+        Metadata dict that may or may not serialize.
+        
+    Returns
+    -------
+    obj: dict
+        Metadata dict that can be serialized.
+    """
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {k: convert_metadata(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_metadata(v) for v in obj]
+    return obj
