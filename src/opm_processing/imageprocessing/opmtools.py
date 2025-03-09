@@ -1,11 +1,12 @@
 """
-OPM-specific data handling tools.
+qi2lab OPM data handling tools.
 
 This module provides tools and utilities specifically for handling
 oblique plane microscopy (OPM) data.
 
 History:
 ---------
+- **2025/03**: Updated for new qi2lab OPM processing pipeline.
 - **2024/12**: Refactored repo structure.
 - **2024/07**: Initial commit.
 """

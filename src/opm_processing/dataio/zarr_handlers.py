@@ -1,3 +1,13 @@
+"""
+Tools to interact with qi2lab zarr stores using Tensorstore.
+
+There is WIP in making a fast NGFF writer.
+
+History:
+---------
+- **2025/03**: Updated for new qi2lab OPM processing pipeline.
+"""
+
 from pathlib import Path
 import tensorstore as ts
 

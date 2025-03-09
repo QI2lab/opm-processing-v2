@@ -1,3 +1,13 @@
+"""
+Metadata tools for qi2lab OPM tensorstore datastores. The instrument produces a zarr2 store
+with full micro-manager metadata in the .zattrs. The processed data produces a zarr3 store
+with minimal metadata, sufficient for downstream processing.
+
+History:
+---------
+- **2025/03**: Updated for new qi2lab OPM processing pipeline.
+"""
+
 import numpy as np
 import json
 
