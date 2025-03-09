@@ -14,6 +14,7 @@ History:
 
 import numpy as np
 import gc
+import dask.array as da
 from numpy.typing import NDArray
 
 # GPU
@@ -82,8 +83,9 @@ def flatfield_correction(
 ) -> NDArray:
     """Perform illumination shading correction.
 
-    I_corrected = (I_raw - I_dark) / (I_bright - I_dark).
-    Here, we assume I_bright is not normalized or background corrected.
+    I_corrected = (I_raw) / (I_bright).
+    Here, we assume I_bright is not normalized or background corrected 
+    and I_raw is already camera corrected.
 
     Parameters
     ----------
@@ -107,7 +109,7 @@ def flatfield_correction(
     return corrected_data
 
 def downsample_image_yx(image: NDArray, level: int = 2) -> NDArray:
-    """2D plane downsampling
+    """2D plane downsampling.
 
     Parameters
     ----------
@@ -130,7 +132,7 @@ def downsample_image_yx(image: NDArray, level: int = 2) -> NDArray:
     return downsampled_image
 
 def downsample_image_isotropic(image: NDArray, level: int = 2) -> NDArray:
-    """3D isotropic downsampling
+    """3D isotropic downsampling.
 
     Parameters
     ----------
@@ -155,7 +157,7 @@ def downsample_image_isotropic(image: NDArray, level: int = 2) -> NDArray:
     return downsampled_image
 
 def downsample_axis(image: NDArray, level: int = 2, axis: int = 0) -> NDArray:
-    """Optimized NumPy implementation of downsampling along a specified axis.
+    """Downsampling along a specified axis.
     
     Parameters
     ----------
@@ -192,3 +194,39 @@ def downsample_axis(image: NDArray, level: int = 2, axis: int = 0) -> NDArray:
     downsampled_image = image_reshaped.mean(axis=axis + 1)
 
     return downsampled_image.astype(image.dtype)
+
+def optimize_stage_positions(ts_store, reg_axis: int = 0):
+    """Optimize stage positions and update metadata.
+    
+    Parameters
+    ----------
+    ts_store: Tensorstore
+        datastore
+    reg_axis : int, default = 0
+        axis to use for registration
+    """
+    
+    datastore_dask = da.squeeze(da.from_array(ts_store, chunks=ts_store.chunk_shape))
+    
+    
+    # msims = []
+    # for pos_idx in datastore_dask.shape[0]:
+    #     sim = si_utils.get_sim_from_array(
+    #         datastore_dask[pos_idx,:],
+    #         dims=["c"] + list(scale.keys()),
+    #         scale=scale,
+    #         translation=translations[pos_idx],
+    #         transform_key="stage_metadata"
+    #     )
+        
+    #     msim = msi_utils.get_msim_from_sim(sim)
+    #     msims.append(msim)
+    
+    # params = registration.register(
+    #     msims,
+    #     registration_binning={'y': 3, 'x': 3},
+    #     reg_channel_index=0,
+    #     transform_key="stage_metadata",
+    #     new_transform_key='affine_registered',
+    #     pre_registration_pruning_method="keep_axis_aligned"
+    # )

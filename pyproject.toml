@@ -41,6 +41,8 @@ dependencies = [
     "tensorstore",
     "napari[pyqt6]",
     "typer",
+    "ngff-zarr[tensorstore]",
+    "multiview-stitcher",
     "basicpy @ git+https://github.com/QI2lab/BaSiCPy.git@main"
 ]
 
