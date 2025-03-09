@@ -242,28 +242,3 @@ def downsample_axis(
                         downsampled_image[z, y, x] = sum_value / count
 
     return downsampled_image
-
-@njit(parallel=True)
-def max_z_projection(data: NDArray) -> NDArray:
-    """Numba accelerated max z projection of 3D image.
-
-    Parameters
-    ----------
-    data: NDArray
-        3D image to be projected.
-
-    Returns
-    -------
-    max_projection: NDArray
-        2D max projection of 3D image.
-    """
-
-    # Get output shape (remove first axis)
-    max_projection = np.empty((data.shape[1], data.shape[2]), dtype=np.uint16)
-
-    # Compute max projection manually (Numba-compatible)
-    for i in prange(data.shape[1]):  # Y-dimension
-        for j in prange(data.shape[2]):  # X-dimension
-            max_projection[i, j] = np.max(data[:, i, j])  # Max over Z-axis
-
-    return max_projection

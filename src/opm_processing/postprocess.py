@@ -168,7 +168,7 @@ def postprocess(
                 )
                 
                 if max_projection:
-                    max_z_deskewed = np.expand_dims(max_z_projection(deskewed),axis=0)
+                    max_z_deskewed = np.max(deskewed,axis=0,keepdims=True)
                     update_per_index_metadata(
                         ts_store = max_z_ts_store, 
                         metadata = {"stage_position": stage_positions[pos_idx], 'channel': channels[chan_idx]}, 

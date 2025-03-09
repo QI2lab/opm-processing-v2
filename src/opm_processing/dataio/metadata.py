@@ -1,5 +1,4 @@
 import numpy as np
-import tensorstore as ts
 import json
 
 def extract_stage_positions(data):
