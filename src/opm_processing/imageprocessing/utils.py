@@ -15,7 +15,6 @@ History:
 import numpy as np
 import gc
 from numpy.typing import NDArray
-from numba import njit, prange
 
 # GPU
 CUPY_AVIALABLE = True
@@ -61,7 +60,7 @@ def replace_hot_pixels(
     inverted_hot_pixels = xp.ones_like(hot_pixels) - hot_pixels.copy()
 
     data = xp.asarray(data, dtype=xp.float32)
-    for z_idx in prange(data.shape[0]):
+    for z_idx in range(data.shape[0]):
         median = ndimage.median_filter(data[z_idx, :, :], size=3)
         data[z_idx, :] = inverted_hot_pixels * data[z_idx, :] + hot_pixels * median
 

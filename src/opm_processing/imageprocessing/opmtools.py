@@ -10,10 +10,7 @@ History:
 - **2024/07**: Initial commit.
 """
 
-from opm_processing.imageprocessing.utils import (
-    replace_hot_pixels,
-    downsample_axis
-)
+from opm_processing.imageprocessing.utils import downsample_axis
 from tqdm import tqdm
 import numpy as np
 from numpy.typing import ArrayLike
