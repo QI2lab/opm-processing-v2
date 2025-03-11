@@ -66,7 +66,7 @@ def display(root_path: Path):
     ]
     viewer = napari.Viewer()
     for time_idx in range(datastore.shape[0]):
-        for pos_idx in range(datastore.shape[1]):
+        for pos_idx in range(15):
             for chan_idx in range(datastore.shape[2]):
                 layer = viewer.add_image(
                     np.squeeze((datastore[time_idx,pos_idx,chan_idx,:]).read().result()),

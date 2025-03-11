@@ -12,8 +12,8 @@ History:
 
 from pathlib import Path
 import tensorstore as ts
-from opm_processing.imageprocessing.opmtools import deskew, downsample_axis, deskew_shape_estimator
-from opm_processing.imageprocessing.utils import create_fused_max_z_projection
+from opm_processing.imageprocessing.opmtools import deskew, deskew_shape_estimator
+from opm_processing.imageprocessing.maxtilefusion import TileFusion
 from opm_processing.dataio.metadata import extract_channels, find_key, extract_stage_positions, update_global_metadata, update_per_index_metadata
 from opm_processing.dataio.zarr_handlers import create_via_tensorstore, write_via_tensorstore
 import json
@@ -96,8 +96,8 @@ def postprocess(
         for pos_idx, _ in enumerate(stage_positions):
             stage_positions[pos_idx,0] = stage_z_max - stage_positions[pos_idx,0]
     
-    # estimate shape of one deskewed volume
-    deskewed_shape = deskew_shape_estimator(
+    # # estimate shape of one deskewed volume
+    deskewed_shape, pad_y, pad_x = deskew_shape_estimator(
         [datastore.shape[-3],datastore.shape[-2],datastore.shape[-1]],
         theta=opm_tilt_deg,
         distance=image_mirror_step_um,
@@ -143,49 +143,18 @@ def postprocess(
         max_z_ts_store = create_via_tensorstore(max_z_output_path,max_z_datastore_shape)
     
     if flatfield_correction:
-        try:
-            flatfields_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_flatfields.zarr")
-            spec = {
-                "driver" : "zarr3",
-                "kvstore" : {
-                    "driver" : "file",
-                    "path" : str(flatfields_output_path)
-                }
-            }
-            flatfields_ts_store = ts.open(spec).result()
-            flatfields = np.squeeze(flatfields_ts_store.read().result())
-            
-            del flatfields_ts_store
-
-        except Exception:
-            flatfields = np.zeros((datastore.shape[2],datastore.shape[-2],datastore.shape[-1]),dtype=np.float32)
-            if datastore.shape[1] > 500:
-                n_rand_images = 500
-            else:
-                n_rand_images = datastore.shape[1]
-            sample_indices = list(np.random.choice(datastore.shape[1], size=n_rand_images, replace=False))
-            for chan_idx in range(datastore.shape[2]):
-                temp_images = ((np.squeeze(datastore[0,sample_indices,chan_idx,datastore.shape[-3]//2,:].read().result()).astype(np.float32)-camera_offset)*camera_conversion).clip(0,2**16-1).astype(np.uint16)
-                basic = BaSiC(get_darkfield=False)
-                #basic.autotune(temp_images, early_stop=True, n_iter=100)
-                basic.fit(temp_images)
-                flatfields[chan_idx,:] = np.squeeze(basic.flatfield) / np.max(basic.flatfield,axis=(0,1))
+        flatfields = np.zeros((datastore.shape[2],datastore.shape[-2],datastore.shape[-1]),dtype=np.float32)
+        if datastore.shape[1] > 500:
+            n_rand_images = 500
+        else:
+            n_rand_images = datastore.shape[1]
+        sample_indices = list(np.random.choice(datastore.shape[1], size=n_rand_images, replace=False))
+        for chan_idx in range(datastore.shape[2]):
+            temp_images = ((np.squeeze(datastore[0,sample_indices,chan_idx,datastore.shape[-3]//2,:].read().result()).astype(np.float32)-camera_offset)*camera_conversion).clip(0,2**16-1).astype(np.uint16)
+            basic = BaSiC(get_darkfield=False)
+            basic.fit(temp_images)
+            flatfields[chan_idx,:] = np.squeeze(basic.flatfield) / np.max(basic.flatfield,axis=(0,1))
         
-            flatfields_6d = np.expand_dims(flatfields, axis=(0, 1, 3))
-            flatfields_6d_shape = [
-                1,
-                1,
-                flatfields.shape[0],
-                1,
-                flatfields.shape[1],
-                flatfields.shape[2]
-            ]
-
-            flatfields_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_flatfields.zarr")
-            flatfields_ts_store = create_via_tensorstore(flatfields_output_path,flatfields_6d_shape,data_type="float32")
-            flatfields_ts_store[0,0,:,0,:].write(flatfields).result()
-
-            del flatfields_6d, flatfields_ts_store
     else:
         flatfields = np.ones((datastore.shape[2],datastore.shape[-2],datastore.shape[-1]),dtype=np.float32)
     
@@ -198,17 +167,13 @@ def postprocess(
         for pos_idx in tqdm(range(datastore.shape[1]),desc="p",leave=False):
             for chan_idx in tqdm(range(datastore.shape[2]),desc="c",leave=False):
                 camera_corrected_data = ((np.squeeze(datastore[t_idx,pos_idx,chan_idx,:].read().result()).astype(np.float32)-camera_offset)*camera_conversion)/(np.squeeze(flatfields[chan_idx,:])).clip(0,2**16-1).astype(np.uint16)
-                deskewed = downsample_axis(
-                    deskew(
-                        camera_corrected_data,
-                        theta = opm_tilt_deg,
-                        distance = image_mirror_step_um,
-                        pixel_size = pixel_size_um,
-                    ),
-                    level = z_downsample_level,
-                    axis = 0
+                deskewed = deskew(
+                    camera_corrected_data,
+                    theta = opm_tilt_deg,
+                    distance = image_mirror_step_um,
+                    pixel_size = pixel_size_um,
                 )
-
+              
                 update_per_index_metadata(
                     ts_store = ts_store, 
                     metadata = {"stage_position": stage_positions[pos_idx], 'channel': channels[chan_idx]}, 
@@ -286,16 +251,81 @@ def postprocess(
         del max_z_deskewed, ts_max_write
         
     if create_fused_max_projection:
-        ngff_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_z_fused.ome.zarr")
-        create_fused_max_z_projection(
-            max_z_ts_store,
-            ngff_output_path
-            [z_downsample_level*pixel_size_um, pixel_size_um, pixel_size_um],
-            stage_positions
-        )
+      
         
-    if create_fused_max_projection and display_fused_max_projection:
-        pass
+        max_z_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_z_deskewed.zarr")
+        # open datastore on disk
+        spec = {
+            "driver" : "zarr3",
+            "kvstore" : {
+                "driver" : "file",
+                "path" : str(max_z_output_path)
+            }
+        }
+        max_z_ts_store = ts.open(spec).result()
+        
+        print("\nEstimating flatfields...")
+        max_flatfields = np.zeros((max_z_ts_store.shape[2],max_z_ts_store.shape[-2],max_z_ts_store.shape[-1]),dtype=np.float32)
+        if max_z_ts_store.shape[1] > 500:
+            n_rand_images = 500
+        else:
+            n_rand_images = max_z_ts_store.shape[1]
+        sample_indices = list(np.random.choice(max_z_ts_store.shape[1], size=n_rand_images, replace=False))
+        for chan_idx in tqdm(range(max_z_ts_store.shape[2]),desc='chan'):
+            temp_images = np.squeeze(max_z_ts_store[0,sample_indices,chan_idx,:].read().result()).astype(np.float32)
+            basic = BaSiC(get_darkfield=False)
+            #basic.autotune(temp_images, early_stop=True, n_iter=100)
+            basic.fit(temp_images)
+            max_flatfields[chan_idx,:] = np.squeeze(basic.flatfield) / np.max(np.squeeze(basic.flatfield),axis=(0,1))
+        
+        print("\nFusing using stage positions...")
+        fused_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_zfused.zarr")
+        tile_fusion = TileFusion(
+            ts_dataset = max_z_ts_store,
+            tile_positions = stage_positions[:,1:],
+            output_path=fused_output_path,
+            pixel_size=np.asarray((pixel_size_um,pixel_size_um),dtype=np.float32),
+            flatfields = max_flatfields
+        )
+        tile_fusion.run()
+        
+        
+    if display_fused_max_projection:
+
+        from cmap import Colormap
+        import napari
+        
+        fused_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_zfused.zarr")
+        # open datastore on disk
+        spec = {
+            "driver" : "zarr3",
+            "kvstore" : {
+                "driver" : "file",
+                "path" : str(fused_output_path)
+            }
+        }
+        fused_max_z_ts_store = ts.open(spec).result()
+        
+
+        
+        colormaps = [
+            Colormap("chrisluts:bop_purple").to_napari(),
+            Colormap("chrisluts:bop_blue").to_napari(),
+            Colormap("chrisluts:bop_orange").to_napari(),
+        ]
+        viewer = napari.Viewer()
+        for time_idx in range(fused_max_z_ts_store.shape[0]):
+            for pos_idx in range(fused_max_z_ts_store.shape[1]):
+                for chan_idx in range(fused_max_z_ts_store.shape[2]):
+                    viewer.add_image(
+                        np.squeeze((fused_max_z_ts_store[time_idx,pos_idx,chan_idx,:]).read().result()),
+                        scale=[pixel_size_um,pixel_size_um],
+                        name = "c"+str(chan_idx).zfill(2),
+                        blending="additive",
+                        colormap=colormaps[chan_idx],
+                        contrast_limits = [0,500]
+                    )
+        napari.run()
 
 # entry for point for CLI        
 def main():

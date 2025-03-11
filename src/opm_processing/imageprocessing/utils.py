@@ -191,19 +191,18 @@ def create_fused_max_z_projection(
         axis to use for registration
     """
     
-    datastore_dask = da.squeeze(da.from_array(ts_store, chunks=ts_store.chunk_shape))
-    
+    max_projection_data = np.squeeze(ts_store.read().result())
     
     msims = []
     scale = {"y": voxel_size_zyx_um[1], "x": voxel_size_zyx_um[2]}
-    for pos_idx in datastore_dask.shape[0]:
+    for pos_idx in range(max_projection_data.shape[0]):
         tile_grid_positions = {
             "y": np.round(stage_positions_zyx_um[pos_idx,1], 2),
             "x": np.round(stage_positions_zyx_um[pos_idx,2], 2),
         }
         
         sim = si_utils.get_sim_from_array(
-            datastore_dask[pos_idx,:],
+            max_projection_data[pos_idx,:],
             dims=["c"] + list(scale.keys()),
             scale=scale,
             translation=tile_grid_positions,
@@ -213,16 +212,19 @@ def create_fused_max_z_projection(
         msim = msi_utils.get_msim_from_sim(sim)
         msims.append(msim)
     
-    _ = registration.register(
-        msims,
-        registration_binning={'y': 3, 'x': 3},
-        reg_channel_index=reg_axis,
-        transform_key="stage_metadata",
-        new_transform_key='affine_registered',
-        pre_registration_pruning_method="keep_axis_aligned",
-        post_registration_do_quality_filter=True
-    )
+    print("Registering views...")
+    with dask.diagnostics.ProgressBar():
+        _ = registration.register(
+            msims,
+            registration_binning={'y': 3, 'x': 3},
+            reg_channel_index=reg_axis,
+            transform_key="stage_metadata",
+            new_transform_key='affine_registered',
+            pre_registration_pruning_method="keep_axis_aligned",
+            post_registration_do_quality_filter=True
+        )
     
+    print("Building fusion graph...")
     fused = fusion.fuse(
         [msi_utils.get_sim_from_msim(msim) for msim in msims],
         transform_key='affine_registered',

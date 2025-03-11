@@ -70,7 +70,7 @@ def deskew_shape_estimator(
     padded_final_ny = final_ny + pad_y 
     padded_final_nx = final_nx + pad_x
 
-    return [final_nz, padded_final_ny, padded_final_nx]
+    return [final_nz, padded_final_ny, padded_final_nx], pad_y, pad_x
 
 
 @njit(parallel=True)
@@ -81,7 +81,8 @@ def deskew(
     pixel_size: float = 0.115,
     flip_scan = False,
     reverse_deskewed_z = False,
-    divisble_by: int = 4
+    divisible_by: int = 4,
+    downsample_factor: int = 2
 ):
     """Numba accelerated orthogonal interpolation for oblique data.
     
@@ -102,6 +103,10 @@ def deskew(
         flip direction of scan stack w.r.t deskew direction
     reverse_deskewed_z: bool, default = False
         flip output z direction to match camera <-> stage orientation 
+    divisible_by: int, default = 4
+        amount to ensure data is divisible by for chunked storage
+    downsample_factor: int, default = 2
+        amount to downsample the output Z axis by
 
     Returns
     -------
@@ -112,98 +117,108 @@ def deskew(
     if flip_scan:
         data = np.flipud(data)
 
-    # unwrap parameters
-    [num_images, ny, nx] = data.shape  # (pixels)
+    num_images, ny, nx = data.shape
+    pixel_step = distance / pixel_size
+    scan_end = num_images * pixel_step
 
-    # change step size from physical space (nm) to camera space (pixels)
-    pixel_step = distance / pixel_size  # (pixels)
+    # Convert angles once
+    theta_rad = np.radians(theta)
+    tantheta = np.tan(theta_rad)
+    sintheta = np.sin(theta_rad)
+    costheta = np.cos(theta_rad)
 
-    # calculate the number of pixels scanned during stage scan
-    scan_end = num_images * pixel_step  # (pixels)
+    # Compute final image size
+    final_ny = np.int64(np.ceil(scan_end + ny * costheta))
+    final_nz = np.int64(np.ceil(ny * sintheta))
+    final_nz_downsampled = max(1, final_nz // downsample_factor)
+    final_nx = np.int64(nx)
 
-    # calculate properties for final image
-    final_ny = np.int64(
-        np.ceil(scan_end + ny * np.cos(theta * np.pi / 180))
-    )  # (pixels)
-    final_nz = np.int64(np.ceil(ny * np.sin(theta * np.pi / 180)))  # (pixels)
-    final_nx = np.int64(nx)  # (pixels)
-    
-    # pad YX array to make sure it is divisble by 4
-    pad_y = (divisble_by - (final_ny % divisble_by)) % divisble_by
-    pad_x = (divisble_by- (final_nx % divisble_by)) % divisble_by
-    padded_final_ny = final_ny + pad_y 
+    # Pad dimensions to be divisible by `divisible_by`
+    pad_y = (divisible_by - (final_ny % divisible_by)) % divisible_by
+    pad_x = (divisible_by - (final_nx % divisible_by)) % divisible_by
+    padded_final_ny = final_ny + pad_y
     padded_final_nx = final_nx + pad_x
 
+    # Allocate output array
+    output = np.zeros((final_nz_downsampled, padded_final_ny, padded_final_nx), dtype=np.float32)
 
-    # create final image
-    output = np.zeros(
-        (final_nz, padded_final_ny, padded_final_nx), dtype=np.float32
-    ) 
+    # Precompute division to avoid redundant division in the loop
+    inv_pixel_step = 1 / pixel_step
 
-    # precalculate trig functions for scan angle
-    tantheta = np.float32(np.tan(theta * np.pi / 180))  # (float32)
-    sintheta = np.float32(np.sin(theta * np.pi / 180))  # (float32)
-    costheta = np.float32(np.cos(theta * np.pi / 180))  # (float32)
+    # Perform deskewing with integrated downsampling
+    for z_ds in prange(final_nz_downsampled):
+        z_start = z_ds * downsample_factor
+        z_end = min(z_start + downsample_factor, final_nz)
 
-    # perform orthogonal interpolation
+        temp_buffer = np.zeros((padded_final_ny, padded_final_nx), dtype=np.float32)
 
-    # loop through output z planes
-    # defined as parallel loop in numba
-    for z in prange(0, final_nz):
-        # calculate range of output y pixels to populate
-        y_range_min = np.minimum(0, np.int64(np.floor(np.float32(z) / tantheta)))
-        y_range_max = np.maximum(
-            final_ny, np.int64(np.ceil(scan_end + np.float32(z) / tantheta + 1))
-        )
+        for z in range(z_start, z_end):
+            for y in prange(final_ny):  
+                virtual_plane = y - z / tantheta
+                plane_before = int(np.floor(virtual_plane * inv_pixel_step))
+                plane_after = plane_before + 1
 
-        # loop through final y pixels
-        # defined as parallel loop in numba
-        for y in prange(y_range_min, y_range_max):
-            # find the virtual tilted plane that intersects the interpolated plane
-            virtual_plane = y - z / tantheta
+                # Strict boundary check to prevent invalid memory accesses
+                if plane_before < 0 or plane_after >= num_images:
+                    continue  # Skip invalid interpolation points
 
-            # find raw data planes that surround the virtual plane
-            plane_before = np.int64(np.floor(virtual_plane / pixel_step))
-            plane_after = np.int64(plane_before + 1)
-
-            # continue if raw data planes are within the data range
-            if (plane_before >= 0) and (plane_after < num_images):
-                # find distance of a point on the  interpolated plane to plane_before and plane_after
-                l_before = virtual_plane - plane_before * pixel_step
-                l_after = pixel_step - l_before
-
-                # determine location of a point along the interpolated plane
                 za = z / sintheta
-                virtual_pos_before = za + l_before * costheta
-                virtual_pos_after = za - l_after * costheta
+                virtual_pos_before = za + (virtual_plane - plane_before * pixel_step) * costheta
+                virtual_pos_after = za - (pixel_step - (virtual_plane - plane_before * pixel_step)) * costheta
 
-                # determine nearest data points to interpoloated point in raw data
-                pos_before = np.int64(np.floor(virtual_pos_before))
-                pos_after = np.int64(np.floor(virtual_pos_after))
+                pos_before = int(np.floor(virtual_pos_before))
+                pos_after = int(np.floor(virtual_pos_after))
 
-                # continue if within data bounds
+                # Strict position index check
+                if pos_before < 0 or pos_after >= ny - 1:
+                    continue  # Skip out-of-bounds pixels
+
+                dz_before = virtual_pos_before - pos_before
+                dz_after = virtual_pos_after - pos_after
+
+                # Fetch pixel values safely, ensuring they are within valid range
+                pixel_1 = data[plane_after, pos_after + 1, :final_nx]
+                pixel_2 = data[plane_after, pos_after, :final_nx]
+                pixel_3 = data[plane_before, pos_before + 1, :final_nx]
+                pixel_4 = data[plane_before, pos_before, :final_nx]
+
+                # **Fix: If all surrounding pixels are zero, skip accumulation**
                 if (
-                    (pos_before >= 0)
-                    and (pos_after >= 0)
-                    and (pos_before < ny - 1)
-                    and (pos_after < ny - 1)
+                    np.all(pixel_1 == 0) and np.all(pixel_2 == 0) and
+                    np.all(pixel_3 == 0) and np.all(pixel_4 == 0)
                 ):
-                    # determine points surrounding interpolated point on the virtual plane
-                    dz_before = virtual_pos_before - pos_before
-                    dz_after = virtual_pos_after - pos_after
+                    continue  # Prevents division by zero and artifacts
 
-                    # compute final image plane using orthogonal interpolation
-                    output[z, y, :final_nx] = (
-                        l_before * dz_after * data[plane_after, pos_after + 1, :]
-                        + l_before * (1 - dz_after) * data[plane_after, pos_after, :]
-                        + l_after * dz_before * data[plane_before, pos_before + 1, :]
-                        + l_after * (1 - dz_before) * data[plane_before, pos_before, :]
-                    ) / pixel_step
-                    
+                # Compute interpolated values
+                new_values = (
+                    dz_after * pixel_1
+                    + (1 - dz_after) * pixel_2
+                    + dz_before * pixel_3
+                    + (1 - dz_before) * pixel_4
+                ) * inv_pixel_step
+
+                # Prevent small floating-point errors from accumulating
+                new_values = np.clip(new_values, 0, 65534)  
+
+                # Accumulate safely
+                temp_buffer[y, :final_nx] = np.clip(temp_buffer[y, :final_nx] + new_values, 0, 65534)
+
+        # Store the averaged downsampled z-slice
+        output[z_ds] = np.clip(temp_buffer / downsample_factor, 0, 65534)  # Prevent overflow after division
+
+    # Explicitly zero out padding before conversion
+    if pad_y > 0:
+        output[:, -pad_y:, :] = 0
+    if pad_x > 0:
+        output[:, :, -pad_x:] = 0
+
+    # Convert to uint16 safely
+    output_uint16 = output.astype(np.uint16)
+
     if reverse_deskewed_z:
-        return np.flipud(output).astype(np.uint16)
+        return np.flipud(output_uint16)
     else:
-        return output.astype(np.uint16)
+        return output_uint16
 
 
 def lab2cam(
