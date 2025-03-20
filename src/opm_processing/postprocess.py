@@ -77,28 +77,30 @@ def postprocess(
     opm_mode = str(find_key(zattrs, "mode"))
     if "mirror" in opm_mode:
         scan_axis_step_um = float(find_key(zattrs,"image_mirror_step_um"))
+        excess_scan_positions = 0
     elif "stage" in opm_mode:
         scan_axis_step_um = float(find_key(zattrs,"scan_axis_step_um"))
-        
+        excess_scan_positions = int(find_key(zattrs,"excess_scan_positions"))
     pixel_size_um = float(find_key(zattrs,"pixel_size_um"))
-    opm_tilt_deg = float(find_key(zattrs,"angle_deg"))
-    
+    opm_tilt_deg = float(find_key(zattrs,"angle_deg"))    
     camera_offset = float(find_key(zattrs,"offset"))
     camera_conversion = float(find_key(zattrs,"e_to_ADU"))
-    
+
     channels = extract_channels(zattrs)
     stage_positions = extract_stage_positions(zattrs)
+    # TO DO: start writing these in metadata!
     stage_x_flipped = False
     stage_y_flipped = True
     stage_z_flipped = True
 
     # flip x positions w.r.t. camera <-> stage orientation
+    # TO DO: this axis is probably affected by the scan_flip flag, need to think
+    #        about that.
     if stage_x_flipped:
         stage_x_max = np.max(stage_positions[:,0])
         for pos_idx, _ in enumerate(stage_positions):
             stage_positions[pos_idx,0] = stage_x_max - stage_positions[pos_idx,0]
     
-
     # flip y positions w.r.t. camera <-> stage orientation
     if stage_y_flipped:
         stage_y_max = np.max(stage_positions[:,1])
@@ -113,7 +115,7 @@ def postprocess(
     
     # # estimate shape of one deskewed volume
     deskewed_shape, pad_y, pad_x = deskew_shape_estimator(
-        [datastore.shape[-3],datastore.shape[-2],datastore.shape[-1]],
+        [datastore.shape[-3],datastore.shape[-2],datastore.shape[-1]-excess_scan_positions],
         theta=opm_tilt_deg,
         distance=scan_axis_step_um,
         pixel_size=pixel_size_um
@@ -188,7 +190,7 @@ def postprocess(
                 else:
                     flip_scan = False
                 deskewed = deskew(
-                    camera_corrected_data,
+                    camera_corrected_data[:,:,excess_scan_positions:],
                     theta = opm_tilt_deg,
                     distance = scan_axis_step_um,
                     pixel_size = pixel_size_um,
