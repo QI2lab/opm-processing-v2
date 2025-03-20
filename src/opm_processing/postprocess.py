@@ -30,7 +30,7 @@ app.pretty_exceptions_enable = False
 def postprocess(
     root_path: Path,
     max_projection: bool = True,
-    write_max_projection_tiffs = True,
+    write_max_projection_tiffs = False,
     flatfield_correction: bool = False, # not working at the moment
     create_fused_max_projection: bool = True,
     display_fused_max_projection: bool = True,
@@ -74,8 +74,13 @@ def postprocess(
     with open(zattrs_path, "r") as f:
         zattrs = json.load(f)
 
-    image_mirror_step_um = float(find_key(zattrs,"image_mirror_step_um"))
-    
+    opm_mode = str(find_key(zattrs, "mode"))
+    if "mirror" in opm_mode:
+        image_step_um = float(find_key(zattrs,"image_mirror_step_um"))
+        # image_mirror_step_um = float(find_key(zattrs,"image_mirror_step_um"))
+    elif "stage" in opm_mode:
+        image_step_um = float(find_key(zattrs,"scan_axis_step_um"))
+        
     pixel_size_um = float(find_key(zattrs,"pixel_size_um"))
     opm_tilt_deg = float(find_key(zattrs,"angle_deg"))
     
@@ -103,7 +108,7 @@ def postprocess(
     deskewed_shape, pad_y, pad_x = deskew_shape_estimator(
         [datastore.shape[-3],datastore.shape[-2],datastore.shape[-1]],
         theta=opm_tilt_deg,
-        distance=image_mirror_step_um,
+        distance=image_step_um,
         pixel_size=pixel_size_um
     )
 
@@ -174,7 +179,7 @@ def postprocess(
                 deskewed = deskew(
                     camera_corrected_data,
                     theta = opm_tilt_deg,
-                    distance = image_mirror_step_um,
+                    distance = image_step_um,
                     pixel_size = pixel_size_um,
                 )
               
@@ -217,39 +222,72 @@ def postprocess(
         for ts_max_write in tqdm(ts_max_writes,desc='max writes'):
             ts_max_write.result()
 
-    update_global_metadata(
-        ts_store = ts_store,
-        global_metadata= {
-                "image_mirror_step_um" : image_mirror_step_um,
-                "raw_pixel_size_um" : pixel_size_um,
-                "opm_tilt_deg" : opm_tilt_deg,
-                "camera_corrected" : True,
-                "camera_offset" : camera_offset,
-                "camera_e_to_ADU" : camera_conversion,
-                "deskewed_voxel_size_um" : [z_downsample_level*pixel_size_um, pixel_size_um, pixel_size_um],
-                "stage_y_flipped": stage_y_flipped,
-                "stage_z_flipped": stage_z_flipped,
-                "flatfield_corrected": flatfield_correction
-            }
-    )
-
-    if max_projection:
+    if "mirror" in opm_mode:
         update_global_metadata(
-            ts_store = max_z_ts_store,
+            ts_store = ts_store,
             global_metadata= {
-                "image_mirror_step_um" : image_mirror_step_um,
-                "raw_pixel_size_um" : pixel_size_um,
-                "opm_tilt_deg" : opm_tilt_deg,
-                "camera_corrected" : True,
-                "camera_offset" : camera_offset,
-                "camera_e_to_ADU" : camera_conversion,
-                "deskewed_voxel_size_um" : [pixel_size_um, pixel_size_um],
-                "stage_y_flipped": stage_y_flipped,
-                "stage_z_flipped": stage_z_flipped,
-                "flatfield_corrected": flatfield_correction
-            }
+                    "image_mirror_step_um" : image_step_um,
+                    "raw_pixel_size_um" : pixel_size_um,
+                    "opm_tilt_deg" : opm_tilt_deg,
+                    "camera_corrected" : True,
+                    "camera_offset" : camera_offset,
+                    "camera_e_to_ADU" : camera_conversion,
+                    "deskewed_voxel_size_um" : [z_downsample_level*pixel_size_um, pixel_size_um, pixel_size_um],
+                    "stage_y_flipped": stage_y_flipped,
+                    "stage_z_flipped": stage_z_flipped,
+                    "flatfield_corrected": flatfield_correction
+                }
         )
-        
+    elif "stage" in opm_mode:
+        update_global_metadata(
+            ts_store = ts_store,
+            global_metadata= {
+                    "scan_axis_step_um" : image_step_um,
+                    "raw_pixel_size_um" : pixel_size_um,
+                    "opm_tilt_deg" : opm_tilt_deg,
+                    "camera_corrected" : True,
+                    "camera_offset" : camera_offset,
+                    "camera_e_to_ADU" : camera_conversion,
+                    "deskewed_voxel_size_um" : [z_downsample_level*pixel_size_um, pixel_size_um, pixel_size_um],
+                    "stage_y_flipped": stage_y_flipped,
+                    "stage_z_flipped": stage_z_flipped,
+                    "flatfield_corrected": flatfield_correction
+                }
+        )
+    if max_projection:
+        if "mirror" in opm_mode:
+            update_global_metadata(
+                ts_store = max_z_ts_store,
+                global_metadata= {
+                    "image_mirror_step_um" : image_step_um,
+                    "raw_pixel_size_um" : pixel_size_um,
+                    "opm_tilt_deg" : opm_tilt_deg,
+                    "camera_corrected" : True,
+                    "camera_offset" : camera_offset,
+                    "camera_e_to_ADU" : camera_conversion,
+                    "deskewed_voxel_size_um" : [pixel_size_um, pixel_size_um],
+                    "stage_y_flipped": stage_y_flipped,
+                    "stage_z_flipped": stage_z_flipped,
+                    "flatfield_corrected": flatfield_correction
+                }
+            )
+        elif "stage" in opm_mode:
+            update_global_metadata(
+                ts_store = max_z_ts_store,
+                global_metadata= {
+                    "scan_axis_step_um" : image_step_um,
+                    "raw_pixel_size_um" : pixel_size_um,
+                    "opm_tilt_deg" : opm_tilt_deg,
+                    "camera_corrected" : True,
+                    "camera_offset" : camera_offset,
+                    "camera_e_to_ADU" : camera_conversion,
+                    "deskewed_voxel_size_um" : [pixel_size_um, pixel_size_um],
+                    "stage_y_flipped": stage_y_flipped,
+                    "stage_z_flipped": stage_z_flipped,
+                    "flatfield_corrected": flatfield_correction
+                }
+            )
+            
     del deskewed, ts_write, ts_store
     if max_projection:
         del max_z_deskewed, ts_max_write
@@ -289,8 +327,10 @@ def postprocess(
             flatfields = max_flatfields
         )
         tile_fusion.run()
+        print(write_max_projection_tiffs)
         
         if write_max_projection_tiffs:
+            print(f"In write max projection tiffs: {write_max_projection_tiffs}")
             tiff_dir_path = max_z_output_path.parent / Path("fused_max_projection_tiff_output")
             tiff_dir_path.mkdir(exist_ok=True)
             max_spec = {
