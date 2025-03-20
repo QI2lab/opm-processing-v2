@@ -31,7 +31,7 @@ def postprocess(
     root_path: Path,
     max_projection: bool = True,
     write_max_projection_tiffs = False,
-    flatfield_correction: bool = False, # not working at the moment
+    flatfield_correction: bool = False, # only working for stage scan at the moment
     create_fused_max_projection: bool = True,
     display_fused_max_projection: bool = True,
     z_downsample_level: int = 2
@@ -76,10 +76,9 @@ def postprocess(
 
     opm_mode = str(find_key(zattrs, "mode"))
     if "mirror" in opm_mode:
-        image_step_um = float(find_key(zattrs,"image_mirror_step_um"))
-        # image_mirror_step_um = float(find_key(zattrs,"image_mirror_step_um"))
+        scan_axis_step_um = float(find_key(zattrs,"image_mirror_step_um"))
     elif "stage" in opm_mode:
-        image_step_um = float(find_key(zattrs,"scan_axis_step_um"))
+        scan_axis_step_um = float(find_key(zattrs,"scan_axis_step_um"))
         
     pixel_size_um = float(find_key(zattrs,"pixel_size_um"))
     opm_tilt_deg = float(find_key(zattrs,"angle_deg"))
@@ -89,8 +88,16 @@ def postprocess(
     
     channels = extract_channels(zattrs)
     stage_positions = extract_stage_positions(zattrs)
+    stage_x_flipped = False
     stage_y_flipped = True
     stage_z_flipped = True
+
+    # flip x positions w.r.t. camera <-> stage orientation
+    if stage_x_flipped:
+        stage_x_max = np.max(stage_positions[:,0])
+        for pos_idx, _ in enumerate(stage_positions):
+            stage_positions[pos_idx,0] = stage_x_max - stage_positions[pos_idx,0]
+    
 
     # flip y positions w.r.t. camera <-> stage orientation
     if stage_y_flipped:
@@ -108,7 +115,7 @@ def postprocess(
     deskewed_shape, pad_y, pad_x = deskew_shape_estimator(
         [datastore.shape[-3],datastore.shape[-2],datastore.shape[-1]],
         theta=opm_tilt_deg,
-        distance=image_step_um,
+        distance=scan_axis_step_um,
         pixel_size=pixel_size_um
     )
 
@@ -151,10 +158,10 @@ def postprocess(
         max_z_ts_store = create_via_tensorstore(max_z_output_path,max_z_datastore_shape)
         
     
-    if flatfield_correction:
+    if flatfield_correction and ("stage" in opm_mode):
         flatfields = np.zeros((datastore.shape[2],datastore.shape[-2],datastore.shape[-1]),dtype=np.float32)
-        if datastore.shape[1] > 500:
-            n_rand_images = 500
+        if datastore.shape[1] > 1000:
+            n_rand_images = 1000
         else:
             n_rand_images = datastore.shape[1]
         sample_indices = list(np.random.choice(datastore.shape[1], size=n_rand_images, replace=False))
@@ -176,11 +183,16 @@ def postprocess(
         for pos_idx in tqdm(range(datastore.shape[1]),desc="p",leave=False):
             for chan_idx in tqdm(range(datastore.shape[2]),desc="c",leave=False):
                 camera_corrected_data = ((np.squeeze(datastore[t_idx,pos_idx,chan_idx,:].read().result()).astype(np.float32)-camera_offset)*camera_conversion)/(np.squeeze(flatfields[chan_idx,:])).clip(0,2**16-1).astype(np.uint16)
+                if "stage" in opm_mode:
+                    flip_scan = True
+                else:
+                    flip_scan = False
                 deskewed = deskew(
                     camera_corrected_data,
                     theta = opm_tilt_deg,
-                    distance = image_step_um,
+                    distance = scan_axis_step_um,
                     pixel_size = pixel_size_um,
+                    flip_scan = flip_scan
                 )
               
                 update_per_index_metadata(
@@ -226,13 +238,14 @@ def postprocess(
         update_global_metadata(
             ts_store = ts_store,
             global_metadata= {
-                    "image_mirror_step_um" : image_step_um,
+                    "scan_axis_step_um" : scan_axis_step_um,
                     "raw_pixel_size_um" : pixel_size_um,
                     "opm_tilt_deg" : opm_tilt_deg,
                     "camera_corrected" : True,
                     "camera_offset" : camera_offset,
                     "camera_e_to_ADU" : camera_conversion,
                     "deskewed_voxel_size_um" : [z_downsample_level*pixel_size_um, pixel_size_um, pixel_size_um],
+                    "stage_x_flipped": stage_x_flipped,
                     "stage_y_flipped": stage_y_flipped,
                     "stage_z_flipped": stage_z_flipped,
                     "flatfield_corrected": flatfield_correction
@@ -242,13 +255,14 @@ def postprocess(
         update_global_metadata(
             ts_store = ts_store,
             global_metadata= {
-                    "scan_axis_step_um" : image_step_um,
+                    "scan_axis_step_um" : scan_axis_step_um,
                     "raw_pixel_size_um" : pixel_size_um,
                     "opm_tilt_deg" : opm_tilt_deg,
                     "camera_corrected" : True,
                     "camera_offset" : camera_offset,
                     "camera_e_to_ADU" : camera_conversion,
                     "deskewed_voxel_size_um" : [z_downsample_level*pixel_size_um, pixel_size_um, pixel_size_um],
+                    "stage_x_flipped": stage_x_flipped,
                     "stage_y_flipped": stage_y_flipped,
                     "stage_z_flipped": stage_z_flipped,
                     "flatfield_corrected": flatfield_correction
@@ -259,13 +273,14 @@ def postprocess(
             update_global_metadata(
                 ts_store = max_z_ts_store,
                 global_metadata= {
-                    "image_mirror_step_um" : image_step_um,
+                    "scan_axis_step_um" : scan_axis_step_um,
                     "raw_pixel_size_um" : pixel_size_um,
                     "opm_tilt_deg" : opm_tilt_deg,
                     "camera_corrected" : True,
                     "camera_offset" : camera_offset,
                     "camera_e_to_ADU" : camera_conversion,
                     "deskewed_voxel_size_um" : [pixel_size_um, pixel_size_um],
+                    "stage_x_flipped": stage_x_flipped,
                     "stage_y_flipped": stage_y_flipped,
                     "stage_z_flipped": stage_z_flipped,
                     "flatfield_corrected": flatfield_correction
@@ -275,13 +290,14 @@ def postprocess(
             update_global_metadata(
                 ts_store = max_z_ts_store,
                 global_metadata= {
-                    "scan_axis_step_um" : image_step_um,
+                    "scan_axis_step_um" : scan_axis_step_um,
                     "raw_pixel_size_um" : pixel_size_um,
                     "opm_tilt_deg" : opm_tilt_deg,
                     "camera_corrected" : True,
                     "camera_offset" : camera_offset,
                     "camera_e_to_ADU" : camera_conversion,
                     "deskewed_voxel_size_um" : [pixel_size_um, pixel_size_um],
+                    "stage_x_flipped": stage_x_flipped,
                     "stage_y_flipped": stage_y_flipped,
                     "stage_z_flipped": stage_z_flipped,
                     "flatfield_corrected": flatfield_correction
@@ -304,19 +320,22 @@ def postprocess(
         }
         max_z_ts_store = ts.open(spec).result()
         
-        max_flatfields = np.zeros((max_z_ts_store.shape[2],max_z_ts_store.shape[-2],max_z_ts_store.shape[-1]),dtype=np.float32)
-        if max_z_ts_store.shape[1] > 500:
-            n_rand_images = 500
+        if "mirror" in opm_mode:
+            max_flatfields = np.zeros((max_z_ts_store.shape[2],max_z_ts_store.shape[-2],max_z_ts_store.shape[-1]),dtype=np.float32)
+            if max_z_ts_store.shape[1] > 500:
+                n_rand_images = 500
+            else:
+                n_rand_images = max_z_ts_store.shape[1]
+            sample_indices = list(np.random.choice(max_z_ts_store.shape[1], size=n_rand_images, replace=False))
+            for chan_idx in range(max_z_ts_store.shape[2]):
+                temp_images = np.squeeze(max_z_ts_store[0,sample_indices,chan_idx,:].read().result()).astype(np.float32)
+                basic = BaSiC(get_darkfield=False)
+                #basic.autotune(temp_images, early_stop=True, n_iter=100)
+                basic.fit(temp_images)
+                max_flatfields[chan_idx,:] = np.squeeze(basic.flatfield) / np.max(np.squeeze(basic.flatfield),axis=(0,1))
         else:
-            n_rand_images = max_z_ts_store.shape[1]
-        sample_indices = list(np.random.choice(max_z_ts_store.shape[1], size=n_rand_images, replace=False))
-        for chan_idx in range(max_z_ts_store.shape[2]):
-            temp_images = np.squeeze(max_z_ts_store[0,sample_indices,chan_idx,:].read().result()).astype(np.float32)
-            basic = BaSiC(get_darkfield=False)
-            #basic.autotune(temp_images, early_stop=True, n_iter=100)
-            basic.fit(temp_images)
-            max_flatfields[chan_idx,:] = np.squeeze(basic.flatfield) / np.max(np.squeeze(basic.flatfield),axis=(0,1))
-        
+            max_flatfields = np.ones((max_z_ts_store.shape[2],max_z_ts_store.shape[-2],max_z_ts_store.shape[-1]),dtype=np.float32)
+
         print("\nFusing using stage positions...")
         fused_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_zfused.zarr")
         tile_fusion = TileFusion(
@@ -327,7 +346,6 @@ def postprocess(
             flatfields = max_flatfields
         )
         tile_fusion.run()
-        print(write_max_projection_tiffs)
         
         if write_max_projection_tiffs:
             print(f"In write max projection tiffs: {write_max_projection_tiffs}")
