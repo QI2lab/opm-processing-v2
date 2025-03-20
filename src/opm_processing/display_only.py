@@ -12,6 +12,8 @@ from opm_processing.dataio.metadata import find_key, extract_stage_positions
 import numpy as np
 from napari.experimental import link_layers
 from cmap import Colormap
+from tqdm import tqdm
+from tifffile import TiffWriter
 
 def display(root_path: Path):
     """Display deskewed OPM data.
@@ -36,8 +38,9 @@ def display(root_path: Path):
 
     pixel_size_um = float(find_key(zattrs,"pixel_size_um"))
     stage_positions = extract_stage_positions(zattrs)
-    max_z_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_z_deskewed.zarr")
-
+    
+    max_z_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_zfused.zarr")
+    # todo: ADD tif creation file here and displyy
     if stage_y_flipped:
         stage_y_max = np.max(stage_positions[:,1])
         for pos_idx, _ in enumerate(stage_positions):
@@ -57,7 +60,7 @@ def display(root_path: Path):
         }
     }
     datastore = ts.open(spec).result()
-    
+        
     channel_layers = {ch: [] for ch in range(datastore.shape[2])}
     colormaps = [
         Colormap("chrisluts:bop_purple").to_napari(),
@@ -66,7 +69,7 @@ def display(root_path: Path):
     ]
     viewer = napari.Viewer()
     for time_idx in range(datastore.shape[0]):
-        for pos_idx in range(15):
+        for pos_idx in range(datastore.shape[1]):
             for chan_idx in range(datastore.shape[2]):
                 layer = viewer.add_image(
                     np.squeeze((datastore[time_idx,pos_idx,chan_idx,:]).read().result()),

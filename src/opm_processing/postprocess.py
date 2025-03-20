@@ -21,6 +21,7 @@ import numpy as np
 from tqdm import tqdm
 from basicpy import BaSiC
 import typer
+from tifffile import TiffWriter
 
 app = typer.Typer()
 app.pretty_exceptions_enable = False
@@ -29,7 +30,8 @@ app.pretty_exceptions_enable = False
 def postprocess(
     root_path: Path,
     max_projection: bool = True,
-    flatfield_correction: bool = True,
+    write_max_projection_tiffs = True,
+    flatfield_correction: bool = False, # not working at the moment
     create_fused_max_projection: bool = True,
     display_fused_max_projection: bool = True,
     z_downsample_level: int = 2
@@ -73,6 +75,7 @@ def postprocess(
         zattrs = json.load(f)
 
     image_mirror_step_um = float(find_key(zattrs,"image_mirror_step_um"))
+    
     pixel_size_um = float(find_key(zattrs,"pixel_size_um"))
     opm_tilt_deg = float(find_key(zattrs,"angle_deg"))
     
@@ -141,6 +144,7 @@ def postprocess(
         # create tensorstore object for writing. This is NOT compatible with OME-NGFF!
         max_z_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_z_deskewed.zarr")
         max_z_ts_store = create_via_tensorstore(max_z_output_path,max_z_datastore_shape)
+        
     
     if flatfield_correction:
         flatfields = np.zeros((datastore.shape[2],datastore.shape[-2],datastore.shape[-1]),dtype=np.float32)
@@ -251,8 +255,6 @@ def postprocess(
         del max_z_deskewed, ts_max_write
         
     if create_fused_max_projection:
-      
-        
         max_z_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_z_deskewed.zarr")
         # open datastore on disk
         spec = {
@@ -264,14 +266,13 @@ def postprocess(
         }
         max_z_ts_store = ts.open(spec).result()
         
-        print("\nEstimating flatfields...")
         max_flatfields = np.zeros((max_z_ts_store.shape[2],max_z_ts_store.shape[-2],max_z_ts_store.shape[-1]),dtype=np.float32)
         if max_z_ts_store.shape[1] > 500:
             n_rand_images = 500
         else:
             n_rand_images = max_z_ts_store.shape[1]
         sample_indices = list(np.random.choice(max_z_ts_store.shape[1], size=n_rand_images, replace=False))
-        for chan_idx in tqdm(range(max_z_ts_store.shape[2]),desc='chan'):
+        for chan_idx in range(max_z_ts_store.shape[2]):
             temp_images = np.squeeze(max_z_ts_store[0,sample_indices,chan_idx,:].read().result()).astype(np.float32)
             basic = BaSiC(get_darkfield=False)
             #basic.autotune(temp_images, early_stop=True, n_iter=100)
@@ -289,7 +290,49 @@ def postprocess(
         )
         tile_fusion.run()
         
-        
+        if write_max_projection_tiffs:
+            tiff_dir_path = max_z_output_path.parent / Path("fused_max_projection_tiff_output")
+            tiff_dir_path.mkdir(exist_ok=True)
+            max_spec = {
+                "driver" : "zarr3",
+                "kvstore" : {
+                    "driver" : "file",
+                    "path" : str(fused_output_path)
+                }
+            }
+            max_proj_datastore = ts.open(max_spec).result()
+            for t_idx in tqdm(range(max_proj_datastore.shape[0]),desc="t"):
+                max_projection = np.squeeze(np.asarray(max_proj_datastore[t_idx,0,chan_idx,:].read().result()))
+                
+                filename = Path(f"fused_z_max_projection_t{t_idx}.ome.tiff")
+                filename_path = tiff_dir_path /  Path(filename)
+                
+                with TiffWriter(filename_path, bigtiff=True) as tif:
+                    metadata={
+                        'axes': 'CYX',
+                        'SignificantBits': 16,
+                        'PhysicalSizeX': pixel_size_um,
+                        'PhysicalSizeXUnit': 'µm',
+                        'PhysicalSizeY': pixel_size_um,
+                        'PhysicalSizeYUnit': 'µm',
+                    }
+                    options = dict(
+                        compression='zlib',
+                        compressionargs={'level': 8},
+                        predictor=True,
+                        photometric='minisblack',
+                        resolutionunit='CENTIMETER',
+                    )
+                    tif.write(
+                        max_projection,
+                        resolution=(
+                            1e4 / pixel_size_um,
+                            1e4 / pixel_size_um
+                        ),
+                        **options,
+                        metadata=metadata
+                    )
+                                
     if display_fused_max_projection:
 
         from cmap import Colormap
@@ -305,8 +348,6 @@ def postprocess(
             }
         }
         fused_max_z_ts_store = ts.open(spec).result()
-        
-
         
         colormaps = [
             Colormap("chrisluts:bop_purple").to_napari(),
