@@ -41,6 +41,7 @@ dependencies = [
     "tensorstore",
     "napari[pyqt6]",
     "typer",
+    "cmap",
     "basicpy @ git+https://github.com/QI2lab/BaSiCPy.git@main"
 ]
 

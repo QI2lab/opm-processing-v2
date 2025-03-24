@@ -41,7 +41,7 @@ def extract_stage_positions(data):
             y_pos = stage_data["y_pos"]
             z_pos = stage_data["z_pos"]
 
-            positions.append([z_pos, y_pos, x_pos])
+            positions.append([z_pos, x_pos, y_pos])
             p_values.append(p)
         except KeyError:
             continue  # Skip entries missing expected keys

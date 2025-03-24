@@ -79,7 +79,6 @@ def deskew(
     theta: float = 30.0,
     distance: float = 0.4,
     pixel_size: float = 0.115,
-    flip_scan = False,
     reverse_deskewed_z = False,
     divisible_by: int = 4,
     downsample_factor: int = 2
@@ -113,9 +112,6 @@ def deskew(
     output: ArrayLike
         image stack of deskewed OPM planes on uniform grid
     """
-    
-    if flip_scan:
-        data = np.flipud(data)
 
     num_images, ny, nx = data.shape
     pixel_step = distance / pixel_size

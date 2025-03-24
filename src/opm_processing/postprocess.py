@@ -10,6 +10,10 @@ History:
 - **2025/03**: Updated for new qi2lab OPM processing pipeline.
 """
 
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.simplefilter("ignore", category=FutureWarning)
+
 from pathlib import Path
 import tensorstore as ts
 from opm_processing.imageprocessing.opmtools import deskew, deskew_shape_estimator
@@ -30,10 +34,11 @@ app.pretty_exceptions_enable = False
 def postprocess(
     root_path: Path,
     max_projection: bool = True,
-    write_max_projection_tiffs = False,
-    flatfield_correction: bool = False, # only working for stage scan at the moment
+    write_max_projection_tiffs: bool = False,
+    flatfield_correction: bool = False, # NOT WORKING YET
     create_fused_max_projection: bool = True,
     display_fused_max_projection: bool = True,
+    display_deskewed_tiles: bool = False,
     z_downsample_level: int = 2
 ):
     """Postprocess qi2lab OPM dataset.
@@ -48,12 +53,16 @@ def postprocess(
         Path to OPM pymmcoregui zarr file.
     max_projection: bool, default = True
         Create a maximum projection datastore.
+    write_max_projection_tiffs: bool, default = False,
+        Write max projection to OME-TIFF file 
     flatfield_correction: bool, default = True
         Estimate and apply flatfield correction on raw data.
+    create_fused_max_projection: bool, default = True
+        Create stage position fused max projection
     display_max_projection: bool, default = False
         Display maximum projection in napari.
-    display_full_volume: bool, default = False
-        Display full volume in napari.
+    display_deskewed_tiles: bool, default = False
+        Display all deskewed tiles in napari.
 
     z_downsample_level: int, default = 2
         Amount to downsample deskewed data in z.
@@ -80,7 +89,7 @@ def postprocess(
         excess_scan_positions = 0
     elif "stage" in opm_mode:
         scan_axis_step_um = float(find_key(zattrs,"scan_axis_step_um"))
-        excess_scan_positions = int(find_key(zattrs,"excess_scan_positions"))
+        excess_scan_positions = int(find_key(zattrs,"excess_scan_positions"))*2
     pixel_size_um = float(find_key(zattrs,"pixel_size_um"))
     opm_tilt_deg = float(find_key(zattrs,"angle_deg"))    
     camera_offset = float(find_key(zattrs,"offset"))
@@ -99,7 +108,7 @@ def postprocess(
     if stage_x_flipped:
         stage_x_max = np.max(stage_positions[:,0])
         for pos_idx, _ in enumerate(stage_positions):
-            stage_positions[pos_idx,0] = stage_x_max - stage_positions[pos_idx,0]
+            stage_positions[pos_idx,2] = stage_x_max - stage_positions[pos_idx,2]
     
     # flip y positions w.r.t. camera <-> stage orientation
     if stage_y_flipped:
@@ -115,7 +124,7 @@ def postprocess(
     
     # # estimate shape of one deskewed volume
     deskewed_shape, pad_y, pad_x = deskew_shape_estimator(
-        [datastore.shape[-3],datastore.shape[-2],datastore.shape[-1]-excess_scan_positions],
+        [datastore.shape[-3]-excess_scan_positions,datastore.shape[-2],datastore.shape[-1]],
         theta=opm_tilt_deg,
         distance=scan_axis_step_um,
         pixel_size=pixel_size_um
@@ -138,7 +147,7 @@ def postprocess(
     # create tensorstore object for writing. This is NOT compatible with OME-NGFF!
     output_path = root_path.parents[0] / Path(str(root_path.stem)+"_deskewed.zarr")
     ts_store = create_via_tensorstore(output_path,datastore_shape)
-
+    
     if max_projection:
         max_z_datastore_shape = [
             datastore.shape[0],
@@ -162,20 +171,21 @@ def postprocess(
     
     if flatfield_correction and ("stage" in opm_mode):
         flatfields = np.zeros((datastore.shape[2],datastore.shape[-2],datastore.shape[-1]),dtype=np.float32)
-        if datastore.shape[1] > 1000:
+        if datastore.shape[-3] > 1000:
             n_rand_images = 1000
         else:
-            n_rand_images = datastore.shape[1]
-        sample_indices = list(np.random.choice(datastore.shape[1], size=n_rand_images, replace=False))
+            n_rand_images = datastore.shape[-3]
+        sample_indices = list(np.random.choice(datastore.shape[-3], size=n_rand_images, replace=False))
         for chan_idx in range(datastore.shape[2]):
-            temp_images = ((np.squeeze(datastore[0,sample_indices,chan_idx,datastore.shape[-3]//2,:].read().result()).astype(np.float32)-camera_offset)*camera_conversion).clip(0,2**16-1).astype(np.uint16)
-            basic = BaSiC(get_darkfield=False)
+            temp_images = ((np.squeeze(datastore[0,0,chan_idx,sample_indices,:].read().result()).astype(np.float32)-camera_offset)*camera_conversion).clip(0,2**16-1).astype(np.uint16)
+            basic = BaSiC(get_darkfield=True)
+            basic.autotune(temp_images)
             basic.fit(temp_images)
             flatfields[chan_idx,:] = np.squeeze(basic.flatfield) / np.max(basic.flatfield,axis=(0,1))
         
     else:
         flatfields = np.ones((datastore.shape[2],datastore.shape[-2],datastore.shape[-1]),dtype=np.float32)
-    
+        
     # loop over all components and stream to zarr using tensorstore
     ts_writes = []
     if max_projection:
@@ -189,13 +199,24 @@ def postprocess(
                     flip_scan = True
                 else:
                     flip_scan = False
-                deskewed = deskew(
-                    camera_corrected_data[:,:,excess_scan_positions:],
-                    theta = opm_tilt_deg,
-                    distance = scan_axis_step_um,
-                    pixel_size = pixel_size_um,
-                    flip_scan = flip_scan
-                )
+                
+                if flip_scan:
+                    camera_corrected_data = np.flip(camera_corrected_data,axis=0)
+                
+                if excess_scan_positions > 0:
+                    deskewed = deskew(
+                        camera_corrected_data[excess_scan_positions:,:,:],
+                        theta = opm_tilt_deg,
+                        distance = scan_axis_step_um,
+                        pixel_size = pixel_size_um
+                    )
+                else:
+                    deskewed = deskew(
+                        camera_corrected_data,
+                        theta = opm_tilt_deg,
+                        distance = scan_axis_step_um,
+                        pixel_size = pixel_size_um
+                    )
               
                 update_per_index_metadata(
                     ts_store = ts_store, 
@@ -350,7 +371,6 @@ def postprocess(
         tile_fusion.run()
         
         if write_max_projection_tiffs:
-            print(f"In write max projection tiffs: {write_max_projection_tiffs}")
             tiff_dir_path = max_z_output_path.parent / Path("fused_max_projection_tiff_output")
             tiff_dir_path.mkdir(exist_ok=True)
             max_spec = {
@@ -366,10 +386,14 @@ def postprocess(
                 
                 filename = Path(f"fused_z_max_projection_t{t_idx}.ome.tiff")
                 filename_path = tiff_dir_path /  Path(filename)
+                if len(max_projection.shape) == 2:
+                    axes = "YX"
+                else:
+                    axes = "CYX"
                 
                 with TiffWriter(filename_path, bigtiff=True) as tif:
                     metadata={
-                        'axes': 'CYX',
+                        'axes': axes,
                         'SignificantBits': 16,
                         'PhysicalSizeX': pixel_size_um,
                         'PhysicalSizeXUnit': 'µm',

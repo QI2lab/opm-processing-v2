@@ -17,8 +17,11 @@ import gc
 import dask.array as da
 import dask.diagnostics
 from pathlib import Path
-from multiview_stitcher import spatial_image_utils as si_utils
-from multiview_stitcher import msi_utils, registration, fusion, ngff_utils
+try:
+    from multiview_stitcher import spatial_image_utils as si_utils
+    from multiview_stitcher import msi_utils, registration, fusion, ngff_utils
+except:
+    pass
 from numpy.typing import NDArray
 
 # GPU
