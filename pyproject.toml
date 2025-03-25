@@ -42,6 +42,7 @@ dependencies = [
     "napari[pyqt6]",
     "typer",
     "cmap",
+    "zarr",
     "basicpy @ git+https://github.com/QI2lab/BaSiCPy.git@main"
 ]
 
