@@ -33,11 +33,11 @@ app.pretty_exceptions_enable = False
 @app.command()
 def postprocess(
     root_path: Path,
-    max_projection: bool = True,
+    max_projection: bool = False,
     write_max_projection_tiffs: bool = False,
-    flatfield_correction: bool = False, # NOT WORKING YET
-    create_fused_max_projection: bool = True,
-    display_fused_max_projection: bool = True,
+    flatfield_correction: bool = True, # NOT WORKING YET
+    create_fused_max_projection: bool = False,
+    display_fused_max_projection: bool = False,
     display_deskewed_tiles: bool = False,
     z_downsample_level: int = 2
 ):
@@ -132,7 +132,7 @@ def postprocess(
 
     datastore_shape = [
         datastore.shape[0],
-        datastore.shape[1],
+        11,
         datastore.shape[2],
         deskewed_shape[0]//z_downsample_level,
         deskewed_shape[1],
@@ -151,7 +151,7 @@ def postprocess(
     if max_projection:
         max_z_datastore_shape = [
             datastore.shape[0],
-            datastore.shape[1],
+            11,
             datastore.shape[2],
             1,
             deskewed_shape[1],
@@ -171,14 +171,14 @@ def postprocess(
     
     if flatfield_correction and ("stage" in opm_mode):
         flatfields = np.zeros((datastore.shape[2],datastore.shape[-2],datastore.shape[-1]),dtype=np.float32)
-        if datastore.shape[-3] > 1000:
-            n_rand_images = 1000
+        if datastore.shape[-3] > 100:
+            n_rand_images = 100
         else:
             n_rand_images = datastore.shape[-3]
         sample_indices = list(np.random.choice(datastore.shape[-3], size=n_rand_images, replace=False))
         for chan_idx in range(datastore.shape[2]):
             temp_images = ((np.squeeze(datastore[0,0,chan_idx,sample_indices,:].read().result()).astype(np.float32)-camera_offset)*camera_conversion).clip(0,2**16-1).astype(np.uint16)
-            basic = BaSiC(get_darkfield=True)
+            basic = BaSiC(get_darkfield=False)
             basic.autotune(temp_images)
             basic.fit(temp_images)
             flatfields[chan_idx,:] = np.squeeze(basic.flatfield) / np.max(basic.flatfield,axis=(0,1))
@@ -192,7 +192,7 @@ def postprocess(
         ts_max_writes = []
     
     for t_idx in tqdm(range(datastore.shape[0]),desc="t"):
-        for pos_idx in tqdm(range(11),desc="p",leave=False): #datastore.shape[1])
+        for pos_idx in tqdm(range(11),desc="p",leave=False): 
             for chan_idx in tqdm(range(datastore.shape[2]),desc="c",leave=False):
                 camera_corrected_data = ((np.squeeze(datastore[t_idx,pos_idx,chan_idx,:].read().result()).astype(np.float32)-camera_offset)*camera_conversion)/(np.squeeze(flatfields[chan_idx,:])).clip(0,2**16-1).astype(np.uint16)
                 if "stage" in opm_mode:
@@ -220,7 +220,7 @@ def postprocess(
               
                 update_per_index_metadata(
                     ts_store = ts_store, 
-                    metadata = {"stage_position": stage_positions[pos_idx], 'channel': channels[chan_idx]}, 
+                    metadata = {"stage_position": stage_positions[pos_idx,:], 'channel': channels[chan_idx]}, 
                     index_location = (t_idx,pos_idx,chan_idx)
                 )
                 

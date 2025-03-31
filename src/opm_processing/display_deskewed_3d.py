@@ -27,7 +27,6 @@ def display(root_path: Path):
     """
     
     # TO DO: start writing these in metadata!
-    # TO DO: start writing these in metadata!
     stage_x_flipped = False
     stage_y_flipped = True
     stage_z_flipped = True
@@ -43,6 +42,11 @@ def display(root_path: Path):
     # max_z_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_zfused.zarr")
     deskewed_data_path = root_path.parents[0] / Path(str(root_path.stem)+"_deskewed.zarr")
     
+    if stage_x_flipped:
+        stage_x_max = np.max(stage_positions[:,2])
+        for pos_idx, _ in enumerate(stage_positions):
+            stage_positions[pos_idx,2] = stage_x_max - stage_positions[pos_idx,2]  
+    
     if stage_y_flipped:
         stage_y_max = np.max(stage_positions[:,1])
         for pos_idx, _ in enumerate(stage_positions):
@@ -53,7 +57,7 @@ def display(root_path: Path):
         for pos_idx, _ in enumerate(stage_positions):
             stage_positions[pos_idx,0] = stage_z_max - stage_positions[pos_idx,0]
     
-    dz = 0.4 #stage_positions[1,0] - stage_positions[0,0]
+    dz = 0.23 # it is twice the xy pixel spacing because we downsample by 2x in the processing
     
     # open datastore on disk
     spec = {
@@ -64,7 +68,7 @@ def display(root_path: Path):
         }
     }
     datastore = ts.open(spec).result()
-        
+            
     channel_layers = {ch: [] for ch in range(datastore.shape[2])}
     colormaps = [
         Colormap("chrisluts:bop_purple").to_napari(),
@@ -72,8 +76,8 @@ def display(root_path: Path):
         Colormap("chrisluts:bop_orange").to_napari(),
     ]
     viewer = napari.Viewer()
-    for time_idx in range(datastore.shape[0]):
-        for pos_idx in range(150):#datastore.shape[1]
+    for time_idx in range(1):
+        for pos_idx in range(4):
             for chan_idx in range(datastore.shape[2]):
                 layer = viewer.add_image(
                     np.squeeze(datastore[time_idx,pos_idx,chan_idx,:].read().result()),
@@ -94,5 +98,5 @@ def display(root_path: Path):
     
 
 if __name__ == "__main__":
-    root_path = Path(r"G:\20250324_organoid_testing\depth_test_008.zarr")
+    root_path = Path(r"G:\20250325_OB_stage\full_run_004.zarr")
     display(root_path)

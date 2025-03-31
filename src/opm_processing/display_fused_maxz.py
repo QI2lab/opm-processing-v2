@@ -40,7 +40,7 @@ def display(root_path: Path):
     stage_positions = extract_stage_positions(zattrs)
     
     max_z_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_zfused.zarr")
-    # todo: ADD tif creation file here and displyy
+
     if stage_y_flipped:
         stage_y_max = np.max(stage_positions[:,1])
         for pos_idx, _ in enumerate(stage_positions):
@@ -90,5 +90,5 @@ def display(root_path: Path):
     
 
 if __name__ == "__main__":
-    root_path = Path(r"G:\20250305_bulbc_brain_control\full_run_006.zarr")
+    root_path = Path(r"G:\20250325_OB_stage\full_run_004.zarr")
     display(root_path)
