@@ -20,6 +20,7 @@ from pathlib import Path
 import tensorstore as ts
 from opm_processing.imageprocessing.opmtools import deskew, deskew_shape_estimator
 from opm_processing.imageprocessing.maxtilefusion import TileFusion
+from opm_processing.imageprocessing.utils import no_op
 from opm_processing.dataio.metadata import extract_channels, find_key, extract_stage_positions, update_global_metadata, update_per_index_metadata
 from opm_processing.dataio.zarr_handlers import create_via_tensorstore, write_via_tensorstore
 import json
@@ -28,6 +29,7 @@ from tqdm import tqdm
 from basicpy import BaSiC
 import typer
 from tifffile import TiffWriter
+import builtins
 
 app = typer.Typer()
 app.pretty_exceptions_enable = False
@@ -192,9 +194,12 @@ def postprocess(
         sample_indices = list(np.random.choice(datastore.shape[-3], size=n_rand_images, replace=False))
         for chan_idx in range(datastore.shape[2]):
             temp_images = ((np.squeeze(datastore[0,0,chan_idx,sample_indices,:].read().result()).astype(np.float32)-camera_offset)*camera_conversion).clip(0,2**16-1)
+            original_print = builtins.print
+            builtins.print= no_op
             basic = BaSiC(get_darkfield=False)
             basic.autotune(temp_images)
             basic.fit(temp_images)
+            builtins.print = original_print
             flatfields[chan_idx,:] = np.squeeze(basic.flatfield) / np.max(np.squeeze(basic.flatfield),axis=(0,1))
         
     else:

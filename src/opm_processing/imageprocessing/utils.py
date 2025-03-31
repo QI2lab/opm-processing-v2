@@ -239,3 +239,16 @@ def create_fused_max_z_projection(
         fused = ngff_utils.write_sim_to_ome_zarr(
             fused, ome_output_path, overwrite=True
         )
+         
+def no_op(*args, **kwargs):
+    """Function to monkey patch print to suppress output.
+    
+    Parameters
+    ----------
+    args: Any
+        positional arguments
+    kwargs: Any
+        keyword arguments
+    """
+    
+    pass

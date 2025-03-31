@@ -90,7 +90,6 @@ def display(
         }
     }
     datastore = ts.open(spec).result()
-    print(datastore.shape)
         
     channel_layers = {ch: [] for ch in range(datastore.shape[2])}
     colormaps = [
