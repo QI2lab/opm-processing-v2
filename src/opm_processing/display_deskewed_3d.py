@@ -76,8 +76,8 @@ def display(root_path: Path):
         Colormap("chrisluts:bop_orange").to_napari(),
     ]
     viewer = napari.Viewer()
-    for time_idx in range(1):
-        for pos_idx in range(4):
+    for time_idx in range(datastore.shape[0]):
+        for pos_idx in range(datastore.shape[1]):
             for chan_idx in range(datastore.shape[2]):
                 layer = viewer.add_image(
                     np.squeeze(datastore[time_idx,pos_idx,chan_idx,:].read().result()),
@@ -98,5 +98,7 @@ def display(root_path: Path):
     
 
 if __name__ == "__main__":
-    root_path = Path(r"G:\20250325_OB_stage\full_run_004.zarr")
+    root_path = Path(r"G:\20250324_organoid_testing\depth_test_006.zarr")
+    display(root_path)
+    root_path = Path(r"G:\20250324_organoid_testing\organoid_test_003.zarr")
     display(root_path)
