@@ -13,6 +13,8 @@ History:
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.simplefilter("ignore", category=FutureWarning)
+import multiprocessing as mp
+mp.set_start_method('spawn', force=True)
 
 from pathlib import Path
 import tensorstore as ts
@@ -35,11 +37,12 @@ def postprocess(
     root_path: Path,
     max_projection: bool = True,
     write_max_projection_tiffs: bool = False,
-    flatfield_correction: bool = False, # NOT WORKING YET
+    flatfield_correction: bool = True,
     create_fused_max_projection: bool = True,
-    display_fused_max_projection: bool = True,
-    display_deskewed_tiles: bool = False,
-    z_downsample_level: int = 2
+    display_fused_max_projection: bool = False,
+    z_downsample_level: int = 2,
+    time_range: tuple[int,int] = None,
+    pos_range: tuple[int,int] = None,    
 ):
     """Postprocess qi2lab OPM dataset.
     
@@ -61,11 +64,12 @@ def postprocess(
         Create stage position fused max projection
     display_max_projection: bool, default = False
         Display maximum projection in napari.
-    display_deskewed_tiles: bool, default = False
-        Display all deskewed tiles in napari.
-
     z_downsample_level: int, default = 2
         Amount to downsample deskewed data in z.
+    time_range: list[int,int], default = None
+        Range of timepoints to reconstruct
+    pos_range: list[int,int], default = None
+        Range of stage positions to reconstruct        
     """
     
     # open raw datastore
@@ -177,11 +181,11 @@ def postprocess(
             n_rand_images = datastore.shape[-3]
         sample_indices = list(np.random.choice(datastore.shape[-3], size=n_rand_images, replace=False))
         for chan_idx in range(datastore.shape[2]):
-            temp_images = ((np.squeeze(datastore[0,0,chan_idx,sample_indices,:].read().result()).astype(np.float32)-camera_offset)*camera_conversion).clip(0,2**16-1).astype(np.uint16)
-            basic = BaSiC(get_darkfield=True)
+            temp_images = ((np.squeeze(datastore[0,0,chan_idx,sample_indices,:].read().result()).astype(np.float32)-camera_offset)*camera_conversion).clip(0,2**16-1)
+            basic = BaSiC(get_darkfield=False)
             basic.autotune(temp_images)
             basic.fit(temp_images)
-            flatfields[chan_idx,:] = np.squeeze(basic.flatfield) / np.max(basic.flatfield,axis=(0,1))
+            flatfields[chan_idx,:] = np.squeeze(basic.flatfield) / np.max(np.squeeze(basic.flatfield),axis=(0,1))
         
     else:
         flatfields = np.ones((datastore.shape[2],datastore.shape[-2],datastore.shape[-1]),dtype=np.float32)
@@ -190,9 +194,19 @@ def postprocess(
     ts_writes = []
     if max_projection:
         ts_max_writes = []
+        
+    if time_range is not None:
+        time_iterator = tqdm(range(time_range[0],time_range[1]),desc="t")
+    else:
+        time_iterator = tqdm(range(datastore.shape[0]),desc="t")
+        
+    if pos_range is not None:
+        pos_iterator = tqdm(range(pos_range[0],pos_range[1]),desc="p",leave=False)
+    else:
+        pos_iterator = tqdm(range(datastore.shape[1]),desc="p",leave=False)
     
-    for t_idx in tqdm(range(datastore.shape[0]),desc="t"):
-        for pos_idx in tqdm(range(11),desc="p",leave=False): #datastore.shape[1])
+    for t_idx in time_iterator:
+        for pos_idx in pos_iterator:
             for chan_idx in tqdm(range(datastore.shape[2]),desc="c",leave=False):
                 camera_corrected_data = ((np.squeeze(datastore[t_idx,pos_idx,chan_idx,:].read().result()).astype(np.float32)-camera_offset)*camera_conversion)/(np.squeeze(flatfields[chan_idx,:])).clip(0,2**16-1).astype(np.uint16)
                 if "stage" in opm_mode:

@@ -15,7 +15,7 @@ allow-direct-references = true
 # https://peps.python.org/pep-0621/
 [project]
 name = "opm-processing-v2"
-version = "0.1.0"
+version = "0.2.1"
 description = "qi2lab OPM post-processing package v2"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -43,6 +43,7 @@ dependencies = [
     "typer",
     "cmap",
     "zarr",
+    "jax[cuda12_local]==0.4.38; sys_platform == 'linux'",
     "basicpy @ git+https://github.com/QI2lab/BaSiCPy.git@main"
 ]
 
@@ -51,7 +52,7 @@ dependencies = [
 [project.optional-dependencies]
 # add dependencies used for testing here
 test = ["pytest", "pytest-cov"]
-flatfield = ["basicpy"]
+
 # add anything else you like to have in your dev environment here
 dev = [
     "ipython",
@@ -68,10 +69,13 @@ repository = "https://github.com/qi2lab/opm-processing-v2"
 # same as console_scripts entry point
 [project.scripts]
 postprocess = "opm_processing.postprocess:main"
+display = "opm_processing.display:main"
 
 # [project.entry-points."some.group"]
 # tomatoes = "opm_processing:main_tomatoes"
 
+[tool.ruff]
+ignore = ["E402"]
 
 
 # https://docs.pytest.org/

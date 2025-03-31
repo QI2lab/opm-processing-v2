@@ -16,12 +16,17 @@ Deconvolution is planned, but will require GPU-accleration. Currently, this libr
 
 Create a python 3.11 environment,
 ```bash
-conda create -n opmprocessing python=3.11
+conda create -n opmprocessing python=3.12
 ```
 
 activate the environment,
 ```bash
 conda activate opmprocessing
+```
+
+If on Linux, we can use an Nvidia GPU to accelerate flatfield calculation
+```bash
+conda install -c conda-forge -c nvidia -c rapidsai cupy=13.4 cucim=25.02 pycudadecon "cuda-version>=12.0,<=12.8" cudnn cutensor nccl
 ```
 
 and install the repository
