@@ -134,9 +134,19 @@ def postprocess(
         pixel_size=pixel_size_um
     )
 
+    if time_range is not None:
+        time_shape = time_range[1]
+    else:
+        time_shape = datastore.shape[0]
+        
+    if pos_range is not None:
+        pos_shape = pos_range[1]
+    else:
+        pos_shape = datastore.shape[1]
+        
     datastore_shape = [
-        datastore.shape[0],
-        datastore.shape[1],
+        time_shape,
+        pos_shape,
         datastore.shape[2],
         deskewed_shape[0]//z_downsample_level,
         deskewed_shape[1],
@@ -154,8 +164,8 @@ def postprocess(
     
     if max_projection:
         max_z_datastore_shape = [
-            datastore.shape[0],
-            datastore.shape[1],
+            time_shape,
+            pos_shape,
             datastore.shape[2],
             1,
             deskewed_shape[1],
@@ -367,7 +377,7 @@ def postprocess(
             for chan_idx in range(max_z_ts_store.shape[2]):
                 temp_images = np.squeeze(max_z_ts_store[0,sample_indices,chan_idx,:].read().result()).astype(np.float32)
                 basic = BaSiC(get_darkfield=False)
-                #basic.autotune(temp_images, early_stop=True, n_iter=100)
+                basic.autotune(temp_images, early_stop=True, n_iter=100)
                 basic.fit(temp_images)
                 max_flatfields[chan_idx,:] = np.squeeze(basic.flatfield) / np.max(np.squeeze(basic.flatfield),axis=(0,1))
         else:
