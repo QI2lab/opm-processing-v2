@@ -14,7 +14,7 @@ Deconvolution is planned, but will require GPU-accleration. Currently, this libr
 
 ## Installation
 
-Create a python 3.11 environment,
+Create a python 3.12 environment,
 ```bash
 conda create -n opmprocessing python=3.12
 ```
@@ -36,9 +36,26 @@ pip install "opm-processing-v2 @ git+https://github.com/QI2lab/opm-processing-v2
 
 ## Usage
 
-Activate the conda environment. From the top-level directory of the repository,
+Activate the conda environment.
+
+To process raw data,
 ```bash
 postprocess "/path/to/qi2labacquition.zarr"
 ```
 
-The defaults parameters generate two zarr3 compliant datastores, one for the full 3D data (`/path/to/qi2labacquition_deskewed.zarr`) with dimensions `tpczyx` and one with maximum Z projections (`/path/to/qi2labacquition_max_z_projection.zarr`) with dimensions `tpcyx`. Both datastores are camera offset and gain corrected, but only the maximum Z projection datastore has post-hoc flatfield correction estimated from the deskewed maximum Z projected data. The flatfield estimation for each channel is saved in `/path/to/qi2labacquition_flatfields.zarr`.
+The defaults parameters generate three zarr3 compliant datastores:
+1. Full 3D data (`/path/to/qi2labacquition_deskewed.zarr`) with dimensions `tpczyx`.
+2. Maximum Z projections (`/path/to/qi2labacquition_max_z_deskewed.zarr`) with dimensions `tpcyx`. 
+3. Stage-position fused maximum z projections (`/path/to/qi2labacquition_maxz.zarr`) with dimensions `tcyx`.
+
+All three datastores are camera offset and gain corrected. The fused datastore uses the provided stage positions, without optimization.
+
+To display the data, 
+```bash
+display "/path/to/qi2labacquition.zarr" --to_display full
+```
+
+There are three `to_display` options that correspond to the three datastores described above,
+1. full
+2. max-z
+3. fused-max-z

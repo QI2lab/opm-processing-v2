@@ -134,7 +134,7 @@ def display(
                     ]
                     
                 layer = viewer.add_image(
-                    np.squeeze((datastore[time_idx,pos_idx,chan_idx,:]).read().result()),
+                    datastore[time_idx,pos_idx,chan_idx,:],
                     scale=scale_to_use,
                     translate=translate_to_use,
                     name = "p"+str(pos_idx).zfill(3)+"_c"+str(chan_idx),

@@ -38,10 +38,9 @@ app.pretty_exceptions_enable = False
 def postprocess(
     root_path: Path,
     max_projection: bool = True,
-    write_max_projection_tiffs: bool = False,
-    flatfield_correction: bool = True,
+    flatfield_correction: bool = False,
     create_fused_max_projection: bool = True,
-    display_fused_max_projection: bool = False,
+    write_fused_max_projection_tiff: bool = False,
     z_downsample_level: int = 2,
     time_range: tuple[int,int] = None,
     pos_range: tuple[int,int] = None,    
@@ -58,20 +57,18 @@ def postprocess(
         Path to OPM pymmcoregui zarr file.
     max_projection: bool, default = True
         Create a maximum projection datastore.
-    write_max_projection_tiffs: bool, default = False,
-        Write max projection to OME-TIFF file 
     flatfield_correction: bool, default = True
         Estimate and apply flatfield correction on raw data.
     create_fused_max_projection: bool, default = True
-        Create stage position fused max projection
-    display_max_projection: bool, default = False
-        Display maximum projection in napari.
+        Create stage position fused max Z projection.
+    write_fused_max_projection_tiff: bool, default = False
+        Write fused maxZ  projection to OME-TIFF file.
     z_downsample_level: int, default = 2
         Amount to downsample deskewed data in z.
     time_range: list[int,int], default = None
-        Range of timepoints to reconstruct
+        Range of timepoints to reconstruct.
     pos_range: list[int,int], default = None
-        Range of stage positions to reconstruct        
+        Range of stage positions to reconstruct.     
     """
     
     # open raw datastore
@@ -193,14 +190,14 @@ def postprocess(
             n_rand_images = datastore.shape[-3]
         sample_indices = list(np.random.choice(datastore.shape[-3], size=n_rand_images, replace=False))
         for chan_idx in range(datastore.shape[2]):
-            temp_images = ((np.squeeze(datastore[0,0,chan_idx,sample_indices,:].read().result()).astype(np.float32)-camera_offset)*camera_conversion).clip(0,2**16-1)
+            temp_images = ((np.squeeze(datastore[0,0,chan_idx,sample_indices,:].read().result()).astype(np.float32)-camera_offset)*camera_conversion).clip(0,2**16-1).astype(np.uint16)
             original_print = builtins.print
             builtins.print= no_op
             basic = BaSiC(get_darkfield=False)
             basic.autotune(temp_images)
             basic.fit(temp_images)
             builtins.print = original_print
-            flatfields[chan_idx,:] = np.squeeze(basic.flatfield) / np.max(np.squeeze(basic.flatfield),axis=(0,1))
+            flatfields[chan_idx,:] = (np.squeeze(basic.flatfield) / np.max(np.squeeze(basic.flatfield),axis=(0,1))).astype(np.float32)
         
     else:
         flatfields = np.ones((datastore.shape[2],datastore.shape[-2],datastore.shape[-1]),dtype=np.float32)
@@ -279,11 +276,11 @@ def postprocess(
                 )
                 
     # wait for writes to finish
-    for ts_write in tqdm(ts_writes,desc='writes'):
+    for ts_write in ts_writes:
         ts_write.result()
 
     if max_projection:
-        for ts_max_write in tqdm(ts_max_writes,desc='max writes'):
+        for ts_max_write in ts_max_writes:
             ts_max_write.result()
 
     if "mirror" in opm_mode:
@@ -390,16 +387,24 @@ def postprocess(
 
         print("\nFusing using stage positions...")
         fused_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_zfused.zarr")
+        
+        print(stage_positions.shape)
+        if pos_range is not None:
+            tile_positions = stage_positions[pos_range[0]:pos_range[1],1:]
+            
+        else:
+            tile_positions = stage_positions[:,1:]
+        
         tile_fusion = TileFusion(
             ts_dataset = max_z_ts_store,
-            tile_positions = stage_positions[:,1:],
+            tile_positions = tile_positions,
             output_path=fused_output_path,
             pixel_size=np.asarray((pixel_size_um,pixel_size_um),dtype=np.float32),
             flatfields = max_flatfields
         )
         tile_fusion.run()
         
-        if write_max_projection_tiffs:
+        if write_fused_max_projection_tiff:
             tiff_dir_path = max_z_output_path.parent / Path("fused_max_projection_tiff_output")
             tiff_dir_path.mkdir(exist_ok=True)
             max_spec = {
@@ -445,41 +450,6 @@ def postprocess(
                         **options,
                         metadata=metadata
                     )
-                                
-    if display_fused_max_projection:
-
-        from cmap import Colormap
-        import napari
-        
-        fused_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_zfused.zarr")
-        # open datastore on disk
-        spec = {
-            "driver" : "zarr3",
-            "kvstore" : {
-                "driver" : "file",
-                "path" : str(fused_output_path)
-            }
-        }
-        fused_max_z_ts_store = ts.open(spec).result()
-        
-        colormaps = [
-            Colormap("chrisluts:bop_purple").to_napari(),
-            Colormap("chrisluts:bop_blue").to_napari(),
-            Colormap("chrisluts:bop_orange").to_napari(),
-        ]
-        viewer = napari.Viewer()
-        for time_idx in range(fused_max_z_ts_store.shape[0]):
-            for pos_idx in range(fused_max_z_ts_store.shape[1]):
-                for chan_idx in range(fused_max_z_ts_store.shape[2]):
-                    viewer.add_image(
-                        np.squeeze((fused_max_z_ts_store[time_idx,pos_idx,chan_idx,:]).read().result()),
-                        scale=[pixel_size_um,pixel_size_um],
-                        name = "c"+str(chan_idx).zfill(2),
-                        blending="additive",
-                        colormap=colormaps[chan_idx],
-                        contrast_limits = [0,500]
-                    )
-        napari.run()
 
 # entry for point for CLI        
 def main():
