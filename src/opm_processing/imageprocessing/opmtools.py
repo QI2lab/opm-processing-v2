@@ -166,7 +166,8 @@ def deskew(
                 pos_after = int(np.floor(virtual_pos_after))
 
                 # Strict position index check
-                if pos_before < 0 or pos_after >= ny - 1:
+                if (pos_before < 0 or pos_after < 0 or
+                    pos_before + 1 >= ny or pos_after + 1 >= ny):
                     continue  # Skip out-of-bounds pixels
 
                 dz_before = virtual_pos_before - pos_before

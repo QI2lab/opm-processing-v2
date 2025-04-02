@@ -229,16 +229,16 @@ def postprocess(
                 if flip_scan:
                     camera_corrected_data = np.flip(camera_corrected_data,axis=0)
                 
-                if excess_scan_positions > 0:
+                if excess_scan_positions==0:
                     deskewed = deskew(
-                        camera_corrected_data[excess_scan_positions:,:,:],
+                        camera_corrected_data,
                         theta = opm_tilt_deg,
                         distance = scan_axis_step_um,
                         pixel_size = pixel_size_um
                     )
                 else:
                     deskewed = deskew(
-                        camera_corrected_data,
+                        camera_corrected_data[excess_scan_positions:,:,:],
                         theta = opm_tilt_deg,
                         distance = scan_axis_step_um,
                         pixel_size = pixel_size_um
