@@ -198,10 +198,11 @@ def deskew(
     else:
         pos_iterator = tqdm(range(datastore.shape[1]),desc="p",leave=False)
     
+    print("\nDeskewing...")
     for t_idx in time_iterator:
         for pos_idx in pos_iterator:
             for chan_idx in tqdm(range(datastore.shape[2]),desc="c",leave=False):
-                camera_corrected_data = ((np.squeeze(datastore[t_idx,pos_idx,chan_idx,:].read().result()).astype(np.float32)-camera_offset)*camera_conversion)/(np.squeeze(flatfields[chan_idx,:])).clip(0,2**16-1).astype(np.uint16)
+                camera_corrected_data = (((np.squeeze(datastore[t_idx,pos_idx,chan_idx,:].read().result()).astype(np.float32)-camera_offset)*camera_conversion)/flatfields[chan_idx,:].astype(np.float32)).clip(0,2**16-1).astype(np.uint16)
                 if "stage" in opm_mode:
                     flip_scan = True
                 else:
@@ -210,20 +211,13 @@ def deskew(
                 if flip_scan:
                     camera_corrected_data = np.flip(camera_corrected_data,axis=0)
                 
-                if excess_scan_positions > 0:
-                    deskewed = orthogonal_deskew(
-                        camera_corrected_data[excess_scan_positions:,:,:],
-                        theta = opm_tilt_deg,
-                        distance = scan_axis_step_um,
-                        pixel_size = pixel_size_um
-                    )
-                else:
-                    deskewed = orthogonal_deskew(
-                        camera_corrected_data,
-                        theta = opm_tilt_deg,
-                        distance = scan_axis_step_um,
-                        pixel_size = pixel_size_um
-                    )
+                deskewed = orthogonal_deskew(
+                    camera_corrected_data[excess_scan_positions:,:,:],
+                    theta = opm_tilt_deg,
+                    distance = scan_axis_step_um,
+                    pixel_size = pixel_size_um
+                )
+
               
                 update_per_index_metadata(
                     ts_store = ts_store, 
@@ -350,10 +344,9 @@ def deskew(
         }
         max_z_ts_store = ts.open(spec).result()
         
-        print("\nFusing using stage positions...")
+        print("\nFusing max projection using stage positions...")
         fused_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_zfused.zarr")
         
-        print(stage_positions.shape)
         if pos_range is not None:
             tile_positions = stage_positions[pos_range[0]:pos_range[1],1:]
             

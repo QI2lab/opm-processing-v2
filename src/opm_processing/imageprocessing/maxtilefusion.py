@@ -178,7 +178,7 @@ class TileFusion:
             write_futures.append(future)
 
         # **Wait for all writes to complete**
-        for future in tqdm(write_futures, desc="Writing tiles"):
+        for future in write_futures:
             future.result()
 
     def run(self):
