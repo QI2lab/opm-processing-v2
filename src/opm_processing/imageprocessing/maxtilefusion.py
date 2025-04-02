@@ -19,12 +19,11 @@ class TileFusion:
         Pixel size (y, x) in physical units.
     """
     
-    def __init__(self, ts_dataset, tile_positions, output_path, pixel_size,flatfields):
+    def __init__(self, ts_dataset, tile_positions, output_path, pixel_size):
         self.ts_dataset = ts_dataset
         self.tile_positions = np.array(tile_positions)
         self.output_path = Path(output_path)
         self.pixel_size = pixel_size
-        self.flatfields = flatfields
         
         self.time_dim, self.position_dim, self.channels, self.z_dim, height, width = self.ts_dataset.shape
         
@@ -145,9 +144,6 @@ class TileFusion:
         for tile_idx, (y, x) in enumerate(tqdm(self.tile_positions, desc="Processing tiles")):
             # Read tile correctly from its respective position
             tile_data = self.ts_dataset[0, tile_idx, :, 0, :, :].read().result().astype(np.float32)  # Shape: (C, H_tile, W_tile)
-
-            for chan_idx in range(self.channels):
-                tile_data[chan_idx, :] /= self.flatfields[chan_idx, :]
 
             # Ensure tile_data has explicit Z-dimension
             tile_data = tile_data[:, np.newaxis, :, :]  # Shape: (C, 1, H_tile, W_tile)

@@ -18,24 +18,22 @@ mp.set_start_method('spawn', force=True)
 
 from pathlib import Path
 import tensorstore as ts
-from opm_processing.imageprocessing.opmtools import deskew, deskew_shape_estimator
+from opm_processing.imageprocessing.opmtools import orthogonal_deskew, deskew_shape_estimator
 from opm_processing.imageprocessing.maxtilefusion import TileFusion
-from opm_processing.imageprocessing.utils import no_op
+from opm_processing.imageprocessing.utils import estimate_illuminations
 from opm_processing.dataio.metadata import extract_channels, find_key, extract_stage_positions, update_global_metadata, update_per_index_metadata
 from opm_processing.dataio.zarr_handlers import create_via_tensorstore, write_via_tensorstore
 import json
 import numpy as np
 from tqdm import tqdm
-from basicpy import BaSiC
 import typer
 from tifffile import TiffWriter
-import builtins
 
 app = typer.Typer()
 app.pretty_exceptions_enable = False
 
 @app.command()
-def postprocess(
+def deskew(
     root_path: Path,
     max_projection: bool = True,
     flatfield_correction: bool = False,
@@ -92,7 +90,7 @@ def postprocess(
         excess_scan_positions = 0
     elif "stage" in opm_mode:
         scan_axis_step_um = float(find_key(zattrs,"scan_axis_step_um"))
-        excess_scan_positions = int(find_key(zattrs,"excess_scan_positions"))*2
+        excess_scan_positions = int(find_key(zattrs,"excess_scan_positions"))
     pixel_size_um = float(find_key(zattrs,"pixel_size_um"))
     opm_tilt_deg = float(find_key(zattrs,"angle_deg"))    
     camera_offset = float(find_key(zattrs,"offset"))
@@ -183,24 +181,7 @@ def postprocess(
         
     
     if flatfield_correction and ("stage" in opm_mode):
-        flatfields = np.zeros((datastore.shape[2],datastore.shape[-2],datastore.shape[-1]),dtype=np.float32)
-        if datastore.shape[-3] > 1000:
-            n_rand_images = 1000
-        else:
-            n_rand_images = datastore.shape[-3]
-        sample_indices = list(np.random.choice(datastore.shape[-3], size=n_rand_images, replace=False))
-        for chan_idx in range(datastore.shape[2]):
-            temp_images = ((np.squeeze(datastore[0,0,chan_idx,sample_indices,:].read().result()).astype(np.float32)-camera_offset)*camera_conversion).clip(0,2**16-1).astype(np.uint16)
-            original_print = builtins.print
-            builtins.print= no_op
-            basic = BaSiC(get_darkfield=False)
-            basic.autotune(temp_images)
-            basic.fit(temp_images)
-            builtins.print = original_print
-            flatfields[chan_idx,:] = (np.squeeze(basic.flatfield) / np.max(np.squeeze(basic.flatfield),axis=(0,1))).astype(np.float32)
-        
-    else:
-        flatfields = np.ones((datastore.shape[2],datastore.shape[-2],datastore.shape[-1]),dtype=np.float32)
+        flatfields = estimate_illuminations(datastore,camera_offset,camera_conversion)
         
     # loop over all components and stream to zarr using tensorstore
     ts_writes = []
@@ -230,14 +211,14 @@ def postprocess(
                     camera_corrected_data = np.flip(camera_corrected_data,axis=0)
                 
                 if excess_scan_positions > 0:
-                    deskewed = deskew(
+                    deskewed = orthogonal_deskew(
                         camera_corrected_data[excess_scan_positions:,:,:],
                         theta = opm_tilt_deg,
                         distance = scan_axis_step_um,
                         pixel_size = pixel_size_um
                     )
                 else:
-                    deskewed = deskew(
+                    deskewed = orthogonal_deskew(
                         camera_corrected_data,
                         theta = opm_tilt_deg,
                         distance = scan_axis_step_um,
@@ -369,22 +350,6 @@ def postprocess(
         }
         max_z_ts_store = ts.open(spec).result()
         
-        if "mirror" in opm_mode:
-            max_flatfields = np.zeros((max_z_ts_store.shape[2],max_z_ts_store.shape[-2],max_z_ts_store.shape[-1]),dtype=np.float32)
-            if max_z_ts_store.shape[1] > 500:
-                n_rand_images = 500
-            else:
-                n_rand_images = max_z_ts_store.shape[1]
-            sample_indices = list(np.random.choice(max_z_ts_store.shape[1], size=n_rand_images, replace=False))
-            for chan_idx in range(max_z_ts_store.shape[2]):
-                temp_images = np.squeeze(max_z_ts_store[0,sample_indices,chan_idx,:].read().result()).astype(np.float32)
-                basic = BaSiC(get_darkfield=False)
-                basic.autotune(temp_images, early_stop=True, n_iter=100)
-                basic.fit(temp_images)
-                max_flatfields[chan_idx,:] = np.squeeze(basic.flatfield) / np.max(np.squeeze(basic.flatfield),axis=(0,1))
-        else:
-            max_flatfields = np.ones((max_z_ts_store.shape[2],max_z_ts_store.shape[-2],max_z_ts_store.shape[-1]),dtype=np.float32)
-
         print("\nFusing using stage positions...")
         fused_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_zfused.zarr")
         
@@ -400,7 +365,6 @@ def postprocess(
             tile_positions = tile_positions,
             output_path=fused_output_path,
             pixel_size=np.asarray((pixel_size_um,pixel_size_um),dtype=np.float32),
-            flatfields = max_flatfields
         )
         tile_fusion.run()
         
