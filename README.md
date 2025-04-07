@@ -10,7 +10,7 @@
 
 qi2lab OPM post-processing package v2. Data reading and writing using Tensorstore. Performs Numba-accelerated deskewing, downsampling, flatfield correction, and maximum Z projection operations. Additionally uses the BaSiCPy library to estimate illumination profiles. 
 
-Deconvolution is planned, but will require GPU-accleration. Currently, this library uses highly parallelized CPU algorithms for all calculations.
+Deconvolution is planned, but will require GPU-accleration.
 
 ## Installation
 
