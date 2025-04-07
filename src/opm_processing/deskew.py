@@ -180,8 +180,33 @@ def deskew(
         max_z_ts_store = create_via_tensorstore(max_z_output_path,max_z_datastore_shape)
         
     
-    if flatfield_correction and ("stage" in opm_mode):
+    if flatfield_correction:
         flatfields = estimate_illuminations(datastore,camera_offset,camera_conversion)
+        flatfield_path = root_path.parents[0] / Path(str(root_path.stem)+"_flatfield.ome.tif")
+        with TiffWriter(flatfield_path, bigtiff=True) as tif:
+            metadata={
+                'axes': "CYX",
+                'SignificantBits': 32,
+                'PhysicalSizeX': pixel_size_um,
+                'PhysicalSizeXUnit': 'µm',
+                'PhysicalSizeY': pixel_size_um,
+                'PhysicalSizeYUnit': 'µm',
+            }
+            options = dict(
+                photometric='minisblack',
+                resolutionunit='CENTIMETER',
+            )
+            tif.write(
+                flatfields,
+                resolution=(
+                    1e4 / pixel_size_um,
+                    1e4 / pixel_size_um
+                ),
+                **options,
+                metadata=metadata
+            )
+    else:
+        flatfields = np.ones((datastore.shape[2],datastore.shape[-2],datastore.shape[-1]),dtype=np.float32)
         
     # loop over all components and stream to zarr using tensorstore
     ts_writes = []
@@ -198,7 +223,6 @@ def deskew(
     else:
         pos_iterator = tqdm(range(datastore.shape[1]),desc="p",leave=False)
     
-    print("\nDeskewing...")
     for t_idx in time_iterator:
         for pos_idx in pos_iterator:
             for chan_idx in tqdm(range(datastore.shape[2]),desc="c",leave=False):

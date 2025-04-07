@@ -14,14 +14,6 @@ History:
 
 import numpy as np
 import gc
-import dask.array as da
-import dask.diagnostics
-from pathlib import Path
-try:
-    from multiview_stitcher import spatial_image_utils as si_utils
-    from multiview_stitcher import msi_utils, registration, fusion, ngff_utils
-except:
-    pass
 from numpy.typing import NDArray
 from basicpy import BaSiC
 import builtins
@@ -173,74 +165,6 @@ def downsample_axis(image: NDArray, level: int = 2, axis: int = 0) -> NDArray:
 
     return downsampled_image.astype(image.dtype)
 
-def create_fused_max_z_projection(
-    ts_store, 
-    ome_output_path: Path, 
-    voxel_size_zyx_um: list[NDArray],
-    stage_positions_zyx_um: list[NDArray],
-    reg_axis: int = 0
-):
-    """Optimize stage positions and create fused maximum z projection.
-    
-    Parameters
-    ----------
-    ts_store: Tensorstore
-        datastore
-    ome_output_path: Path
-        output path for max z projection fused ome.zarr
-    voxel_size_zyx_um: NDArray
-        voxel size of deskewed data in microns
-    stage_positions_zyx_um: list[NDArray]
-        stage position list of deskewed data in microns
-    reg_axis : int, default = 0
-        axis to use for registration
-    """
-    
-    max_projection_data = np.squeeze(ts_store.read().result())
-    
-    msims = []
-    scale = {"y": voxel_size_zyx_um[1], "x": voxel_size_zyx_um[2]}
-    for pos_idx in range(max_projection_data.shape[0]):
-        tile_grid_positions = {
-            "y": np.round(stage_positions_zyx_um[pos_idx,1], 2),
-            "x": np.round(stage_positions_zyx_um[pos_idx,2], 2),
-        }
-        
-        sim = si_utils.get_sim_from_array(
-            max_projection_data[pos_idx,:],
-            dims=["c"] + list(scale.keys()),
-            scale=scale,
-            translation=tile_grid_positions,
-            transform_key="stage_metadata"
-        )
-        
-        msim = msi_utils.get_msim_from_sim(sim)
-        msims.append(msim)
-    
-    print("Registering views...")
-    with dask.diagnostics.ProgressBar():
-        _ = registration.register(
-            msims,
-            registration_binning={'y': 3, 'x': 3},
-            reg_channel_index=reg_axis,
-            transform_key="stage_metadata",
-            new_transform_key='affine_registered',
-            pre_registration_pruning_method="keep_axis_aligned",
-            post_registration_do_quality_filter=True
-        )
-    
-    print("Building fusion graph...")
-    fused = fusion.fuse(
-        [msi_utils.get_sim_from_msim(msim) for msim in msims],
-        transform_key='affine_registered',
-        output_chunksize=256,
-    )
-    
-    print(f'Fusing views and saving output to {str(ome_output_path)}...')
-    with dask.diagnostics.ProgressBar():
-        fused = ngff_utils.write_sim_to_ome_zarr(
-            fused, ome_output_path, overwrite=True
-        )
          
 def no_op(*args, **kwargs):
     """Function to monkey patch print to suppress output.
@@ -257,7 +181,7 @@ def no_op(*args, **kwargs):
 
 def estimate_illuminations(datastore, camera_offset,camera_conversion):
     flatfields = np.zeros((datastore.shape[2],datastore.shape[-2],datastore.shape[-1]),dtype=np.float32)
-    n_image_batches = 50
+    n_image_batches = 25
     if datastore.shape[-3] > 5000:
         n_rand_images = 5000
     else:
@@ -265,33 +189,64 @@ def estimate_illuminations(datastore, camera_offset,camera_conversion):
         n_rand_images -= n_rand_images % n_image_batches
     n_images_to_max = n_rand_images // n_image_batches
     
-    if datastore.shape[2] > 5:
-        flatfield_pos_iterator = list(np.random.choice(datastore.shape[2], size=5, replace=False))
+    n_pos_samples = 15
+    if datastore.shape[1] > n_pos_samples+5:
+        flatfield_pos_iterator = list(np.random.choice(range(datastore.shape[1]//2-(n_pos_samples+5)//2,datastore.shape[1]//2+(n_pos_samples+5)//2), size=n_pos_samples, replace=False))
     else:
-        flatfield_pos_iterator = range(datastore.shape[2])
+        flatfield_pos_iterator = range(datastore.shape[1])
     
-    for pos_idx in flatfield_pos_iterator:
-        for chan_idx in range(datastore.shape[2]):
+    for chan_idx in range(datastore.shape[2]):
+        images = []
+        for pos_idx in flatfield_pos_iterator:
             sample_indices = list(np.random.choice(datastore.shape[-3], size=n_rand_images, replace=False))
-            temp_images = ((np.squeeze(datastore[0,0,chan_idx,sample_indices,:].read().result()).astype(np.float32)-camera_offset)*camera_conversion).clip(0,2**16-1).astype(np.uint16)
+            temp_images = ((np.squeeze(datastore[0,pos_idx,chan_idx,sample_indices,:].read().result()).astype(np.float32)-camera_offset)*camera_conversion).clip(0,2**16-1).astype(np.uint16)
             temp_images = temp_images.reshape(n_image_batches, n_images_to_max, temp_images.shape[-2], temp_images.shape[-1])
             temp_images = np.squeeze(np.mean(temp_images,axis=1))
-            original_print = builtins.print
-            builtins.print= no_op
-            basic = BaSiC(
-                get_darkfield=False,
-                darkfield=np.zeros((temp_images.shape[-2]//4,temp_images.shape[-1]//4),dtype=np.float64),
-                flatfield=np.zeros((temp_images.shape[-2]//4,temp_images.shape[-1]//4),dtype=np.float64)
-            )
-            basic.autotune(temp_images)
-            basic.fit(temp_images)
-            builtins.print = original_print
-            if pos_idx == 0:
-                flatfields[chan_idx,:] = (np.squeeze(basic.flatfield) / np.max(np.squeeze(basic.flatfield),axis=(0,1))).astype(np.float32)
-            else:
-                new_flatfield = (np.squeeze(basic.flatfield) / np.max(np.squeeze(basic.flatfield),axis=(0,1))).astype(np.float32)
-                flatfields[chan_idx,:] = (flatfields[chan_idx,:] + new_flatfield)/2
-    else:
-        flatfields = np.ones((datastore.shape[2],datastore.shape[-2],datastore.shape[-1]),dtype=np.float32)
-        
+            images.append(temp_images)
+        images = np.asarray(images,dtype=np.float32)
+        images = images.reshape(n_pos_samples*n_image_batches,images.shape[-2],images.shape[-1])
+        original_print = builtins.print
+        builtins.print= no_op
+        basic = BaSiC(
+            get_darkfield=False,
+            darkfield=np.zeros((temp_images.shape[-2]//4,temp_images.shape[-1]//4),dtype=np.float64),
+            flatfield=np.zeros((temp_images.shape[-2]//4,temp_images.shape[-1]//4),dtype=np.float64)
+        )
+        basic.autotune(images)
+        basic.fit(images)
+        builtins.print = original_print
+        flatfields[chan_idx,:] = np.squeeze(basic.flatfield).astype(np.float32)
+
     return flatfields
+
+
+
+class TensorStoreWrapper:
+    """Wrapper for tensorstore array to provide ndarray properties.
+    
+    Parameters
+    ----------
+    ts_array: tensorstore
+        tensorstore array
+    """
+    
+    def __init__(self, ts_array):
+        self.ts_array = ts_array
+        self.shape = tuple(ts_array.shape)
+        self.dtype = ts_array.dtype.numpy_dtype
+        self.ndim = len(self.shape)
+
+    def __getitem__(self, idx):
+        """Return item from tensorstore array at requested indices.
+        
+        Parameters
+        ----------
+        idx: list
+            slice indices
+        """
+        
+        return self.ts_array[idx].read().result()
+
+    def __array__(self):
+        """Return fake array with correct dtype."""
+        return np.empty(self.shape, dtype=self.dtype)

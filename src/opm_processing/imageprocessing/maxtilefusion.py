@@ -19,7 +19,13 @@ class TileFusion:
         Pixel size (y, x) in physical units.
     """
     
-    def __init__(self, ts_dataset, tile_positions, output_path, pixel_size):
+    def __init__(
+        self, 
+        ts_dataset: str|Path, 
+        tile_positions: list[float,float], 
+        output_path: str|Path, 
+        pixel_size: tuple[float,float]
+    ):
         self.ts_dataset = ts_dataset
         self.tile_positions = np.array(tile_positions)
         self.output_path = Path(output_path)
@@ -55,28 +61,46 @@ class TileFusion:
 
         return fused_shape, (min_y, min_x)
 
-    def generate_blending_weights(self, blend_ratio=0.1):
+    def generate_blending_weights(self, blend_pixels: list[int,int] = [200,400]):
         """
         Generate a feathered blending weight mask for a tile.
 
         Parameters
         ----------
-        blend_ratio : float, optional
+        blend_pixels : int
             Fraction of the tile edge used for blending, by default 0.2.
 
         Returns
         -------
-        ndarray
+        weight_mask: ndarray
             A (h, w) weight array for blending.
         """
         h, w = self.tile_shape
-        y = np.linspace(0, 1, h)
-        x = np.linspace(0, 1, w)
-        
-        y_blend = 0.5 * (1 - np.cos(np.pi * np.clip((y - blend_ratio) / (1 - 2 * blend_ratio), 0, 1)))
-        x_blend = 0.5 * (1 - np.cos(np.pi * np.clip((x - blend_ratio) / (1 - 2 * blend_ratio), 0, 1)))
-        
-        return np.outer(y_blend, x_blend)
+
+        # Clamp blend_pixels to half the tile size
+        blend_pixels_y = min(blend_pixels[0], h // 2)
+        blend_pixels_x = min(blend_pixels[1], w // 2)
+
+        y = np.ones(h, dtype=np.float32)
+        x = np.ones(w, dtype=np.float32)
+
+        # Y blending
+        blend_zone_y = np.linspace(0, np.pi, blend_pixels_y)
+        feather_y = 0.5 * (1 - np.cos(blend_zone_y))
+
+        y[:blend_pixels_y] = feather_y  # top
+        y[-blend_pixels_y:] = feather_y[::-1]  # bottom
+
+        # X blending
+        blend_zone_x = np.linspace(0, np.pi, blend_pixels_x)
+        feather_x = 0.5 * (1 - np.cos(blend_zone_x))
+
+        x[:blend_pixels_x] = feather_x  # left
+        x[-blend_pixels_x:] = feather_x[::-1]  # right
+
+        weight_mask = np.outer(y, x)
+
+        return weight_mask
 
     def create_fused_tensorstore(self):
         """
