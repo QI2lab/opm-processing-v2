@@ -70,7 +70,7 @@ def register_and_fuse(root_path: Path):
     }
     
     # Create list of multiscale spatial images over all tiles
-    print('Loading data and stage coordinates...')
+    print('Lazy loading deskewed data and stage coordinates...')
     msims = []
     for time_idx in trange(datastore.shape[0],desc="t",leave=False):
         for pos_idx in trange(datastore.shape[1],desc="p",leave=False):
@@ -120,12 +120,12 @@ def register_and_fuse(root_path: Path):
         )
         
     # Create dask task map for fusion given output chunksize
-    print('Fusing views...')
+    print('Fusing tiles...')
     with diag.ProgressBar():
         fused = fusion.fuse(
             [msi_utils.get_sim_from_msim(msim) for msim in msims],
             transform_key="affine_registered",
-            output_chunksize=512
+            output_chunksize=256
         )
         
     # Save fusion to disk

@@ -45,6 +45,8 @@ def display(
             position in napari.
         - `fused-max-z` loads the maximum z projections fused using recorded \
             stage positions in napari.
+        - `fused-full` loads the full registered and fused deskewed data if \
+            available.
     `TSTART` and `TEND` are the start (inclusive) and stop (exclusive) time \
         indices to load and display
     `PSTART` and `PEND` are the start (inclusive) and stop (exclusive) position \

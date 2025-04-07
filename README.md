@@ -8,9 +8,11 @@
 
 ## Overview 
 
-qi2lab OPM post-processing package v2. Data reading and writing using Tensorstore. Performs Numba-accelerated deskewing, downsampling, flatfield correction, and maximum Z projection operations. Additionally uses the BaSiCPy library to estimate illumination profiles. 
+qi2lab OPM post-processing package v2. This packages provides performant data reading and writing through Tensorstore combined with performant deskewing, downsampling, and maximum Z projection operations using Numba.
 
-Deconvolution is planned, but will require GPU-accleration.
+Additionally uses [BaSiCPy](https://github.com/peng-lab/BaSiCPy) to estimate illumination profiles and [multiview-stitcher](https://github.com/multiview-stitcher/multiview-stitcher) to register and fuse tiled data into ome-zarr v0.4 format.
+
+Raw data deconvolution is planned, but will require GPU-accleration.
 
 ## Installation
 
