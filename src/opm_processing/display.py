@@ -1,7 +1,7 @@
 """
 Display OPM data
 
-This file is meant for quick deskew and display of qi2lab OPM results. No deconvolution and it assumes everything fits in memory.
+This file displays of qi2lab OPM raw or deskewed results.
 """
 
 import warnings
@@ -33,8 +33,23 @@ def display(
 ):
     """Display deskewed OPM data.
     
-    This code assumes data is already deskewed and on disk. Pass in the raw data
-    folder for now to ensure metadata is read properly.
+    This code assumes data is already deskewed and on disk.
+    
+    Usage: `display /path/to/raw/data/raw_data.zarr --to-display DISPLAY_OPTION` \
+    --time-range TSTART TEND --pos-range PSTART PEND
+    
+    `OPTION` is one of `{max-z, fused-max-z, full}`. 
+        - `max-z` loads each maximum Z projection and places in the recorded \
+            stage position in napari.
+        - `full` loads each deskewed tile and place in the recorded stage \
+            position in napari.
+        - `fused-max-z` loads the maximum z projections fused using recorded \
+            stage positions in napari.
+    `TSTART` and `TEND` are the start (inclusive) and stop (exclusive) time \
+        indices to load and display
+    `PSTART` and `PEND` are the start (inclusive) and stop (exclusive) position \
+        indices to load and display
+    
     
     Parameters
     ----------

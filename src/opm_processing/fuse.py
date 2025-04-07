@@ -1,3 +1,9 @@
+"""
+Fuse OPM data
+
+This file registers and fuses deskewed qi2lab OPM results.
+"""
+
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.simplefilter("ignore", category=FutureWarning)
