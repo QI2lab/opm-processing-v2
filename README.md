@@ -38,24 +38,31 @@ pip install "opm-processing-v2 @ git+https://github.com/QI2lab/opm-processing-v2
 
 Activate the conda environment.
 
-To process raw data,
+To deskew raw data,
 ```bash
-postprocess "/path/to/qi2labacquition.zarr"
+deskew "/path/to/qi2lab_acquisition.zarr"
 ```
 
 The defaults parameters generate three zarr3 compliant datastores:
-1. Full 3D data (`/path/to/qi2labacquition_deskewed.zarr`) with dimensions `tpczyx`.
-2. Maximum Z projections (`/path/to/qi2labacquition_max_z_deskewed.zarr`) with dimensions `tpcyx`. 
-3. Stage-position fused maximum z projections (`/path/to/qi2labacquition_maxz.zarr`) with dimensions `tcyx`.
+1. Full 3D data (`/path/to/qi2lab_acquisition_deskewed.zarr`) with dimensions `tpczyx`.
+2. Maximum Z projections (`/path/to/qi2lab_acquisition_max_z_deskewed.zarr`) with dimensions `tpcyx`. 
+3. Stage-position fused maximum z projections (`/path/to/qi2lab_acquisition_maxz.zarr`) with dimensions `tcyx`.
 
 All three datastores are camera offset and gain corrected. The fused datastore uses the provided stage positions, without optimization.
 
-To display the data, 
+To display deskewed data, 
 ```bash
-display "/path/to/qi2labacquition.zarr" --to_display full
+display "/path/to/qi2lab_acquisition.zarr" --to_display full
 ```
 
 There are three `to_display` options that correspond to the three datastores described above,
 1. full
 2. max-z
 3. fused-max-z
+
+To register and fused desekwed data,
+```bash
+fuse "/path/to/qi2lab_acquisition.zarr"
+```
+
+The registered and fused data will be in `/path/to/qi2lab_acquisition_fused_deskewed.ome.zarr`

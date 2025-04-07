@@ -35,9 +35,9 @@ def register_and_fuse(root_path: Path):
     
     This code assumes data is already deskewed and on disk.
     
-    Usage: `fuse /path/to/raw/data/raw_data.zarr`
+    Usage: `fuse "/path/to/qi2lab_acquisition.zarr"
     
-    Output will be in `/path/to/raw/data/raw_data_fused_deskewed.ome.zarr`
+    Output will be in `/path/to/qi2lab_acquisition_fused_deskewed.ome.zarr`
     
     Parameters
     ----------

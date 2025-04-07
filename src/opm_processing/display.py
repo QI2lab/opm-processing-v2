@@ -35,7 +35,7 @@ def display(
     
     This code assumes data is already deskewed and on disk.
     
-    Usage: `display /path/to/raw/data/raw_data.zarr --to-display DISPLAY_OPTION` \
+    Usage: `display "/path/to/qi2lab_acquisition.zarr" --to-display DISPLAY_OPTION` \
     --time-range TSTART TEND --pos-range PSTART PEND
     
     `OPTION` is one of `{max-z, fused-max-z, full}`. 

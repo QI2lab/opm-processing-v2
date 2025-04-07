@@ -43,17 +43,17 @@ def deskew(
     saved using OPMMirrorHandler. All revelant metadata is read from imaging \ 
     files, including stage transformation, camera parameters, and channels.
     
-    Usage: `deskew /path/to/raw/data/raw_data.zarr`
+    Usage: `deskew "/path/to/qi2lab_acquisition.zarr"`
     
     See docstring for the various options available.
     
     Outputs are in:
     - Deskewed 3D individual deskewed tiles: \
-        `/path/to/raw/data/raw_data_deskewed.zarr`
+        `"/path/to/qi2lab_acquisition_deskewed.zarr"`
     - Maximum Z projected individual deskewed tiles: \
-        `/path/to/raw/data/raw_data_max_z_deskewed.zarr`
+        `"/path/to/qi2lab_acquisition_max_z_deskewed.zarr"`
     - Maximum Z projection fused deskewed tiles: \
-        `/path/to/raw/data/raw_data_max_z_fused.zarr`
+        `"/path/to/qi2lab_acquisition_max_z_fused.zarr"`
     
     Parameters
     ----------
