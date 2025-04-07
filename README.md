@@ -8,7 +8,9 @@
 
 ## Overview 
 
-qi2lab OPM post-processing package v2. This packages provides performant data reading and writing through Tensorstore combined with performant deskewing, downsampling, and maximum Z projection operations using Numba.
+This package is the 2nd generation of the Quantitative Imaging and Inference (qi2lab) oblique plane microscopy (OPM) processing software. Currently, it assumes that data is generated using the [2nd generation qi2lab OPM control code](https://github.com/QI2lab/opm-v2). The core algorithms can be used for any microscope that acquires data at a skewed angle, including diSPIM, LLSM, or OPM. Please open an issue if you would like help adapting the code to work with your microscope, we are happy to assist.
+
+The goal is provide highly performant data I/O using Tensorstore combined deskewing, downsampling, and maximum Z projection operations using Numba.
 
 Additionally uses [BaSiCPy](https://github.com/peng-lab/BaSiCPy) to estimate illumination profiles and [multiview-stitcher](https://github.com/multiview-stitcher/multiview-stitcher) to register and fuse tiled data into ome-zarr v0.4 format.
 
