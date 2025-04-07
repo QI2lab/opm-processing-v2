@@ -1,7 +1,7 @@
 """
-Fuse OPM data
+Fuse qi2lab OPM data
 
-This file registers and fuses deskewed qi2lab OPM results.
+This file registers and fuses deskewed qi2lab OPM data.
 """
 
 import warnings

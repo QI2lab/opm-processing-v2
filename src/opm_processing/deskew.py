@@ -1,7 +1,7 @@
 """
 Deskew qi2lab OPM data.
 
-This file deskews and creates maximum projections of qi2lab OPM raw data.
+This file deskews and creates maximum projections of raw qi2lab OPM data.
 """
 
 import warnings

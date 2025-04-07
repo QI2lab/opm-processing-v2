@@ -1,7 +1,7 @@
 """
-Display OPM data
+Display qi2lab OPM data
 
-This file displays of qi2lab OPM raw or deskewed results.
+This file displays deskewed qi2lab OPM data.
 """
 
 import warnings
