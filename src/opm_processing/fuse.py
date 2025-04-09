@@ -120,7 +120,7 @@ def register_and_fuse(root_path: Path):
         )
         
     # Create dask task map for fusion given output chunksize
-    print('Fusing tiles...')
+    print('Constructing task map for tile fusion...')
     with diag.ProgressBar():
         fused = fusion.fuse(
             [msi_utils.get_sim_from_msim(msim) for msim in msims],
