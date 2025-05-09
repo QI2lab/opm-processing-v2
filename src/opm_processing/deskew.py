@@ -12,6 +12,8 @@ mp.set_start_method('spawn', force=True)
 
 from pathlib import Path
 import tensorstore as ts
+from opm_processing.imageprocessing.opmpsf import generate_skewed_psf
+from opm_processing.imageprocessing.rlgc import chunked_rlgc
 from opm_processing.imageprocessing.opmtools import orthogonal_deskew, deskew_shape_estimator
 from opm_processing.imageprocessing.maxtilefusion import TileFusion
 from opm_processing.imageprocessing.utils import estimate_illuminations
@@ -29,6 +31,7 @@ app.pretty_exceptions_enable = False
 @app.command()
 def deskew(
     root_path: Path,
+    deconvolve: bool = False,
     max_projection: bool = True,
     flatfield_correction: bool = False,
     create_fused_max_projection: bool = True,
@@ -59,6 +62,8 @@ def deskew(
     ----------
     root_path: Path
         Path to OPM pymmcoregui zarr file.
+    deconvolve: bool, default = False
+        Deconvolve the data using RLGC.
     max_projection: bool, default = True
         Create a maximum projection datastore.
     flatfield_correction: bool, default = True
@@ -240,13 +245,48 @@ def deskew(
                 
                 if flip_scan:
                     camera_corrected_data = np.flip(camera_corrected_data,axis=0)
-                
-                deskewed = orthogonal_deskew(
-                    camera_corrected_data[excess_scan_positions:,:,:],
-                    theta = opm_tilt_deg,
-                    distance = scan_axis_step_um,
-                    pixel_size = pixel_size_um
-                )
+                    
+                if deconvolve:
+                    psf = generate_skewed_psf(
+                        em_wvl=float(int(str(channels[chan_idx]).rstrip("nm")) / 1000),
+                        pixel_size_um=pixel_size_um,
+                        scan_axis_step_um=scan_axis_step_um,
+                        pz=0.0,
+                        plot=False
+                    )
+                    # decon_temp = chunked_rlgc(
+                    #     camera_corrected_data, 
+                    #     psf,
+                    #     scan_chunk_size=256,
+                    #     scan_overlap_size=64
+                    # )
+                    
+                    # import napari
+                    # viewer = napari.Viewer()
+                    # viewer.add_image(decon_temp)
+                    # viewer.add_image(camera_corrected_data)
+                    # napari.run()
+                    
+                    deconvolved_data = chunked_rlgc(
+                        camera_corrected_data,
+                        psf,
+                        scan_chunk_size=256,
+                        scan_overlap_size=32
+                    )
+                    
+                    deskewed = orthogonal_deskew(
+                        deconvolved_data,
+                        theta = opm_tilt_deg,
+                        distance = scan_axis_step_um,
+                        pixel_size = pixel_size_um
+                    )
+                else:        
+                    deskewed = orthogonal_deskew(
+                        camera_corrected_data[excess_scan_positions:,:,:],
+                        theta = opm_tilt_deg,
+                        distance = scan_axis_step_um,
+                        pixel_size = pixel_size_um
+                    )
 
               
                 update_per_index_metadata(
