@@ -1,3 +1,12 @@
+"""Richardson-Lucy Gradient Consensus deconvolution.
+
+Original idea for gradient consensus deconvolution from: James Maton and Andrew York, https://zenodo.org/records/10278919
+
+RLGC code based on James Manton's implementation, https://colab.research.google.com/drive/1mfVNSCaYHz1g56g92xBkIoa8190XNJpJ
+
+Biggs-Andrews acceleration based on their 1997 paper, https://doi.org/10.1364/AO.36.001766
+"""
+
 import cupy as cp
 import numpy as np
 from cupy import ElementwiseKernel
