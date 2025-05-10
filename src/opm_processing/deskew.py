@@ -258,8 +258,7 @@ def deskew(
                                 pz=0.0,
                                 plot=False
                             )
-                        psfs.append(psf)
-                        psfs = np.asarray(psfs)
+                            psfs.append(psf)
 
                     # This code is for debugging the RLGC deconvolution
                     # ------------------------------------
@@ -279,7 +278,7 @@ def deskew(
                     
                     deconvolved_data = chunked_rlgc(
                         camera_corrected_data[excess_scan_positions:,:,:],
-                        psfs[chan_idx,:],
+                        np.asarray(psfs[chan_idx]),
                         scan_chunk_size=384,
                         scan_overlap_size=64
                     )
