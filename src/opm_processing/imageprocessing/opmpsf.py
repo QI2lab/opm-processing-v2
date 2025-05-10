@@ -5,7 +5,7 @@ Reconstruction tools
 
 Generate theoretical OPM in skewed coordinates
 
-Last updated: Shepherd 01/22
+Last updated: Shepherd 05/25
 '''
 
 import psfmodels as psfm
@@ -17,13 +17,25 @@ from scipy.interpolate import interp2d
 # ROI tools
 def get_skewed_roi_size(sizes, theta, dc, dstep, ensure_odd=True):
     """
-    Get ROI size in OPM matrix that includes sufficient xy and z points
-    :param sizes: [z-size, y-size, x-size] in same units as dc, dstep
-    :param theta: angle in radians
-    :param dc: camera pixel size
-    :param dstep: step size
-    :param bool ensure_odd:
-    :return [no, n1, n2]: integer size of roi in skewed coordinates
+    Calculate the ROI size in the OPM matrix to include sufficient xy and z points.
+
+    Parameters
+    ----------
+    sizes : list of float
+        [z-size, y-size, x-size] in the same units as `dc` and `dstep`.
+    theta : float
+        Angle in radians.
+    dc : float
+        Camera pixel size.
+    dstep : float
+        Step size.
+    ensure_odd : bool, optional
+        Whether to ensure the ROI dimensions are odd. Default is True.
+
+    Returns
+    -------
+    list of int
+        [n0, n1, n2]: Integer size of ROI in skewed coordinates.
     """
 
     # x-size determines n2 size
@@ -50,13 +62,46 @@ def get_skewed_roi_size(sizes, theta, dc, dstep, ensure_odd=True):
 # coordinate transformations between OPM and coverslip frames
 def get_skewed_coords(sizes, dc, ds, theta, scan_direction="lateral"):
     """
-    Get laboratory coordinates (i.e. coverslip coordinates) for a stage-scanning OPM set
-    :param sizes: (n0, n1, n2)
-    :param dc: camera pixel size
-    :param ds: stage step size
-    :param theta: in radians
-    :return x, y, z:
+    Get laboratory coordinates (i.e., coverslip coordinates) for a stage-scanning OPM set.
+
+    Parameters
+    ----------
+    sizes : tuple of int
+        A tuple (n0, n1, n2) where:
+        - n0: Number of images (nimgs).
+        - n1: Number of camera pixels in the y-direction (ny_cam).
+        - n2: Number of camera pixels in the x-direction (nx_cam).
+    dc : float
+        Camera pixel size.
+    ds : float
+        Stage step size.
+    theta : float
+        Angle in radians.
+    scan_direction : {'lateral', 'axial'}, optional
+        Direction of the scan. Must be either 'lateral' or 'axial'. Default is 'lateral'.
+
+    Returns
+    -------
+    x : ndarray
+        X-coordinates of the laboratory frame.
+    y : ndarray
+        Y-coordinates of the laboratory frame.
+    z : ndarray
+        Z-coordinates of the laboratory frame.
+
+    Raises
+    ------
+    ValueError
+        If `scan_direction` is not 'lateral' or 'axial'.
+
+    Notes
+    -----
+    - For `scan_direction='lateral'`, the stage moves laterally, and the y-coordinates are computed
+      based on the stage position and the camera pixel size.
+    - For `scan_direction='axial'`, the stage moves axially, and the z-coordinates are computed
+      based on the stage position and the camera pixel size.
     """
+   
     nimgs, ny_cam, nx_cam = sizes
 
     if scan_direction == "lateral":
@@ -223,13 +268,13 @@ def generate_skewed_psf(
     if plot:
     # plot gridded psf
         figh1 = plt.figure()
-        ax11 = plt.subplot(2, 2, 1)
+        ax11 = plt.subplot(2, 2, 1) # noqa: F841
         plt.imshow(psf_grid[psf_grid.shape[0]//2])
 
-        ax12 = plt.subplot(2, 2, 2)
+        ax12 = plt.subplot(2, 2, 2) # noqa: F841
         plt.imshow(psf_grid[:, psf_grid.shape[1]//2, :])
 
-        ax13 = plt.subplot(2, 2, 3)
+        ax13 = plt.subplot(2, 2, 3) # noqa: F841
         plt.imshow(psf_grid[:, :, psf_grid.shape[2]//2])
 
     # get value from interpolation
@@ -247,13 +292,13 @@ def generate_skewed_psf(
     if plot:
         # plot gridded psf
         figh2 = plt.figure()
-        ax21 = plt.subplot(2, 2, 1)
+        ax21 = plt.subplot(2, 2, 1) # noqa: F841
         plt.imshow(skewed_psf[skewed_psf.shape[0]//2])
 
-        ax22 = plt.subplot(2, 2, 2)
+        ax22 = plt.subplot(2, 2, 2) # noqa: F841
         plt.imshow(skewed_psf[:, skewed_psf.shape[1]//2, :])
 
-        ax23 = plt.subplot(2, 2, 3)
+        ax23 = plt.subplot(2, 2, 3) # noqa: F841
         plt.imshow(skewed_psf[:, :, skewed_psf.shape[2]//2])
 
         figh1.show()
