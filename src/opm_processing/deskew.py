@@ -257,7 +257,7 @@ def deskew(
                     # decon_temp = chunked_rlgc(
                     #     camera_corrected_data, 
                     #     psf,
-                    #     scan_chunk_size=256,
+                    #     scan_chunk_size=384,
                     #     scan_overlap_size=64
                     # )
                     
@@ -270,8 +270,8 @@ def deskew(
                     deconvolved_data = chunked_rlgc(
                         camera_corrected_data,
                         psf,
-                        scan_chunk_size=256,
-                        scan_overlap_size=32
+                        scan_chunk_size=384,
+                        scan_overlap_size=64
                     )
                     
                     deskewed = orthogonal_deskew(

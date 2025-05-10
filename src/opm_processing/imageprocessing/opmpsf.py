@@ -136,6 +136,18 @@ def create_psf_silicone_100x(
     zv = np.linspace(-lim + pz, lim + pz, nz)
     
     psf = psfm.vectorial_psf(zv=zv,nx=nxy,dxy=dxy,pz=pz,wvl=em_wvl,params=em_lens)
+    psf = psf / np.sum(psf)
+    x = np.linspace(1, psf.shape[1], psf.shape[1])
+    x = x - psf.shape[1] / 2
+    y = np.linspace(1, psf.shape[2], psf.shape[2])
+    y = y - psf.shape[2] / 2
+    x, y = np.meshgrid(x, y)
+    r = np.sqrt(np.power(x, 2) + np.power(y, 2))
+    sigma = 15
+    filter = np.exp(-np.power(r, 2) / (2 * sigma**2))
+    filter = filter / np.max(filter)
+
+    psf = psf * filter
     
     return psf
 
@@ -167,8 +179,6 @@ def generate_skewed_psf(
         OPM PSF in skewed coordinates
     """
 
-    
-    
     dc = pixel_size_um
     na = 1.35
     ni = 1.4
@@ -179,7 +189,7 @@ def generate_skewed_psf(
     z_res = 2.355*(np.sqrt(6) / np.pi * ni * em_wvl / na ** 2)
     z_res_mod = z_res + np.divide(pz+1e-12,15) / 5
     
-    roi_skewed_size = get_skewed_roi_size([z_res_mod * 10, xy_res * 10, xy_res * 10],
+    roi_skewed_size = get_skewed_roi_size([z_res_mod * 12, xy_res * 12, xy_res * 12],
                                                           theta, dc, dstage, ensure_odd=True)
     # make square
     roi_skewed_size[2]= roi_skewed_size[1]
@@ -230,18 +240,8 @@ def generate_skewed_psf(
     #skewed_psf = np.swapaxes(skewed_psf, 1,2)
     
     #tot_psf = psfm.vectorialXYZFocalScan(em_lens, dxy, nxy, zv2_mod, pz=pz, wvl=em_wvl, zd=200e3)
-    x = np.linspace(1, skewed_psf.shape[1], skewed_psf.shape[1])
-    x = x - skewed_psf.shape[1] / 2
-    y = np.linspace(1, skewed_psf.shape[2], skewed_psf.shape[2])
-    y = y - skewed_psf.shape[2] / 2
-    x, y = np.meshgrid(x, y)
-    r = np.sqrt(np.power(x, 2) + np.power(y, 2))
-    sigma = 5
-    filter = np.exp(-np.power(r, 2) / (2 * sigma**2))
-    filter = filter / np.max(filter)
 
-    skewed_psf = skewed_psf * filter
-    skewed_psf = skewed_psf / np.sum(skewed_psf)
+    #skewed_psf = skewed_psf / np.sum(skewed_psf)
 
     
     if plot:
