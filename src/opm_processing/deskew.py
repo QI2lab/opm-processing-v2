@@ -247,13 +247,21 @@ def deskew(
                     camera_corrected_data = np.flip(camera_corrected_data,axis=0)
                     
                 if deconvolve:
-                    psf = generate_skewed_psf(
-                        em_wvl=float(int(str(channels[chan_idx]).rstrip("nm")) / 1000),
-                        pixel_size_um=pixel_size_um,
-                        scan_axis_step_um=scan_axis_step_um,
-                        pz=0.0,
-                        plot=False
-                    )
+                    if pos_idx == 0:
+                        psfs = []
+                        for psf_idx in range(datastore.shape[2]):
+                            psf = generate_skewed_psf(
+                                em_wvl=float(int(str(channels[psf_idx]).rstrip("nm")) / 1000),
+                                pixel_size_um=pixel_size_um,
+                                scan_axis_step_um=scan_axis_step_um,
+                                pz=0.0,
+                                plot=False
+                            )
+                        psfs.append(psf)
+                        psfs = np.asarray(psfs)
+
+                    # This code is for debugging the RLGC deconvolution
+                    # ------------------------------------
                     # decon_temp = chunked_rlgc(
                     #     camera_corrected_data, 
                     #     psf,
@@ -266,10 +274,11 @@ def deskew(
                     # viewer.add_image(decon_temp)
                     # viewer.add_image(camera_corrected_data)
                     # napari.run()
+                    # ------------------------------------
                     
                     deconvolved_data = chunked_rlgc(
-                        camera_corrected_data,
-                        psf,
+                        camera_corrected_data[excess_scan_positions:,:,:],
+                        psfs[chan_idx,:],
                         scan_chunk_size=384,
                         scan_overlap_size=64
                     )

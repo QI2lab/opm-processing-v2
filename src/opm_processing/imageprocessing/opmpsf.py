@@ -188,7 +188,7 @@ def create_psf_silicone_100x(
     y = y - psf.shape[2] / 2
     x, y = np.meshgrid(x, y)
     r = np.sqrt(np.power(x, 2) + np.power(y, 2))
-    sigma = 15
+    sigma = 10
     filter = np.exp(-np.power(r, 2) / (2 * sigma**2))
     filter = filter / np.max(filter)
 
@@ -281,13 +281,6 @@ def generate_skewed_psf(
     skewed_psf = np.zeros(roi_skewed_size)
     for ii in range(nz):
         skewed_psf[:, ii, :] = interp2d(xg, yg, psf_grid[ii], kind="linear")(x.ravel(), y[:, ii].ravel())
-    #skewed_psf = np.flip(skewed_psf, axis=0)
-    #skewed_psf = np.swapaxes(skewed_psf, 1,2)
-    
-    #tot_psf = psfm.vectorialXYZFocalScan(em_lens, dxy, nxy, zv2_mod, pz=pz, wvl=em_wvl, zd=200e3)
-
-    #skewed_psf = skewed_psf / np.sum(skewed_psf)
-
     
     if plot:
         # plot gridded psf
