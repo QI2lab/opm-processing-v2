@@ -16,7 +16,6 @@ from opm_processing.imageprocessing.opmpsf import generate_skewed_psf
 from opm_processing.imageprocessing.rlgc import chunked_rlgc
 from opm_processing.imageprocessing.opmtools import orthogonal_deskew, deskew_shape_estimator
 from opm_processing.imageprocessing.maxtilefusion import TileFusion
-from opm_processing.imageprocessing.utils import estimate_illuminations
 from opm_processing.dataio.metadata import extract_channels, find_key, extract_stage_positions, update_global_metadata, update_per_index_metadata
 from opm_processing.dataio.zarr_handlers import create_via_tensorstore, write_via_tensorstore
 import json
@@ -192,7 +191,9 @@ def deskew(
         
     
     if flatfield_correction:
-        flatfields = estimate_illuminations(datastore,camera_offset,camera_conversion)
+        
+        flatfields = call_estimate_illuminations(datastore, camera_offset, camera_conversion)
+        #flatfields = estimate_illuminations(datastore,camera_offset,camera_conversion)
         flatfield_path = root_path.parents[0] / Path(str(root_path.stem)+"_flatfield.ome.tif")
         with TiffWriter(flatfield_path, bigtiff=True) as tif:
             metadata={
@@ -486,6 +487,35 @@ def deskew(
                         **options,
                         metadata=metadata
                     )
+
+def run_estimate_illuminations(datastore, camera_offset, camera_conversion, conn):
+    from opm_processing.imageprocessing.flatfield import estimate_illuminations
+
+    try:
+        flatfields = estimate_illuminations(datastore, camera_offset, camera_conversion)
+        conn.send(flatfields)
+    except Exception as e:
+        conn.send(e)
+    finally:
+        conn.close()
+    
+def call_estimate_illuminations(datastore, camera_offset, camera_conversion):
+    parent_conn, child_conn = mp.Pipe()
+    p = mp.Process(
+        target=run_estimate_illuminations,
+        args=(datastore, camera_offset, camera_conversion, child_conn)
+    )
+    p.start()
+    result = parent_conn.recv()
+    p.join()
+
+    if p.exitcode != 0:
+        raise RuntimeError("Subprocess failed")
+
+    if isinstance(result, Exception):
+        raise result
+
+    return result
 
 # entry for point for CLI        
 def main():
