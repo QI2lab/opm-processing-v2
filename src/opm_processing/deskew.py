@@ -248,7 +248,7 @@ def deskew(
                     camera_corrected_data = np.flip(camera_corrected_data,axis=0)
                     
                 if deconvolve:
-                    if pos_idx == 0:
+                    if pos_idx == 0 and chan_idx == 0:
                         psfs = []
                         for psf_idx in range(datastore.shape[2]):
                             psf = generate_skewed_psf(
