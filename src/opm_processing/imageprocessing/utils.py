@@ -162,33 +162,3 @@ def downsample_axis(image: NDArray, level: int = 2, axis: int = 0) -> NDArray:
     downsampled_image = image_reshaped.mean(axis=axis + 1)
 
     return downsampled_image.astype(image.dtype)
-
-class TensorStoreWrapper:
-    """Wrapper for tensorstore array to provide ndarray properties.
-    
-    Parameters
-    ----------
-    ts_array: tensorstore
-        tensorstore array
-    """
-    
-    def __init__(self, ts_array):
-        self.ts_array = ts_array
-        self.shape = tuple(ts_array.shape)
-        self.dtype = ts_array.dtype.numpy_dtype
-        self.ndim = len(self.shape)
-
-    def __getitem__(self, idx):
-        """Return item from tensorstore array at requested indices.
-        
-        Parameters
-        ----------
-        idx: list
-            slice indices
-        """
-        
-        return self.ts_array[idx].read().result()
-
-    def __array__(self):
-        """Return fake array with correct dtype."""
-        return np.empty(self.shape, dtype=self.dtype)

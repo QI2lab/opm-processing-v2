@@ -13,7 +13,7 @@ mp.set_start_method('spawn', force=True)
 from pathlib import Path
 import tensorstore as ts
 import json
-from opm_processing.imageprocessing.utils import TensorStoreWrapper
+from opm_processing.dataio.zarr_handlers import TensorStoreWrapper
 import dask.array as da
 import dask.diagnostics as diag
 from multiview_stitcher import spatial_image_utils as si_utils

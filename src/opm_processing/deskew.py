@@ -262,7 +262,7 @@ def deskew(
                             )
                             psfs.append(psf)
 
-                    # This code is for debugging the RLGC deconvolution
+                    # This code is for debugging RLGC deconvolution
                     # ------------------------------------
                     # decon_temp = chunked_rlgc(
                     #     camera_corrected_data, 
@@ -490,6 +490,23 @@ def deskew(
                     )
 
 def run_estimate_illuminations(datastore, camera_offset, camera_conversion, conn):
+    """Helper function to run estimate_illuminations in a subprocess.
+    
+    This is necessary because jaxlib does not release GPU memory until the
+    process exists. So we need to isolate it so that the GPU can be used for
+    other processing tasks.
+    
+    Parameters
+    ----------
+    datastore: TensorStore
+        TensorStore object containing the data.
+    camera_offset: float
+        Camera offset value.
+    camera_conversion: float
+        Camera conversion value.
+    conn: Pipe
+        Pipe connection to send the result back to the main process.
+    """
     from opm_processing.imageprocessing.flatfield import estimate_illuminations
 
     try:
@@ -501,6 +518,26 @@ def run_estimate_illuminations(datastore, camera_offset, camera_conversion, conn
         conn.close()
     
 def call_estimate_illuminations(datastore, camera_offset, camera_conversion):
+    """Helper function to call estimate_illuminations in a subprocess.
+    
+    This is necessary because jaxlib does not release GPU memory until the
+    process exists. So we need to isolate it so that the GPU can be used for
+    other processing tasks.
+    
+    Parameters
+    ----------
+    datastore: TensorStore
+        TensorStore object containing the data.
+    camera_offset: float
+        Camera offset value.
+    camera_conversion: float
+        Camera conversion value.
+    
+    Returns
+    -------
+    flatfields: np.ndarray
+        Estimated illuminations.
+    """
     parent_conn, child_conn = mp.Pipe()
     p = mp.Process(
         target=run_estimate_illuminations,
