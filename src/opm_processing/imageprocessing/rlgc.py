@@ -249,12 +249,13 @@ def rlgc_biggs(
         kld1 = kl_div(Hu, split1)
         kld2 = kl_div(Hu, split2)
 
-        if (kld1 > prev_kld1) or (kld2 > prev_kld2):
+        if (kld1 > prev_kld1) or (kld2 > prev_kld2) or (kld1 == 0) or (kld2 == 0):
             recon[:] = previous_recon
             if DEBUG:
                 total_time = timeit.default_timer() - start_time
                 print(
                     f"Optimum result obtained after {num_iters - 1} iterations "
+                 
                     f"in {total_time:.1f} seconds."
                 )
             break

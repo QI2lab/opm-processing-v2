@@ -22,7 +22,7 @@ import json
 import numpy as np
 from tqdm import tqdm
 import typer
-from tifffile import TiffWriter
+from tifffile import TiffWriter, imread
 
 app = typer.Typer()
 app.pretty_exceptions_enable = False
@@ -192,31 +192,33 @@ def deskew(
     
     if flatfield_correction:
         
-        flatfields = call_estimate_illuminations(datastore, camera_offset, camera_conversion)
-        #flatfields = estimate_illuminations(datastore,camera_offset,camera_conversion)
         flatfield_path = root_path.parents[0] / Path(str(root_path.stem)+"_flatfield.ome.tif")
-        with TiffWriter(flatfield_path, bigtiff=True) as tif:
-            metadata={
-                'axes': "CYX",
-                'SignificantBits': 32,
-                'PhysicalSizeX': pixel_size_um,
-                'PhysicalSizeXUnit': 'µm',
-                'PhysicalSizeY': pixel_size_um,
-                'PhysicalSizeYUnit': 'µm',
-            }
-            options = dict(
-                photometric='minisblack',
-                resolutionunit='CENTIMETER',
-            )
-            tif.write(
-                flatfields,
-                resolution=(
-                    1e4 / pixel_size_um,
-                    1e4 / pixel_size_um
-                ),
-                **options,
-                metadata=metadata
-            )
+        if flatfield_path.exists():
+            flatfields = imread(flatfield_path).astype(np.float32)
+        else:
+            flatfields = call_estimate_illuminations(datastore, camera_offset, camera_conversion)
+            with TiffWriter(flatfield_path, bigtiff=True) as tif:
+                metadata={
+                    'axes': "CYX",
+                    'SignificantBits': 32,
+                    'PhysicalSizeX': pixel_size_um,
+                    'PhysicalSizeXUnit': 'µm',
+                    'PhysicalSizeY': pixel_size_um,
+                    'PhysicalSizeYUnit': 'µm',
+                }
+                options = dict(
+                    photometric='minisblack',
+                    resolutionunit='CENTIMETER',
+                )
+                tif.write(
+                    flatfields,
+                    resolution=(
+                        1e4 / pixel_size_um,
+                        1e4 / pixel_size_um
+                    ),
+                    **options,
+                    metadata=metadata
+                )
     else:
         flatfields = np.ones((datastore.shape[2],datastore.shape[-2],datastore.shape[-1]),dtype=np.float32)
         
