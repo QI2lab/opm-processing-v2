@@ -125,7 +125,7 @@ def register_and_fuse(root_path: Path):
         fused = fusion.fuse(
             [msi_utils.get_sim_from_msim(msim) for msim in msims],
             transform_key="affine_registered",
-            output_chunksize=256
+            #output_chunksize=256
         )
         
     # Save fusion to disk
@@ -135,6 +135,7 @@ def register_and_fuse(root_path: Path):
         fused = ngff_utils.write_sim_to_ome_zarr(
             fused, output_filename, overwrite=True
         )
+
         
 # entry for point for CLI        
 def main():
