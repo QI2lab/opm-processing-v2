@@ -12,16 +12,17 @@ mp.set_start_method('spawn', force=True)
 
 from pathlib import Path
 import tensorstore as ts
+from opm_processing.imageprocessing.opmpsf import generate_skewed_psf
+from opm_processing.imageprocessing.rlgc import chunked_rlgc
 from opm_processing.imageprocessing.opmtools import orthogonal_deskew, deskew_shape_estimator
 from opm_processing.imageprocessing.maxtilefusion import TileFusion
-from opm_processing.imageprocessing.utils import estimate_illuminations
 from opm_processing.dataio.metadata import extract_channels, find_key, extract_stage_positions, update_global_metadata, update_per_index_metadata
 from opm_processing.dataio.zarr_handlers import create_via_tensorstore, write_via_tensorstore
 import json
 import numpy as np
 from tqdm import tqdm
 import typer
-from tifffile import TiffWriter
+from tifffile import TiffWriter, imread
 
 app = typer.Typer()
 app.pretty_exceptions_enable = False
@@ -29,6 +30,7 @@ app.pretty_exceptions_enable = False
 @app.command()
 def deskew(
     root_path: Path,
+    deconvolve: bool = False,
     max_projection: bool = True,
     flatfield_correction: bool = False,
     create_fused_max_projection: bool = True,
@@ -59,6 +61,8 @@ def deskew(
     ----------
     root_path: Path
         Path to OPM pymmcoregui zarr file.
+    deconvolve: bool, default = False
+        Deconvolve the data using RLGC.
     max_projection: bool, default = True
         Create a maximum projection datastore.
     flatfield_correction: bool, default = True
@@ -187,30 +191,34 @@ def deskew(
         
     
     if flatfield_correction:
-        flatfields = estimate_illuminations(datastore,camera_offset,camera_conversion)
+        
         flatfield_path = root_path.parents[0] / Path(str(root_path.stem)+"_flatfield.ome.tif")
-        with TiffWriter(flatfield_path, bigtiff=True) as tif:
-            metadata={
-                'axes': "CYX",
-                'SignificantBits': 32,
-                'PhysicalSizeX': pixel_size_um,
-                'PhysicalSizeXUnit': 'µm',
-                'PhysicalSizeY': pixel_size_um,
-                'PhysicalSizeYUnit': 'µm',
-            }
-            options = dict(
-                photometric='minisblack',
-                resolutionunit='CENTIMETER',
-            )
-            tif.write(
-                flatfields,
-                resolution=(
-                    1e4 / pixel_size_um,
-                    1e4 / pixel_size_um
-                ),
-                **options,
-                metadata=metadata
-            )
+        if flatfield_path.exists():
+            flatfields = imread(flatfield_path).astype(np.float32)
+        else:
+            flatfields = call_estimate_illuminations(datastore, camera_offset, camera_conversion)
+            with TiffWriter(flatfield_path, bigtiff=True) as tif:
+                metadata={
+                    'axes': "CYX",
+                    'SignificantBits': 32,
+                    'PhysicalSizeX': pixel_size_um,
+                    'PhysicalSizeXUnit': 'µm',
+                    'PhysicalSizeY': pixel_size_um,
+                    'PhysicalSizeYUnit': 'µm',
+                }
+                options = dict(
+                    photometric='minisblack',
+                    resolutionunit='CENTIMETER',
+                )
+                tif.write(
+                    flatfields,
+                    resolution=(
+                        1e4 / pixel_size_um,
+                        1e4 / pixel_size_um
+                    ),
+                    **options,
+                    metadata=metadata
+                )
     else:
         flatfields = np.ones((datastore.shape[2],datastore.shape[-2],datastore.shape[-1]),dtype=np.float32)
         
@@ -240,13 +248,56 @@ def deskew(
                 
                 if flip_scan:
                     camera_corrected_data = np.flip(camera_corrected_data,axis=0)
-                
-                deskewed = orthogonal_deskew(
-                    camera_corrected_data[excess_scan_positions:,:,:],
-                    theta = opm_tilt_deg,
-                    distance = scan_axis_step_um,
-                    pixel_size = pixel_size_um
-                )
+                    
+                if deconvolve:
+                    if pos_idx == 0 and chan_idx == 0:
+                        psfs = []
+                        for psf_idx in range(datastore.shape[2]):
+                            psf = generate_skewed_psf(
+                                em_wvl=float(int(str(channels[psf_idx]).rstrip("nm")) / 1000),
+                                pixel_size_um=pixel_size_um,
+                                scan_axis_step_um=scan_axis_step_um,
+                                pz=0.0,
+                                plot=False
+                            )
+                            psfs.append(psf)
+
+                    # This code is for debugging RLGC deconvolution
+                    # ------------------------------------
+                    # decon_temp = chunked_rlgc(
+                    #     camera_corrected_data, 
+                    #     psf,
+                    #     scan_chunk_size=384,
+                    #     scan_overlap_size=64
+                    # )
+                    
+                    # import napari
+                    # viewer = napari.Viewer()
+                    # viewer.add_image(decon_temp)
+                    # viewer.add_image(camera_corrected_data)
+                    # napari.run()
+                    # ------------------------------------
+                    
+                    deconvolved_data = chunked_rlgc(
+                        camera_corrected_data[excess_scan_positions:,:,:],
+                        np.asarray(psfs[chan_idx]),
+                        scan_chunk_size=384,
+                        scan_overlap_size=64
+                    )
+                    
+                    deskewed = orthogonal_deskew(
+                        deconvolved_data,
+                        theta = opm_tilt_deg,
+                        distance = scan_axis_step_um,
+                        pixel_size = pixel_size_um
+                    )
+                else:        
+                    deskewed = orthogonal_deskew(
+                        camera_corrected_data[excess_scan_positions:,:,:],
+                        theta = opm_tilt_deg,
+                        distance = scan_axis_step_um,
+                        pixel_size = pixel_size_um
+                    )
 
               
                 update_per_index_metadata(
@@ -437,6 +488,72 @@ def deskew(
                         **options,
                         metadata=metadata
                     )
+
+def run_estimate_illuminations(datastore, camera_offset, camera_conversion, conn):
+    """Helper function to run estimate_illuminations in a subprocess.
+    
+    This is necessary because jaxlib does not release GPU memory until the
+    process exists. So we need to isolate it so that the GPU can be used for
+    other processing tasks.
+    
+    Parameters
+    ----------
+    datastore: TensorStore
+        TensorStore object containing the data.
+    camera_offset: float
+        Camera offset value.
+    camera_conversion: float
+        Camera conversion value.
+    conn: Pipe
+        Pipe connection to send the result back to the main process.
+    """
+    from opm_processing.imageprocessing.flatfield import estimate_illuminations
+
+    try:
+        flatfields = estimate_illuminations(datastore, camera_offset, camera_conversion)
+        conn.send(flatfields)
+    except Exception as e:
+        conn.send(e)
+    finally:
+        conn.close()
+    
+def call_estimate_illuminations(datastore, camera_offset, camera_conversion):
+    """Helper function to call estimate_illuminations in a subprocess.
+    
+    This is necessary because jaxlib does not release GPU memory until the
+    process exists. So we need to isolate it so that the GPU can be used for
+    other processing tasks.
+    
+    Parameters
+    ----------
+    datastore: TensorStore
+        TensorStore object containing the data.
+    camera_offset: float
+        Camera offset value.
+    camera_conversion: float
+        Camera conversion value.
+    
+    Returns
+    -------
+    flatfields: np.ndarray
+        Estimated illuminations.
+    """
+    parent_conn, child_conn = mp.Pipe()
+    p = mp.Process(
+        target=run_estimate_illuminations,
+        args=(datastore, camera_offset, camera_conversion, child_conn)
+    )
+    p.start()
+    result = parent_conn.recv()
+    p.join()
+
+    if p.exitcode != 0:
+        raise RuntimeError("Subprocess failed")
+
+    if isinstance(result, Exception):
+        raise result
+
+    return result
 
 # entry for point for CLI        
 def main():

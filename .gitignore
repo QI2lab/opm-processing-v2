@@ -110,3 +110,4 @@ ENV/
 .vscode/
 .idea/
 src/opm_processing/test_flatfield.py
+tests/test_symlink.py

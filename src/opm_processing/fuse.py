@@ -13,7 +13,7 @@ mp.set_start_method('spawn', force=True)
 from pathlib import Path
 import tensorstore as ts
 import json
-from opm_processing.imageprocessing.utils import TensorStoreWrapper
+from opm_processing.dataio.zarr_handlers import TensorStoreWrapper
 import dask.array as da
 import dask.diagnostics as diag
 from multiview_stitcher import spatial_image_utils as si_utils
@@ -125,7 +125,7 @@ def register_and_fuse(root_path: Path):
         fused = fusion.fuse(
             [msi_utils.get_sim_from_msim(msim) for msim in msims],
             transform_key="affine_registered",
-            output_chunksize=256
+            #output_chunksize=256
         )
         
     # Save fusion to disk
@@ -135,6 +135,7 @@ def register_and_fuse(root_path: Path):
         fused = ngff_utils.write_sim_to_ome_zarr(
             fused, output_filename, overwrite=True
         )
+
         
 # entry for point for CLI        
 def main():

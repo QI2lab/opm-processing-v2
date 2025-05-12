@@ -92,7 +92,7 @@ def display(
         data_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_z_deskewed.zarr")
         scale_to_use = [pixel_size_um,pixel_size_um]
     if to_display == "fused-max-z":
-        data_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_zfused.zarr")
+        data_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_z_fused.zarr")
         scale_to_use = [pixel_size_um,pixel_size_um]
     elif to_display == "full":
         data_path = root_path.parents[0] / Path(str(root_path.stem)+"_deskewed.zarr")
