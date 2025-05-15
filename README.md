@@ -12,12 +12,9 @@ This package is the 2nd generation of the Arizona State University Quantitative 
 
 The core algorithms can be used for any microscope that acquires data at a skewed angle, including diSPIM, LLSM, or OPM. Please open an issue if you would like help adapting the code to work with your microscope, we are happy to assist.
 
-The goal is provide highly performant data I/O via [Tensorstore](https://google.github.io/tensorstore/) and image processing (deskewing, downsampling, and maximum Z projection) via [Numba](https://numba.pydata.org/).
+The goal is provide highly performant data I/O via [Tensorstore](https://google.github.io/tensorstore/) and image processing (illumination correction, deconvolution, deskewing, downsampling, maximum Z projection, and 3D stitching+fusion) via [Numba](https://numba.pydata.org/), [CuPy](https://cupy.dev/), and [cuCIM](https://github.com/rapidsai/cucim?tab=readme-ov-file).
 
-We additionally use [BaSiCPy](https://github.com/peng-lab/BaSiCPy) to estimate illumination profiles and [multiview-stitcher](https://github.com/multiview-stitcher/multiview-stitcher) to register and fuse tiled data into ome-zarr v0.4 format.
-
-Raw data deconvolution is planned, but will require GPU-accleration.
-
+We rely on [BaSiCPy](https://github.com/peng-lab/BaSiCPy) to post-hoc estimate illumination profiles and a modified version of [gradient consensus Richardson-Lucy deconvolution](https://zenodo.org/records/10278919) to perform 3D deconvolution.
 ## Installation
 
 Create a python 3.12 environment,
@@ -30,19 +27,20 @@ activate the environment,
 conda activate opmprocessing
 ```
 
-If on Linux, we can use an Nvidia GPU to accelerate flatfield calculation
-```bash
-conda install -c conda-forge -c nvidia -c rapidsai cupy=13.4 cucim=25.02 pycudadecon "cuda-version>=12.0,<=12.8" cudnn cutensor nccl
-```
-
 and install the repository
 ```bash
 pip install "opm-processing-v2 @ git+https://github.com/QI2lab/opm-processing-v2"
 ```
 
+
 ## Usage
 
-Activate the conda environment.
+Activate the conda environment and register CUDA,
+For now, we need to register the local CUDA install (work in progress to automate) before running any code,
+```bash
+conda activate opmprocessing
+for d in $(find $CONDA_PREFIX/lib/python3.12/site-packages/nvidia -type d -name lib); do     export LD_LIBRARY_PATH="$d:$LD_LIBRARY_PATH"; done
+```
 
 To deskew raw data,
 ```bash
