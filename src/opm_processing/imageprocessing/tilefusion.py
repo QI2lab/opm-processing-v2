@@ -40,10 +40,9 @@ void fuse3d(
     float t = tile[idx];
     float b = blk[idx];
     float v = t*weight + b*(1.0f - weight);
-    unsigned short uv = (unsigned short)min(max(v + 0.5f, 0.0f), 65535.0f);
-    out[idx] = uv;
+    out[idx] = (unsigned short)min(max(v + 0.5f, 0.0f), 65535.0f);
 }
-'''  
+'''
 _module = cp.RawModule(code=_fuse_kernel_code, options=("-std=c++11",))
 _fuse3d = _module.get_function('fuse3d')
 
@@ -101,6 +100,8 @@ class TileFusion:
         ) = self.ts_dataset.shape
 
         self.tile_shape = (self.z_dim, height, width)
+        self.Y = height
+        self.X = width
 
         # 3D weight mask
         self.weight_3d = self._generate_3d_blending_weights(blend_pixels)
@@ -111,6 +112,18 @@ class TileFusion:
         # Fusion volume attributes
         self.offset = None
         self.unpadded_shape = None
+        self.chunk_shape = (1,1,1,1,512,512)
+        self.chunk_y = self.chunk_shape[-2]
+        self.chunk_x = self.chunk_shape[-1]
+        self._buf_tile = cp.empty((self.channels, self.z_dim, self.chunk_y, self.chunk_x), cp.uint16)
+        self._buf_blk  = cp.empty_like(self._buf_tile)
+        self._buf_out  = cp.empty_like(self._buf_tile)
+        # thread pool for TensorStore I/O (interior writes and slab reads/writes)
+        self.io_executor = ThreadPoolExecutor(max_workers=2)
+        # CUDA streams to overlap host→device, compute, and device→host
+        self.streams = [cp.cuda.Stream() for _ in range(4)]
+        self._next_stream = 0
+        
         self.padded_shape = None
         self.pad = (0, 0, 0)
         self.fused_ts = None
@@ -211,11 +224,11 @@ class TileFusion:
         self.unpadded_shape = (size_z, size_y, size_x)
         self.offset = (min_z, min_y, min_x)
 
-    def _pad_to_tile_multiple(self) -> None:
+    def _pad_to_chunk_multiple(self) -> None:
         """
-        Compute and store padded_shape and pad for tile multiples.
+        Compute and store padded_shape and pad for chunk multiples.
         """
-        tz, th, tw = self.tile_shape
+        _, _, _, tz, th, tw = self.chunk_shape
         sz, sy, sx = self.unpadded_shape
 
         pad_z = (-sz) % tz
@@ -229,25 +242,28 @@ class TileFusion:
         """
         Create the output TensorStore using padded_shape.
         """
-        tz, th, tw = self.tile_shape
-        chunk = [1, 1, self.channels, tz, th // 4, tw // 4]
-        shard = [1, 1, self.channels, tz, th, tw]
+        # full volume shape in T,P,C,Z,Y,X:
+        full_shape = [1, 1, self.channels, *self.padded_shape]
+        # codec will break each Y×X into 512×512 tiles (per t,p,c,z):
+        codec_chunk = [1, 1, 1, 1, self.chunk_shape[-2], self.chunk_shape[-1]]
+        # shard groups the *entire* Y×X plane for each t,p,c,z:
+        shard_chunk = [1, 1, 1, 1, self.padded_shape[1], self.padded_shape[2]]
 
         config = {
             "driver": "zarr3",
             "kvstore": {"driver": "file", "path": str(self.output_path)},
             "metadata": {
-                "shape": [1, 1, self.channels, *self.padded_shape],
+                "shape": full_shape,
                 "chunk_grid": {
                     "name": "regular",
-                    "configuration": {"chunk_shape": shard},
+                    "configuration": {"chunk_shape": shard_chunk},
                 },
                 "chunk_key_encoding": {"name": "default"},
                 "codecs": [
                     {
                         "name": "sharding_indexed",
                         "configuration": {
-                            "chunk_shape": chunk,
+                            "chunk_shape": codec_chunk,
                             "codecs": [
                                 {
                                     "name": "bytes",
@@ -280,145 +296,116 @@ class TileFusion:
         self.fused_ts = ts.open(
             config, create=True, open=True
         ).result()
+        
+    def _write_interior(self, interior, z0, y0, x0, bz, tz, by, th, bx, tw):
+        z_slice = slice(z0 + bz, z0 + tz - bz)
+        y_slice = slice(y0 + by, y0 + th - by)
+        x_slice = slice(x0 + bx, x0 + tw - bx)
+        self.fused_ts[0,0,:, z_slice, y_slice, x_slice].write(interior).result()
 
-    # @staticmethod
-    # @numba.njit(parallel=True, cache=True)
-    # def _blend_arrays(tc, block, wm):
-    #     """
-    #     JIT-blended fusion of two volumes with weights wm in parallel.
-
-    #     Parameters
-    #     ----------
-    #     tc : ndarray
-    #         Tile crop array of shape (C, Z, Y, X).
-    #     block : ndarray
-    #         Existing fused block, same shape.
-    #     wm : ndarray
-    #         Weight mask array of shape (Z, Y, X).
-
-    #     Returns
-    #     -------
-    #     fused : ndarray
-    #         Fused result array of shape (C, Z, Y, X).
-    #     """
-    #     C, Z, Y, X = block.shape
-    #     fused = np.empty((C, Z, Y, X), dtype=np.float32)
-    #     # Parallel loops over channels and z
-    #     for c in numba.prange(C):
-    #         for z in range(Z):
-    #             for y in range(Y):
-    #                 for x in range(X):
-    #                     wv = wm[z, y, x]
-    #                     t = tc[c, z, y, x]
-    #                     b = block[c, z, y, x]
-    #                     num = t * wv + b * (1.0 - wv)
-    #                     den = wv + (1.0 - wv)
-    #                     fused[c, z, y, x] = num / den if den != 0.0 else 0.0
-    #     return fused
+    def _write_chunk(self, data, z0, y0, x0, zs, ze, ys0, ys1, xs0, xs1):
+        z_slice = slice(z0 + zs, z0 + ze)
+        y_slice = slice(y0 + ys0, y0 + ys1)
+        x_slice = slice(x0 + xs0, x0 + xs1)
+        arr = data.reshape((self.channels, ze - zs, ys1 - ys0, xs1 - xs0))
+        self.fused_ts[0,0,:, z_slice, y_slice, x_slice].write(arr).result()
 
     def _process_slab(self, idx, z0, y0, x0, tile, slab_spec):
-        """
-        Read existing fused slab, fuse with tile slab on GPU, write back.
-        slab_spec = (zs, ze, ys, ye, xs, xe)
-        """
         zs, ze, ys, ye, xs, xe = slab_spec
-        # slab origin slices
-        zslice = slice(z0 + zs, z0 + ze)
-        yslice = slice(y0 + ys, y0 + ye)
-        xslice = slice(x0 + xs, x0 + xe)
-        # read existing fused block for this slab
-        blk = self.fused_ts[0,0,:, zslice, yslice, xslice]  
-        blk_arr = blk.read().result().astype(np.uint16)
-        # dimensions of slab
-        C = self.channels
-        Z = ze - zs
-        Y = ye - ys
-        X = xe - xs
-        total = C * Z * Y * X
-        # allocate GPU buffers sized exactly for this slab
-        tile_buf = cp.empty(total, dtype=cp.uint16)
-        blk_buf = cp.empty(total, dtype=cp.uint16)
-        out_buf = cp.empty(total, dtype=cp.uint16)
-        # copy tile slab and block into buffers
-        tile_sub = tile[:, zs:ze, ys:ye, xs:xe].ravel()
-        tile_buf[:] = cp.asarray(tile_sub, dtype=cp.uint16)
-        blk_buf[:] = cp.asarray(blk_arr.ravel(), dtype=cp.uint16)
-        # launch fusion kernel
-        threads = 256
-        blocks = (total + threads - 1) // threads
-        weight_flat = self.weight_3d_gpu[zs:ze, ys:ye, xs:xe].ravel()
-        _fuse3d((blocks,), (threads,), (tile_buf, blk_buf, weight_flat, out_buf, C, Z, Y, X))
-        # retrieve and write fused slab
-        fused = out_buf.get().reshape((C, Z, Y, X))
-        return self.fused_ts[0,0,:, zslice, yslice, xslice].write(fused)
+        Zs = ze - zs
+        # subdivide boundary slab into chunk_y × chunk_x blocks
+        for ys0 in range(ys, ye, self.chunk_y):
+            ys1 = min(ye, ys0 + self.chunk_y)
+            for xs0 in range(xs, xe, self.chunk_x):
+                xs1 = min(xe, xs0 + self.chunk_x)
+                # read fused block
+                blk_future = self.io_executor.submit(
+                    self.fused_ts[0,0,:, slice(z0+zs, z0+ze),
+                                           slice(y0+ys0, y0+ys1),
+                                           slice(x0+xs0, x0+xs1)].read().result
+                )
+                blk_arr = blk_future.result().astype(np.uint16)
+                # copy into GPU buffers
+                self._buf_tile[:, zs:ze, : (ys1-ys0), : (xs1-xs0)] = cp.asarray(
+                    tile[:, zs:ze, ys0:ys1, xs0:xs1], cp.uint16)
+                self._buf_blk[:, zs:ze, : (ys1-ys0), : (xs1-xs0)] = cp.asarray(
+                    blk_arr.reshape((self.channels, Zs, ys1-ys0, xs1-xs0)))
+                # launch kernel on stream
+                stream = self.streams[self._next_stream]
+                self._next_stream = (self._next_stream + 1) % len(self.streams)
+                with stream:
+                    total = self.channels * Zs * (ys1-ys0) * (xs1-xs0)
+                    threads = 256
+                    blocks = (total + threads - 1) // threads
+                    wflat = self.weight_3d_gpu[zs:ze, ys0:ys1, xs0:xs1].ravel()
+                    _fuse3d((blocks,), (threads,), (
+                        self._buf_tile.ravel(),
+                        self._buf_blk.ravel(),
+                        wflat,
+                        self._buf_out.ravel(),
+                        self.channels, Zs, ys1-ys0, xs1-xs0
+                    ))
+                    dev2host = self._buf_out.get(stream=stream)
+                # write fused chunk
+                self.io_executor.submit(
+                    self._write_chunk,
+                    dev2host, z0, y0, x0, zs, ze, ys0, ys1, xs0, xs1
+                )
 
-    def _fuse_tiles(self) -> None:
-        """
-        Fuse all tiles by:
-        - doing the interior region copy immediately,
-        - submitting only the slab‐fusion tasks for one tile,
-        - waiting for those to finish (and drop the tile),
-        - then moving on to the next tile.
-        This keeps peak RAM bounded to ~one‐tile’s worth.
-        """
+    def _fuse_tiles(self):
         tz, th, tw = self.tile_shape
         bz, by, bx = self.blend_pixels
-        zi0, zi1 = bz, tz - bz
-        yi0, yi1 = by, th - by
-        xi0, xi1 = bx, tw - bx
-
         slab_specs = [
-            (0, zi0, 0, th, 0, tw),
-            (zi1, tz, 0, th, 0, tw),
-            (zi0, zi1, 0, yi0, 0, tw),
-            (zi0, zi1, yi1, th, 0, tw),
-            (zi0, zi1, yi0, yi1, 0, xi0),
-            (zi0, zi1, yi0, yi1, xi1, tw),
+            (0, bz, 0, th, 0, tw),
+            (tz-bz, tz, 0, th, 0, tw),
+            (bz, tz-bz, 0, by, 0, tw),
+            (bz, tz-bz, th-by, th, 0, tw),
+            (bz, tz-bz, by, th-by, 0, bx),
+            (bz, tz-bz, by, th-by, tw-bx, tw),
         ]
-
-        executor = ThreadPoolExecutor(max_workers=2)
-
         for idx, (z_phys, y_phys, x_phys) in enumerate(
             tqdm(self.tile_positions, desc="fuse-tile", leave=False)
         ):
-            # compute write origin
             z0 = int((z_phys - self.offset[0]) / self.pixel_size[0])
             y0 = int((y_phys - self.offset[1]) / self.pixel_size[1])
             x0 = int((x_phys - self.offset[2]) / self.pixel_size[2])
-
-            # 1) Read the full tile once
-            tile = self.ts_dataset[0, idx, :, :, :, :].read().result().astype(np.uint16)
-
-            # 2) Interior region: copy immediately (no GPU)
-            interior = tile[:, zi0:zi1, yi0:yi1, xi0:xi1]
-            wf_int = self.fused_ts[
-                0,0,:, z0+zi0:z0+zi1,
-                    y0+yi0:y0+yi1,
-                    x0+xi0:x0+xi1
-            ].write(interior)
-            wf_int.result()  # wait here for sequential write
-
-            # 3) Slabs: submit GPU‐blend jobs
-            slab_futures = []
+            tile = (
+                self.ts_dataset[0, idx, :, :, :, :]
+                .read().result()
+                .astype(np.uint16)
+            )
+            # Schedule interior write
+            self.io_executor.submit(
+                self._write_interior,
+                tile[:, bz:tz-bz, by:th-by, bx:tw-bx],
+                z0, y0, x0, bz, tz, by, th, bx, tw
+            )
+            # GPU-boundary slabs
             for spec in slab_specs:
-                slab_futures.append(
-                    executor.submit(
-                        self._process_slab,
-                        idx, z0, y0, x0, tile, spec
-                    )
-                )
-
-            # 4) Drain this tile’s slab jobs before moving on
-            for fut in slab_futures:
-                write_future = fut.result()    # returns the TS-write future
-                write_future.result()          # wait for that write to finish
-
-            # drop `tile` and its buffers here
+                self._process_slab(idx, z0, y0, x0, tile, spec)
             del tile
+        self.io_executor.shutdown(wait=True)
 
-        # clean up executor
-        executor.shutdown(wait=True)
+    def save_pairwise_metrics(self, filepath: str | Path) -> None:
+        """
+        Save self.pairwise_metrics (results of refine_tile_positions) to a JSON file.
+        """
+        path = Path(filepath)
+        out = {f"{i},{j}": list(v) for (i, j), v in self.pairwise_metrics.items()}
+        with open(path, 'w') as f:
+            json.dump(out, f)
 
+    def load_pairwise_metrics(self, filepath: str | Path) -> None:
+        """
+        Load pairwise_metrics from a JSON file previously saved.
+        """
+        path = Path(filepath)
+        with open(path, 'r') as f:
+            data = json.load(f)
+        self.pairwise_metrics = {}
+        for key, v in data.items():
+            i, j = map(int, key.split(','))
+            self.pairwise_metrics[(i, j)] = tuple(v)
 
     @staticmethod
     def register_and_score(
@@ -715,9 +702,14 @@ if __name__ == "__main__":
         blend_pixels= [10,400,400],
         debug=False
     )
-    tile_fuser.refine_tile_positions_with_cross_correlation(
-        downsample_factors=[3,5,5]
-    )
+    metric_path = root_path.parents[0] / Path(str(root_path.stem)+"_metrics.json")
+    try:
+        tile_fuser.load_pairwise_metrics(metric_path)
+    except Exception:
+        tile_fuser.refine_tile_positions_with_cross_correlation(
+            downsample_factors=[3,5,5]
+        )
+        tile_fuser.save_pairwise_metrics(metric_path)
     tile_fuser.optimize_shifts()
 
     for idx, off in enumerate(tile_fuser.global_offsets):
@@ -725,6 +717,6 @@ if __name__ == "__main__":
             tile_fuser.pixel_size
         )
     tile_fuser._compute_fused_image_space()
-    tile_fuser._pad_to_tile_multiple()
+    tile_fuser._pad_to_chunk_multiple()
     tile_fuser._create_fused_tensorstore()
     tile_fuser._fuse_tiles()
