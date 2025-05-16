@@ -58,34 +58,35 @@ def extract_stage_positions(data):
 
     return sorted_positions
 
-def extract_channels(data: dict, channels=None) -> list:
-    """Extract channel names from qi2lab tensorstore metadata.
+def extract_channels(data: dict) -> list:
+    """Extract channel names from qi2lab tensorstore metadata in order.
 
     Parameters
     ----------
     data : dict
         Metadata from .zattrs.
-    channels : set, optional
 
     Returns
     -------
     channels : list
-        Set of channel names.
+        Ordered list of unique channel names.
     """
-
-    if channels is None:
-        channels = set()
+    seen = set()
+    channels = []
+    
+    frame_metadatas = data.get("frame_metadatas", [])
+    
+    for frame in frame_metadatas:
+        mda_event = frame.get("mda_event", {})
+        metadata = mda_event.get("metadata", {})
+        daq = metadata.get("DAQ", {})
+        channel = daq.get("current_channel")
         
-    if isinstance(data, dict):
-        for key, value in data.items():
-            if key == "current_channel":
-                channels.add(value)
-            else:
-                extract_channels(value, channels)
-    elif isinstance(data, list):
-        for item in data:
-            extract_channels(item, channels)
-    return list(channels)
+        if channel and channel not in seen:
+            seen.add(channel)
+            channels.append(channel)
+
+    return channels
 
 
 def find_key(data: dict, target_key: str) -> dict | list | None:

@@ -7,8 +7,6 @@ This file registers and fuses deskewed qi2lab OPM data.
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.simplefilter("ignore", category=FutureWarning)
-import multiprocessing as mp
-mp.set_start_method('spawn', force=True)
 
 from pathlib import Path
 import tensorstore as ts
@@ -142,4 +140,6 @@ def main():
     app()
 
 if __name__ == "__main__":
+    import multiprocessing as mp
+    mp.set_start_method('spawn', force=True)
     main()
