@@ -19,14 +19,15 @@ rng = cp.random.default_rng(42)
 DEBUG = False
 
 # Custom CUDA kernel provided for gradient consensus
-gradient_consensus = ElementwiseKernel(
-    'float32 recon, float32 ratio, float32 r1, float32 r2',
+filter_update = ElementwiseKernel(
+    'float32 recon, float32 HTratio, float32 consensus_map',
     'float32 out',
     '''
-    bool skip = (r1 - 1.0f)*(r2 - 1.0f) < 0;
-    out = skip ? recon : recon * ratio;
+    bool skip = consensus_map < 0;
+    out = skip ? recon : recon * HTratio;
+    out = out < 0 ? 0 : out
     ''',
-    'gradient_consensus'
+    'filter_update'
 )
 
 def next_multiple_of_64(x: int) -> int:
@@ -201,6 +202,7 @@ def rlgc_biggs(
         psf_gpu = pad_psf(cp.asarray(psf, dtype=cp.float32), image_gpu.shape)
         otf = cp.fft.rfftn(psf_gpu)
         otfT = cp.conjugate(otf)
+        otfotfT = otf * otfT
         del psf_gpu
         cp.get_default_memory_pool().free_all_blocks()
 
@@ -219,6 +221,7 @@ def rlgc_biggs(
     HTratio1 = cp.empty_like(recon)
     HTratio2 = cp.empty_like(recon)
 
+    consensus_map = cp.zeros_like(recon)
     g1 = cp.zeros_like(recon)
     g2 = cp.zeros_like(recon)
     recon_next = cp.empty_like(recon)
@@ -271,7 +274,8 @@ def rlgc_biggs(
         HTratio2[:] = fft_conv(cp.divide(split2, 0.5 * Hu_safe), otfT, shape)
         HTratio[:] = fft_conv(cp.divide(image_gpu, Hu_safe), otfT, shape)
 
-        recon_next[:] = gradient_consensus(recon, HTratio, HTratio1, HTratio2)
+        consensus_map[:] = fft_conv((HTratio1 - 1) * (HTratio2 - 1), otfotfT, recon.shape)
+        recon_next[:] = filter_update(recon, HTratio, filter_update)
 
         g2[:], g1[:] = g1, recon_next - recon
         recon[:] = recon_next
