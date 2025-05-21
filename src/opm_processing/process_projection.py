@@ -14,7 +14,6 @@ from pathlib import Path
 import tensorstore as ts
 from opm_processing.imageprocessing.opmpsf import generate_skewed_psf
 from opm_processing.imageprocessing.rlgc import chunked_rlgc
-from opm_processing.imageprocessing.opmtools import orthogonal_deskew, deskew_shape_estimator
 from opm_processing.imageprocessing.maxtilefusion import TileFusion
 from opm_processing.dataio.metadata import extract_channels, find_key, extract_stage_positions, update_global_metadata, update_per_index_metadata
 from opm_processing.dataio.zarr_handlers import create_via_tensorstore, write_via_tensorstore
@@ -28,14 +27,12 @@ app = typer.Typer()
 app.pretty_exceptions_enable = False
 
 @app.command()
-def deskew(
+def process_projection(
     root_path: Path,
     deconvolve: bool = False,
-    max_projection: bool = True,
     flatfield_correction: bool = False,
-    create_fused_max_projection: bool = True,
-    write_fused_max_projection_tiff: bool = False,
-    z_downsample_level: int = 2,
+    create_fused_projection: bool = False,
+    write_fused_projection_tiff: bool = False,
     time_range: tuple[int,int] = None,
     pos_range: tuple[int,int] = None,    
 ):
@@ -95,12 +92,7 @@ def deskew(
         zattrs = json.load(f)
 
     opm_mode = str(find_key(zattrs, "mode"))
-    if "mirror" in opm_mode:
-        scan_axis_step_um = float(find_key(zattrs,"image_mirror_step_um"))
-        excess_scan_positions = 0
-    elif "stage" in opm_mode:
-        scan_axis_step_um = float(find_key(zattrs,"scan_axis_step_um"))
-        excess_scan_positions = int(find_key(zattrs,"excess_scan_positions"))
+
     pixel_size_um = float(find_key(zattrs,"pixel_size_um"))
     opm_tilt_deg = float(find_key(zattrs,"angle_deg"))    
     camera_offset = float(find_key(zattrs,"offset"))
@@ -108,6 +100,7 @@ def deskew(
 
     channels = extract_channels(zattrs)
     stage_positions = extract_stage_positions(zattrs)
+    
     # TO DO: start writing these in metadata!
     stage_x_flipped = False
     stage_y_flipped = True
@@ -133,13 +126,6 @@ def deskew(
         for pos_idx, _ in enumerate(stage_positions):
             stage_positions[pos_idx,0] = stage_z_max - stage_positions[pos_idx,0]
     
-    # estimate shape of one deskewed volume
-    deskewed_shape, pad_y, pad_x = deskew_shape_estimator(
-        [datastore.shape[-3]-excess_scan_positions,datastore.shape[-2],datastore.shape[-1]],
-        theta=opm_tilt_deg,
-        distance=scan_axis_step_um,
-        pixel_size=pixel_size_um
-    )
 
     if time_range is not None:
         time_shape = time_range[1]
@@ -155,41 +141,11 @@ def deskew(
         time_shape,
         pos_shape,
         datastore.shape[2],
-        deskewed_shape[0]//z_downsample_level,
-        deskewed_shape[1],
-        deskewed_shape[2]
+        datastore.shape[0],
+        datastore.shape[1]
     ]
-    # create array to hold one deskewed volume 
-    deskewed = np.zeros(
-        (deskewed_shape[0]//z_downsample_level,deskewed_shape[1],deskewed_shape[2]),
-        dtype=np.uint16
-    )
     
-    # create tensorstore object for writing. This is NOT compatible with OME-NGFF!
-    output_path = root_path.parents[0] / Path(str(root_path.stem)+"_deskewed.zarr")
-    ts_store = create_via_tensorstore(output_path,datastore_shape)
-    
-    if max_projection:
-        max_z_datastore_shape = [
-            time_shape,
-            pos_shape,
-            datastore.shape[2],
-            1,
-            deskewed_shape[1],
-            deskewed_shape[2]
-        ]
-
-        # create array to hold one maximum projection deskewed volume 
-        max_z_deskewed = np.zeros(
-            (1,deskewed_shape[1],deskewed_shape[2]),
-            dtype=np.uint16
-        )
-
-        # create tensorstore object for writing. This is NOT compatible with OME-NGFF!
-        max_z_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_z_deskewed.zarr")
-        max_z_ts_store = create_via_tensorstore(max_z_output_path,max_z_datastore_shape)
         
-    
     if flatfield_correction:
         
         flatfield_path = root_path.parents[0] / Path(str(root_path.stem)+"_flatfield.ome.tif")
@@ -256,10 +212,11 @@ def deskew(
                             psf = generate_skewed_psf(
                                 em_wvl=float(int(str(channels[psf_idx]).rstrip("nm")) / 1000),
                                 pixel_size_um=pixel_size_um,
-                                scan_axis_step_um=scan_axis_step_um,
+                                scan_axis_step_um=0.4,
                                 pz=0.0,
                                 plot=False
                             )
+                            psf = np.sum(psf, axis=0)
                             psfs.append(psf)
 
                     # This code is for debugging RLGC deconvolution
@@ -279,25 +236,13 @@ def deskew(
                     # ------------------------------------
                     
                     deconvolved_data = chunked_rlgc(
-                        camera_corrected_data[excess_scan_positions:,:,:],
+                        camera_corrected_data[:,:],
                         np.asarray(psfs[chan_idx]),
                         scan_chunk_size=384,
                         scan_overlap_size=64
                     )
                     
-                    deskewed = orthogonal_deskew(
-                        deconvolved_data,
-                        theta = opm_tilt_deg,
-                        distance = scan_axis_step_um,
-                        pixel_size = pixel_size_um
-                    )
-                else:        
-                    deskewed = orthogonal_deskew(
-                        camera_corrected_data[excess_scan_positions:,:,:],
-                        theta = opm_tilt_deg,
-                        distance = scan_axis_step_um,
-                        pixel_size = pixel_size_um
-                    )
+    
 
               
                 update_per_index_metadata(
@@ -306,31 +251,7 @@ def deskew(
                     index_location = (t_idx, pos_idx, chan_idx)
                 )
                 
-                if max_projection:
-                    max_z_deskewed = np.max(deskewed,axis=0,keepdims=True)
-                    update_per_index_metadata(
-                        ts_store = max_z_ts_store, 
-                        metadata = {"stage_position": stage_positions[pos_idx], 'channel': channels[chan_idx]}, 
-                        index_location = (t_idx,pos_idx,chan_idx)
-                    )
-                    # create future objects for async data writing
-                    ts_max_writes.append(
-                        write_via_tensorstore(
-                            ts_store = max_z_ts_store,
-                            data = max_z_deskewed,
-                            data_location = [t_idx,pos_idx,chan_idx]
-                        )
-                    )
 
-                # create future objects for async data writing
-                ts_writes.append(
-                    write_via_tensorstore(
-                        ts_store = ts_store,
-                        data = deskewed,
-                        data_location = [t_idx,pos_idx,chan_idx]
-                    )
-                )
-                
     # wait for writes to finish
     for ts_write in ts_writes:
         ts_write.result()
@@ -339,81 +260,23 @@ def deskew(
         for ts_max_write in ts_max_writes:
             ts_max_write.result()
 
-    if "mirror" in opm_mode:
-        update_global_metadata(
-            ts_store = ts_store,
-            global_metadata= {
-                    "scan_axis_step_um" : scan_axis_step_um,
-                    "raw_pixel_size_um" : pixel_size_um,
-                    "opm_tilt_deg" : opm_tilt_deg,
-                    "camera_corrected" : True,
-                    "camera_offset" : camera_offset,
-                    "camera_e_to_ADU" : camera_conversion,
-                    "deskewed_voxel_size_um" : [z_downsample_level*pixel_size_um, pixel_size_um, pixel_size_um],
-                    "stage_x_flipped": stage_x_flipped,
-                    "stage_y_flipped": stage_y_flipped,
-                    "stage_z_flipped": stage_z_flipped,
-                    "flatfield_corrected": flatfield_correction
-                }
-        )
-    elif "stage" in opm_mode:
-        update_global_metadata(
-            ts_store = ts_store,
-            global_metadata= {
-                    "scan_axis_step_um" : scan_axis_step_um,
-                    "raw_pixel_size_um" : pixel_size_um,
-                    "opm_tilt_deg" : opm_tilt_deg,
-                    "camera_corrected" : True,
-                    "camera_offset" : camera_offset,
-                    "camera_e_to_ADU" : camera_conversion,
-                    "deskewed_voxel_size_um" : [z_downsample_level*pixel_size_um, pixel_size_um, pixel_size_um],
-                    "stage_x_flipped": stage_x_flipped,
-                    "stage_y_flipped": stage_y_flipped,
-                    "stage_z_flipped": stage_z_flipped,
-                    "flatfield_corrected": flatfield_correction
-                }
-        )
-    if max_projection:
-        if "mirror" in opm_mode:
-            update_global_metadata(
-                ts_store = max_z_ts_store,
-                global_metadata= {
-                    "scan_axis_step_um" : scan_axis_step_um,
-                    "raw_pixel_size_um" : pixel_size_um,
-                    "opm_tilt_deg" : opm_tilt_deg,
-                    "camera_corrected" : True,
-                    "camera_offset" : camera_offset,
-                    "camera_e_to_ADU" : camera_conversion,
-                    "deskewed_voxel_size_um" : [pixel_size_um, pixel_size_um],
-                    "stage_x_flipped": stage_x_flipped,
-                    "stage_y_flipped": stage_y_flipped,
-                    "stage_z_flipped": stage_z_flipped,
-                    "flatfield_corrected": flatfield_correction
-                }
-            )
-        elif "stage" in opm_mode:
-            update_global_metadata(
-                ts_store = max_z_ts_store,
-                global_metadata= {
-                    "scan_axis_step_um" : scan_axis_step_um,
-                    "raw_pixel_size_um" : pixel_size_um,
-                    "opm_tilt_deg" : opm_tilt_deg,
-                    "camera_corrected" : True,
-                    "camera_offset" : camera_offset,
-                    "camera_e_to_ADU" : camera_conversion,
-                    "deskewed_voxel_size_um" : [pixel_size_um, pixel_size_um],
-                    "stage_x_flipped": stage_x_flipped,
-                    "stage_y_flipped": stage_y_flipped,
-                    "stage_z_flipped": stage_z_flipped,
-                    "flatfield_corrected": flatfield_correction
-                }
-            )
-            
-    del deskewed, ts_write, ts_store
-    if max_projection:
-        del max_z_deskewed, ts_max_write
-        
-    if create_fused_max_projection:
+    update_global_metadata(
+        ts_store = ts_store,
+        global_metadata= {
+                "scan_axis_step_um" : scan_axis_step_um,
+                "raw_pixel_size_um" : pixel_size_um,
+                "opm_tilt_deg" : opm_tilt_deg,
+                "camera_corrected" : True,
+                "camera_offset" : camera_offset,
+                "camera_e_to_ADU" : camera_conversion,
+                "voxel_size_um" : [pixel_size_um, pixel_size_um],
+                "stage_x_flipped": stage_x_flipped,
+                "stage_y_flipped": stage_y_flipped,
+                "stage_z_flipped": stage_z_flipped,
+                "flatfield_corrected": flatfield_correction
+            }
+    )
+    if create_fused_projection:
         max_z_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_z_deskewed.zarr")
         # open datastore on disk
         spec = {
@@ -442,7 +305,7 @@ def deskew(
         )
         tile_fusion.run()
         
-        if write_fused_max_projection_tiff:
+        if write_fused_projection_tiff:
             tiff_dir_path = max_z_output_path.parent / Path("fused_max_projection_tiff_output")
             tiff_dir_path.mkdir(exist_ok=True)
             max_spec = {
