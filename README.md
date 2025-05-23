@@ -27,25 +27,27 @@ activate the environment,
 conda activate opmprocessing
 ```
 
-and install the repository
+install the repository and register the local cuda
 ```bash
 pip install "opm-processing-v2 @ git+https://github.com/QI2lab/opm-processing-v2"
+setup-cuda
+conda deactivate opmprocessing
 ```
 
 
 ## Usage
 
-Activate the conda environment and register CUDA,
-For now, we need to register the local CUDA install (work in progress to automate) before running any code,
+Activate the conda environment,
 ```bash
 conda activate opmprocessing
-for d in $(find $CONDA_PREFIX/lib/python3.12/site-packages/nvidia -type d -name lib); do     export LD_LIBRARY_PATH="$d:$LD_LIBRARY_PATH"; done
 ```
 
 To deskew raw data,
 ```bash
 deskew "/path/to/qi2lab_acquisition.zarr"
 ```
+
+If you get an error, make sure you ran `setup-cuda`!
 
 The defaults parameters generate three zarr3 compliant datastores:
 1. Full 3D data (`/path/to/qi2lab_acquisition_deskewed.zarr`) with dimensions `tpczyx`.
@@ -63,10 +65,11 @@ There are three `to_display` options that correspond to the three datastores des
 1. full
 2. max-z
 3. fused-max-z
+4. fused-full
 
-To register and fused desekwed data,
+To register and fused desekwed data into an ome-ngff v0.5 datastore,
 ```bash
 fuse "/path/to/qi2lab_acquisition.zarr"
 ```
 
-The registered and fused data will be in `/path/to/qi2lab_acquisition_fused_deskewed.ome.zarr`
+The registered, optionally deconvolved, and fused data will be in `/path/to/qi2lab_acquisition_fused_deskewed.ome.zarr`
