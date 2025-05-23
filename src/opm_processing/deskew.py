@@ -7,8 +7,6 @@ This file deskews and creates maximum projections of raw qi2lab OPM data.
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.simplefilter("ignore", category=FutureWarning)
-import multiprocessing as mp
-mp.set_start_method('spawn', force=True)
 
 from pathlib import Path
 import tensorstore as ts
@@ -166,7 +164,10 @@ def deskew(
     )
     
     # create tensorstore object for writing. This is NOT compatible with OME-NGFF!
-    output_path = root_path.parents[0] / Path(str(root_path.stem)+"_deskewed.zarr")
+    if not(deconvolve):
+        output_path = root_path.parents[0] / Path(str(root_path.stem)+"_deskewed.zarr")
+    else:
+        output_path = root_path.parents[0] / Path(str(root_path.stem)+"_decon_deskewed.zarr")
     ts_store = create_via_tensorstore(output_path,datastore_shape)
     
     if max_projection:
@@ -186,7 +187,10 @@ def deskew(
         )
 
         # create tensorstore object for writing. This is NOT compatible with OME-NGFF!
-        max_z_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_z_deskewed.zarr")
+        if not(deconvolve):
+            max_z_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_z_deskewed.zarr")
+        else:
+            max_z_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_z_decon_deskewed.zarr")
         max_z_ts_store = create_via_tensorstore(max_z_output_path,max_z_datastore_shape)
         
     
@@ -277,12 +281,15 @@ def deskew(
                     # viewer.add_image(camera_corrected_data)
                     # napari.run()
                     # ------------------------------------
-                    
+                    if camera_corrected_data.shape[1]==256:
+                        chunk_size = 384
+                    elif camera_corrected_data.shape[1]==512:
+                        chunk_size = 196
                     deconvolved_data = chunked_rlgc(
                         camera_corrected_data[excess_scan_positions:,:,:],
                         np.asarray(psfs[chan_idx]),
-                        scan_chunk_size=384,
-                        scan_overlap_size=64
+                        scan_chunk_size=chunk_size,
+                        scan_overlap_size=32
                     )
                     
                     deskewed = orthogonal_deskew(
@@ -560,4 +567,6 @@ def main():
     app()
 
 if __name__ == "__main__":
+    import multiprocessing as mp
+    mp.set_start_method('spawn', force=True)
     main()

@@ -12,12 +12,9 @@ This package is the 2nd generation of the Arizona State University Quantitative 
 
 The core algorithms can be used for any microscope that acquires data at a skewed angle, including diSPIM, LLSM, or OPM. Please open an issue if you would like help adapting the code to work with your microscope, we are happy to assist.
 
-The goal is provide highly performant data I/O via [Tensorstore](https://google.github.io/tensorstore/) and image processing (deskewing, downsampling, and maximum Z projection) via [Numba](https://numba.pydata.org/).
+The goal is provide highly performant data I/O via [Tensorstore](https://google.github.io/tensorstore/) and image processing (illumination correction, deconvolution, deskewing, downsampling, maximum Z projection, and 3D stitching+fusion) via [Numba](https://numba.pydata.org/), [CuPy](https://cupy.dev/), and [cuCIM](https://github.com/rapidsai/cucim?tab=readme-ov-file).
 
-We additionally use [BaSiCPy](https://github.com/peng-lab/BaSiCPy) to estimate illumination profiles and [multiview-stitcher](https://github.com/multiview-stitcher/multiview-stitcher) to register and fuse tiled data into ome-zarr v0.4 format.
-
-Raw data deconvolution is planned, but will require GPU-accleration.
-
+We rely on [BaSiCPy](https://github.com/peng-lab/BaSiCPy) to post-hoc estimate illumination profiles and a modified version of [gradient consensus Richardson-Lucy deconvolution](https://zenodo.org/records/10278919) to perform 3D deconvolution.
 ## Installation
 
 Create a python 3.12 environment,
@@ -30,24 +27,27 @@ activate the environment,
 conda activate opmprocessing
 ```
 
-If on Linux, we can use an Nvidia GPU to accelerate flatfield calculation
-```bash
-conda install -c conda-forge -c nvidia -c rapidsai cupy=13.4 cucim=25.02 pycudadecon "cuda-version>=12.0,<=12.8" cudnn cutensor nccl
-```
-
-and install the repository
+install the repository and register the local cuda
 ```bash
 pip install "opm-processing-v2 @ git+https://github.com/QI2lab/opm-processing-v2"
+setup-cuda
+conda deactivate opmprocessing
 ```
+
 
 ## Usage
 
-Activate the conda environment.
+Activate the conda environment,
+```bash
+conda activate opmprocessing
+```
 
 To deskew raw data,
 ```bash
 deskew "/path/to/qi2lab_acquisition.zarr"
 ```
+
+If you get an error, make sure you ran `setup-cuda`!
 
 The defaults parameters generate three zarr3 compliant datastores:
 1. Full 3D data (`/path/to/qi2lab_acquisition_deskewed.zarr`) with dimensions `tpczyx`.
@@ -65,10 +65,11 @@ There are three `to_display` options that correspond to the three datastores des
 1. full
 2. max-z
 3. fused-max-z
+4. fused-full
 
-To register and fused desekwed data,
+To register and fused desekwed data into an ome-ngff v0.5 datastore,
 ```bash
 fuse "/path/to/qi2lab_acquisition.zarr"
 ```
 
-The registered and fused data will be in `/path/to/qi2lab_acquisition_fused_deskewed.ome.zarr`
+The registered, optionally deconvolved, and fused data will be in `/path/to/qi2lab_acquisition_fused_deskewed.ome.zarr`
