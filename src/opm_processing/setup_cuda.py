@@ -5,6 +5,7 @@ from pathlib import Path
 import typer
 
 app = typer.Typer()
+app.pretty_exceptions_enable = False
 
 @app.command()
 def setup_activation():
@@ -44,6 +45,4 @@ def main():
     app()
 
 if __name__ == "__main__":
-    import multiprocessing as mp
-    mp.set_start_method('spawn', force=True)
     main()

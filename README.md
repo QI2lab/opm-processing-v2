@@ -67,7 +67,7 @@ There are three `to_display` options that correspond to the three datastores des
 3. fused-max-z
 4. fused-full
 
-To register and fused desekwed data into an ome-ngff v0.5 datastore,
+To register and fuse optionally deconvolved and desekwed data into an ome-ngff v0.5 datastore,
 ```bash
 fuse "/path/to/qi2lab_acquisition.zarr"
 ```

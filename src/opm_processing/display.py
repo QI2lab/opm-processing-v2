@@ -4,9 +4,12 @@ Display qi2lab OPM data
 This file displays deskewed qi2lab OPM data.
 """
 
+import multiprocessing as mp
+mp.set_start_method('forkserver', force=True)
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.simplefilter("ignore", category=FutureWarning)
+
 
 from pathlib import Path
 import tensorstore as ts
@@ -18,6 +21,7 @@ from napari.experimental import link_layers
 from cmap import Colormap
 import typer
 from tqdm import tqdm
+
 
 app = typer.Typer()
 app.pretty_exceptions_enable = False
@@ -171,6 +175,4 @@ def main():
     app()
 
 if __name__ == "__main__":
-    import multiprocessing as mp
-    mp.set_start_method('spawn', force=True)
     main()

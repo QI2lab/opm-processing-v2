@@ -4,6 +4,9 @@ Deskew qi2lab OPM data.
 This file deskews and creates maximum projections of raw qi2lab OPM data.
 """
 
+import multiprocessing as mp
+mp.set_start_method('forkserver', force=True)
+
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.simplefilter("ignore", category=FutureWarning)
@@ -567,6 +570,4 @@ def main():
     app()
 
 if __name__ == "__main__":
-    import multiprocessing as mp
-    mp.set_start_method('spawn', force=True)
     main()
