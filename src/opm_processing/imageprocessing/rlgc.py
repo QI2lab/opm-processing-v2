@@ -19,7 +19,7 @@ rng = cp.random.default_rng(42)
 DEBUG = False
 
 # Custom CUDA kernel provided for gradient consensus
-filter_update = ElementwiseKernel(
+filter_update_kernel = ElementwiseKernel(
     'float32 recon, float32 HTratio, float32 consensus_map',
     'float32 out',
     '''
@@ -275,7 +275,7 @@ def rlgc_biggs(
         HTratio[:] = fft_conv(cp.divide(image_gpu, Hu_safe), otfT, shape)
 
         consensus_map[:] = fft_conv((HTratio1 - 1) * (HTratio2 - 1), otfotfT, recon.shape)
-        recon_next[:] = filter_update(recon, HTratio, filter_update)
+        recon_next[:] = filter_update_kernel(recon, HTratio, consensus_map)
 
         g2[:], g1[:] = g1, recon_next - recon
         recon[:] = recon_next
