@@ -33,7 +33,11 @@ def extract_stage_positions(data):
 
     for entry in data["frame_metadatas"]:
         try:
-            p = entry["mda_event"]["index"]["p"]
+            idx = entry["mda_event"]["index"]
+            if idx["t"] != first_t:
+                # skip any frames not at t=first_t
+                continue
+            p = idx["p"]
             stage_data = entry["mda_event"]["metadata"]["Stage"]
 
             # Ensure valid stage data
