@@ -3,7 +3,7 @@ import tensorstore as ts
 from pathlib import Path
 from tqdm import tqdm
 
-class TileFusion:
+class MaxZTileFusion:
     """
     A class for fusing multiple overlapping image tiles stored in a TensorStore dataset.
 
