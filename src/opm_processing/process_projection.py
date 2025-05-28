@@ -14,7 +14,7 @@ from pathlib import Path
 import tensorstore as ts
 from opm_processing.imageprocessing.opmpsf import generate_skewed_psf
 # from opm_processing.imageprocessing.rlgc import chunked_rlgc
-from opm_processing.imageprocessing.maxtilefusion import TileFusion
+from opm_processing.imageprocessing.maxtilefusion import MaxZTileFusion
 from opm_processing.dataio.metadata import extract_channels, find_key, extract_stage_positions, update_global_metadata, update_per_index_metadata
 from opm_processing.dataio.zarr_handlers import create_via_tensorstore, write_via_tensorstore
 import json
@@ -292,41 +292,14 @@ def process():
         else:
             tile_positions = stage_positions[:,1:]
         
-        
-        temp_fusion = TileFusion(
-                ts_dataset = ts_store[0,:,:,:,:,:],
-                tile_positions = tile_positions,
-                output_path=fused_output_path,
-                pixel_size=np.asarray((pixel_size_um,pixel_size_um),dtype=np.float32),
-            )
-        fused_shape = temp_fusion.fused_shape
-        ts_fused_store = create_via_tensorstore(
-            fused_output_path, 
-            data_shape=fused_shape
+        tile_fusion = TileFusion(
+            ts_dataset = ts_store,
+            tile_positions = tile_positions,
+            output_path=fused_output_path,
+            pixel_size=np.asarray((pixel_size_um,pixel_size_um),dtype=np.float32),
         )
-        
-        ts_fused_writes = []
-        for t_idx in time_iterator:
-        
-            for chan_idx in channels:
-                # Fuse a single time point
-                tile_fusion = TileFusion(
-                    ts_dataset = ts_store[t_idx,chan_idx,:,:,:,:],
-                    tile_positions = tile_positions,
-                    output_path=fused_output_path,
-                    pixel_size=np.asarray((pixel_size_um,pixel_size_um),dtype=np.float32),
-                )
-                tile_fusion.run()
-                # Add this fused timepoint the the ts to be written
-                ts_fused_writes.append(
-                    write_via_tensorstore(
-                        ts_store = ts_fused_store,
-                        data = tile_fusion.fused_ts[0,0,0].read().result().astype(np.float32),
-                        data_location = [t_idx,0,chan_idx]
-                    )
-                )
-            for ts_f_write in ts_fused_writes:
-                ts_f_write.result()
+        tile_fusion.run()
+
     # if write_fused_projection_tiff:
     #     tiff_dir_path = output_path.parent / Path("fused_projection_tiff_output")
     #     tiff_dir_path.mkdir(exist_ok=True)
