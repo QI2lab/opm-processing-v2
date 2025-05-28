@@ -1,7 +1,7 @@
 import numpy as np
 import tensorstore as ts
 from pathlib import Path
-from tqdm import tqdm, trange
+from tqdm import tqdm
 
 class TileFusion:
     """
@@ -164,45 +164,47 @@ class TileFusion:
         This method ensures that all channels are fused separately and blended correctly.
         """
         write_futures = []
-        for tile_idx, (y, x) in enumerate(tqdm(self.tile_positions, desc="Processing tiles")):
-            # Read tile correctly from its respective position
-            tile_data = self.ts_dataset[0, tile_idx, :, 0, :, :].read().result().astype(np.float32)  # Shape: (C, H_tile, W_tile)
-
-            # Ensure tile_data has explicit Z-dimension
-            tile_data = tile_data[:, np.newaxis, :, :]  # Shape: (C, 1, H_tile, W_tile)
-
-            # Compute global indices
-            y_start = int((y - self.offset[0]) / self.pixel_size[0])
-            x_start = int((x - self.offset[1]) / self.pixel_size[1])
-            y_end = y_start + self.tile_shape[0]
-            x_end = x_start + self.tile_shape[1]
-
-            # Expand weight mask to match shape (C, 1, H_tile, W_tile)
-            weight_mask_reshaped = np.broadcast_to(self.weight_mask, (self.channels, 1, *self.weight_mask.shape))
-
-            # **Read existing fused image region before modifying**
-            existing_fused = self.fused_ts[:, :, :, :, y_start:y_end, x_start:x_end].read().result().astype(np.float32)
-            existing_weight_sum = np.ones_like(existing_fused)  # Initialize weight sum if uninitialized
-
-            # **Ensure weighted_tile shape matches existing_fused**
-            weighted_tile = (tile_data * weight_mask_reshaped)[np.newaxis, np.newaxis, :, :, :, :]  # Shape: (1,1,C,1,H_tile,W_tile)
-
-            existing_fused += weighted_tile
-            existing_weight_sum += weight_mask_reshaped[np.newaxis, np.newaxis, :, :, :, :]
-
-            existing_weight_sum[existing_weight_sum == 0] = 1
-            existing_fused /= existing_weight_sum
-
-            # Convert to uint16
-            fused_patch = np.clip(existing_fused, 0, 65535).astype(np.uint16)
-
-            # **Asynchronously write the normalized region**
-            future = self.fused_ts[:, :, :, :, y_start:y_end, x_start:x_end].write(fused_patch)
-            write_futures.append(future)
-
-        # **Wait for all writes to complete**
-        for future in write_futures:
-            future.result()
+        
+        for time_idx in trange(self.time_dim,desc='time'):
+            for tile_idx, (y, x) in enumerate(tqdm(self.tile_positions, desc="tile"),leave=False):
+                # Read tile correctly from its respective position
+                tile_data = self.ts_dataset[time_idx, tile_idx, :, 0, :, :].read().result().astype(np.float32)  # Shape: (C, H_tile, W_tile)
+    
+                # Ensure tile_data has explicit Z-dimension
+                tile_data = tile_data[:, np.newaxis, :, :]  # Shape: (C, 1, H_tile, W_tile)
+    
+                # Compute global indices
+                y_start = int((y - self.offset[0]) / self.pixel_size[0])
+                x_start = int((x - self.offset[1]) / self.pixel_size[1])
+                y_end = y_start + self.tile_shape[0]
+                x_end = x_start + self.tile_shape[1]
+    
+                # Expand weight mask to match shape (C, 1, H_tile, W_tile)
+                weight_mask_reshaped = np.broadcast_to(self.weight_mask, (self.channels, 1, *self.weight_mask.shape))
+    
+                # **Read existing fused image region before modifying**
+                existing_fused = self.fused_ts[:, :, :, :, y_start:y_end, x_start:x_end].read().result().astype(np.float32)
+                existing_weight_sum = np.ones_like(existing_fused)  # Initialize weight sum if uninitialized
+    
+                # **Ensure weighted_tile shape matches existing_fused**
+                weighted_tile = (tile_data * weight_mask_reshaped)[np.newaxis, np.newaxis, :, :, :, :]  # Shape: (1,1,C,1,H_tile,W_tile)
+    
+                existing_fused += weighted_tile
+                existing_weight_sum += weight_mask_reshaped[np.newaxis, np.newaxis, :, :, :, :]
+    
+                existing_weight_sum[existing_weight_sum == 0] = 1
+                existing_fused /= existing_weight_sum
+    
+                # Convert to uint16
+                fused_patch = np.clip(existing_fused, 0, 65535).astype(np.uint16)
+    
+                # **Asynchronously write the normalized region**
+                future = self.fused_ts[time_idx, :, :, :, y_start:y_end, x_start:x_end].write(fused_patch)
+                write_futures.append(future)
+    
+            # **Wait for all writes to complete**
+            for future in write_futures:
+                future.result()
 
     def run(self):
         """
