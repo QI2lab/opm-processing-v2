@@ -134,7 +134,7 @@ def deskew(
         for pos_idx, _ in enumerate(stage_positions):
             stage_positions[pos_idx,0] = stage_z_max - stage_positions[pos_idx,0]
     
-    # # estimate shape of one deskewed volume
+    # estimate shape of one deskewed volume
     deskewed_shape, pad_y, pad_x = deskew_shape_estimator(
         [datastore.shape[-3]-excess_scan_positions,datastore.shape[-2],datastore.shape[-1]],
         theta=opm_tilt_deg,
@@ -313,7 +313,7 @@ def deskew(
                 update_per_index_metadata(
                     ts_store = ts_store, 
                     metadata = {"stage_position": stage_positions[pos_idx], 'channel': channels[chan_idx]}, 
-                    index_location = (t_idx,pos_idx,chan_idx)
+                    index_location = (t_idx, pos_idx, chan_idx)
                 )
                 
                 if max_projection:
