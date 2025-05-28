@@ -1,7 +1,7 @@
 import numpy as np
 import tensorstore as ts
 from pathlib import Path
-from tqdm import tqdm
+from tqdm import tqdm, trange
 
 class TileFusion:
     """
@@ -164,7 +164,6 @@ class TileFusion:
         This method ensures that all channels are fused separately and blended correctly.
         """
         write_futures = []
-
         for tile_idx, (y, x) in enumerate(tqdm(self.tile_positions, desc="Processing tiles")):
             # Read tile correctly from its respective position
             tile_data = self.ts_dataset[0, tile_idx, :, 0, :, :].read().result().astype(np.float32)  # Shape: (C, H_tile, W_tile)

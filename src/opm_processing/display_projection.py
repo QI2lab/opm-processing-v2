@@ -65,7 +65,10 @@ def display(
     pos_range: list[int,int], default = None
         Range of stage positions to reconstruct   
     """
-    root_path =  Path(r"/home/steven/Documents/qi2lab/projects/OPM/20250521_test_autophagy/20250521_174119_test_timelapse/test_timelapse.zarr")
+    root_path =  Path(
+        r'G:\20250521_test_autophagy\20250521_174119_test_timelapse\test_timelapse.zarr',
+        # r"G:\20250523_autophagy\20250523_202020_projection_timelapse\projection_timelapse.zarr"
+        )
     # account for flip between camera and stage in y direction
     stage_y_flipped = True
     stage_z_flipped = True
@@ -92,7 +95,7 @@ def display(
         data_path = root_path.parents[0] / Path(str(root_path.stem)+"_fused.zarr")
         scale_to_use = [pixel_size_um,pixel_size_um]
     elif to_display == "full":
-        data_path = root_path.parents[0] / Path(str(root_path.stem)+"processed.zarr")
+        data_path = root_path.parents[0] / Path(str(root_path.stem)+"_processed.zarr")
         scale_to_use = [pixel_size_um*2,pixel_size_um,pixel_size_um]
         
     # open datastore on disk
@@ -104,11 +107,11 @@ def display(
         }
     }
     datastore = ts.open(spec).result()
-        
+    print(datastore.shape)    
     channel_layers = {ch: [] for ch in range(datastore.shape[2])}
     colormaps = [
-        Colormap("chrisluts:bop_purple").to_napari(),
         Colormap("chrisluts:bop_blue").to_napari(),
+        Colormap("chrisluts:bop_purple").to_napari(),
         Colormap("chrisluts:bop_orange").to_napari(),
     ]
     viewer = napari.Viewer()
@@ -146,7 +149,7 @@ def display(
                     datastore[time_idx,pos_idx,chan_idx,:],
                     scale=scale_to_use,
                     translate=translate_to_use,
-                    name = "p"+str(pos_idx).zfill(3)+"_c"+str(chan_idx),
+                    name = "t"+str(time_idx).zfill(3)+"_p"+str(pos_idx).zfill(3)+"_c"+str(chan_idx),
                     blending="additive",
                     colormap=colormaps[chan_idx],
                     contrast_limits = [10,500]

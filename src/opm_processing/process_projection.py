@@ -21,11 +21,7 @@ import json
 import numpy as np
 from tqdm import tqdm
 import typer
-import os
 
-# Explicitly tell Qt to use your working display platform
-os.environ["QT_QPA_PLATFORM"] = "wayland"  # or "xcb" if Wayland gives issues
-os.environ["QT_OPENGL"] = "egl"   
 from tifffile import TiffWriter, imread
 import napari
 from napari.experimental import link_layers
@@ -100,23 +96,21 @@ def call_estimate_illuminations(datastore, camera_offset, camera_conversion):
 
     return result
 
-
-
 app = typer.Typer()
 app.pretty_exceptions_enable = False
 
 @app.command()
 def process():
     root_path = Path(
-        "/home/steven/Documents/qi2lab/projects/OPM/20250521_test_autophagy/20250521_174119_test_timelapse/test_timelapse.zarr"
+        r'G:\20250521_test_autophagy\20250521_174119_test_timelapse\test_timelapse.zarr',
+        # r"G:\20250523_autophagy\20250523_202020_projection_timelapse\projection_timelapse.zarr"
         )
     deconvolve=False
     flatfield_correction = True
     create_fused_projection = True
-    write_fused_projection_tiff = False
-    time_range = None
+    write_fused_projection_tiff = True
     pos_range = None
-
+    time_range = [1,5]
     app = typer.Typer()
     app.pretty_exceptions_enable = False
 
@@ -183,7 +177,7 @@ def process():
         pos_shape = datastore.shape[1]
         
     datastore_shape = [
-        timse_shape,
+        time_shape,
         pos_shape,
         datastore.shape[2],
         1,
@@ -288,7 +282,7 @@ def process():
                 "flatfield_corrected": flatfield_correction
             }
     )
-    if create_fused_projection:
+    if create_fused_projection:       
         print("\nFusing max projection using stage positions...")
         fused_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_fused.zarr")
         
@@ -298,159 +292,88 @@ def process():
         else:
             tile_positions = stage_positions[:,1:]
         
-        tile_fusion = TileFusion(
-            ts_dataset = ts_store,
-            tile_positions = tile_positions,
-            output_path=fused_output_path,
-            pixel_size=np.asarray((pixel_size_um,pixel_size_um),dtype=np.float32),
+        
+        temp_fusion = TileFusion(
+                ts_dataset = ts_store[0,:,:,:,:,:],
+                tile_positions = tile_positions,
+                output_path=fused_output_path,
+                pixel_size=np.asarray((pixel_size_um,pixel_size_um),dtype=np.float32),
+            )
+        fused_shape = temp_fusion.fused_shape
+        ts_fused_store = create_via_tensorstore(
+            fused_output_path, 
+            data_shape=fused_shape
         )
-        tile_fusion.run()
         
-    if write_fused_projection_tiff:
-        tiff_dir_path = output_path.parent / Path("fused_projection_tiff_output")
-        tiff_dir_path.mkdir(exist_ok=True)
-        max_spec = {
-            "driver" : "zarr3",
-            "kvstore" : {
-                "driver" : "file",
-                "path" : str(fused_output_path)
-            }
-        }
-        max_proj_datastore = ts.open(max_spec).result()
-        for t_idx in tqdm(range(max_proj_datastore.shape[0]),desc="t"):
-            max_projection = np.squeeze(np.asarray(max_proj_datastore[t_idx,0,chan_idx,:].read().result()))
-            
-            filename = Path(f"fused_z_max_projection_t{t_idx}.ome.tiff")
-            filename_path = tiff_dir_path /  Path(filename)
-            if len(max_projection.shape) == 2:
-                axes = "YX"
-            else:
-                axes = "CYX"
-            
-            with TiffWriter(filename_path, bigtiff=True) as tif:
-                metadata={
-                    'axes': axes,
-                    'SignificantBits': 16,
-                    'PhysicalSizeX': pixel_size_um,
-                    'PhysicalSizeXUnit': 'µm',
-                    'PhysicalSizeY': pixel_size_um,
-                    'PhysicalSizeYUnit': 'µm',
-                }
-                options = dict(
-                    compression='zlib',
-                    compressionargs={'level': 8},
-                    predictor=True,
-                    photometric='minisblack',
-                    resolutionunit='CENTIMETER',
-                )
-                tif.write(
-                    max_projection,
-                    resolution=(
-                        1e4 / pixel_size_um,
-                        1e4 / pixel_size_um
-                    ),
-                    **options,
-                    metadata=metadata
-                )
-                
-                
-    # account for flip between camera and stage in y direction
-    stage_y_flipped = True
-    stage_z_flipped = True
-    
-    # Read metadata
-    zattrs_path = root_path / Path(".zattrs")
-    with open(zattrs_path, "r") as f:
-        zattrs = json.load(f)
-
-    pixel_size_um = float(find_key(zattrs,"pixel_size_um"))
-    stage_positions = extract_stage_positions(zattrs)
-    
-    if stage_y_flipped:
-        stage_y_max = np.max(stage_positions[:,1])
-        for pos_idx, _ in enumerate(stage_positions):
-            stage_positions[pos_idx,1] = stage_y_max - stage_positions[pos_idx,1]
-
-    if stage_z_flipped:
-        stage_z_max = np.max(stage_positions[:,0])
-        for pos_idx, _ in enumerate(stage_positions):
-            stage_positions[pos_idx,0] = stage_z_max - stage_positions[pos_idx,0]
-            
-
-    data_path = root_path.parents[0] / Path(str(root_path.stem)+"_fused.zarr")
-    scale_to_use = [pixel_size_um,pixel_size_um]
-    # open datastore on disk
-    spec = {
-        "driver" : "zarr3",
-        "kvstore" : {
-            "driver" : "file",
-            "path" : str(data_path)
-        }
-    }
-    datastore = ts.open(spec).result()
-    from cmap import Colormap
+        ts_fused_writes = []
+        for t_idx in time_iterator:
         
-    channel_layers = {ch: [] for ch in range(datastore.shape[2])}
-    colormaps = [
-        Colormap("chrisluts:bop_purple").to_napari(),
-        Colormap("chrisluts:bop_blue").to_napari(),
-        Colormap("chrisluts:bop_orange").to_napari(),
-    ]
-
-    viewer = napari.Viewer()
-    
-    
-    if time_range is not None:
-        time_iterator = tqdm(range(time_range[0],time_range[1]),desc="t")
-    else:
-        time_iterator = tqdm(range(datastore.shape[0]),desc="t")
-    to_display = 'fused'
-    if not('fused' in to_display):
-        if pos_range is not None:
-            pos_iterator = tqdm(range(pos_range[0],pos_range[1]),desc="p",leave=False)
-        else:
-            pos_iterator = tqdm(range(datastore.shape[1]),desc="p",leave=False)
-    else:
-        pos_iterator = tqdm(range(datastore.shape[1]),desc="p",leave=False)
-        
-    for time_idx in time_iterator:
-        for pos_idx in pos_iterator:
-            for chan_idx in range(datastore.shape[2]):
-                if to_display == "full":
-                    translate_to_use = [
-                        stage_positions[pos_idx,0],
-                        stage_positions[pos_idx,1],
-                        stage_positions[pos_idx,2]
-                    ]
-                elif to_display == "max-z":
-                    translate_to_use = [
-                        stage_positions[pos_idx,1],
-                        stage_positions[pos_idx,2]
-                    ]
-                elif to_display == "fused-max-z":
-                    translate_to_use = [
-                        (np.max(stage_positions[:,1]) - np.min(stage_positions[:,1]))/2,
-                        (np.max(stage_positions[:,2]) - np.min(stage_positions[:,2]))/2
-                    ]
-                    
-                layer = viewer.add_image(
-                    datastore[time_idx,pos_idx,chan_idx,:],
-                    scale=scale_to_use,
-                    translate=translate_to_use,
-                    name = "p"+str(pos_idx).zfill(3)+"_c"+str(chan_idx),
-                    blending="additive",
-                    colormap=colormaps[chan_idx],
-                    contrast_limits = [10,500]
+            for chan_idx in channels:
+                # Fuse a single time point
+                tile_fusion = TileFusion(
+                    ts_dataset = ts_store[t_idx,chan_idx,:,:,:,:],
+                    tile_positions = tile_positions,
+                    output_path=fused_output_path,
+                    pixel_size=np.asarray((pixel_size_um,pixel_size_um),dtype=np.float32),
                 )
-                
-                channel_layers[chan_idx].append(layer)
-    
-    if not(to_display == "fused-max-z"):
-        for chan_idx in range(datastore.shape[2]):
+                tile_fusion.run()
+                # Add this fused timepoint the the ts to be written
+                ts_fused_writes.append(
+                    write_via_tensorstore(
+                        ts_store = ts_fused_store,
+                        data = tile_fusion.fused_ts[0,0,0].read().result().astype(np.float32),
+                        data_location = [t_idx,0,chan_idx]
+                    )
+                )
+            for ts_f_write in ts_fused_writes:
+                ts_f_write.result()
+    # if write_fused_projection_tiff:
+    #     tiff_dir_path = output_path.parent / Path("fused_projection_tiff_output")
+    #     tiff_dir_path.mkdir(exist_ok=True)
+    #     max_spec = {
+    #         "driver" : "zarr3",
+    #         "kvstore" : {
+    #             "driver" : "file",
+    #             "path" : str(fused_output_path)
+    #         }
+    #     }
+    #     max_proj_datastore = ts.open(max_spec).result()
+    #     for t_idx in tqdm(range(max_proj_datastore.shape[0]),desc="t"):
+    #         max_projection = np.squeeze(np.asarray(max_proj_datastore[t_idx,0,chan_idx,:].read().result()))
             
-            link_layers(channel_layers[chan_idx],("contrast_limits","gamma"))
+    #         filename = Path(f"fused_z_max_projection_t{t_idx}.ome.tiff")
+    #         filename_path = tiff_dir_path /  Path(filename)
+    #         if len(max_projection.shape) == 2:
+    #             axes = "YX"
+    #         else:
+    #             axes = "CYX"
             
-    napari.run()
+    #         with TiffWriter(filename_path, bigtiff=True) as tif:
+    #             metadata={
+    #                 'axes': axes,
+    #                 'SignificantBits': 16,
+    #                 'PhysicalSizeX': pixel_size_um,
+    #                 'PhysicalSizeXUnit': 'µm',
+    #                 'PhysicalSizeY': pixel_size_um,
+    #                 'PhysicalSizeYUnit': 'µm',
+    #             }
+    #             options = dict(
+    #                 compression='zlib',
+    #                 compressionargs={'level': 8},
+    #                 predictor=True,
+    #                 photometric='minisblack',
+    #                 resolutionunit='CENTIMETER',
+    #             )
+    #             tif.write(
+    #                 max_projection,
+    #                 resolution=(
+    #                     1e4 / pixel_size_um,
+    #                     1e4 / pixel_size_um
+    #                 ),
+    #                 **options,
+    #                 metadata=metadata
+    #             )
+            
 # entry for point for CLI        
 def main():
     app()

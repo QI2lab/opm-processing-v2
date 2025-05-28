@@ -34,9 +34,10 @@ def extract_stage_positions(data):
     for entry in data["frame_metadatas"]:
         try:
             idx = entry["mda_event"]["index"]
-            if idx["t"] != first_t:
-                # skip any frames not at t=first_t
-                continue
+            # SJS: Why do we ignore other time points?
+            # if idx["t"] != first_t:
+            #     # skip any frames not at t=first_t
+            #     continue
             p = idx["p"]
             stage_data = entry["mda_event"]["metadata"]["Stage"]
 
