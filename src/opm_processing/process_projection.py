@@ -175,7 +175,7 @@ def process():
         pos_shape = pos_range[1]
     else:
         pos_shape = datastore.shape[1]
-        
+    
     datastore_shape = [
         time_shape,
         pos_shape,
@@ -292,7 +292,7 @@ def process():
         else:
             tile_positions = stage_positions[:,1:]
         
-        tile_fusion = TileFusion(
+        tile_fusion = MaxZTileFusion(
             ts_dataset = ts_store,
             tile_positions = tile_positions,
             output_path=fused_output_path,

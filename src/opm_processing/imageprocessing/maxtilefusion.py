@@ -117,7 +117,7 @@ class MaxZTileFusion:
 
         # Define shard shape as one full tile
         shard_shape = [1, 1, self.channels, 1, self.tile_shape[0], self.tile_shape[1]]  
-
+        print([self.time_dim, 1, self.channels, 1, *self.fused_shape])
         config = {
                 "driver": "zarr3",
                 "kvstore": {
@@ -125,7 +125,7 @@ class MaxZTileFusion:
                     "path": str(self.output_path)
                 },
                 "metadata": {
-                    "shape": [1, 1, self.channels, 1, *self.fused_shape],
+                    "shape": [self.time_dim, 1, self.channels, 1, *self.fused_shape],
                     "chunk_grid": {
                         "name": "regular",
                         "configuration": {
@@ -165,8 +165,8 @@ class MaxZTileFusion:
         """
         write_futures = []
         
-        for time_idx in trange(self.time_dim,desc='time'):
-            for tile_idx, (y, x) in enumerate(tqdm(self.tile_positions, desc="tile"),leave=False):
+        for time_idx in range(self.time_dim):
+            for tile_idx, (y, x) in enumerate(tqdm(self.tile_positions, desc="tile",leave=False)):
                 # Read tile correctly from its respective position
                 tile_data = self.ts_dataset[time_idx, tile_idx, :, 0, :, :].read().result().astype(np.float32)  # Shape: (C, H_tile, W_tile)
     
@@ -183,7 +183,9 @@ class MaxZTileFusion:
                 weight_mask_reshaped = np.broadcast_to(self.weight_mask, (self.channels, 1, *self.weight_mask.shape))
     
                 # **Read existing fused image region before modifying**
-                existing_fused = self.fused_ts[:, :, :, :, y_start:y_end, x_start:x_end].read().result().astype(np.float32)
+                existing_fused = self.fused_ts[time_idx, :, :, :, y_start:y_end, x_start:x_end].read().result().astype(np.float32)
+                # existing_fused = self.fused_ts[time_idx, :, :, :, y_start:y_end, x_start:x_end].read().result().astype(np.float32)
+                existing_fused = existing_fused[np.newaxis, :, :, :, :, :]
                 existing_weight_sum = np.ones_like(existing_fused)  # Initialize weight sum if uninitialized
     
                 # **Ensure weighted_tile shape matches existing_fused**
@@ -196,7 +198,7 @@ class MaxZTileFusion:
                 existing_fused /= existing_weight_sum
     
                 # Convert to uint16
-                fused_patch = np.clip(existing_fused, 0, 65535).astype(np.uint16)
+                fused_patch = np.clip(existing_fused[0], 0, 65535).astype(np.uint16)
     
                 # **Asynchronously write the normalized region**
                 future = self.fused_ts[time_idx, :, :, :, y_start:y_end, x_start:x_end].write(fused_patch)

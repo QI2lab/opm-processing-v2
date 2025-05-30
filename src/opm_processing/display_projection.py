@@ -69,6 +69,8 @@ def display(
         r'G:\20250521_test_autophagy\20250521_174119_test_timelapse\test_timelapse.zarr',
         # r"G:\20250523_autophagy\20250523_202020_projection_timelapse\projection_timelapse.zarr"
         )
+    # time_range = [1,5]
+    to_display = 'fused'
     # account for flip between camera and stage in y direction
     stage_y_flipped = True
     stage_z_flipped = True
@@ -129,35 +131,39 @@ def display(
             pos_iterator = tqdm(range(datastore.shape[1]),desc="p",leave=False)
     else:
         pos_iterator = tqdm(range(datastore.shape[1]),desc="p",leave=False)
-        
-    for time_idx in time_iterator:
-        for pos_idx in pos_iterator:
-            for chan_idx in range(datastore.shape[2]):
-                if to_display == "full":
+
+    if to_display == 'fused':
+        for chan_idx in range(datastore.shape[2]):
+            layer = viewer.add_image(
+                datastore[:,0,chan_idx,:,:,:],
+                scale=scale_to_use,
+                name = "c"+str(chan_idx),
+                blending="additive",
+                colormap=colormaps[chan_idx],
+                contrast_limits = [10,500]
+            )
+    elif to_display == 'full':
+        for time_idx in time_iterator:
+            for pos_idx in pos_iterator:
+                for chan_idx in range(datastore.shape[2]):
                     translate_to_use = [
                         stage_positions[pos_idx,0],
                         stage_positions[pos_idx,1],
                         stage_positions[pos_idx,2]
                     ]
-                elif to_display == "fused":
-                    translate_to_use = [
-                        (np.max(stage_positions[:,1]) - np.min(stage_positions[:,1]))/2,
-                        (np.max(stage_positions[:,2]) - np.min(stage_positions[:,2]))/2
-                    ]
+                        
+                    layer = viewer.add_image(
+                        datastore[time_idx,pos_idx,chan_idx,:],
+                        scale=scale_to_use,
+                        translate=translate_to_use,
+                        name = "t"+str(time_idx).zfill(3)+"_p"+str(pos_idx).zfill(3)+"_c"+str(chan_idx),
+                        blending="additive",
+                        colormap=colormaps[chan_idx],
+                        contrast_limits = [10,500]
+                    )
                     
-                layer = viewer.add_image(
-                    datastore[time_idx,pos_idx,chan_idx,:],
-                    scale=scale_to_use,
-                    translate=translate_to_use,
-                    name = "t"+str(time_idx).zfill(3)+"_p"+str(pos_idx).zfill(3)+"_c"+str(chan_idx),
-                    blending="additive",
-                    colormap=colormaps[chan_idx],
-                    contrast_limits = [10,500]
-                )
-                
-                channel_layers[chan_idx].append(layer)
+                    channel_layers[chan_idx].append(layer)
     
-    if not(to_display == "fused"):
         for chan_idx in range(datastore.shape[2]):
             link_layers(channel_layers[chan_idx],("contrast_limits","gamma"))
             
