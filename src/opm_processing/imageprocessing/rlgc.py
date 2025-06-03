@@ -82,7 +82,7 @@ def pad_y(image: cp.ndarray, bkd: int) -> tuple[cp.ndarray, int, int]:
 
     padded_image = cp.pad(
         (image.astype(cp.float32)-float(bkd)).clip(0,2**16-1).astype(cp.uint16), 
-        pad_width, mode="symmetric"
+        pad_width, mode="reflect"
     )
 
     return padded_image, pad_y_before, pad_y_after
@@ -172,7 +172,7 @@ def kl_div(p: cp.ndarray, q: cp.ndarray) -> float:
 def rlgc_biggs(
     image: np.ndarray,
     psf: np.ndarray,
-    bkd: int = 25,
+    bkd: int = 0,
     otf: cp.ndarray = None,
     otfT: cp.ndarray = None
 ) -> np.ndarray:
@@ -190,7 +190,7 @@ def rlgc_biggs(
         optional pre-computed OTF.
     otfT: cp.ndarray
         optional pre-computed OTF conjugate.
-    
+
     Returns
     -------
     output: np.ndarray
@@ -252,13 +252,13 @@ def rlgc_biggs(
         kld1 = kl_div(Hu, split1)
         kld2 = kl_div(Hu, split2)
 
-        if (kld1 > prev_kld1) or (kld2 > prev_kld2) or (kld1 == 0) or (kld2 == 0):
+        if (kld1 > .999 * prev_kld1) or (kld2 > .999 * prev_kld2) or (kld1 < 1e-2) or (kld2 < 1e-2):
             recon[:] = previous_recon
             if DEBUG:
                 total_time = timeit.default_timer() - start_time
                 print(
                     f"Optimum result obtained after {num_iters - 1} iterations "
-                 
+                
                     f"in {total_time:.1f} seconds."
                 )
             break
@@ -272,7 +272,7 @@ def rlgc_biggs(
 
         HTratio1[:] = fft_conv(cp.divide(split1, 0.5 * Hu_safe), otfT, shape)
         HTratio2[:] = fft_conv(cp.divide(split2, 0.5 * Hu_safe), otfT, shape)
-        HTratio[:] = fft_conv(cp.divide(image_gpu, Hu_safe), otfT, shape)
+        HTratio[:] = HTratio1 + HTratio2
 
         consensus_map[:] = fft_conv((HTratio1 - 1) * (HTratio2 - 1), otfotfT, recon.shape)
         recon_next[:] = filter_update_kernel(recon, HTratio, consensus_map)
@@ -303,7 +303,7 @@ def chunked_rlgc(
     psf: np.ndarray, 
     scan_chunk_size: int = 384,
     scan_overlap_size: int = 64,
-    bkd: int = 25
+    bkd: int = 10
 ) -> np.ndarray:
     """Chunked RLGC deconvolution.
     

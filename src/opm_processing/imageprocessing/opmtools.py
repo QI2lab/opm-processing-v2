@@ -25,6 +25,7 @@ def deskew_shape_estimator(
     theta: float = 30.0,
     distance: float = 0.4,
     pixel_size: float = 0.115,
+    crop_after_deskew: bool = True,
     divisble_by: int = 4
 ):
     """Generate shape of orthogonal interpolation output array.
@@ -64,13 +65,19 @@ def deskew_shape_estimator(
     )  # (pixels)
     final_nx = np.int64(input_shape[2])
     
+    if crop_after_deskew:
+        crop_y = int(np.ceil(input_shape[1] * np.cos(theta * np.pi / 180)))
+        final_ny = final_ny - int(crop_y*2)
+    else:
+        crop_y = 0
+    
     # pad YX array size to make sure it is divisble by 4
     pad_y = (divisble_by - (final_ny % divisble_by)) % divisble_by  
     pad_x = (divisble_by - (final_nx % divisble_by)) % divisble_by
     padded_final_ny = final_ny + pad_y 
     padded_final_nx = final_nx + pad_x
 
-    return [final_nz, padded_final_ny, padded_final_nx], pad_y, pad_x
+    return [final_nz, padded_final_ny, padded_final_nx], pad_y, pad_x, crop_y
 
 
 @njit(parallel=True)

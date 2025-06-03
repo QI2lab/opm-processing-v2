@@ -9,10 +9,9 @@ The final fused volume is written to a ome-ngff v0.5 datastore using tensorstore
 
 import gc
 import json
-import multiprocessing as mp
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import List, Sequence, Tuple, Union
+from typing import List, Sequence, Tuple, Union, Any, Dict, Optional
 
 import numpy as np
 import tensorstore as ts
@@ -26,6 +25,7 @@ from opm_processing.imageprocessing.ssim_cuda import (
     structural_similarity_cupy_sep_shared as ssim_cuda
 )
 from tqdm import trange
+
 
 @njit(parallel=True)
 def _accumulate_tile_shard(
@@ -73,6 +73,7 @@ def _accumulate_tile_shard(
                 base_f[gx] += sub_line[x_i] * w_val
                 base_w[gx] += w_val
 
+
 @njit(parallel=True)
 def _normalize_shard(fused: np.ndarray, weight: np.ndarray) -> None:
     """
@@ -98,6 +99,7 @@ def _normalize_shard(fused: np.ndarray, weight: np.ndarray) -> None:
         for x_i in range(Xp):
             w_val = base_w[x_i]
             base_f[x_i] = base_f[x_i] / w_val if w_val > 0 else 0.0
+
 
 @njit(parallel=True)
 def _blend_numba(
@@ -143,12 +145,11 @@ def _blend_numba(
                 wj = wj_zy * wx_j[x]
                 tot = wi + wj
                 if tot > 1e-6:
-                    out_f[z, y, x] = (
-                        wi * sub_i[z, y, x] + wj * sub_j[z, y, x]
-                    ) / tot
+                    out_f[z, y, x] = (wi * sub_i[z, y, x] + wj * sub_j[z, y, x]) / tot
                 else:
                     out_f[z, y, x] = sub_i[z, y, x]
     return out_f
+
 
 class TileFusion:
     """
@@ -176,28 +177,27 @@ class TileFusion:
         If True, prints debug info.
     metrics_filename : str
         Filename for storing registration metrics.
+    channel_to_use : int
+        Channel index for registration.
     """
 
     def __init__(
         self,
         root_path: Union[str, Path],
-        blend_pixels: Tuple[int, int, int] = (20, 400, 400),
+        blend_pixels: Tuple[int, int, int] = (20, 600, 400),
         downsample_factors: Tuple[int, int, int] = (3, 5, 5),
-        ssim_window: int = 7,
+        ssim_window: int = 15,
         threshold: float = 0.7,
-        multiscale_factors: Sequence[int] = (2, 4, 8, 16),
+        multiscale_factors: Sequence[int] = (2, 4, 8, 16, 32),
         resolution_multiples: Sequence[Union[int, Sequence[int]]] = (
-            (1, 1, 1), (2, 2, 2), (4, 4, 4), (8, 8, 8), (16,16,16)
+            (1, 1, 1), (2, 2, 2), (4, 4, 4), (8, 8, 8), (16,16,16), (32,32,32)
         ),
         max_workers: int = 8,
         debug: bool = False,
         metrics_filename: str = "metrics.json",
+        channel_to_use: int = 0
     ):
-        import warnings
-        warnings.filterwarnings("ignore", category=UserWarning)
-        warnings.simplefilter("ignore", category=FutureWarning)
 
-        mp.set_start_method("spawn", force=True)
         self.root = Path(root_path)
         base = self.root.parents[0]
         stem = self.root.stem
@@ -235,6 +235,7 @@ class TileFusion:
         self._debug = bool(debug)
         self.metrics_filename = metrics_filename
         self._blend_pixels = tuple(blend_pixels)
+        self.channel_to_use = channel_to_use
 
         spec = {
             "context": {
@@ -246,7 +247,9 @@ class TileFusion:
             "driver": "zarr3",
             "kvstore": {"driver": "file", "path": str(self.deskewed)},
         }
-        self.ts = ts.open(spec, create=False, open=True).result()
+        ts_full = ts.open(spec, create=False, open=True).result()
+        self.ts = ts_full
+
         (
             self.time_dim,
             self.position_dim,
@@ -257,17 +260,17 @@ class TileFusion:
         ) = self.ts.shape
 
         self._update_profiles()
-        self.chunk_shape = (1, 1, 1, 512, 512)
+        self.chunk_shape = (1, 1, 1, 1024, 1024)
         self.chunk_y, self.chunk_x = self.chunk_shape[-2:]
 
-        self.pairwise_metrics = {}
-        self.global_offsets = None
-        self.offset = None
-        self.unpadded_shape = None
-        self.padded_shape = None
+        self.pairwise_metrics: Dict[Tuple[int,int], Tuple[int,int,int,float]] = {}
+        self.global_offsets: Optional[np.ndarray] = None
+        self.offset: Optional[Tuple[float,float,float]] = None
+        self.unpadded_shape: Optional[Tuple[int,int,int]] = None
+        self.padded_shape: Optional[Tuple[int,int,int]] = None
         self.pad = (0, 0, 0)
         self.fused_ts = None
-        
+    
     @property
     def tile_positions(self) -> List[Tuple[float, float, float]]:
         """
@@ -331,6 +334,7 @@ class TileFusion:
     @debug.setter
     def debug(self, flag: bool):
         self._debug = bool(flag)
+
     def _update_profiles(self) -> None:
         """
         Recompute 1D feather profiles from blend_pixels.
@@ -363,13 +367,13 @@ class TileFusion:
             prof[:blend] = ramp
             prof[-blend:] = ramp[::-1]
         return prof
-    
+
     @staticmethod
     def register_and_score(
         g1: cp.ndarray,
         g2: cp.ndarray,
-        win_size: int = 7,
-        debug: bool = False,
+        win_size: int,
+        debug: bool = True,
     ) -> Union[Tuple[Tuple[float, float, float], float], Tuple[None, None]]:
         """
         Histogram-match g2→g1, compute subpixel shift, and SSIM.
@@ -391,13 +395,48 @@ class TileFusion:
             SSIM score.
         """
         try:
+            # first, match histograms
             g2m = match_histograms(g2, g1)
-            shift, _, _ = phase_cross_correlation(
-                g1, g2m, disambiguate=True, normalization="phase"
+            
+            # next, register z max projections
+            g2_zmax = cp.max(g2m, axis=0)
+            g1_zmax = cp.max(g1, axis=0)
+            
+            shift_zmax, _, _ = phase_cross_correlation(
+                g1_zmax, 
+                g2_zmax, 
+                disambiguate=True, 
+                normalization="phase", 
+                upsample_factor=10,
+                overlap_ratio=1.0
             )
-            g2s = cp_shift(g2m, shift=shift, order=1)
+            if debug:
+                print(f"shift_zmax: {shift_zmax}")
+            shift_zmax_expanded = np.array(
+                [0,shift_zmax[0],shift_zmax[1]], 
+                dtype=np.float32
+            )
+            if debug:
+                print(f"shift_zmax_expanded: {shift_zmax_expanded}")
+            
+            g2s_zmax = cp_shift(g2m, shift=shift_zmax_expanded, order=1, prefilter=False)
+            
+            shift, _, _ = phase_cross_correlation(
+                g1, 
+                g2s_zmax,  
+                disambiguate=True, 
+                normalization="phase", 
+                upsample_factor=10,
+                overlap_ratio=1.0
+            )
+
+            final_shift = np.array(shift_zmax_expanded+shift, dtype=np.float32)
+            if debug:
+                print(f"final_shift: {final_shift}")            
+            g2s = cp_shift(g2m, shift=final_shift, order=1, prefilter=False)
+            
             ssim_val = ssim_cuda(g1, g2s, win_size=win_size)
-            return tuple(float(s) for s in shift), float(ssim_val)
+            return tuple(float(s) for s in final_shift), float(ssim_val)
         except Exception:
             return None, None
     
@@ -434,7 +473,7 @@ class TileFusion:
 
         for t in range(self.time_dim):
             base = t * n_pos
-            for i_pos in trange(n_pos,desc="register",leave=True):
+            for i_pos in trange(n_pos, desc="register", leave=True):
                 i = base + i_pos
                 for j_pos in range(i_pos + 1, n_pos):
                     j = base + j_pos
@@ -448,6 +487,7 @@ class TileFusion:
                     bounds_j = [bounds_1d(-dz, self.z_dim),
                                 bounds_1d(-dy, self.Y),
                                 bounds_1d(-dx, self.X)]
+
                     if any(hi <= lo for lo, hi in bounds_i):
                         continue
 
@@ -472,10 +512,11 @@ class TileFusion:
                         continue
 
                     dz_s, dy_s, dx_s = [int(shift_ds[k] * df[k]) for k in range(3)]
-                    if any(abs(v) > m for v, m in zip((dz_s, dy_s, dx_s),
-                                                      self.multiscale_factors)):
+                    max_shift = (20, 50, 100)  # adjust to your expected maximum neighbor‐tile displacement
+
+                    if abs(dz_s) > max_shift[0] or abs(dy_s) > max_shift[1] or abs(dx_s) > max_shift[2]:
                         if self._debug:
-                            print(f"Dropping link {(i,j)} shift={(dz_s,dy_s,dx_s)}")
+                            print(f"Dropping link {(i,j)} shift={(dz_s,dy_s,dx_s)} — exceeds max {max_shift}")
                         continue
 
                     self.pairwise_metrics[(i, j)] = (
@@ -484,47 +525,129 @@ class TileFusion:
 
         executor.shutdown(wait=True)
 
-    def optimize_shifts(self) -> None:
+    @staticmethod
+    def _solve_global(
+        links: List[Dict[str, Any]],
+        n_tiles: int,
+        fixed_indices: List[int]
+    ) -> np.ndarray:
         """
-        Globally optimize tile shifts from pairwise constraints.
+        Solve a linear least-squares for all 3 axes at once,
+        given weighted pairwise links and fixed tile indices.
         """
-        metrics = self.pairwise_metrics
-        N = len(self._tile_positions)
-        neighbors = {i: set() for i in range(N)}
-        for (i, j) in metrics:
-            neighbors[i].add(j)
-            neighbors[j].add(i)
-
-        d_opt = np.zeros((N, 3), dtype=np.float64)
-        smoothness_weight = 0.1
-
+        shifts = np.zeros((n_tiles, 3), dtype=np.float64)
         for axis in range(3):
-            rows, vals = [], []
-            for (i, j), v in metrics.items():
-                w = np.sqrt(v[3])
-                row = np.zeros(N)
-                row[j], row[i] = w, -w
-                rows.append(row)
-                vals.append(w * v[axis])
-
-            for i, neigh in neighbors.items():
-                deg = len(neigh)
-                if deg == 0:
-                    continue
-                row = np.zeros(N)
-                row[i] = smoothness_weight * deg
-                for j in neigh:
-                    row[j] = -smoothness_weight
-                rows.append(row)
-                vals.append(0.0)
-
-            rows.append(np.ones(N))
-            vals.append(0.0)
-
-            A = np.vstack(rows)
-            b = np.array(vals)
+            m = len(links) + len(fixed_indices)
+            A = np.zeros((m, n_tiles), dtype=np.float64)
+            b = np.zeros(m, dtype=np.float64)
+            row = 0
+            for link in links:
+                i, j = link['i'], link['j']
+                t, w = link['t'][axis], link['w']
+                A[row, j] = w
+                A[row, i] = -w
+                b[row] = w * t
+                row += 1
+            for idx in fixed_indices:
+                A[row, idx] = 1.0
+                b[row] = 0.0
+                row += 1
             sol, *_ = np.linalg.lstsq(A, b, rcond=None)
-            d_opt[:, axis] = sol
+            shifts[:, axis] = sol
+        return shifts
+
+    def _two_round_opt(
+        self,
+        links: List[Dict[str, Any]],
+        n_tiles: int,
+        fixed_indices: List[int],
+        rel_thresh: float,
+        abs_thresh: float,
+        iterative: bool
+    ) -> np.ndarray:
+        """
+        Perform two-round (or iterative two-round) robust optimization:
+        1. Solve on all links.
+        2. Remove any link whose residual > max(abs_thresh, rel_thresh * median(residuals)).
+        3. Re-solve on the remaining links.
+        If iterative=True, repeat step 2 + 3 until no more links are removed.
+        """
+        shifts = self._solve_global(links, n_tiles, fixed_indices)
+
+        def compute_res(ls: List[Dict[str, Any]], sh: np.ndarray) -> np.ndarray:
+            return np.array([
+                np.linalg.norm(sh[l['j']] - sh[l['i']] - l['t'])
+                for l in ls
+            ])
+
+        work = links.copy()
+        res = compute_res(work, shifts)
+        cutoff = max(abs_thresh, rel_thresh * np.median(res))
+        outliers = set(np.where(res > cutoff)[0])
+
+        if iterative:
+            while outliers:
+                for k in sorted(outliers, reverse=True):
+                    work.pop(k)
+                shifts = self._solve_global(work, n_tiles, fixed_indices)
+                res = compute_res(work, shifts)
+                cutoff = max(abs_thresh, rel_thresh * np.median(res))
+                outliers = set(np.where(res > cutoff)[0])
+        else:
+            for k in sorted(outliers, reverse=True):
+                work.pop(k)
+            shifts = self._solve_global(work, n_tiles, fixed_indices)
+
+        return shifts
+
+    def optimize_shifts(
+        self,
+        method: str = 'ONE_ROUND',
+        rel_thresh: float = 0.3,
+        abs_thresh: float = 5.0,
+        iterative: bool = False
+    ) -> None:
+        """
+        Globally optimize tile shifts using either:
+          - ONE_ROUND: single least-squares solve, or
+          - TWO_ROUND_SIMPLE: remove outliers once then re-solve, or
+          - TWO_ROUND_ITERATIVE: remove outliers repeatedly until none remain.
+
+        Parameters
+        ----------
+        method : {'ONE_ROUND', 'TWO_ROUND_SIMPLE', 'TWO_ROUND_ITERATIVE'}
+        rel_thresh : float
+            Relative threshold (fraction of median residual) for link removal.
+        abs_thresh : float
+            Absolute threshold for link removal.
+        iterative : bool
+            If True, repeat outlier removal until convergence.
+        """
+        links: List[Dict[str, Any]] = []
+        for (i, j), v in self.pairwise_metrics.items():
+            links.append({
+                'i': i,
+                'j': j,
+                't': np.array(v[:3], dtype=np.float64),
+                'w': np.sqrt(v[3])
+            })
+
+        n = len(self._tile_positions)
+        fixed = [0]  # by default, fix tile index 0 at zero shift
+
+        if method == 'ONE_ROUND':
+            d_opt = self._solve_global(links, n, fixed)
+        elif method.startswith('TWO_ROUND'):
+            d_opt = self._two_round_opt(
+                links,
+                n,
+                fixed,
+                rel_thresh,
+                abs_thresh,
+                method.endswith('ITERATIVE')
+            )
+        else:
+            raise ValueError(f"Unknown method {method}")
 
         self.global_offsets = d_opt
     
@@ -562,7 +685,7 @@ class TileFusion:
 
     def _compute_fused_image_space(self) -> None:
         """
-        Compute fused volume physical shape and offset.
+        Compute fused volume physical shape and offset based on tile positions.
         """
         pos = np.array(self._tile_positions)
         min_z, min_y, min_x = pos.min(axis=0)
@@ -584,7 +707,7 @@ class TileFusion:
 
     def _pad_to_chunk_multiple(self) -> None:
         """
-        Pad unpadded_shape to exact multiples of tile shape.
+        Pad unpadded_shape to exact multiples of tile shape (z_dim, Y, X).
         """
         tz, ty, tx = self.z_dim, self.Y, self.X
         sz, sy, sx = self.unpadded_shape
@@ -614,7 +737,7 @@ class TileFusion:
         out = Path(output_path)
         full_shape = [1, self.channels, *self.padded_shape]
         shard_chunk = [1, 1, z_slices_per_shard,
-                       self.chunk_y * 4, self.chunk_x * 4]
+                       self.chunk_y * 2, self.chunk_x * 2]
         codec_chunk = [1, 1, 1, self.chunk_y, self.chunk_x]
         self.shard_chunk = shard_chunk
 
@@ -680,7 +803,7 @@ class TileFusion:
         overlaps : list of (i, j, region)
             region = (z0, z1, y0, y1, x0, x1)
         """
-        overlaps = []
+        overlaps: List[Tuple[int,int,Tuple[int,int,int,int,int,int]]] = []
         n = len(offsets)
         for i in range(n):
             z0_i, y0_i, x0_i = offsets[i]
@@ -860,62 +983,79 @@ class TileFusion:
 
     def _fuse_by_shard(self) -> None:
         """
-        Shard-centric fusion with Numba kernels and non-blocking writes.
+        Shard-centric fusion, channel by channel to cap memory.
         """
         offsets = [
-            (int((z - self.offset[0]) / self._pixel_size[0]),
-             int((y - self.offset[1]) / self._pixel_size[1]),
-             int((x - self.offset[2]) / self._pixel_size[2]))
-            for z, y, x in self._tile_positions
+            (
+                int((z - self.offset[0]) / self._pixel_size[0]),
+                int((y - self.offset[1]) / self._pixel_size[1]),
+                int((x - self.offset[2]) / self._pixel_size[2])
+            )
+            for (z, y, x) in self._tile_positions
         ]
-        z_step   = self.shard_chunk[2]
-        pad_Y    = self.padded_shape[1]
-        pad_X    = self.padded_shape[2]
-        nz       = (self.padded_shape[0] + z_step - 1) // z_step
-        futures  = []
+        z_step = self.shard_chunk[2]
+        pad_Y, pad_X = self.padded_shape[1], self.padded_shape[2]
+        nz = (self.padded_shape[0] + z_step - 1) // z_step
 
-        for shard_idx in trange(nz,desc="scale0",leave=True):
-            z0  = shard_idx * z_step
-            z1  = min(z0 + z_step, self.padded_shape[0])
-            dz  = z1 - z0
-            fused_block = np.zeros((self.channels, dz, pad_Y, pad_X), dtype=np.float32)
-            weight_sum  = np.zeros_like(fused_block)
+        futures = []
 
-            for t_idx, (oz, oy, ox) in enumerate(offsets):
-                tz0 = max(z0, oz)
-                tz1 = min(z1, oz + self.z_dim)
-                if tz1 <= tz0:
-                    continue
+        for shard_idx in trange(nz, desc="scale0", leave=True):
+            z0 = shard_idx * z_step
+            z1 = min(z0 + z_step, self.padded_shape[0])
+            dz = z1 - z0
 
-                local_z0, local_z1 = tz0 - oz, tz1 - oz
-                sub = (self.ts[0, t_idx, slice(None),
-                               slice(local_z0, local_z1),
-                               slice(0, self.Y),
-                               slice(0, self.X)]
-                       .read().result().astype(np.float32))
+            # process each channel independently
+            for c in range(self.channels):
+                # 1-channel accum buffers
+                fused_block = np.zeros((1, dz, pad_Y, pad_X), dtype=np.float32)
+                weight_sum  = np.zeros_like(fused_block)
 
-                wz = self.z_profile[local_z0:local_z1]
-                wy = self.y_profile
-                wx = self.x_profile
-                w3d = wz[:, None, None] * wy[None, :, None] * wx[None, None, :]
+                # accumulate every tile into this channel
+                for t_idx, (oz, oy, ox) in enumerate(offsets):
+                    tz0 = max(z0, oz)
+                    tz1 = min(z1, oz + self.z_dim)
+                    if tz1 <= tz0:
+                        continue
 
-                z_off = tz0 - z0
-                _accumulate_tile_shard(
-                    fused_block, weight_sum,
-                    sub, w3d,
-                    z_off, oy, ox
-                )
+                    local_z0, local_z1 = tz0 - oz, tz1 - oz
+                    # read only channel c
+                    sub = (
+                        self.ts[0, t_idx, slice(c, c+1),
+                                slice(local_z0, local_z1),
+                                slice(0, self.Y),
+                                slice(0, self.X)]
+                        .read().result().astype(np.float32)
+                    )
 
-            _normalize_shard(fused_block, weight_sum)
-            fused_u16 = fused_block.astype(np.uint16)
-            fut = self.fused_ts[
-                0, slice(None),
-                slice(z0, z1),
-                slice(0, pad_Y),
-                slice(0, pad_X)
-            ].write(fused_u16)
-            futures.append(fut)
+                    wz = self.z_profile[local_z0:local_z1]
+                    wy = self.y_profile
+                    wx = self.x_profile
+                    w3d = wz[:, None, None] * wy[None, :, None] * wx[None, None, :]
 
+                    z_off = tz0 - z0
+                    _accumulate_tile_shard(
+                        fused_block, weight_sum,
+                        sub, w3d,
+                        z_off, oy, ox
+                    )
+
+                # normalize and schedule write for this channel
+                _normalize_shard(fused_block, weight_sum)
+                fut = self.fused_ts[
+                    0, slice(c, c+1),
+                    slice(z0, z1),
+                    slice(0, pad_Y),
+                    slice(0, pad_X)
+                ].write(fused_block.astype(np.uint16))
+                futures.append(fut)
+
+                # immediate cleanup
+                del fused_block, weight_sum
+                gc.collect()
+                cp.get_default_memory_pool().free_all_blocks()
+                cp.get_default_pinned_memory_pool().free_all_blocks()
+
+        # wait for all writes to finish
         for fut in futures:
             fut.result()
 
@@ -955,9 +1095,9 @@ class TileFusion:
             shard_z = min(z_slices_per_shard, new_z)
 
             # choose chunk_y, chunk_x
-            chunk_y = (512 if new_y >= 2048 else
+            chunk_y = (1024 if new_y >= 2048 else
                        new_y // 4 if new_y >= 4 else 1)
-            chunk_x = (512 if new_x >= 2048 else
+            chunk_x = (1024 if new_x >= 2048 else
                        new_x // 4 if new_x >= 4 else 1)
 
             self.padded_shape = (new_z, new_y, new_x)
@@ -968,7 +1108,7 @@ class TileFusion:
                 z_slices_per_shard=shard_z
             )
 
-            for z0 in trange(0, new_z, shard_z,desc=f'scale{idx+1}',leave=True):
+            for z0 in trange(0, new_z, shard_z, desc=f'scale{idx+1}', leave=True):
                 bz = min(shard_z, new_z - z0)
                 in_z0, in_z1 = z0 * factor_to_use, (z0 + bz) * factor_to_use
                 for y0 in range(0, new_y, chunk_y):
@@ -1080,25 +1220,22 @@ class TileFusion:
             self.load_pairwise_metrics(metrics_path)
             self.optimize_shifts()
         except FileNotFoundError:
-            self.refine_tile_positions_with_cross_correlation()
+            self.refine_tile_positions_with_cross_correlation(
+                downsample_factors=(5,3,3),
+                ch_idx=self.channel_to_use,
+                threshold=0.7)
             self.save_pairwise_metrics(metrics_path)
 
-            self.optimize_shifts()
-            gc.collect()
-            cp.get_default_memory_pool().free_all_blocks()
-            cp.get_default_pinned_memory_pool().free_all_blocks()
+        self.optimize_shifts(
+            method="TWO_ROUND_ITERATIVE",
+            rel_thresh=1.5,
+            abs_thresh=2.5,
+            iterative=True
+        )
+        gc.collect()
+        cp.get_default_memory_pool().free_all_blocks()
+        cp.get_default_pinned_memory_pool().free_all_blocks()
 
-            self.tile_positions = [
-                tuple(np.array(pos) + off * np.array(self._pixel_size))
-                for pos, off in zip(self.tile_positions, self.global_offsets)
-            ]
-            self.refine_tile_positions_with_cross_correlation()
-            self.save_pairwise_metrics(metrics_path)
-            self.optimize_shifts()
-            gc.collect()
-            cp.get_default_memory_pool().free_all_blocks()
-            cp.get_default_pinned_memory_pool().free_all_blocks()
-            
         self.tile_positions = [
             tuple(np.array(pos) + off * np.array(self._pixel_size))
             for pos, off in zip(self.tile_positions, self.global_offsets)

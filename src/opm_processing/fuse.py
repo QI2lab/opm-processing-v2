@@ -22,7 +22,7 @@ app.pretty_exceptions_enable = False
 @app.command()
 def register_and_fuse(
     root_path: Path,
-    saved_shifts: bool = False
+    chan_idx: int = 0,
 ):
     """Register and fuse deskewed OPM data.
     
@@ -36,18 +36,16 @@ def register_and_fuse(
     ----------
     root_path: Path
         Path to OPM pymmcoregui zarr file.
-    saved_shifts: bool
-        If True, use existing shifts on disk if available.
-        If False, compute shifts from the zarr file.
+    chan_idx: int, default = 0
+        Channel index to use for registration and fusion.
+        If there is only one channel, this should be 0.
+        If there are multiple channels, this should be the index of the channel
+        to use for registration.
     """
     
     # Open zarr using tensorstore
-    if saved_shifts:
-        tile_fuser = TileFusion(root_path=root_path)
-    else:
-        tile_fuser = TileFusion(root_path=root_path,metrics_filename=Path("none"))
+    tile_fuser = TileFusion(root_path=root_path,channel_to_use=chan_idx)    
     tile_fuser.run()
-    
     
 # entry for point for CLI        
 def main():

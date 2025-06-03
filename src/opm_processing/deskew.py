@@ -37,8 +37,11 @@ def deskew(
     create_fused_max_projection: bool = True,
     write_fused_max_projection_tiff: bool = False,
     z_downsample_level: int = 2,
+    crop_after_deskew: bool = False,
     time_range: tuple[int,int] = None,
-    pos_range: tuple[int,int] = None,    
+    pos_range: tuple[int,int] = None,
+    excess_overide: int = None,
+    flyback_crop: int = None,
 ):
     """Postprocess qi2lab OPM dataset.
     
@@ -102,6 +105,10 @@ def deskew(
     elif "stage" in opm_mode:
         scan_axis_step_um = float(find_key(zattrs,"scan_axis_step_um"))
         excess_scan_positions = int(find_key(zattrs,"excess_scan_positions"))
+        if excess_overide is not None:
+            excess_scan_positions = excess_overide
+        if flyback_crop is not None:
+            flyback_crop = int(flyback_crop)
     pixel_size_um = float(find_key(zattrs,"pixel_size_um"))
     opm_tilt_deg = float(find_key(zattrs,"angle_deg"))    
     camera_offset = float(find_key(zattrs,"offset"))
@@ -135,13 +142,23 @@ def deskew(
             stage_positions[pos_idx,0] = stage_z_max - stage_positions[pos_idx,0]
     
     # # estimate shape of one deskewed volume
-    deskewed_shape, pad_y, pad_x = deskew_shape_estimator(
-        [datastore.shape[-3]-excess_scan_positions,datastore.shape[-2],datastore.shape[-1]],
-        theta=opm_tilt_deg,
-        distance=scan_axis_step_um,
-        pixel_size=pixel_size_um
-    )
-
+    if flyback_crop is not None:
+        deskewed_shape, pad_y, pad_x, crop_y = deskew_shape_estimator(
+            [datastore.shape[-3]-excess_scan_positions-flyback_crop,datastore.shape[-2],datastore.shape[-1]],
+            theta=opm_tilt_deg,
+            distance=scan_axis_step_um,
+            pixel_size=pixel_size_um,
+            crop_after_deskew=crop_after_deskew
+        )
+    else:
+        deskewed_shape, pad_y, pad_x, crop_y = deskew_shape_estimator(
+            [datastore.shape[-3]-excess_scan_positions,datastore.shape[-2],datastore.shape[-1]],
+            theta=opm_tilt_deg,
+            distance=scan_axis_step_um,
+            pixel_size=pixel_size_um,
+            crop_after_deskew=crop_after_deskew
+        )
+        
     if time_range is not None:
         time_shape = time_range[1]
     else:
@@ -288,13 +305,20 @@ def deskew(
                         chunk_size = 384
                     elif camera_corrected_data.shape[1]==512:
                         chunk_size = 196
-                    deconvolved_data = chunked_rlgc(
-                        camera_corrected_data[excess_scan_positions:,:,:],
-                        np.asarray(psfs[chan_idx]),
-                        scan_chunk_size=chunk_size,
-                        scan_overlap_size=32
-                    )
-                    
+                    if flyback_crop is not None:
+                        deconvolved_data = chunked_rlgc(
+                            camera_corrected_data[excess_scan_positions:-flyback_crop,:,:],
+                            np.asarray(psfs[chan_idx]),
+                            scan_chunk_size=chunk_size,
+                            scan_overlap_size=64
+                        )
+                    else:
+                        deconvolved_data = chunked_rlgc(
+                            camera_corrected_data[excess_scan_positions:,:,:],
+                            np.asarray(psfs[chan_idx]),
+                            scan_chunk_size=chunk_size,
+                            scan_overlap_size=64
+                        )
                     deskewed = orthogonal_deskew(
                         deconvolved_data,
                         theta = opm_tilt_deg,
@@ -302,14 +326,24 @@ def deskew(
                         pixel_size = pixel_size_um
                     )
                 else:        
-                    deskewed = orthogonal_deskew(
-                        camera_corrected_data[excess_scan_positions:,:,:],
-                        theta = opm_tilt_deg,
-                        distance = scan_axis_step_um,
-                        pixel_size = pixel_size_um
-                    )
+                    if flyback_crop is not None:
+                        deskewed = orthogonal_deskew(
+                            camera_corrected_data[excess_scan_positions:-flyback_crop,:,:],
+                            theta = opm_tilt_deg,
+                            distance = scan_axis_step_um,
+                            pixel_size = pixel_size_um
+                        )
+                    else:
+                        deskewed = orthogonal_deskew(
+                            camera_corrected_data[excess_scan_positions:,:,:],
+                            theta = opm_tilt_deg,
+                            distance = scan_axis_step_um,
+                            pixel_size = pixel_size_um
+                        )
 
-              
+                if crop_after_deskew:
+                    deskewed = deskewed[:,crop_y:-crop_y,:]
+
                 update_per_index_metadata(
                     ts_store = ts_store, 
                     metadata = {"stage_position": stage_positions[pos_idx], 'channel': channels[chan_idx]}, 
@@ -363,7 +397,9 @@ def deskew(
                     "stage_x_flipped": stage_x_flipped,
                     "stage_y_flipped": stage_y_flipped,
                     "stage_z_flipped": stage_z_flipped,
-                    "flatfield_corrected": flatfield_correction
+                    "flatfield_corrected": flatfield_correction,
+                    "pad_y" : pad_y,
+                    "pad_x" : pad_x
                 }
         )
     elif "stage" in opm_mode:
@@ -380,7 +416,9 @@ def deskew(
                     "stage_x_flipped": stage_x_flipped,
                     "stage_y_flipped": stage_y_flipped,
                     "stage_z_flipped": stage_z_flipped,
-                    "flatfield_corrected": flatfield_correction
+                    "flatfield_corrected": flatfield_correction,
+                    "pad_y" : pad_y,
+                    "pad_x" : pad_x
                 }
         )
     if max_projection:
@@ -398,7 +436,9 @@ def deskew(
                     "stage_x_flipped": stage_x_flipped,
                     "stage_y_flipped": stage_y_flipped,
                     "stage_z_flipped": stage_z_flipped,
-                    "flatfield_corrected": flatfield_correction
+                    "flatfield_corrected": flatfield_correction,
+                    "pad_y" : pad_y,
+                    "pad_x" : pad_x
                 }
             )
         elif "stage" in opm_mode:
@@ -415,7 +455,9 @@ def deskew(
                     "stage_x_flipped": stage_x_flipped,
                     "stage_y_flipped": stage_y_flipped,
                     "stage_z_flipped": stage_z_flipped,
-                    "flatfield_corrected": flatfield_correction
+                    "flatfield_corrected": flatfield_correction,
+                    "pad_y" : pad_y,
+                    "pad_x" : pad_x
                 }
             )
             
@@ -424,7 +466,11 @@ def deskew(
         del max_z_deskewed, ts_max_write
         
     if create_fused_max_projection:
-        max_z_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_z_deskewed.zarr")
+        
+        if deconvolve:
+            max_z_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_z_decon_deskewed.zarr")
+        else:
+            max_z_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_z_deskewed.zarr")
         # open datastore on disk
         spec = {
             "driver" : "zarr3",

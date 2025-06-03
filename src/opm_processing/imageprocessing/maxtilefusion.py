@@ -1,7 +1,7 @@
 import numpy as np
 import tensorstore as ts
 from pathlib import Path
-from tqdm import tqdm
+from tqdm import tqdm, trange
 
 class TileFusion:
     """
@@ -17,6 +17,8 @@ class TileFusion:
         Path to the output TensorStore dataset.
     pixel_size : tuple of float
         Pixel size (y, x) in physical units.
+    pad_yx : list of int, default  = [0, 0].
+        Padding in y and x dimensions already applied to the dataset
     """
     
     def __init__(
@@ -24,19 +26,37 @@ class TileFusion:
         ts_dataset: str|Path, 
         tile_positions: list[float,float], 
         output_path: str|Path, 
-        pixel_size: tuple[float,float]
+        pixel_size: tuple[float,float],
+        pad_yx: list[int,int] = [0,0]
     ):
-        self.ts_dataset = ts_dataset
+        self.pad_y = pad_yx[0]
+        self.pad_x = pad_yx[1]
+        print(ts_dataset.shape)
+        if self.pad_y > 0 and self.pad_x > 0:
+            self.ts_dataset = ts_dataset[:,:,:,:,self.pad_y:-self.pad_y,self.pad_x:-self.pad_x]
+        elif self.pad_y > 0:
+            self.ts_dataset = ts_dataset[:,:,:,:,self.pad_y:-self.pad_y,:]
+        elif self.pad_x > 0:
+            self.ts_dataset = ts_dataset[:,:,:,:,:,self.pad_x:-self.pad_x]
+        else:
+            self.ts_dataset = ts_dataset
+        print(self.ts_dataset.shape)
         self.tile_positions = np.array(tile_positions)
         self.output_path = Path(output_path)
         self.pixel_size = pixel_size
         
         self.time_dim, self.position_dim, self.channels, self.z_dim, height, width = self.ts_dataset.shape
         
+        self.chunks_per_shard = 8  # Number of chunks per shard in the fused image
+        self.chunk_size = 512
+        
         self.tile_shape = (height, width)
+
         self.fused_shape, self.offset = self.compute_fused_image_space()
         self.weight_mask = self.generate_blending_weights()
         self.fused_ts = self.create_fused_tensorstore()
+        
+        
 
     def compute_fused_image_space(self):
         """
@@ -54,9 +74,19 @@ class TileFusion:
         max_y = np.max(self.tile_positions[:, 0]) + self.tile_shape[0]
         max_x = np.max(self.tile_positions[:, 1]) + self.tile_shape[1]
 
-        fused_shape = (
+        fused_shape_unpadded = (
             int((max_y - min_y) / self.pixel_size[0]),
             int((max_x - min_x) / self.pixel_size[1])
+        )
+        
+        pad_y = (self.chunks_per_shard - (fused_shape_unpadded[0] % self.chunks_per_shard)) % self.chunks_per_shard  
+        pad_x = (self.chunks_per_shard - (fused_shape_unpadded[1] % self.chunks_per_shard)) % self.chunks_per_shard
+        padded_final_ny = fused_shape_unpadded[0] + pad_y 
+        padded_final_nx = fused_shape_unpadded[1] + pad_x
+        
+        fused_shape = (
+            padded_final_ny,
+            padded_final_nx
         )
 
         return fused_shape, (min_y, min_x)
@@ -111,12 +141,12 @@ class TileFusion:
         tensorstore.TensorStore
             A TensorStore dataset for storing the fused image.
         """
-
+                
         # Define chunk shape based on tile size
-        chunk_shape = [1, 1, self.channels, 1, self.tile_shape[0] // 4, self.tile_shape[1] // 4]
+        chunk_shape = [1, 1, self.channels, 1, self.chunk_size , self.chunk_size]
 
         # Define shard shape as one full tile
-        shard_shape = [1, 1, self.channels, 1, self.tile_shape[0], self.tile_shape[1]]  
+        shard_shape = [1, 1, self.channels, 1, self.chunks_per_shard*self.chunk_size, self.chunks_per_shard*self.chunk_size]  
 
         config = {
                 "driver": "zarr3",
@@ -164,46 +194,48 @@ class TileFusion:
         This method ensures that all channels are fused separately and blended correctly.
         """
         write_futures = []
+        
+        for time_idx in trange(self.time_dim):
 
-        for tile_idx, (y, x) in enumerate(tqdm(self.tile_positions, desc="Processing tiles")):
-            # Read tile correctly from its respective position
-            tile_data = self.ts_dataset[0, tile_idx, :, 0, :, :].read().result().astype(np.float32)  # Shape: (C, H_tile, W_tile)
+            for tile_idx, (y, x) in enumerate(tqdm(self.tile_positions, desc="Processing tiles")):
+                # Read tile correctly from its respective position
+                tile_data = self.ts_dataset[time_idx, tile_idx, :, 0, :, :].read().result().astype(np.float32)  # Shape: (C, H_tile, W_tile)
 
-            # Ensure tile_data has explicit Z-dimension
-            tile_data = tile_data[:, np.newaxis, :, :]  # Shape: (C, 1, H_tile, W_tile)
+                # Ensure tile_data has explicit Z-dimension
+                tile_data = tile_data[:, np.newaxis, :, :]  # Shape: (C, 1, H_tile, W_tile)
 
-            # Compute global indices
-            y_start = int((y - self.offset[0]) / self.pixel_size[0])
-            x_start = int((x - self.offset[1]) / self.pixel_size[1])
-            y_end = y_start + self.tile_shape[0]
-            x_end = x_start + self.tile_shape[1]
+                # Compute global indices
+                y_start = int((y - self.offset[0]) / self.pixel_size[0])
+                x_start = int((x - self.offset[1]) / self.pixel_size[1])
+                y_end = y_start + self.tile_shape[0]
+                x_end = x_start + self.tile_shape[1]
 
-            # Expand weight mask to match shape (C, 1, H_tile, W_tile)
-            weight_mask_reshaped = np.broadcast_to(self.weight_mask, (self.channels, 1, *self.weight_mask.shape))
+                # Expand weight mask to match shape (C, 1, H_tile, W_tile)
+                weight_mask_reshaped = np.broadcast_to(self.weight_mask, (self.channels, 1, *self.weight_mask.shape))
 
-            # **Read existing fused image region before modifying**
-            existing_fused = self.fused_ts[:, :, :, :, y_start:y_end, x_start:x_end].read().result().astype(np.float32)
-            existing_weight_sum = np.ones_like(existing_fused)  # Initialize weight sum if uninitialized
+                # **Read existing fused image region before modifying**
+                existing_fused = self.fused_ts[:, :, :, :, y_start:y_end, x_start:x_end].read().result().astype(np.float32)
+                existing_weight_sum = np.ones_like(existing_fused)  # Initialize weight sum if uninitialized
 
-            # **Ensure weighted_tile shape matches existing_fused**
-            weighted_tile = (tile_data * weight_mask_reshaped)[np.newaxis, np.newaxis, :, :, :, :]  # Shape: (1,1,C,1,H_tile,W_tile)
+                # **Ensure weighted_tile shape matches existing_fused**
+                weighted_tile = (tile_data * weight_mask_reshaped)[np.newaxis, np.newaxis, :, :, :, :]  # Shape: (1,1,C,1,H_tile,W_tile)
 
-            existing_fused += weighted_tile
-            existing_weight_sum += weight_mask_reshaped[np.newaxis, np.newaxis, :, :, :, :]
+                existing_fused += weighted_tile
+                existing_weight_sum += weight_mask_reshaped[np.newaxis, np.newaxis, :, :, :, :]
 
-            existing_weight_sum[existing_weight_sum == 0] = 1
-            existing_fused /= existing_weight_sum
+                existing_weight_sum[existing_weight_sum == 0] = 1
+                existing_fused /= existing_weight_sum
 
-            # Convert to uint16
-            fused_patch = np.clip(existing_fused, 0, 65535).astype(np.uint16)
+                # Convert to uint16
+                fused_patch = np.clip(existing_fused, 0, 65535).astype(np.uint16)
 
-            # **Asynchronously write the normalized region**
-            future = self.fused_ts[:, :, :, :, y_start:y_end, x_start:x_end].write(fused_patch)
-            write_futures.append(future)
+                # **Asynchronously write the normalized region**
+                future = self.fused_ts[time_idx, :, :, :, y_start:y_end, x_start:x_end].write(fused_patch)
+                write_futures.append(future)
 
-        # **Wait for all writes to complete**
-        for future in write_futures:
-            future.result()
+            # **Wait for all writes to complete**
+            for future in write_futures:
+                future.result()
 
     def run(self):
         """
