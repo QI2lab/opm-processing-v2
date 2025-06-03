@@ -347,7 +347,7 @@ def deskew(
                 update_per_index_metadata(
                     ts_store = ts_store, 
                     metadata = {"stage_position": stage_positions[pos_idx], 'channel': channels[chan_idx]}, 
-                    index_location = (t_idx,pos_idx,chan_idx)
+                    index_location = (t_idx, pos_idx, chan_idx)
                 )
                 
                 if max_projection:
