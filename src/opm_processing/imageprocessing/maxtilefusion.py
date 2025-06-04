@@ -31,7 +31,7 @@ class TileFusion:
     ):
         self.pad_y = pad_yx[0]
         self.pad_x = pad_yx[1]
-        print(ts_dataset.shape)
+
         if self.pad_y > 0 and self.pad_x > 0:
             self.ts_dataset = ts_dataset[:,:,:,:,self.pad_y:-self.pad_y,self.pad_x:-self.pad_x]
         elif self.pad_y > 0:
@@ -40,7 +40,7 @@ class TileFusion:
             self.ts_dataset = ts_dataset[:,:,:,:,:,self.pad_x:-self.pad_x]
         else:
             self.ts_dataset = ts_dataset
-        print(self.ts_dataset.shape)
+
         self.tile_positions = np.array(tile_positions)
         self.output_path = Path(output_path)
         self.pixel_size = pixel_size
@@ -155,7 +155,7 @@ class TileFusion:
                     "path": str(self.output_path)
                 },
                 "metadata": {
-                    "shape": [1, 1, self.channels, 1, *self.fused_shape],
+                    "shape": [self.time_dim, 1, self.channels, 1, *self.fused_shape],
                     "chunk_grid": {
                         "name": "regular",
                         "configuration": {
@@ -214,7 +214,7 @@ class TileFusion:
                 weight_mask_reshaped = np.broadcast_to(self.weight_mask, (self.channels, 1, *self.weight_mask.shape))
 
                 # **Read existing fused image region before modifying**
-                existing_fused = self.fused_ts[:, :, :, :, y_start:y_end, x_start:x_end].read().result().astype(np.float32)
+                existing_fused = self.fused_ts[time_idx, :, :, :, y_start:y_end, x_start:x_end].read().result().astype(np.float32)
                 existing_weight_sum = np.ones_like(existing_fused)  # Initialize weight sum if uninitialized
 
                 # **Ensure weighted_tile shape matches existing_fused**
