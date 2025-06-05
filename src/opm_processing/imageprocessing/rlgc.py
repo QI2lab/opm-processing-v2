@@ -252,7 +252,7 @@ def rlgc_biggs(
         kld1 = kl_div(Hu, split1)
         kld2 = kl_div(Hu, split2)
 
-        if (kld1 > .999 * prev_kld1) or (kld2 > .999 * prev_kld2) or (kld1 < 1e-2) or (kld2 < 1e-2):
+        if (kld1 > prev_kld1) or (kld2 > prev_kld2) or (kld1 < 1e-2) or (kld2 < 1e-2):
             recon[:] = previous_recon
             if DEBUG:
                 total_time = timeit.default_timer() - start_time
