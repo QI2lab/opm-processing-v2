@@ -3,7 +3,7 @@ import tensorstore as ts
 from pathlib import Path
 from tqdm import tqdm, trange
 
-class TileFusion:
+class MaxTileFusion:
     """
     A class for fusing multiple overlapping image tiles stored in a TensorStore dataset.
 
@@ -215,7 +215,6 @@ class TileFusion:
 
                 # **Read existing fused image region before modifying**
                 existing_fused = self.fused_ts[time_idx, :, :, :, y_start:y_end, x_start:x_end].read().result().astype(np.float32)
-                existing_fused = existing_fused[np.newaxis, :, :, :, :, :]
                 existing_weight_sum = np.ones_like(existing_fused)  # Initialize weight sum if uninitialized
 
                 # **Ensure weighted_tile shape matches existing_fused**
@@ -231,7 +230,7 @@ class TileFusion:
                 fused_patch = np.clip(existing_fused, 0, 65535).astype(np.uint16)
                 
                 # **Asynchronously write the normalized region**
-                future = self.fused_ts[time_idx, :, :, :, y_start:y_end, x_start:x_end].write(fused_patch[0, :, :, :, :, :])
+                future = self.fused_ts[time_idx, :, :, :, y_start:y_end, x_start:x_end].write(fused_patch[time_idx, :, :, :, :, :])
                 write_futures.append(future)
 
             # **Wait for all writes to complete**
