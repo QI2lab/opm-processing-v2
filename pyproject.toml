@@ -61,7 +61,6 @@ dependencies = [
     "nvidia-nvjitlink-cu12",
     "nvidia-nvtx-cu12",
     "cucim-cu12; sys_platform == 'linux'",
-    #"cucim-cu12 @ git+https://github.com/rapidsai/cucim.git@v25.04.00#egg=cucim-cu12&subdirectory=python/cucim; sys_platform == 'win32'",
     "cupy-cuda12x",
     "jax[cuda12_local]==0.4.38; sys_platform == 'linux'",
     "basicpy @ git+https://github.com/QI2lab/BaSiCPy.git@main",
