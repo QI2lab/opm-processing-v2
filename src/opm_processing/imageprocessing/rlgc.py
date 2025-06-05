@@ -235,9 +235,13 @@ def rlgc_biggs(
     output: np.ndarray
         Deconvolved 3D image, clipped to [0, 2^16-1] and cast to uint16.
     """
-    image_gpu, pad_y_before, pad_y_after = pad_y(
-        cp.asarray(image, dtype=cp.float32), bkd
-    )
+    if image.ndim == 3:
+        image_gpu, pad_y_before, pad_y_after = pad_y(
+            cp.asarray(image, dtype=cp.float32), bkd
+        )
+    else:
+        image_gpu = cp.asarray(image, dtype=cp.float32)
+        image_gpu = image_gpu[cp.newaxis, ...]
     if isinstance(psf, np.ndarray) and otf is None and otfT is None:
         psf_gpu = pad_psf(cp.asarray(psf, dtype=cp.float32), image_gpu.shape)
         otf = cp.fft.rfftn(psf_gpu)
@@ -326,7 +330,10 @@ def rlgc_biggs(
                 f"KLDs: {kld1:.4f} (split1), {kld2:.4f} (split2)."
             )
     recon = cp.clip(recon, 0, 2**16 - 1).astype(cp.uint16)
-    recon = remove_padding_y(recon, pad_y_before, pad_y_after)
+    if image.ndim == 3:
+        recon = remove_padding_y(recon, pad_y_before, pad_y_after)
+    else:
+        recon = cp.squeeze(recon)
     del recon_next, g1, g2, H_T_ones
     cp.get_default_memory_pool().free_all_blocks()
     return cp.asnumpy(recon)

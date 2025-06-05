@@ -215,9 +215,10 @@ def generate_proj_psf(
     #ex_lens = {**silicone_lens, 'NA': ex_NA}
     em_lens = {**silicone_lens, 'NA': 1.35}
 
-    psf = psfm.vectorial_psf(zv=51,nx=51,dxy=pixel_size_um,pz=pz,wvl=em_wvl,params=em_lens)
+    psf = psfm.vectorial_psf(zv=0,nx=51,dxy=pixel_size_um,pz=pz,wvl=em_wvl,params=em_lens)
     psf = psf / np.sum(psf)
-    psf = np.sum(psf,axis=0,keepdims=True)
+    if psf.ndim == 2:
+        psf = psf[np.newaxis, :, :]
     x = np.linspace(1, psf.shape[1], psf.shape[1])
     x = x - psf.shape[1] / 2
     y = np.linspace(1, psf.shape[2], psf.shape[2])

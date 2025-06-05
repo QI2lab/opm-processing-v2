@@ -109,7 +109,6 @@ def process(
             zattrs, 
             deconvolve,
             flatfield_correction,
-            create_fused_max_projection,
             write_fused_max_projection_tiff,
             time_range,
             pos_range,
@@ -772,9 +771,11 @@ def process_projection(
     ts_writes = []
         
     if time_range is not None:
-        time_iterator = tqdm(range(time_range[0],time_range[1]),desc="t")
+        time_iterator = tqdm(range(time_range[0],time_range[1]),desc="t",leave=True)
     else:
-        time_iterator = tqdm(range(time_shape),desc="t")
+        time_iterator = tqdm(range(time_shape),desc="t",leave=True)
+    if time_shape > 1 or time_range[1] > 1:
+        refresh_position_iterator = True
         
     if pos_range is not None:
         pos_iterator = tqdm(range(pos_range[0],pos_range[1]),desc="p",leave=False)
@@ -785,21 +786,24 @@ def process_projection(
         for pos_idx in pos_iterator:
             for chan_idx in tqdm(range(datastore.shape[2]),desc="c",leave=False):
                 camera_corrected_data = (((np.squeeze(datastore[t_idx,pos_idx,chan_idx,:].read().result()).astype(np.float32)-camera_offset)*camera_conversion)/flatfields[chan_idx,:].astype(np.float32)).clip(0,2**16-1).astype(np.uint16)
-                if pos_idx == 0 and chan_idx == 0:
-                    psfs = []
-                    for psf_idx in range(datastore.shape[2]):
-                        psf = generate_proj_psf(
-                            em_wvl=float(int(str(channels[psf_idx]).rstrip("nm")) / 1000),
-                            pixel_size_um=pixel_size_um,
-                            pz=0.0,
-                            plot=False
-                        )
-                        psfs.append(psf)
+                if deconvolve:
+                    if pos_idx == 0 and chan_idx == 0:
+                        psfs = []
+                        for psf_idx in range(datastore.shape[2]):
+                            psf = generate_proj_psf(
+                                em_wvl=float(int(str(channels[psf_idx]).rstrip("nm")) / 1000),
+                                pixel_size_um=pixel_size_um,
+                                pz=0.0,
+                                plot=False
+                            )
+                            psfs.append(psf)
 
-                deconvolved_data = rlgc_biggs(
-                    camera_corrected_data,
-                    np.asarray(psfs[chan_idx]),
-                )
+                    deconvolved_data = rlgc_biggs(
+                        camera_corrected_data,
+                        np.asarray(psfs[chan_idx]),
+                    )
+                else:
+                    deconvolved_data = camera_corrected_data
 
                 update_per_index_metadata(
                     ts_store = ts_store, 
@@ -815,6 +819,12 @@ def process_projection(
                         data_location = [t_idx,pos_idx,chan_idx]
                     )
                 )
+        if refresh_position_iterator:    
+            if pos_range is not None:
+                pos_iterator = tqdm(range(pos_range[0],pos_range[1]),desc="p",leave=False)
+            else:
+                pos_iterator = tqdm(range(pos_shape),desc="p",leave=False)
+        
                 
     # wait for writes to finish
     for ts_write in ts_writes:
@@ -838,8 +848,8 @@ def process_projection(
    
     del deconvolved_data, ts_write, ts_store
     
-    print("\nFusing max projection using stage positions...")
-    fused_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_z_fused.zarr")
+    print("\nFusing using stage positions...")
+    fused_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_fused.zarr")
     
     if pos_range is not None:
         tile_positions = stage_positions[pos_range[0]:pos_range[1],1:]
@@ -852,11 +862,12 @@ def process_projection(
         tile_positions = tile_positions,
         output_path=fused_output_path,
         pixel_size=np.asarray((pixel_size_um,pixel_size_um),dtype=np.float32),
+        time_range=time_range
     )
     tile_fusion.run()
     
     if write_fused_max_projection_tiff:
-        tiff_dir_path = fused_output_path.parent / Path("fused_max_projection_tiff_output")
+        tiff_dir_path = fused_output_path.parent / Path("fused_tiff_output")
         tiff_dir_path.mkdir(exist_ok=True)
         max_spec = {
             "driver" : "zarr3",
@@ -869,9 +880,9 @@ def process_projection(
 
         max_projection = np.asarray(max_proj_datastore.read().result())
         
-        filename = Path(f"fused_z_max_projection_t{t_idx}.ome.tiff")
+        filename = Path("fused.ome.tiff")
         filename_path = tiff_dir_path /  Path(filename)
-        axes = "TCYX"
+        axes = "TCZYX"
         
         with TiffWriter(filename_path, bigtiff=True) as tif:
             metadata={
