@@ -90,7 +90,7 @@ repository = "https://github.com/qi2lab/opm-processing-v2"
 # same as console_scripts entry point
 [project.scripts]
 setup-cuda = "opm_processing.setup_cuda:main"
-deskew = "opm_processing.deskew:main"
+process = "opm_processing.process:main"
 display = "opm_processing.display:main"
 fuse = "opm_processing.fuse:main"
 

@@ -5,7 +5,12 @@ This file displays deskewed qi2lab OPM data.
 """
 
 import multiprocessing as mp
-mp.set_start_method('forkserver', force=True)
+import sys
+if sys.platform.startswith("linux"):
+    mp.set_start_method("forkserver", force=True)
+elif sys.platform.startswith("win"):
+    mp.set_start_method("spawn", force=True)
+    
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.simplefilter("ignore", category=FutureWarning)
