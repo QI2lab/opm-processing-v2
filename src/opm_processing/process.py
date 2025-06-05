@@ -20,7 +20,7 @@ import tensorstore as ts
 from opm_processing.imageprocessing.opmpsf import generate_skewed_psf, generate_proj_psf
 from opm_processing.imageprocessing.rlgc import chunked_rlgc, rlgc_biggs
 from opm_processing.imageprocessing.opmtools import orthogonal_deskew, deskew_shape_estimator
-from opm_processing.imageprocessing.maxtilefusion import TileFusion
+from opm_processing.imageprocessing.maxtilefusion import MaxTileFusion
 from opm_processing.dataio.metadata import extract_channels, find_key, extract_stage_positions, update_global_metadata, update_per_index_metadata
 from opm_processing.dataio.zarr_handlers import create_via_tensorstore, write_via_tensorstore
 import json
@@ -374,19 +374,19 @@ def process_skewed(
 
                     # This code is for debugging RLGC deconvolution
                     # ------------------------------------
-                    decon_temp = chunked_rlgc(
-                        camera_corrected_data, 
-                        psf,
-                        scan_chunk_size=256,
-                        scan_overlap_size=32,
-                        bkd=0
-                    )
+                    # decon_temp = chunked_rlgc(
+                    #     camera_corrected_data, 
+                    #     psf,
+                    #     scan_chunk_size=256,
+                    #     scan_overlap_size=32,
+                    #     bkd=0
+                    # )
                     
-                    import napari
-                    viewer = napari.Viewer()
-                    viewer.add_image(decon_temp)
-                    viewer.add_image(camera_corrected_data)
-                    napari.run()
+                    # import napari
+                    # viewer = napari.Viewer()
+                    # viewer.add_image(decon_temp)
+                    # viewer.add_image(camera_corrected_data)
+                    # napari.run()
                     # ------------------------------------
                     if camera_corrected_data.shape[1]==256:
                         chunk_size = 256
@@ -579,7 +579,7 @@ def process_skewed(
         else:
             tile_positions = stage_positions[:,1:]
         
-        tile_fusion = TileFusion(
+        tile_fusion = MaxTileFusion(
             ts_dataset = max_z_ts_store,
             tile_positions = tile_positions,
             output_path=fused_output_path,
@@ -847,7 +847,7 @@ def process_projection(
     else:
         tile_positions = stage_positions[:,1:]
     
-    tile_fusion = TileFusion(
+    tile_fusion = MaxTileFusion(
         ts_dataset = datastore,
         tile_positions = tile_positions,
         output_path=fused_output_path,
