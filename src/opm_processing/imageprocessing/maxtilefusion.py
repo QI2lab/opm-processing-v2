@@ -215,11 +215,12 @@ class TileFusion:
 
                 # **Read existing fused image region before modifying**
                 existing_fused = self.fused_ts[time_idx, :, :, :, y_start:y_end, x_start:x_end].read().result().astype(np.float32)
+                existing_fused = existing_fused[np.newaxis, :, :, :, :, :]
                 existing_weight_sum = np.ones_like(existing_fused)  # Initialize weight sum if uninitialized
 
                 # **Ensure weighted_tile shape matches existing_fused**
                 weighted_tile = (tile_data * weight_mask_reshaped)[np.newaxis, np.newaxis, :, :, :, :]  # Shape: (1,1,C,1,H_tile,W_tile)
-
+                
                 existing_fused += weighted_tile
                 existing_weight_sum += weight_mask_reshaped[np.newaxis, np.newaxis, :, :, :, :]
 
@@ -228,9 +229,9 @@ class TileFusion:
 
                 # Convert to uint16
                 fused_patch = np.clip(existing_fused, 0, 65535).astype(np.uint16)
-
+                
                 # **Asynchronously write the normalized region**
-                future = self.fused_ts[time_idx, :, :, :, y_start:y_end, x_start:x_end].write(fused_patch)
+                future = self.fused_ts[time_idx, :, :, :, y_start:y_end, x_start:x_end].write(fused_patch[0, :, :, :, :, :])
                 write_futures.append(future)
 
             # **Wait for all writes to complete**

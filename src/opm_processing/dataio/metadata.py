@@ -30,7 +30,7 @@ def extract_stage_positions(data):
     
     positions = []
     p_values = []
-
+    first_t = 0
     for entry in data["frame_metadatas"]:
         try:
             idx = entry["mda_event"]["index"]
