@@ -27,7 +27,17 @@ def extract_stage_positions(data):
     stage_positions: np.ndarray
         stage positions in ascending order of position idx ("p")
     """
-    
+    t_values = []
+    for entry in data.get("frame_metadatas", []):
+        try:
+            t_values.append(entry["mda_event"]["index"]["t"])
+        except (KeyError, TypeError):
+            continue
+    if len(t_values) == 0:
+        # no valid t found
+        return np.empty((0, 3), dtype=float)
+    first_t = min(t_values)
+
     positions = []
     p_values = []
     first_t = 0
