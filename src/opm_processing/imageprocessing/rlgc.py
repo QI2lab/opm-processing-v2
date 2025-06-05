@@ -18,10 +18,8 @@ rng = cp.random.default_rng(42)
 DEBUG = False
 
 gc_update_kernel = ElementwiseKernel(
-    # Signature: use Cupy’s alias “float32” (NOT “float”)
     'float32 recon, float32 gradient, float32 consensus_map, float32 H_T_ones',
     'float32 recon_next',
-    # Body: use valid C types (“float”), not “float32”
     '''
     float step = recon / H_T_ones;
     float upd  = recon + gradient * step;
@@ -36,6 +34,9 @@ gc_update_kernel = ElementwiseKernel(
     'gc_update_kernel'
 )
 
+_fft_cache: dict[tuple[int,int,int], tuple[cp.ndarray, cp.ndarray]] = {}
+_H_T_cache: dict[tuple[int,int,int], cp.ndarray] = {}
+
 def next_multiple_of_64(x: int) -> int:
     """Determine the next multiple of 64 greater than or equal to x.
     
@@ -49,13 +50,11 @@ def next_multiple_of_64(x: int) -> int:
     next_64_x: int
         The next multiple of 64 that is greater than or equal to x.
     """
-    
-    next_64_x = int(np.ceil((x + 63) / 63)) * 64
+    next_64_x = int(np.ceil((x + 31) / 31)) * 32
     return next_64_x
 
 def pad_y(image: cp.ndarray, bkd: int) -> tuple[cp.ndarray, int, int]:
-    """
-    Pad y-axis of 3D array by the next multiple of 64 (zyx order).
+    """Pad y-axis of 3D array by the next multiple of 64 (zyx order).
 
     Parameters
     ----------
@@ -90,8 +89,7 @@ def remove_padding_y(
     pad_y_before: int,
     pad_y_after: int
 ) -> cp.ndarray:
-    """
-    Remove y-axis padding added by pad_y.
+    """Remove y-axis padding added by pad_y.
 
     Parameters
     ----------
@@ -111,8 +109,7 @@ def remove_padding_y(
     return image
 
 def pad_psf(psf_temp: cp.ndarray, image_shape: tuple[int, int, int]) -> cp.ndarray:
-    """
-    Pad and center a PSF to match the target image shape.
+    """Pad and center a PSF to match the target image shape.
 
     Parameters
     ----------
@@ -134,11 +131,10 @@ def pad_psf(psf_temp: cp.ndarray, image_shape: tuple[int, int, int]) -> cp.ndarr
         psf = cp.roll(psf, -int(axis_size / 2), axis=axis)
     psf = cp.fft.ifftshift(psf)
     psf = psf / cp.sum(psf)
-    return psf
+    return cp.clip(psf,a_min=1e-12, a_max=2**16-1).astype(cp.float32)
 
 def fft_conv(image: cp.ndarray, OTF: cp.ndarray, shape) -> cp.ndarray:
-    """
-    Perform convolution via FFT: irfftn(rfftn(image) * OTF).
+    """Perform convolution via FFT: irfftn(rfftn(image) * OTF).
 
     Parameters
     ----------
@@ -154,11 +150,20 @@ def fft_conv(image: cp.ndarray, OTF: cp.ndarray, shape) -> cp.ndarray:
     result: cp.ndarray
         Convolved image in object space.
     """
-    return cp.fft.irfftn(cp.fft.rfftn(image) * OTF, s=shape)
+    if shape not in _fft_cache:
+        z, y, x = shape
+        freq_shape = (z, y, x // 2 + 1)
+        fft_buf = cp.empty(freq_shape, dtype=cp.complex64)
+        ifft_buf = cp.empty(shape, dtype=cp.float32)
+        _fft_cache[shape] = (fft_buf, ifft_buf)
+    fft_buf, ifft_buf = _fft_cache[shape]
+    fft_buf[...] = cp.fft.rfftn(image)
+    fft_buf[...] *= OTF
+    ifft_buf[...] = cp.fft.irfftn(fft_buf, s=shape)
+    return cp.clip(ifft_buf,a_min=1e-12, a_max=2**16-1)
 
 def kl_div(p: cp.ndarray, q: cp.ndarray) -> float:
-    """
-    Compute Kullback–Leibler divergence between two distributions.
+    """Compute Kullback–Leibler divergence between two distributions.
 
     Parameters
     ----------
@@ -179,7 +184,23 @@ def kl_div(p: cp.ndarray, q: cp.ndarray) -> float:
     kldiv = p * (cp.log(p) - cp.log(q))
     kldiv[cp.isnan(kldiv)] = 0
     kldiv = cp.sum(kldiv)
-    return kldiv
+    return float(kldiv)
+
+def _get_H_T_ones(otf: cp.ndarray, otfT: cp.ndarray, shape: tuple[int,int,int]) -> cp.ndarray:
+    if shape in _H_T_cache:
+        return _H_T_cache[shape]
+    ones = cp.ones(shape, dtype=cp.float32)
+    freq_shape = (shape[0], shape[1], shape[2] // 2 + 1)
+    fft_buf = cp.empty(freq_shape, dtype=cp.complex64)
+    ifft_buf = cp.empty(shape, dtype=cp.float32)
+    fft_buf[...] = cp.fft.rfftn(ones)
+    fft_buf[...] *= otf
+    ifft_buf[...] = cp.fft.irfftn(fft_buf, s=shape)
+    fft_buf[...] = cp.fft.rfftn(ifft_buf)
+    fft_buf[...] *= otfT
+    ifft_buf[...] = cp.fft.irfftn(fft_buf, s=shape)
+    _H_T_cache[shape] = ifft_buf
+    return cp.clip(ifft_buf,a_min=1e-12, a_max=2**16-1).astype(cp.float32)
 
 def rlgc_biggs(
     image: np.ndarray,
@@ -217,69 +238,56 @@ def rlgc_biggs(
     image_gpu, pad_y_before, pad_y_after = pad_y(
         cp.asarray(image, dtype=cp.float32), bkd
     )
-
     if isinstance(psf, np.ndarray) and otf is None and otfT is None:
         psf_gpu = pad_psf(cp.asarray(psf, dtype=cp.float32), image_gpu.shape)
         otf = cp.fft.rfftn(psf_gpu)
         otfT = cp.conjugate(otf)
-        otfotfT = otf * otfT
         del psf_gpu
         cp.get_default_memory_pool().free_all_blocks()
-    else:
-        otfotfT = otf * otfT
-
+    otfotfT = cp.clip(cp.real(otf * otfT).astype(cp.float32),a_min=1e-12, a_max=2**16-1).astype(cp.float32)
     shape = image_gpu.shape
-
-    ones = cp.ones(shape, dtype=cp.float32)
-    H_T_ones = fft_conv(fft_conv(ones, otf, shape), otfT, shape)
-
+    z, y, x = shape
     recon = cp.full(shape, cp.mean(image_gpu), dtype=cp.float32)
     previous_recon = cp.empty_like(recon)
-    previous_recon[:] = recon
-
+    previous_recon[...] = recon
+    recon_next = cp.empty_like(recon)
     split1 = cp.empty_like(recon)
     split2 = cp.empty_like(recon)
-
     Hu = cp.empty_like(recon)
     Hu_safe = cp.empty_like(recon)
-
     HTratio1 = cp.empty_like(recon)
     HTratio2 = cp.empty_like(recon)
     HTratio = cp.empty_like(recon)
-
-    consensus_map = cp.zeros_like(recon)
+    consensus_map = cp.empty_like(recon)
     g1 = cp.zeros_like(recon)
     g2 = cp.zeros_like(recon)
-    recon_next = cp.empty_like(recon)
-
+    H_T_ones = _get_H_T_ones(otf, otfT, shape)
     prev_kld1 = np.inf
     prev_kld2 = np.inf
     num_iters = 0
     start_time = timeit.default_timer()
-
     while True:
         iter_start_time = timeit.default_timer()
-
-        split1[:] = rng.binomial(image_gpu.astype(cp.int64), p=0.5).astype(cp.float32)
+        split1[...] = rng.binomial(image_gpu.astype(cp.int64), p=0.5).astype(cp.float32)
         cp.subtract(image_gpu, split1, out=split2)
-
         if num_iters >= 2:
             numerator = cp.sum(g1 * g2)
             denominator = cp.sum(g2 * g2) + 1e-12
             alpha = numerator / denominator
             alpha = cp.clip(alpha, 0.0, 1.0)
+            alpha = float(alpha)
         else:
             alpha = 0.0
-
-        recon_next[:] = recon + alpha * (recon - previous_recon)
-
-        Hu[:] = fft_conv(recon_next, otf, shape)
-
+        temp = recon - previous_recon
+        cp.multiply(temp, alpha, out=temp)
+        cp.add(recon, temp, out=recon_next)
+        recon, recon_next = recon_next, recon
+        previous_recon[...] = recon
+        Hu[...] = fft_conv(recon, otf, shape)
         kld1 = kl_div(Hu, split1)
         kld2 = kl_div(Hu, split2)
-
-        if ((kld1 > prev_kld1) and (kld2 > prev_kld2)) or (kld1 < 1e-2) or (kld2 < 1e-2):
-            recon[:] = previous_recon
+        if (kld1 > prev_kld1) or (kld2 > prev_kld2) or (kld1 < 1e-1) or (kld2 < 1e-1):
+            recon[...] = previous_recon
             if DEBUG:
                 total_time = timeit.default_timer() - start_time
                 print(
@@ -287,27 +295,18 @@ def rlgc_biggs(
                     f"in {total_time:.1f} seconds."
                 )
             break
-
         prev_kld1 = kld1
         prev_kld2 = kld2
-
-        previous_recon[:], recon[:] = recon, recon_next
-
         cp.add(Hu, 1e-12, out=Hu_safe)
-
-        ratio1 = split1 / Hu_safe
-        cp.subtract(ratio1, 0.5, out=ratio1)
-        HTratio1[:] = fft_conv(ratio1, otfT, shape)
-
-        ratio2 = split2 / Hu_safe
-        cp.subtract(ratio2, 0.5, out=ratio2)
-        HTratio2[:] = fft_conv(ratio2, otfT, shape)
-
-        HTratio[:] = HTratio1 + HTratio2
-
-        consensus_input = HTratio1 * HTratio2
-        consensus_map[:] = fft_conv(consensus_input, otfotfT, shape)
-
+        cp.divide(split1, Hu_safe, out=split1)
+        cp.subtract(split1, 0.5, out=split1)
+        HTratio1[...] = fft_conv(split1, otfT, shape)
+        cp.divide(split2, Hu_safe, out=split2)
+        cp.subtract(split2, 0.5, out=split2)
+        HTratio2[...] = fft_conv(split2, otfT, shape)
+        cp.add(HTratio1, HTratio2, out=HTratio)
+        cp.multiply(HTratio1, HTratio2, out=split1)
+        consensus_map[...] = fft_conv(split1, otfotfT, shape)
         gc_update_kernel(
             recon,
             HTratio,
@@ -315,27 +314,22 @@ def rlgc_biggs(
             H_T_ones,
             recon_next
         )
-
-        g2[:], g1[:] = g1, recon_next - recon
-        recon[:] = recon_next
-
+        temp_g2 = recon_next - recon
+        g2[...] = g1
+        g1[...] = temp_g2
+        recon[...] = recon_next
         num_iters += 1
-
         if DEBUG:
             calc_time = timeit.default_timer() - iter_start_time
             print(
                 f"Iteration {num_iters:03d} completed in {calc_time:.3f}s. "
                 f"KLDs: {kld1:.4f} (split1), {kld2:.4f} (split2)."
             )
-
-        cp.get_default_memory_pool().free_all_blocks()
-
     recon = cp.clip(recon, 0, 2**16 - 1).astype(cp.uint16)
     recon = remove_padding_y(recon, pad_y_before, pad_y_after)
+    del recon_next, g1, g2, H_T_ones
     cp.get_default_memory_pool().free_all_blocks()
-
     return cp.asnumpy(recon)
-
 
 def chunked_rlgc(
     image: np.ndarray, 
@@ -365,16 +359,13 @@ def chunked_rlgc(
         deconvolved image.
     """
     
+    cp.fft._cache.PlanCache(memsize=0)
     output = np.zeros_like(image)
-    
     crop_size = (scan_chunk_size, image.shape[-2], image.shape[-1])
     overlap = (scan_overlap_size, 0, 0)
     slices = Slicer(image, crop_size=crop_size, overlap=overlap)
-    
     for crop, source, destination in tqdm(slices,desc="decon chunk:",leave=False):
-        
-        crop_array = rlgc_biggs(crop,psf,bkd)
+        crop_array = rlgc_biggs(crop, psf, bkd)
         cp.get_default_memory_pool().free_all_blocks()
         output[destination] = crop_array[source]
-        
     return output

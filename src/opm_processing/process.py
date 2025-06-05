@@ -374,36 +374,39 @@ def process_skewed(
 
                     # This code is for debugging RLGC deconvolution
                     # ------------------------------------
-                    # decon_temp = chunked_rlgc(
-                    #     camera_corrected_data, 
-                    #     psf,
-                    #     scan_chunk_size=384,
-                    #     scan_overlap_size=64
-                    # )
+                    decon_temp = chunked_rlgc(
+                        camera_corrected_data, 
+                        psf,
+                        scan_chunk_size=256,
+                        scan_overlap_size=32,
+                        bkd=0
+                    )
                     
-                    # import napari
-                    # viewer = napari.Viewer()
-                    # viewer.add_image(decon_temp)
-                    # viewer.add_image(camera_corrected_data)
-                    # napari.run()
+                    import napari
+                    viewer = napari.Viewer()
+                    viewer.add_image(decon_temp)
+                    viewer.add_image(camera_corrected_data)
+                    napari.run()
                     # ------------------------------------
                     if camera_corrected_data.shape[1]==256:
-                        chunk_size = 384
+                        chunk_size = 256
+                        overlap_size = 32
                     elif camera_corrected_data.shape[1]==512:
-                        chunk_size = 196
+                        chunk_size = 128
+                        overlap_size = 32
                     if flyback_crop is not None:
                         deconvolved_data = chunked_rlgc(
                             camera_corrected_data[excess_scan_positions:-flyback_crop,:,:],
                             np.asarray(psfs[chan_idx]),
                             scan_chunk_size=chunk_size,
-                            scan_overlap_size=64
+                            scan_overlap_size=overlap_size
                         )
                     else:
                         deconvolved_data = chunked_rlgc(
                             camera_corrected_data[excess_scan_positions:,:,:],
                             np.asarray(psfs[chan_idx]),
                             scan_chunk_size=chunk_size,
-                            scan_overlap_size=64
+                            scan_overlap_size=overlap_size
                         )
                     deskewed = orthogonal_deskew(
                         deconvolved_data,
@@ -685,7 +688,6 @@ def process_projection(
     }
     datastore = ts.open(spec).result()
     
-    opm_mode = str(find_key(zattrs, "mode"))    
     pixel_size_um = float(find_key(zattrs,"pixel_size_um"))
     opm_tilt_deg = float(find_key(zattrs,"angle_deg"))    
     camera_offset = float(find_key(zattrs,"offset"))
