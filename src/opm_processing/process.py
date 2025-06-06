@@ -672,9 +672,9 @@ def process_projection(
     write_fused_max_projection_tiff: bool, default = False
         Write fused maxZ  projection to OME-TIFF file.
     time_range: list[int,int], default = None
-        Range of timepoints to reconstruct.
+        Range of timepoints to process.
     pos_range: list[int,int], default = None
-        Range of stage positions to reconstruct.     
+        Range of stage positions to process.
     """
     
     # open raw datastore
