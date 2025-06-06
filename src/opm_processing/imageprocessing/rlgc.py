@@ -290,6 +290,7 @@ def rlgc_biggs(
         Hu[...] = fft_conv(recon, otf, shape)
         kld1 = kl_div(Hu, split1)
         kld2 = kl_div(Hu, split2)
+
         if (kld1 > prev_kld1) or (kld2 > prev_kld2) or (kld1 < 1e-1) or (kld2 < 1e-1):
             recon[...] = previous_recon
             if DEBUG:
