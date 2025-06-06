@@ -196,6 +196,43 @@ def create_psf_silicone_100x(
     
     return psf
 
+def generate_proj_psf(
+    em_wvl: float,
+    pixel_size_um: float = 0.115,
+    pz : float = 0.0,
+    plot=False
+):
+    
+    silicone_lens = {
+
+        'ni0': 1.4, # immersion medium RI design value
+        'ni': 1.4,  # immersion medium RI experimental value
+        'tg0': 170, # microns, coverslip thickness design value
+        'tg': 170,  # microns, coverslip thickness
+        'ns': 1.38,  # specimen refractive index
+        'ti0': 300,
+    }
+    #ex_lens = {**silicone_lens, 'NA': ex_NA}
+    em_lens = {**silicone_lens, 'NA': 1.35}
+
+    psf = psfm.vectorial_psf(zv=0,nx=51,dxy=pixel_size_um,pz=pz,wvl=em_wvl,params=em_lens)
+    psf = psf / np.sum(psf)
+    if psf.ndim == 2:
+        psf = psf[np.newaxis, :, :]
+    x = np.linspace(1, psf.shape[1], psf.shape[1])
+    x = x - psf.shape[1] / 2
+    y = np.linspace(1, psf.shape[2], psf.shape[2])
+    y = y - psf.shape[2] / 2
+    x, y = np.meshgrid(x, y)
+    r = np.sqrt(np.power(x, 2) + np.power(y, 2))
+    sigma = 10
+    filter = np.exp(-np.power(r, 2) / (2 * sigma**2))
+    filter = filter / np.max(filter)
+
+    psf = psf * filter
+    
+    return psf
+
 def generate_skewed_psf(
     em_wvl: float,
     pixel_size_um: float = 0.115,

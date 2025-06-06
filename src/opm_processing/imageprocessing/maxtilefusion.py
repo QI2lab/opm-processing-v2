@@ -1,9 +1,9 @@
 import numpy as np
 import tensorstore as ts
 from pathlib import Path
-from tqdm import tqdm, trange
+from tqdm import tqdm
 
-class TileFusion:
+class MaxTileFusion:
     """
     A class for fusing multiple overlapping image tiles stored in a TensorStore dataset.
 
@@ -19,6 +19,7 @@ class TileFusion:
         Pixel size (y, x) in physical units.
     pad_yx : list of int, default  = [0, 0].
         Padding in y and x dimensions already applied to the dataset
+    time_range: list of int, default = None
     """
     
     def __init__(
@@ -27,7 +28,8 @@ class TileFusion:
         tile_positions: list[float,float], 
         output_path: str|Path, 
         pixel_size: tuple[float,float],
-        pad_yx: list[int,int] = [0,0]
+        pad_yx: list[int,int] = [0,0],
+        time_range: list[int] = None
     ):
         self.pad_y = pad_yx[0]
         self.pad_x = pad_yx[1]
@@ -51,6 +53,7 @@ class TileFusion:
         self.chunk_size = 512
         
         self.tile_shape = (height, width)
+        self.time_range = time_range
 
         self.fused_shape, self.offset = self.compute_fused_image_space()
         self.weight_mask = self.generate_blending_weights()
@@ -147,6 +150,11 @@ class TileFusion:
 
         # Define shard shape as one full tile
         shard_shape = [1, 1, self.channels, 1, self.chunks_per_shard*self.chunk_size, self.chunks_per_shard*self.chunk_size]  
+        
+        if self.time_range is not None:
+            time_to_use = self.time_range[1] - self.time_range[0]
+        else:
+            time_to_use = self.time_dim
 
         config = {
                 "driver": "zarr3",
@@ -155,7 +163,7 @@ class TileFusion:
                     "path": str(self.output_path)
                 },
                 "metadata": {
-                    "shape": [self.time_dim, 1, self.channels, 1, *self.fused_shape],
+                    "shape": [time_to_use, 1, self.channels, 1, *self.fused_shape],
                     "chunk_grid": {
                         "name": "regular",
                         "configuration": {
@@ -195,9 +203,17 @@ class TileFusion:
         """
         write_futures = []
         
-        for time_idx in trange(self.time_dim):
-
-            for tile_idx, (y, x) in enumerate(tqdm(self.tile_positions, desc="Processing tiles")):
+        if self.time_range is not None:
+            time_iterator = tqdm(range(self.time_range[0],self.time_range[1]),desc="t",leave=True)
+        else:
+            time_iterator = tqdm(range(self.time_dim),desc="t",leave=True)
+        if self.time_dim > 1 or self.time_range[1] > 1:
+            refresh_position_iterator = True
+            
+        pos_iterator = enumerate(tqdm(self.tile_positions, desc="p",leave=False))
+        
+        for time_idx in time_iterator:
+            for tile_idx, (y, x) in pos_iterator:
                 # Read tile correctly from its respective position
                 tile_data = self.ts_dataset[time_idx, tile_idx, :, 0, :, :].read().result().astype(np.float32)  # Shape: (C, H_tile, W_tile)
 
@@ -215,11 +231,13 @@ class TileFusion:
 
                 # **Read existing fused image region before modifying**
                 existing_fused = self.fused_ts[time_idx, :, :, :, y_start:y_end, x_start:x_end].read().result().astype(np.float32)
+                if existing_fused.ndim == 5:
+                    existing_fused = existing_fused[np.newaxis, ...]
                 existing_weight_sum = np.ones_like(existing_fused)  # Initialize weight sum if uninitialized
 
                 # **Ensure weighted_tile shape matches existing_fused**
                 weighted_tile = (tile_data * weight_mask_reshaped)[np.newaxis, np.newaxis, :, :, :, :]  # Shape: (1,1,C,1,H_tile,W_tile)
-
+                
                 existing_fused += weighted_tile
                 existing_weight_sum += weight_mask_reshaped[np.newaxis, np.newaxis, :, :, :, :]
 
@@ -228,14 +246,17 @@ class TileFusion:
 
                 # Convert to uint16
                 fused_patch = np.clip(existing_fused, 0, 65535).astype(np.uint16)
-
+                
                 # **Asynchronously write the normalized region**
-                future = self.fused_ts[time_idx, :, :, :, y_start:y_end, x_start:x_end].write(fused_patch)
+                future = self.fused_ts[time_idx, :, :, :, y_start:y_end, x_start:x_end].write(fused_patch[0, :, :, :, :, :])
                 write_futures.append(future)
 
             # **Wait for all writes to complete**
             for future in write_futures:
                 future.result()
+                
+            if refresh_position_iterator:    
+                pos_iterator = enumerate(tqdm(self.tile_positions, desc="p",leave=False))
 
     def run(self):
         """

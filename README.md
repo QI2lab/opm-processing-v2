@@ -15,6 +15,7 @@ The core algorithms can be used for any microscope that acquires data at a skewe
 The goal is provide highly performant data I/O via [Tensorstore](https://google.github.io/tensorstore/) and image processing (illumination correction, deconvolution, deskewing, downsampling, maximum Z projection, and 3D stitching+fusion) via [Numba](https://numba.pydata.org/), [CuPy](https://cupy.dev/), and [cuCIM](https://github.com/rapidsai/cucim?tab=readme-ov-file).
 
 We rely on [BaSiCPy](https://github.com/peng-lab/BaSiCPy) to post-hoc estimate illumination profiles and a modified version of [gradient consensus Richardson-Lucy deconvolution](https://zenodo.org/records/10278919) to perform 3D deconvolution.
+
 ## Installation
 
 Create a python 3.12 environment,
@@ -27,13 +28,12 @@ activate the environment,
 conda activate opmprocessing
 ```
 
-install the repository and register the local cuda
+install the repository and register the local cuda code. On Windows, this will also install the `skimage` portion of `cucim`.
 ```bash
 pip install "opm-processing-v2 @ git+https://github.com/QI2lab/opm-processing-v2"
 setup-cuda
 conda deactivate opmprocessing
 ```
-
 
 ## Usage
 
@@ -44,17 +44,23 @@ conda activate opmprocessing
 
 To deskew raw data,
 ```bash
-deskew "/path/to/qi2lab_acquisition.zarr"
+process "/path/to/qi2lab_acquisition.zarr"
 ```
 
 If you get an error, make sure you ran `setup-cuda`!
 
-The defaults parameters generate three zarr3 compliant datastores:
+The defaults parameters generate different outputs depending if it acquisition is of oblique or projection data.
+
+For oblique data, there are three zarr3 compliant datastores:
 1. Full 3D data (`/path/to/qi2lab_acquisition_deskewed.zarr`) with dimensions `tpczyx`.
 2. Maximum Z projections (`/path/to/qi2lab_acquisition_max_z_deskewed.zarr`) with dimensions `tpcyx`. 
 3. Stage-position fused maximum z projections (`/path/to/qi2lab_acquisition_maxz.zarr`) with dimensions `tcyx`.
 
-All three datastores are camera offset and gain corrected. The fused datastore uses the provided stage positions, without optimization.
+For projection data, there are two zarr3 compliant datastores:
+1. Full 2D projection data (`/path/to/qi2lab_acquisition_deconvolved.zarr`) with dimensions `tpczyx`.
+2. Stage-position fused 2D projection data (`/path/to/qi2lab_acquisition_fused.zarr`) with dimensions `tcyx`.
+
+All datastores are camera offset and gain corrected. The fused datastore uses the provided stage positions, without optimization.
 
 To display deskewed data, 
 ```bash
