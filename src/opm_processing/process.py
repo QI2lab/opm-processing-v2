@@ -662,9 +662,9 @@ def process_skewed(
 def process_projection(
     root_path: Path,
     zattrs: dict, 
-    deconvolve: bool = False,
-    flatfield_correction: bool = False,
-    write_fused_max_projection_tiff: bool = False,
+    deconvolve: bool = True,
+    flatfield_correction: bool = True,
+    write_fused_max_projection_tiff: bool = True,
     time_range: tuple[int,int] = None,
     pos_range: tuple[int,int] = None,
 ):
@@ -744,6 +744,8 @@ def process_projection(
         for pos_idx, _ in enumerate(stage_positions):
             stage_positions[pos_idx,0] = stage_z_max - stage_positions[pos_idx,0]
             
+    print(stage_positions)
+            
     if time_range is not None:
         time_shape = time_range[1]
     else:
@@ -799,8 +801,11 @@ def process_projection(
         time_iterator = tqdm(range(time_range[0],time_range[1]),desc="t",leave=True)
     else:
         time_iterator = tqdm(range(time_shape),desc="t",leave=True)
+        
     if time_shape > 1 or time_range[1] > 1:
         refresh_position_iterator = True
+    else:
+        refresh_position_iterator = False
         
     if pos_range is not None:
         pos_iterator = tqdm(range(pos_range[0],pos_range[1]),desc="p",leave=False)
@@ -818,8 +823,6 @@ def process_projection(
                             psf = generate_proj_psf(
                                 em_wvl=float(int(str(channels[psf_idx]).rstrip("nm")) / 1000),
                                 pixel_size_um=pixel_size_um,
-                                pz=0.0,
-                                plot=False
                             )
                             psfs.append(psf)
 

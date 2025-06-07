@@ -277,7 +277,7 @@ def create_psf_water_40x(
 def generate_proj_psf(
     em_wvl: float,
     pixel_size_um: float = 0.115,
-    pz : float = 0.0,
+    pz : float = 15.0,
     plot=False
 ):
     
