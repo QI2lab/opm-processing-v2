@@ -17,7 +17,7 @@ warnings.simplefilter("ignore", category=FutureWarning)
 
 from pathlib import Path
 import tensorstore as ts
-from opm_processing.imageprocessing.opmpsf import generate_skewed_psf, generate_proj_psf
+from opm_processing.imageprocessing.opmpsf import generate_skewed_psf, generate_proj_psf, ASI_generate_skewed_psf
 from opm_processing.imageprocessing.rlgc import chunked_rlgc, rlgc_biggs
 from opm_processing.imageprocessing.opmtools import orthogonal_deskew, deskew_shape_estimator
 from opm_processing.imageprocessing.maxtilefusion import MaxTileFusion
@@ -27,7 +27,7 @@ import json
 import numpy as np
 from tqdm import tqdm
 import typer
-from tifffile import TiffWriter, imread
+from tifffile import TiffWriter, imread, TiffFile
 
 app = typer.Typer()
 app.pretty_exceptions_enable = False
@@ -80,39 +80,64 @@ def process(
         Range of stage positions to reconstruct.     
     """
     
-    # Read metadata
-    zattrs_path = root_path / Path(".zattrs")
-    with open(zattrs_path, "r") as f:
-        zattrs = json.load(f)
+    if root_path.suffix == ".zarr":
+        # Read metadata
+        zattrs_path = root_path / Path(".zattrs")
+        with open(zattrs_path, "r") as f:
+            zattrs = json.load(f)
 
-    opm_mode = str(find_key(zattrs, "mode"))
-    
-    if "mirror" in opm_mode or "stage" in opm_mode:
-        process_skewed(
-            root_path,
-            zattrs, 
-            deconvolve,
-            max_projection,
-            flatfield_correction,
-            create_fused_max_projection,
-            write_fused_max_projection_tiff,
-            z_downsample_level,
-            crop_after_deskew,
-            time_range,
-            pos_range,
-            excess_overide,
-            flyback_crop
-        )
-    elif "projection" in opm_mode:
-        process_projection(
-            root_path,
-            zattrs, 
-            deconvolve,
-            flatfield_correction,
-            write_fused_max_projection_tiff,
-            time_range,
-            pos_range,
-        )
+        opm_mode = str(find_key(zattrs, "mode"))
+        
+        if "mirror" in opm_mode or "stage" in opm_mode:
+            process_skewed(
+                root_path,
+                zattrs, 
+                deconvolve,
+                max_projection,
+                flatfield_correction,
+                create_fused_max_projection,
+                write_fused_max_projection_tiff,
+                z_downsample_level,
+                crop_after_deskew,
+                time_range,
+                pos_range,
+                excess_overide,
+                flyback_crop
+            )
+        elif "projection" in opm_mode:
+            process_projection(
+                root_path,
+                zattrs, 
+                deconvolve,
+                flatfield_correction,
+                write_fused_max_projection_tiff,
+                time_range,
+                pos_range,
+            )
+    elif root_path.suffixes[-2:] == [".ome", ".tif"]:
+        with TiffFile(root_path) as tif:
+            axes = tif.series[0].axes
+            all_metadata = dict(tif.micromanager_metadata)
+            micromanager_metadata = all_metadata["Summary"]
+            asi_metadata = json.loads(all_metadata['Summary']["SPIMAcqSettings"])
+            write_fused_tiff = True
+            z_downsample_level = 4
+            process_ASI_SCOPE(
+                root_path,
+                axes,
+                micromanager_metadata,
+                asi_metadata,
+                deconvolve,
+                max_projection,
+                flatfield_correction,
+                create_fused_max_projection,
+                write_fused_max_projection_tiff,
+                write_fused_tiff,
+                z_downsample_level,
+                crop_after_deskew,
+                time_range,
+                pos_range,
+            )
     
 def process_skewed(
     root_path: Path,
@@ -637,9 +662,9 @@ def process_skewed(
 def process_projection(
     root_path: Path,
     zattrs: dict, 
-    deconvolve: bool = False,
-    flatfield_correction: bool = False,
-    write_fused_max_projection_tiff: bool = False,
+    deconvolve: bool = True,
+    flatfield_correction: bool = True,
+    write_fused_max_projection_tiff: bool = True,
     time_range: tuple[int,int] = None,
     pos_range: tuple[int,int] = None,
 ):
@@ -718,7 +743,7 @@ def process_projection(
         stage_z_max = np.max(stage_positions[:,0])
         for pos_idx, _ in enumerate(stage_positions):
             stage_positions[pos_idx,0] = stage_z_max - stage_positions[pos_idx,0]
-            
+                        
     if time_range is not None:
         time_shape = time_range[1]
     else:
@@ -774,8 +799,11 @@ def process_projection(
         time_iterator = tqdm(range(time_range[0],time_range[1]),desc="t",leave=True)
     else:
         time_iterator = tqdm(range(time_shape),desc="t",leave=True)
+        
     if time_shape > 1 or time_range[1] > 1:
         refresh_position_iterator = True
+    else:
+        refresh_position_iterator = False
         
     if pos_range is not None:
         pos_iterator = tqdm(range(pos_range[0],pos_range[1]),desc="p",leave=False)
@@ -793,8 +821,6 @@ def process_projection(
                             psf = generate_proj_psf(
                                 em_wvl=float(int(str(channels[psf_idx]).rstrip("nm")) / 1000),
                                 pixel_size_um=pixel_size_um,
-                                pz=0.0,
-                                plot=False
                             )
                             psfs.append(psf)
 
@@ -911,6 +937,584 @@ def process_projection(
                 **options,
                 metadata=metadata
             )
+            
+            
+def process_ASI_SCOPE(
+    root_path: Path,
+    axes: str,
+    micromanager_metadata: dict,
+    asi_metadata: dict,
+    deconvolve: bool = False,
+    max_projection: bool = True,
+    flatfield_correction: bool = False,
+    create_fused_max_projection: bool = True,
+    write_fused_max_projection_tiff: bool = False,
+    write_fused_tiff: bool = True,
+    z_downsample_level: int = 4,
+    crop_after_deskew: bool = False,
+    time_range: tuple[int,int] = None,
+    pos_range: tuple[int,int] = None
+):
+    """Postprocess ASI SCOPE OPM dataset.
+    
+    This code assumes data is generated by ASI MM plugin GUI and the resulting data is \
+    saved using ome.tiff handler. All revelant metadata is read from imaging \
+    files, including stage transformation, camera parameters, and channels.
+    
+    Usage: `process "/path/to/asi_scope_acquisition.ome.tiff"`
+    
+    See docstring for the various options available.
+    
+    Outputs are in:
+    - Deskewed 3D individual deskewed tiles: \
+        `"/path/to/qi2lab_acquisition_deskewed.zarr"`
+    - Maximum Z projected individual deskewed tiles: \
+        `"/path/to/qi2lab_acquisition_max_z_deskewed.zarr"`
+    - Maximum Z projection fused deskewed tiles: \
+        `"/path/to/qi2lab_acquisition_max_z_fused.zarr"`
+    
+    Parameters
+    ----------
+    root_path: Path
+        Path to OPM pymmcoregui zarr file.
+    axes: str
+        Axes of the OME-TIFF file.
+    micromanager_metadata: dict
+        Micromanager metadata dictionary containing OPM data attributes.
+    asi_metadata: dict
+        ASI metadata dictionary containing OPM data attributes.
+    deconvolve: bool, default = False
+        Deconvolve the data using RLGC.
+    max_projection: bool, default = True
+        Create a maximum projection datastore.
+    flatfield_correction: bool, default = True
+        Estimate and apply flatfield correction on raw data.
+    create_fused_max_projection: bool, default = True
+        Create stage position fused max Z projection.
+    write_fused_max_projection_tiff: bool, default = False
+        Write fused maxZ  projection to OME-TIFF file.
+    z_downsample_level: int, default = 2
+        Amount to downsample deskewed data in z.
+    time_range: list[int,int], default = None
+        Range of timepoints to reconstruct.
+    pos_range: list[int,int], default = None
+        Range of stage positions to reconstruct.     
+    """
+    
+    import zarr
+    import re
+    
+    store = imread(root_path, aszarr=True)
+    datastore = zarr.open(store,mode="r")
+    
+    if datastore.ndim != 6:
+        if axes == "TZCYX":
+            datastore = np.swapaxes(datastore,1,2)
+            datastore = datastore[:,None,:,:,:]
+        elif axes == "ZCYX":
+            datastore = np.swapaxes(datastore,0,1)
+            datastore = datastore[None,None,:,:,:,:]
+        elif axes == "CZYX":
+            datastore = datastore[None,None,:,:,:,:]
+        elif axes == "TZYX":
+            datastore = datastore[:,None,None,:,:,:]
+    
+    tif = TiffFile(root_path,is_mmstack=False)
+    per_image_metadata = dict(tif.series[0].pages[0].tags['MicroManagerMetadata'].value)
+    camera_offset = float(per_image_metadata["pvcam-Offset"])
+    if "Dynamic Range" in str(per_image_metadata["pvcam-Port"]):
+        camera_conversion = 0.23
+    elif "Speed" in str(per_image_metadata["pvcam-Port"]):
+        camera_conversion = 0.85
+    elif "Sensitivity" in str(per_image_metadata["pvcam-Port"]):
+        camera_conversion = 0.25
+    elif "Sub-Electron" in str(per_image_metadata["pvcam-Port"]):
+        camera_conversion = 0.015
+    del tif
+        
+    asi_step_um = float(micromanager_metadata["z-step_um"])
+    pixel_size_um = float(micromanager_metadata["PixelSize_um"])
+    asi_tilt_deg = float(micromanager_metadata["StageScanAnglePathA"])
+    opm_tilt_deg = 90 - asi_tilt_deg
+    scan_axis_step_um = asi_step_um / np.tan(np.deg2rad(asi_tilt_deg))
+
+    if asi_metadata["isStageScanning"]:
+        opm_mode = "stage"
+    else:
+        opm_mode = "mirror"
+
+    em_values = []
+    for ch in asi_metadata["channels"]:
+        config = ch.get('config_', '')
+        match = re.search(r'(\d+(?:\.\d+)?)\s*em', config)
+        if match:
+            em_values.append(float(match.group(1)) / 1000.0)
+
+    stage_positions = np.asarray([
+        [
+            float(0.),
+            float(micromanager_metadata['Position_Y'].strip(' µm')),
+            float(micromanager_metadata['Position_X'].strip(' µm'))
+        ]
+    ])
+  
+    # TO DO: start writing these in metadata!
+    stage_x_flipped = False
+    stage_y_flipped = True
+    stage_z_flipped = True
+
+    # flip x positions w.r.t. camera <-> stage orientation
+    # TO DO: this axis is probably affected by the scan_flip flag, need to think
+    #        about that.
+    if stage_x_flipped:
+        stage_x_max = np.max(stage_positions[:,2])
+        for pos_idx, _ in enumerate(stage_positions):
+            stage_positions[pos_idx,2] = stage_x_max - stage_positions[pos_idx,2]
+    
+    # flip y positions w.r.t. camera <-> stage orientation
+    if stage_y_flipped:
+        stage_y_max = np.max(stage_positions[:,1])
+        for pos_idx, _ in enumerate(stage_positions):
+            stage_positions[pos_idx,1] = stage_y_max - stage_positions[pos_idx,1]
+    
+    # flip z positions w.r.t. camera <-> stage orientation
+    if stage_z_flipped:
+        stage_z_max = np.max(stage_positions[:,0])
+        for pos_idx, _ in enumerate(stage_positions):
+            stage_positions[pos_idx,0] = stage_z_max - stage_positions[pos_idx,0]
+    
+    # estimate shape of one deskewed volume
+    deskewed_shape, pad_y, pad_x, crop_y = deskew_shape_estimator(
+        [datastore.shape[-3],datastore.shape[-2],datastore.shape[-1]],
+        theta=opm_tilt_deg,
+        distance=scan_axis_step_um,
+        pixel_size=pixel_size_um,
+        crop_after_deskew=crop_after_deskew
+    )
+        
+    if time_range is not None:
+        time_shape = time_range[1]
+    else:
+        time_shape = datastore.shape[0]
+        
+    if pos_range is not None:
+        pos_shape = pos_range[1]
+    else:
+        pos_shape = datastore.shape[1]
+        
+    datastore_shape = [
+        time_shape,
+        pos_shape,
+        datastore.shape[2],
+        deskewed_shape[0]//z_downsample_level,
+        deskewed_shape[1],
+        deskewed_shape[2]
+    ]
+    # create array to hold one deskewed volume 
+    deskewed = np.zeros(
+        (deskewed_shape[0]//z_downsample_level,deskewed_shape[1],deskewed_shape[2]),
+        dtype=np.uint16
+    )
+    
+    # create tensorstore object for writing. This is NOT compatible with OME-NGFF!
+    if not(deconvolve):
+        output_path = root_path.parents[0] / Path(str(root_path.stem)+"_deskewed.zarr")
+    else:
+        output_path = root_path.parents[0] / Path(str(root_path.stem)+"_decon_deskewed.zarr")
+    ts_store = create_via_tensorstore(output_path,datastore_shape)
+    
+    if max_projection:
+        max_z_datastore_shape = [
+            time_shape,
+            pos_shape,
+            datastore.shape[2],
+            1,
+            deskewed_shape[1],
+            deskewed_shape[2]
+        ]
+
+        # create array to hold one maximum projection deskewed volume 
+        max_z_deskewed = np.zeros(
+            (1,deskewed_shape[1],deskewed_shape[2]),
+            dtype=np.uint16
+        )
+
+        # create tensorstore object for writing. This is NOT compatible with OME-NGFF!
+        if not(deconvolve):
+            max_z_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_z_deskewed.zarr")
+        else:
+            max_z_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_z_decon_deskewed.zarr")
+        max_z_ts_store = create_via_tensorstore(max_z_output_path,max_z_datastore_shape)
+        
+    
+    if flatfield_correction:
+        flatfield_dir = root_path.parents[0] / Path("flatfield")
+        if not(flatfield_dir.exists()):
+            flatfield_dir.mkdir()
+        flatfield_path = root_path.parents[0] / Path("flatfield") / Path(str(root_path.stem)+"_flatfield.ome.tif")
+        if flatfield_path.exists():
+            flatfields = imread(flatfield_path).astype(np.float32)
+        else:
+            flatfields = call_estimate_illuminations(datastore, camera_offset, camera_conversion)
+            with TiffWriter(flatfield_path, bigtiff=True) as tif:
+                metadata={
+                    'axes': "CYX",
+                    'SignificantBits': 32,
+                    'PhysicalSizeX': pixel_size_um,
+                    'PhysicalSizeXUnit': 'µm',
+                    'PhysicalSizeY': pixel_size_um,
+                    'PhysicalSizeYUnit': 'µm',
+                }
+                options = dict(
+                    photometric='minisblack',
+                    resolutionunit='CENTIMETER',
+                )
+                tif.write(
+                    flatfields,
+                    resolution=(
+                        1e4 / pixel_size_um,
+                        1e4 / pixel_size_um
+                    ),
+                    **options,
+                    metadata=metadata
+                )
+    else:
+        flatfields = np.ones((datastore.shape[2],datastore.shape[-2],datastore.shape[-1]),dtype=np.float32)
+        
+    # loop over all components and stream to zarr using tensorstore
+    ts_writes = []
+    if max_projection:
+        ts_max_writes = []
+        
+    if time_range is not None:
+        time_iterator = tqdm(range(time_range[0],time_range[1]),desc="t")
+    else:
+        time_iterator = tqdm(range(datastore.shape[0]),desc="t")
+        
+    if pos_range is not None:
+        pos_iterator = tqdm(range(pos_range[0],pos_range[1]),desc="p",leave=False)
+    else:
+        pos_iterator = tqdm(range(datastore.shape[1]),desc="p",leave=False)
+    
+    for t_idx in time_iterator:
+        for pos_idx in pos_iterator:
+            for chan_idx in tqdm(range(datastore.shape[2]),desc="c",leave=False):
+                camera_corrected_data = ((np.squeeze(np.asarray(datastore[t_idx,pos_idx,chan_idx,:],dtype=np.float32)-camera_offset)*camera_conversion)/flatfields[chan_idx,:].astype(np.float32)).clip(0,2**16-1).astype(np.uint16)
+                if "stage" in opm_mode:
+                    flip_scan = True
+                else:
+                    flip_scan = False
+                
+                if flip_scan:
+                    camera_corrected_data = np.flip(camera_corrected_data,axis=0)
+                    
+                if deconvolve:
+                    if pos_idx == 0 and chan_idx == 0:
+                        psfs = []
+                        for psf_idx in range(datastore.shape[2]):
+                            psf = ASI_generate_skewed_psf(
+                                em_wvl=em_values[psf_idx],
+                                pixel_size_um=pixel_size_um,
+                                scan_axis_step_um=scan_axis_step_um,
+                                theta_deg = opm_tilt_deg,
+                                pz=0.0,
+                                plot=False
+                            )
+                            psfs.append(psf)
+
+                    # This code is for debugging RLGC deconvolution
+                    # ------------------------------------
+                    # decon_temp = chunked_rlgc(
+                    #     camera_corrected_data, 
+                    #     psf,
+                    #     scan_chunk_size=256,
+                    #     scan_overlap_size=32,
+                    #     bkd=0
+                    # )
+                    
+                    # import napari
+                    # viewer = napari.Viewer()
+                    # viewer.add_image(decon_temp)
+                    # viewer.add_image(camera_corrected_data)
+                    # napari.run()
+                    # ------------------------------------
+                    if camera_corrected_data.shape[1]<=256:
+                        chunk_size = 256
+                        overlap_size = 32
+                    elif camera_corrected_data.shape[1]<=512:
+                        chunk_size = 128
+                        overlap_size = 32
+
+                    deconvolved_data = chunked_rlgc(
+                        camera_corrected_data,
+                        np.asarray(psfs[chan_idx]),
+                        scan_chunk_size=chunk_size,
+                        scan_overlap_size=overlap_size
+                    )
+    
+                    deskewed = orthogonal_deskew(
+                        deconvolved_data,
+                        theta = opm_tilt_deg,
+                        distance = scan_axis_step_um,
+                        pixel_size = pixel_size_um,
+                        downsample_factor=z_downsample_level
+                    )
+                else:        
+                    deskewed = orthogonal_deskew(
+                        camera_corrected_data,
+                        theta = opm_tilt_deg,
+                        distance = scan_axis_step_um,
+                        pixel_size = pixel_size_um,
+                        downsample_factor=z_downsample_level
+                    )
+
+                if crop_after_deskew:
+                    deskewed = deskewed[:,crop_y:-crop_y,:]
+
+                update_per_index_metadata(
+                    ts_store = ts_store, 
+                    metadata = {"stage_position": stage_positions[pos_idx], 'channel': em_values[chan_idx]}, 
+                    index_location = (t_idx, pos_idx, chan_idx)
+                )
+                
+                if max_projection:
+                    max_z_deskewed = np.max(deskewed,axis=0,keepdims=True)
+                    update_per_index_metadata(
+                        ts_store = max_z_ts_store, 
+                        metadata = {"stage_position": stage_positions[pos_idx], 'channel': em_values[chan_idx]}, 
+                        index_location = (t_idx,pos_idx,chan_idx)
+                    )
+                    # create future objects for async data writing
+                    ts_max_writes.append(
+                        write_via_tensorstore(
+                            ts_store = max_z_ts_store,
+                            data = max_z_deskewed,
+                            data_location = [t_idx,pos_idx,chan_idx]
+                        )
+                    )
+
+                # create future objects for async data writing
+                ts_writes.append(
+                    write_via_tensorstore(
+                        ts_store = ts_store,
+                        data = deskewed,
+                        data_location = [t_idx,pos_idx,chan_idx]
+                    )
+                )
+                
+    # wait for writes to finish
+    for ts_write in ts_writes:
+        ts_write.result()
+
+    if max_projection:
+        for ts_max_write in ts_max_writes:
+            ts_max_write.result()
+
+    if "mirror" in opm_mode:
+        update_global_metadata(
+            ts_store = ts_store,
+            global_metadata= {
+                    "scan_axis_step_um" : scan_axis_step_um,
+                    "raw_pixel_size_um" : pixel_size_um,
+                    "opm_tilt_deg" : opm_tilt_deg,
+                    "camera_corrected" : True,
+                    "camera_offset" : camera_offset,
+                    "camera_e_to_ADU" : camera_conversion,
+                    "deskewed_voxel_size_um" : [z_downsample_level*pixel_size_um, pixel_size_um, pixel_size_um],
+                    "stage_x_flipped": stage_x_flipped,
+                    "stage_y_flipped": stage_y_flipped,
+                    "stage_z_flipped": stage_z_flipped,
+                    "flatfield_corrected": flatfield_correction,
+                    "pad_y" : pad_y,
+                    "pad_x" : pad_x
+                }
+        )
+    elif "stage" in opm_mode:
+        update_global_metadata(
+            ts_store = ts_store,
+            global_metadata= {
+                    "scan_axis_step_um" : scan_axis_step_um,
+                    "raw_pixel_size_um" : pixel_size_um,
+                    "opm_tilt_deg" : opm_tilt_deg,
+                    "camera_corrected" : True,
+                    "camera_offset" : camera_offset,
+                    "camera_e_to_ADU" : camera_conversion,
+                    "deskewed_voxel_size_um" : [z_downsample_level*pixel_size_um, pixel_size_um, pixel_size_um],
+                    "stage_x_flipped": stage_x_flipped,
+                    "stage_y_flipped": stage_y_flipped,
+                    "stage_z_flipped": stage_z_flipped,
+                    "flatfield_corrected": flatfield_correction,
+                    "pad_y" : pad_y,
+                    "pad_x" : pad_x
+                }
+        )
+    if max_projection:
+        if "mirror" in opm_mode:
+            update_global_metadata(
+                ts_store = max_z_ts_store,
+                global_metadata= {
+                    "scan_axis_step_um" : scan_axis_step_um,
+                    "raw_pixel_size_um" : pixel_size_um,
+                    "opm_tilt_deg" : opm_tilt_deg,
+                    "camera_corrected" : True,
+                    "camera_offset" : camera_offset,
+                    "camera_e_to_ADU" : camera_conversion,
+                    "deskewed_voxel_size_um" : [pixel_size_um, pixel_size_um],
+                    "stage_x_flipped": stage_x_flipped,
+                    "stage_y_flipped": stage_y_flipped,
+                    "stage_z_flipped": stage_z_flipped,
+                    "flatfield_corrected": flatfield_correction,
+                    "pad_y" : pad_y,
+                    "pad_x" : pad_x
+                }
+            )
+        elif "stage" in opm_mode:
+            update_global_metadata(
+                ts_store = max_z_ts_store,
+                global_metadata= {
+                    "scan_axis_step_um" : scan_axis_step_um,
+                    "raw_pixel_size_um" : pixel_size_um,
+                    "opm_tilt_deg" : opm_tilt_deg,
+                    "camera_corrected" : True,
+                    "camera_offset" : camera_offset,
+                    "camera_e_to_ADU" : camera_conversion,
+                    "deskewed_voxel_size_um" : [pixel_size_um, pixel_size_um],
+                    "stage_x_flipped": stage_x_flipped,
+                    "stage_y_flipped": stage_y_flipped,
+                    "stage_z_flipped": stage_z_flipped,
+                    "flatfield_corrected": flatfield_correction,
+                    "pad_y" : pad_y,
+                    "pad_x" : pad_x
+                }
+            )
+            
+    del deskewed, ts_write, ts_store
+    if max_projection:
+        del max_z_deskewed, ts_max_write
+        
+    if create_fused_max_projection:
+        
+        if deconvolve:
+            max_z_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_z_decon_deskewed.zarr")
+        else:
+            max_z_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_z_deskewed.zarr")
+        # open datastore on disk
+        spec = {
+            "driver" : "zarr3",
+            "kvstore" : {
+                "driver" : "file",
+                "path" : str(max_z_output_path)
+            }
+        }
+        max_z_ts_store = ts.open(spec).result()
+        
+        print("\nFusing max projection using stage positions...")
+        fused_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_z_fused.zarr")
+        
+        if pos_range is not None:
+            tile_positions = stage_positions[pos_range[0]:pos_range[1],1:]
+            
+        else:
+            tile_positions = stage_positions[:,1:]
+        
+        tile_fusion = MaxTileFusion(
+            ts_dataset = max_z_ts_store,
+            tile_positions = tile_positions,
+            output_path=fused_output_path,
+            pixel_size=np.asarray((pixel_size_um,pixel_size_um),dtype=np.float32),
+        )
+        tile_fusion.run()
+        
+        if write_fused_max_projection_tiff:
+            tiff_dir_path = max_z_output_path.parent / Path("fused_max_projection_tiff_output")
+            tiff_dir_path.mkdir(exist_ok=True)
+            max_spec = {
+                "driver" : "zarr3",
+                "kvstore" : {
+                    "driver" : "file",
+                    "path" : str(fused_output_path)
+                }
+            }
+            max_proj_datastore = ts.open(max_spec).result()
+            for t_idx in tqdm(range(max_proj_datastore.shape[0]),desc="t"):
+                max_projection = np.squeeze(np.asarray(max_proj_datastore[t_idx,0,chan_idx,:].read().result()))
+                
+                filename = Path(f"fused_z_max_projection_t{t_idx}.ome.tiff")
+                filename_path = tiff_dir_path /  Path(filename)
+                if len(max_projection.shape) == 2:
+                    axes = "YX"
+                else:
+                    axes = "CYX"
+                
+                with TiffWriter(filename_path, bigtiff=True) as tif:
+                    metadata={
+                        'axes': axes,
+                        'SignificantBits': 16,
+                        'PhysicalSizeX': pixel_size_um,
+                        'PhysicalSizeXUnit': 'µm',
+                        'PhysicalSizeY': pixel_size_um,
+                        'PhysicalSizeYUnit': 'µm',
+                    }
+                    options = dict(
+                        compression='zlib',
+                        compressionargs={'level': 8},
+                        predictor=True,
+                        photometric='minisblack',
+                        resolutionunit='CENTIMETER',
+                    )
+                    tif.write(
+                        max_projection,
+                        resolution=(
+                            1e4 / pixel_size_um,
+                            1e4 / pixel_size_um
+                        ),
+                        **options,
+                        metadata=metadata
+                    )
+        if write_fused_tiff:
+            tiff_dir_path = output_path.parent / Path("tiff_output")
+            tiff_dir_path.mkdir(exist_ok=True)
+            datastore_spec = {
+                "driver" : "zarr3",
+                "kvstore" : {
+                    "driver" : "file",
+                    "path" : str(output_path)
+                }
+            }
+            datastore = ts.open(datastore_spec).result()
+            for t_idx in tqdm(range(datastore.shape[0]),desc="t"):
+                image = np.asarray(datastore[t_idx,0,:].read().result())
+                image = np.swapaxes(image,0,1)
+                filename = Path(f"fused_t{t_idx}.ome.tiff")
+                filename_path = tiff_dir_path /  Path(filename)
+                axes = "ZCYX"
+                
+                with TiffWriter(filename_path, bigtiff=True) as tif:
+                    metadata={
+                        'axes': axes,
+                        'SignificantBits': 16,
+                        'PhysicalSizeX': pixel_size_um,
+                        'PhysicalSizeXUnit': 'µm',
+                        'PhysicalSizeY': pixel_size_um,
+                        'PhysicalSizeYUnit': 'µm',
+                        'PhysicalSizeZ': z_downsample_level*pixel_size_um
+                    }
+                    options = dict(
+                        compression='zlib',
+                        compressionargs={'level': 8},
+                        predictor=True,
+                        photometric='minisblack',
+                        resolutionunit='CENTIMETER',
+                    )
+                    tif.write(
+                        image,
+                        resolution=(
+                            1e4 / pixel_size_um,
+                            1e4 / pixel_size_um
+                        ),
+                        **options,
+                        metadata=metadata
+                    )
 
 def run_estimate_illuminations(datastore, camera_offset, camera_conversion, conn):
     """Helper function to run estimate_illuminations in a subprocess.

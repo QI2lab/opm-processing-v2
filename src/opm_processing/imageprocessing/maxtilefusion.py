@@ -74,8 +74,9 @@ class MaxTileFusion:
         """
         min_y = np.min(self.tile_positions[:, 0])
         min_x = np.min(self.tile_positions[:, 1])
-        max_y = np.max(self.tile_positions[:, 0]) + self.tile_shape[0]
-        max_x = np.max(self.tile_positions[:, 1]) + self.tile_shape[1]
+        max_y = np.max(self.tile_positions[:, 0]) + (self.tile_shape[0] * self.pixel_size[0])
+        max_x = np.max(self.tile_positions[:, 1]) + (self.tile_shape[1] * self.pixel_size[1])
+        
 
         fused_shape_unpadded = (
             int((max_y - min_y) / self.pixel_size[0]),
@@ -146,7 +147,7 @@ class MaxTileFusion:
         """
                 
         # Define chunk shape based on tile size
-        chunk_shape = [1, 1, self.channels, 1, self.chunk_size , self.chunk_size]
+        chunk_shape = [1, 1, 1, 1, self.chunk_size , self.chunk_size]
 
         # Define shard shape as one full tile
         shard_shape = [1, 1, self.channels, 1, self.chunks_per_shard*self.chunk_size, self.chunks_per_shard*self.chunk_size]  
