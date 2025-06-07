@@ -1032,9 +1032,10 @@ def process_ASI_SCOPE(
     del tif
         
     asi_step_um = float(micromanager_metadata["z-step_um"])
-    pixel_size_um = float(micromanager_metadata["PixelSize_um"]) 
-    opm_tilt_deg = 90.0 - float(micromanager_metadata["StageScanAnglePathA"])
-    scan_axis_step_um = asi_step_um / np.tan(np.deg2rad(opm_tilt_deg))
+    pixel_size_um = float(micromanager_metadata["PixelSize_um"])
+    asi_tilt_deg = float(micromanager_metadata["StageScanAnglePathA"])
+    opm_tilt_deg = 90 - asi_tilt_deg
+    scan_axis_step_um = asi_step_um / np.tan(np.deg2rad(asi_tilt_deg))
 
     if asi_metadata["isStageScanning"]:
         opm_mode = "stage"
@@ -1254,14 +1255,16 @@ def process_ASI_SCOPE(
                         deconvolved_data,
                         theta = opm_tilt_deg,
                         distance = scan_axis_step_um,
-                        pixel_size = pixel_size_um
+                        pixel_size = pixel_size_um,
+                        downsample_factor=z_downsample_level
                     )
                 else:        
                     deskewed = orthogonal_deskew(
                         camera_corrected_data,
                         theta = opm_tilt_deg,
                         distance = scan_axis_step_um,
-                        pixel_size = pixel_size_um
+                        pixel_size = pixel_size_um,
+                        downsample_factor=z_downsample_level
                     )
 
                 if crop_after_deskew:
@@ -1470,23 +1473,20 @@ def process_ASI_SCOPE(
         if write_fused_tiff:
             tiff_dir_path = output_path.parent / Path("tiff_output")
             tiff_dir_path.mkdir(exist_ok=True)
-            max_spec = {
+            datastore_spec = {
                 "driver" : "zarr3",
                 "kvstore" : {
                     "driver" : "file",
                     "path" : str(output_path)
                 }
             }
-            max_proj_datastore = ts.open(max_spec).result()
-            for t_idx in tqdm(range(max_proj_datastore.shape[0]),desc="t"):
-                max_projection = np.squeeze(np.asarray(max_proj_datastore[t_idx,0,chan_idx,:].read().result()))
-                
+            datastore = ts.open(datastore_spec).result()
+            for t_idx in tqdm(range(datastore.shape[0]),desc="t"):
+                image = np.asarray(datastore[t_idx,0,:].read().result())
+                image = np.swapaxes(image,0,1)
                 filename = Path(f"fused_t{t_idx}.ome.tiff")
                 filename_path = tiff_dir_path /  Path(filename)
-                if len(max_projection.shape) == 2:
-                    axes = "ZYX"
-                else:
-                    axes = "CZYX"
+                axes = "ZCYX"
                 
                 with TiffWriter(filename_path, bigtiff=True) as tif:
                     metadata={
@@ -1506,7 +1506,7 @@ def process_ASI_SCOPE(
                         resolutionunit='CENTIMETER',
                     )
                     tif.write(
-                        max_projection,
+                        image,
                         resolution=(
                             1e4 / pixel_size_um,
                             1e4 / pixel_size_um

@@ -146,7 +146,7 @@ class MaxTileFusion:
         """
                 
         # Define chunk shape based on tile size
-        chunk_shape = [1, 1, self.channels, 1, self.chunk_size , self.chunk_size]
+        chunk_shape = [1, 1, 1, 1, self.chunk_size , self.chunk_size]
 
         # Define shard shape as one full tile
         shard_shape = [1, 1, self.channels, 1, self.chunks_per_shard*self.chunk_size, self.chunks_per_shard*self.chunk_size]  
