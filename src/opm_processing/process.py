@@ -17,7 +17,7 @@ warnings.simplefilter("ignore", category=FutureWarning)
 
 from pathlib import Path
 import tensorstore as ts
-from opm_processing.imageprocessing.opmpsf import generate_skewed_psf, generate_proj_psf
+from opm_processing.imageprocessing.opmpsf import generate_skewed_psf, generate_proj_psf, ASI_generate_skewed_psf
 from opm_processing.imageprocessing.rlgc import chunked_rlgc, rlgc_biggs
 from opm_processing.imageprocessing.opmtools import orthogonal_deskew, deskew_shape_estimator
 from opm_processing.imageprocessing.maxtilefusion import MaxTileFusion
@@ -120,6 +120,8 @@ def process(
             all_metadata = dict(tif.micromanager_metadata)
             micromanager_metadata = all_metadata["Summary"]
             asi_metadata = json.loads(all_metadata['Summary']["SPIMAcqSettings"])
+            write_fused_tiff = True
+            z_downsample_level = 4
             process_ASI_SCOPE(
                 root_path,
                 axes,
@@ -130,6 +132,7 @@ def process(
                 flatfield_correction,
                 create_fused_max_projection,
                 write_fused_max_projection_tiff,
+                write_fused_tiff,
                 z_downsample_level,
                 crop_after_deskew,
                 time_range,
@@ -945,6 +948,7 @@ def process_ASI_SCOPE(
     flatfield_correction: bool = False,
     create_fused_max_projection: bool = True,
     write_fused_max_projection_tiff: bool = False,
+    write_fused_tiff: bool = True,
     z_downsample_level: int = 4,
     crop_after_deskew: bool = False,
     time_range: tuple[int,int] = None,
@@ -1002,7 +1006,6 @@ def process_ASI_SCOPE(
     store = imread(root_path, aszarr=True)
     datastore = zarr.open(store,mode="r")
     
-
     if datastore.ndim != 6:
         if axes == "TZCYX":
             datastore = np.swapaxes(datastore,1,2)
@@ -1014,13 +1017,25 @@ def process_ASI_SCOPE(
             datastore = datastore[None,None,:,:,:,:]
         elif axes == "TZYX":
             datastore = datastore[:,None,None,:,:,:]
-
+    
+    tif = TiffFile(root_path,is_mmstack=False)
+    per_image_metadata = dict(tif.series[0].pages[0].tags['MicroManagerMetadata'].value)
+    camera_offset = float(per_image_metadata["pvcam-Offset"])
+    if "Dynamic Range" in str(per_image_metadata["pvcam-Port"]):
+        camera_conversion = 0.23
+    elif "Speed" in str(per_image_metadata["pvcam-Port"]):
+        camera_conversion = 0.85
+    elif "Sensitivity" in str(per_image_metadata["pvcam-Port"]):
+        camera_conversion = 0.25
+    elif "Sub-Electron" in str(per_image_metadata["pvcam-Port"]):
+        camera_conversion = 0.015
+    del tif
+        
     asi_step_um = float(micromanager_metadata["z-step_um"])
     pixel_size_um = float(micromanager_metadata["PixelSize_um"]) 
     opm_tilt_deg = 90.0 - float(micromanager_metadata["StageScanAnglePathA"])
     scan_axis_step_um = asi_step_um / np.tan(np.deg2rad(opm_tilt_deg))
-    camera_offset = 0.
-    camera_conversion = 1.
+
     if asi_metadata["isStageScanning"]:
         opm_mode = "stage"
     else:
@@ -1032,6 +1047,7 @@ def process_ASI_SCOPE(
         match = re.search(r'(\d+(?:\.\d+)?)\s*em', config)
         if match:
             em_values.append(float(match.group(1)) / 1000.0)
+
     stage_positions = np.asarray([
         [
             float(0.),
@@ -1130,8 +1146,10 @@ def process_ASI_SCOPE(
         
     
     if flatfield_correction:
-        
-        flatfield_path = root_path.parents[0] / Path(str(root_path.stem)+"_flatfield.ome.tif")
+        flatfield_dir = root_path.parents[0] / Path("flatfield")
+        if not(flatfield_dir.exists()):
+            flatfield_dir.mkdir()
+        flatfield_path = root_path.parents[0] / Path("flatfield") / Path(str(root_path.stem)+"_flatfield.ome.tif")
         if flatfield_path.exists():
             flatfields = imread(flatfield_path).astype(np.float32)
         else:
@@ -1192,10 +1210,11 @@ def process_ASI_SCOPE(
                     if pos_idx == 0 and chan_idx == 0:
                         psfs = []
                         for psf_idx in range(datastore.shape[2]):
-                            psf = generate_skewed_psf(
+                            psf = ASI_generate_skewed_psf(
                                 em_wvl=em_values[psf_idx],
                                 pixel_size_um=pixel_size_um,
                                 scan_axis_step_um=scan_axis_step_um,
+                                theta_deg = opm_tilt_deg,
                                 pz=0.0,
                                 plot=False
                             )
@@ -1431,6 +1450,53 @@ def process_ASI_SCOPE(
                         'PhysicalSizeXUnit': 'µm',
                         'PhysicalSizeY': pixel_size_um,
                         'PhysicalSizeYUnit': 'µm',
+                    }
+                    options = dict(
+                        compression='zlib',
+                        compressionargs={'level': 8},
+                        predictor=True,
+                        photometric='minisblack',
+                        resolutionunit='CENTIMETER',
+                    )
+                    tif.write(
+                        max_projection,
+                        resolution=(
+                            1e4 / pixel_size_um,
+                            1e4 / pixel_size_um
+                        ),
+                        **options,
+                        metadata=metadata
+                    )
+        if write_fused_tiff:
+            tiff_dir_path = output_path.parent / Path("tiff_output")
+            tiff_dir_path.mkdir(exist_ok=True)
+            max_spec = {
+                "driver" : "zarr3",
+                "kvstore" : {
+                    "driver" : "file",
+                    "path" : str(output_path)
+                }
+            }
+            max_proj_datastore = ts.open(max_spec).result()
+            for t_idx in tqdm(range(max_proj_datastore.shape[0]),desc="t"):
+                max_projection = np.squeeze(np.asarray(max_proj_datastore[t_idx,0,chan_idx,:].read().result()))
+                
+                filename = Path(f"fused_t{t_idx}.ome.tiff")
+                filename_path = tiff_dir_path /  Path(filename)
+                if len(max_projection.shape) == 2:
+                    axes = "ZYX"
+                else:
+                    axes = "CZYX"
+                
+                with TiffWriter(filename_path, bigtiff=True) as tif:
+                    metadata={
+                        'axes': axes,
+                        'SignificantBits': 16,
+                        'PhysicalSizeX': pixel_size_um,
+                        'PhysicalSizeXUnit': 'µm',
+                        'PhysicalSizeY': pixel_size_um,
+                        'PhysicalSizeYUnit': 'µm',
+                        'PhysicalSizeZ': z_downsample_level*pixel_size_um
                     }
                     options = dict(
                         compression='zlib',
