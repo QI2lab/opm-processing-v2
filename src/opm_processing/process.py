@@ -743,9 +743,7 @@ def process_projection(
         stage_z_max = np.max(stage_positions[:,0])
         for pos_idx, _ in enumerate(stage_positions):
             stage_positions[pos_idx,0] = stage_z_max - stage_positions[pos_idx,0]
-            
-    print(stage_positions)
-            
+                        
     if time_range is not None:
         time_shape = time_range[1]
     else:

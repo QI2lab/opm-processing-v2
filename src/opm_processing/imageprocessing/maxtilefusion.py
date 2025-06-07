@@ -72,19 +72,16 @@ class MaxTileFusion:
         tuple of int
             (min_y, min_x) global offset for positioning tiles.
         """
-        print(self.tile_shape)
         min_y = np.min(self.tile_positions[:, 0])
         min_x = np.min(self.tile_positions[:, 1])
         max_y = np.max(self.tile_positions[:, 0]) + (self.tile_shape[0] * self.pixel_size[0])
         max_x = np.max(self.tile_positions[:, 1]) + (self.tile_shape[1] * self.pixel_size[1])
         
-        print(f"y {min_y},{max_y} x {min_x},{max_x}")
 
         fused_shape_unpadded = (
             int((max_y - min_y) / self.pixel_size[0]),
             int((max_x - min_x) / self.pixel_size[1])
         )
-        print(f"fused shape unpadded {fused_shape_unpadded}")
         
         pad_y = (self.chunks_per_shard - (fused_shape_unpadded[0] % self.chunks_per_shard)) % self.chunks_per_shard  
         pad_x = (self.chunks_per_shard - (fused_shape_unpadded[1] % self.chunks_per_shard)) % self.chunks_per_shard
@@ -95,7 +92,6 @@ class MaxTileFusion:
             padded_final_ny,
             padded_final_nx
         )
-        print(f"fused shape: {fused_shape}")
 
         return fused_shape, (min_y, min_x)
 
