@@ -8,7 +8,7 @@
 
 ## Overview 
 
-This package is the 2nd generation of the Arizona State University Quantitative Imaging and Inference Lab (qi2lab) oblique plane microscopy (OPM) processing software. Currently, it assumes that data is generated using our [2nd generation OPM control code](https://github.com/QI2lab/opm-v2). 
+This package is the 2nd generation of the Arizona State University Quantitative Imaging and Inference Lab (qi2lab) oblique plane microscopy (OPM) processing software. Currently, it assumes that data is generated using (1) our [2nd generation OPM control code](https://github.com/QI2lab/opm-v2) or (2) the [ASI single-objective light sheet](https://www.asiimaging.com/products/light-sheet-microscopy/single-objective-light-sheet/) Micromanager plugin. The ASI instrument support is experimental and will continue to evolve as we get more data examples from "in the wild" instruments. 
 
 The core algorithms can be used for any microscope that acquires data at a skewed angle, including diSPIM, LLSM, or OPM. Please open an issue if you would like help adapting the code to work with your microscope, we are happy to assist.
 
