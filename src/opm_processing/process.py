@@ -105,6 +105,9 @@ def process(
                 flyback_crop
             )
         elif "projection" in opm_mode:
+            write_fused_max_projection_tiff = True
+            deconvolve = True
+            flatfield_correction = True
             process_projection(
                 root_path,
                 zattrs, 
@@ -682,7 +685,7 @@ def process_projection(
     - Deconvolved individual projection tiles: \
         `"/path/to/qi2lab_acquisition_deconvolved.zarr"`
     - Stage position fused projection tiles: \
-        `"/path/to/qi2lab_acquisition_deconvolved_fused.zarr"`
+        `"/path/to/qi2lab_acquisition_deconvolved_stagefused.zarr"`
     
     Parameters
     ----------
@@ -875,7 +878,7 @@ def process_projection(
     del deconvolved_data, ts_write, ts_store
     
     print("\nFusing using stage positions...")
-    fused_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_fused.zarr")
+    fused_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_stagefused.zarr")
     
     if pos_range is not None:
         tile_positions = stage_positions[pos_range[0]:pos_range[1],1:]
@@ -904,11 +907,17 @@ def process_projection(
         }
         max_proj_datastore = ts.open(max_spec).result()
 
-        max_projection = np.asarray(max_proj_datastore.read().result())
+        max_projection = np.squeeze(np.asarray(max_proj_datastore.read().result()))
         
-        filename = Path("fused.ome.tiff")
+        filename = Path("deconvolved_stagefused.ome.tiff")
         filename_path = tiff_dir_path /  Path(filename)
-        axes = "TCZYX"
+        if max_projection.ndim == 3:
+            if datastore.shape[0] > 1 and datastore.shape[2] == 0:
+                axes = "TYX"
+            elif datastore.shape[2] > 1 and datastore.shape[0] == 0:
+                axes = "CYX"
+        elif max_projection.ndim == 4:
+            axes = "TCYX"
         
         with TiffWriter(filename_path, bigtiff=True) as tif:
             metadata={

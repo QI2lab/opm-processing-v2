@@ -95,7 +95,7 @@ class MaxTileFusion:
 
         return fused_shape, (min_y, min_x)
 
-    def generate_blending_weights(self, blend_pixels: list[int,int] = [200,400]):
+    def generate_blending_weights(self, blend_pixels: list[int,int] = [150,150]):
         """
         Generate a feathered blending weight mask for a tile.
 
