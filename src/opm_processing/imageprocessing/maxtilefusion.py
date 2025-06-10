@@ -208,8 +208,12 @@ class MaxTileFusion:
             time_iterator = tqdm(range(self.time_range[0],self.time_range[1]),desc="t",leave=True)
         else:
             time_iterator = tqdm(range(self.time_dim),desc="t",leave=True)
-        if self.time_dim > 1 or self.time_range[1] > 1:
+        
+        # if self.time_range is not None:
+        if (self.time_dim > 1) or (self.time_range is not None and self.time_range[1] > 1):
             refresh_position_iterator = True
+        else:
+            refresh_position_iterator = False
             
         pos_iterator = enumerate(tqdm(self.tile_positions, desc="p",leave=False))
         
