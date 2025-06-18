@@ -1,120 +1,116 @@
 import os
-import sys
+import shlex
+import stat
 import subprocess
+import shutil
 from pathlib import Path
 import typer
 
 app = typer.Typer()
 app.pretty_exceptions_enable = False
 
+# Packages to install via pip (pure-Python dependencies)
+PIP_DEPS = [
+    "numpy",
+    "numba",
+    "llvmlite",
+    "tbb",
+    "tqdm",
+    "ryomen",
+    "tensorstore",
+    "ml_dtypes",
+    "typer",
+    "cmap",
+    "napari[all]",
+    "zarr>=3.0.8",
+    "psfmodels",
+    "tifffile>=2025.6.1",
+    "basicpy @ git+https://github.com/QI2lab/BaSiCPy.git@main",
+    "ome-zarr @ git+https://github.com/ome/ome-zarr-py.git@refs/pull/404/head",
+]
+
+# CUDA and related packages to install via conda (RAPIDS.ai recommendation)
+CONDA_CUDA_PKGS = [
+    "cucim=25.06",
+    "'cuda-version=12.8'",
+    "'cuda-toolkit=12.8'",
+    "cupy",
+    "'cudnn=8.8'",
+    "cutensor",
+    "nccl"
+]
+
+
+def run(command: str):
+    """
+    Run a shell command, echoing it and aborting on error.
+    """
+    typer.echo(f"$ {command}")
+    subprocess.run(command, shell=True, check=True)
+
+
 @app.command()
-def setup_activation():
+def setup_cuda():
     """
-    Create a conda activation script that:
-      • on Linux/macOS, prepends NVIDIA lib dirs to LD_LIBRARY_PATH
-      • on Windows, deletes any old .bat, then prepends Conda Scripts, Library\\bin
-        and all NVIDIA DLL dirs to %PATH%, sets CUDA_PATH correctly so nvrtc64_120_0.dll
-        (and friends) become discoverable by CuPy.
+    1) Installs CUDA 12.8 and matching GPU packages via conda (RAPIDS.ai channel).
+    2) Writes activation hook to override CUDA_ROOT and NVRTC flags.
+    3) Installs pure-Python dependencies via pip (no-deps).
     """
-    conda_prefix = os.environ.get("CONDA_PREFIX")
-    if not conda_prefix:
-        typer.echo("Error: CONDA_PREFIX is not set. Are you inside a conda environment?", err=True)
-        raise typer.Exit(code=1)
+    # Ensure Conda env is active
+    prefix = os.environ.get("CONDA_PREFIX")
+    if not prefix:
+        typer.echo("Error: activate your conda environment first.", err=True)
+        raise typer.Exit(1)
 
-    activate_dir = Path(conda_prefix) / "etc" / "conda" / "activate.d"
+    # Choose installer
+    installer = shutil.which("mamba") or shutil.which("conda")
+    if not installer:
+        typer.echo("Error: neither mamba nor conda found.", err=True)
+        raise typer.Exit(1)
+
+    # 1) Install CUDA packages via RAPIDS.ai recommended channels
+    pkgs = " ".join(CONDA_CUDA_PKGS)
+    run(f"{installer} install -y -c rapidsai -c conda-forge -c nvidia {pkgs}")
+    
+    # 2) Clear existing hooks and write activation hook
+    activate_dir = Path(prefix) / "etc" / "conda" / "activate.d"
     activate_dir.mkdir(parents=True, exist_ok=True)
+    for script in activate_dir.glob("*.sh"):
+        try:
+            script.unlink()
+        except OSError:
+            pass
 
-    if sys.platform == "win32":
-        site_pkgs = Path(conda_prefix) / "Lib" / "site-packages"
+    # 3) Write the new activation hook
+    hook_file = activate_dir / "cuda_override.sh"
+    cuda_root = f"{prefix}/targets/x86_64-linux"
+    env_lib = f"{prefix}/lib"
+    hook_contents = f"""#!/usr/bin/env sh
+# 1) Point at the conda-installed CUDA toolkit
+export CUDA_PATH="{cuda_root}"
+export CUDA_HOME="$CUDA_PATH"
+export PATH="$CUDA_PATH/bin:$PATH"
 
-        # 1) Find all NVIDIA DLL directories
-        dll_dirs = sorted({
-            str(p.parent)
-            for p in site_pkgs.rglob("*.dll")
-            if "nvidia" in map(str.lower, p.parts)
-        })
+# 2) Prepend only the conda toolkit lib & env lib
+export LD_LIBRARY_PATH="$CUDA_PATH/lib:{env_lib}${{LD_LIBRARY_PATH:+:${{LD_LIBRARY_PATH}}}}"
 
-        # 2) Locate the NVRTC root (one level above 'bin')
-        nvrtc_root_dirs = {
-            str(p.parent.parent)
-            for p in site_pkgs.rglob("nvrtc64_*.dll")
-        }
-        nvrtc_root = next(iter(nvrtc_root_dirs), None)
-
-        # 3) Remove any existing batch file, then write nvidia_path.bat
-        script_path = activate_dir / "nvidia_path.bat"
-        if script_path.exists():
-            script_path.unlink()
-
-        lines = [
-            "@echo off",
-            "REM — Prepend Conda Scripts & Library\\bin so executables are visible",
-            'set "PATH=%CONDA_PREFIX%\\Scripts;%CONDA_PREFIX%\\Library\\bin;%PATH%"',
-            ""
-        ]
-        if nvrtc_root:
-            lines += [
-                "REM — Point CUDA_PATH at the NVRTC root (so CuPy adds \\bin correctly)",
-                f'set "CUDA_PATH={nvrtc_root}"',
-                "REM — Also make the NVRTC bin directory visible right away",
-                'set "PATH=%CUDA_PATH%\\bin;%PATH%"',
-                ""
-            ]
-        else:
-            lines += [
-                "REM — Warning: no nvrtc64_*.dll found under site-packages!",
-                ""
-            ]
-        lines += ["REM — Now prepend every NVIDIA DLL directory:"]
-        for d in dll_dirs:
-            lines.append(f'set "PATH={d};%PATH%"')
-
-        script_path.write_text("\r\n".join(lines))
-        typer.echo(f"Activation script written to {script_path}")
-
-        # 4) Register everything in this Python session immediately
-        scripts_dir = Path(conda_prefix) / "Scripts"
-        lib_bin_dir = Path(conda_prefix) / "Library" / "bin"
-        os.environ["PATH"] = str(scripts_dir) + os.pathsep + str(lib_bin_dir) + os.pathsep + os.environ.get("PATH", "")
-
-        if nvrtc_root:
-            os.environ["CUDA_PATH"] = nvrtc_root
-            bin_dir = Path(nvrtc_root) / "bin"
-            os.environ["PATH"] = str(bin_dir) + os.pathsep + os.environ["PATH"]
-            typer.echo(f"Set CUDA_PATH={nvrtc_root}")
-
-        for d in dll_dirs:
-            os.environ["PATH"] = d + os.pathsep + os.environ["PATH"]
-        typer.echo(f"Added {len(dll_dirs)} NVIDIA DLL dirs to PATH for this session.")
-
-        # 5) Verify visibility
-        if nvrtc_root:
-            try:
-                out = subprocess.run(
-                    ["where", "nvrtc64_120_0.dll"],
-                    capture_output=True, text=True, check=True
-                )
-                typer.echo(f"nvrtc DLL found at:\n{out.stdout.strip()}")
-            except subprocess.CalledProcessError:
-                typer.echo("Warning: nvrtc64_120_0.dll still not found!", err=True)
-    else:
-        # Linux/macOS: prepend NVIDIA lib dirs to LD_LIBRARY_PATH
-        py_ver = f"python{sys.version_info.major}.{sys.version_info.minor}"
-        script_path = activate_dir / "nvidia_ld_library_path.sh"
-        if script_path.exists():
-            script_path.unlink()
-        script_content = f"""#!/usr/bin/env sh
-# Automatically added: prepend NVIDIA lib directories to LD_LIBRARY_PATH
-for d in $(find "$CONDA_PREFIX/lib/{py_ver}/site-packages" -type f -path "*/nvidia*/*.so" -printf "%h\\n" | sort -u); do
-    export LD_LIBRARY_PATH="$d:$LD_LIBRARY_PATH"
-done
+# 3) NVRTC must compile with C++17 and ignore deprecated dialect
+export NVRTC_OPTIONS="--std=c++17"
+export CCCL_IGNORE_DEPRECATED_CPP_DIALECT="1"
 """
-        script_path.write_text(script_content)
-        script_path.chmod(script_path.stat().st_mode | 0o111)
-        typer.echo(f"Activation script written to {script_path}")
+    hook_file.write_text(hook_contents)
+    hook_file.chmod(hook_file.stat().st_mode | stat.S_IEXEC)
+
+    # 4) Pip install pure-Python deps without pulling CUDA wheels
+    deps = " ".join(shlex.quote(d) for d in PIP_DEPS)
+    run(f"pip install --no-deps {deps}")
+
+    typer.echo("\nsetup complete!  Please 'conda deactivate' then 'conda activate {env_lib}' to apply changes.")
+
 
 def main():
     app()
+
 
 if __name__ == "__main__":
     main()

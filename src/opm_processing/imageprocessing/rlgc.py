@@ -207,7 +207,8 @@ def rlgc_biggs(
     psf: np.ndarray,
     bkd: int = 0,
     otf: cp.ndarray = None,
-    otfT: cp.ndarray = None
+    otfT: cp.ndarray = None,
+    eager_mode: bool = False
 ) -> np.ndarray:
     """
     Andrew–Biggs accelerated RLGC deconvolution with Gradient Consensus.
@@ -223,12 +224,14 @@ def rlgc_biggs(
     psf: np.ndarray
         3D point-spread function. If `otf` and `otfT` are None, this PSF
         will be padded and transformed to form the OTF internally.
-    bkd: int, optional
+    bkd: int, default = 0
         Constant background to subtract before deconvolution (default=0).
     otf: cp.ndarray, optional
         Precomputed rfftn of the padded PSF. If provided, `psf` is ignored.
     otfT: cp.ndarray, optional
         Conjugate of `otf`. Must match shape of `otf`.
+    eager_mode: bool, default = False
+        Use stricter iteration cutoff, potentially leading to over-fitting.
 
     Returns
     -------
@@ -291,15 +294,27 @@ def rlgc_biggs(
         kld1 = kl_div(Hu, split1)
         kld2 = kl_div(Hu, split2)
 
-        if (kld1 > prev_kld1) or (kld2 > prev_kld2) or (kld1 < 1e-1) or (kld2 < 1e-1):
-            recon[...] = previous_recon
-            if DEBUG:
-                total_time = timeit.default_timer() - start_time
-                print(
-                    f"Optimum result obtained after {num_iters - 1} iterations "
-                    f"in {total_time:.1f} seconds."
-                )
-            break
+        if not(eager_mode):
+            if (kld1 > prev_kld1) or (kld2 > prev_kld2) or (kld1 < 1e-1) or (kld2 < 1e-1):
+                recon[...] = previous_recon
+                if DEBUG:
+                    total_time = timeit.default_timer() - start_time
+                    print(
+                        f"Optimum result obtained after {num_iters - 1} iterations "
+                        f"in {total_time:.1f} seconds."
+                    )
+                break
+        else:
+            if ((kld1 > prev_kld1) and (kld2 > prev_kld2)) or (kld1 < 1e-1) or (kld2 < 1e-1):
+                recon[...] = previous_recon
+                if DEBUG:
+                    total_time = timeit.default_timer() - start_time
+                    print(
+                        f"Optimum result obtained after {num_iters - 1} iterations "
+                        f"in {total_time:.1f} seconds."
+                    )
+                break
+        
         prev_kld1 = kld1
         prev_kld2 = kld2
         cp.add(Hu, 1e-12, out=Hu_safe)
@@ -344,7 +359,8 @@ def chunked_rlgc(
     psf: np.ndarray, 
     scan_chunk_size: int = 384,
     scan_overlap_size: int = 64,
-    bkd: int = 0
+    bkd: int = 0,
+    eager_mode: bool = False
 ) -> np.ndarray:
     """Chunked RLGC deconvolution.
     
@@ -354,12 +370,14 @@ def chunked_rlgc(
         3D image to be deconvolved.
     psf: np.ndarray
         point spread function (PSF) to use for deconvolution.
-    scan_chunk_size: int
+    scan_chunk_size: int, default = 384
         size of the chunk to process at a time.
-    scan_overlap_size: int
+    scan_overlap_size: int, default = 64
         size of the overlap between chunks.
-    bkd: int
+    bkd: int, default = 0
         background value to subtract from the image.
+    eager_mode: bool, default = False
+        Use stricter iteration cutoff, potentially leading to over-fitting.
         
     Returns
     -------
@@ -373,7 +391,7 @@ def chunked_rlgc(
     overlap = (scan_overlap_size, 0, 0)
     slices = Slicer(image, crop_size=crop_size, overlap=overlap)
     for crop, source, destination in tqdm(slices,desc="decon chunk:",leave=False):
-        crop_array = rlgc_biggs(crop, psf, bkd)
+        crop_array = rlgc_biggs(crop, psf, bkd,eager_mode=eager_mode)
         cp.get_default_memory_pool().free_all_blocks()
         output[destination] = crop_array[source]
     return output

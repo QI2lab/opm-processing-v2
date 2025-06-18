@@ -21,6 +21,7 @@ from opm_processing.imageprocessing.opmpsf import generate_skewed_psf, generate_
 from opm_processing.imageprocessing.rlgc import chunked_rlgc, rlgc_biggs
 from opm_processing.imageprocessing.opmtools import orthogonal_deskew, deskew_shape_estimator
 from opm_processing.imageprocessing.maxtilefusion import MaxTileFusion
+from opm_processing.imageprocessing.darksection import dark_sectioning
 from opm_processing.dataio.metadata import extract_channels, find_key, extract_stage_positions, update_global_metadata, update_per_index_metadata
 from opm_processing.dataio.zarr_handlers import create_via_tensorstore, write_via_tensorstore
 import json
@@ -46,6 +47,8 @@ def process(
     pos_range: tuple[int,int] = None,
     excess_overide: int = None,
     flyback_crop: int = None,
+    dark_section: bool = False,
+    eager_mode: bool = False
 ):
     """Postprocess qi2lab OPM dataset.
     
@@ -77,7 +80,11 @@ def process(
     time_range: list[int,int], default = None
         Range of timepoints to reconstruct.
     pos_range: list[int,int], default = None
-        Range of stage positions to reconstruct.     
+        Range of stage positions to reconstruct.
+    dark_section: bool, default = False
+        Perform dark section background subtraction with default parameters.
+    eager_mode: bool, default = False
+        Use stricter iteration cutoff, potentially leading to over-fitting.
     """
     
     if root_path.suffix == ".zarr":
@@ -116,6 +123,8 @@ def process(
                 write_fused_max_projection_tiff,
                 time_range,
                 pos_range,
+                dark_section,
+                eager_mode
             )
     elif root_path.suffixes[-2:] == [".ome", ".tif"]:
         with TiffFile(root_path) as tif:
@@ -670,6 +679,8 @@ def process_projection(
     write_fused_max_projection_tiff: bool = True,
     time_range: tuple[int,int] = None,
     pos_range: tuple[int,int] = None,
+    dark_section: bool = False,
+    eager_mode: bool = False
 ):
     """Postprocess qi2lab OPM dataset.
     
@@ -703,6 +714,10 @@ def process_projection(
         Range of timepoints to process.
     pos_range: list[int,int], default = None
         Range of stage positions to process.
+    dark_section: bool, default = False
+        Perform dark section background substraction
+    eager_mode: bool, default = False
+        Use stricter iteration cutoff, potentially leading to over-fitting.
     """
     
     # open raw datastore
@@ -817,6 +832,17 @@ def process_projection(
         for pos_idx in pos_iterator:
             for chan_idx in tqdm(range(datastore.shape[2]),desc="c",leave=False):
                 camera_corrected_data = (((np.squeeze(datastore[t_idx,pos_idx,chan_idx,:].read().result()).astype(np.float32)-camera_offset)*camera_conversion)/flatfields[chan_idx,:].astype(np.float32)).clip(0,2**16-1).astype(np.uint16)
+                if dark_section:
+                    dark_section_data = dark_sectioning(
+                        input_image = camera_corrected_data,
+                        emwavelength = float(int(str(channels[chan_idx]).rstrip("nm"))),
+                        na = 1.35,
+                        pixel_size = pixel_size_um * 1000,
+                        factor = 10           
+                    )
+                else:
+                    dark_section_data = camera_corrected_data
+                
                 if deconvolve:
                     if pos_idx == 0 and chan_idx == 0:
                         psfs = []
@@ -828,11 +854,12 @@ def process_projection(
                             psfs.append(psf)
 
                     deconvolved_data = rlgc_biggs(
-                        camera_corrected_data,
+                        dark_section_data,
                         np.asarray(psfs[chan_idx]),
+                        eager_mode=eager_mode
                     )
                 else:
-                    deconvolved_data = camera_corrected_data
+                    deconvolved_data = dark_section_data
 
                 update_per_index_metadata(
                     ts_store = ts_store, 
