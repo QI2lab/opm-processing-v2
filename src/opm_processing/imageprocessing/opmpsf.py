@@ -10,7 +10,6 @@ Last updated: Shepherd 05/25
 
 import psfmodels as psfm
 import numpy as np
-import matplotlib.pyplot as plt
 from scipy.interpolate import interp2d
 
 
@@ -293,7 +292,9 @@ def generate_proj_psf(
     #ex_lens = {**silicone_lens, 'NA': ex_NA}
     em_lens = {**silicone_lens, 'NA': 1.35}
 
-    psf = psfm.vectorial_psf(zv=0,nx=51,dxy=pixel_size_um,pz=pz,wvl=em_wvl,params=em_lens)
+    psf = psfm.vectorial_psf_centered(nz=20,dz=.115,nx=71,dxy=pixel_size_um,pz=pz,wvl=em_wvl,params=em_lens)
+    psf = psf / np.sum(psf)
+    psf = np.squeeze(np.sum(psf,axis=0))
     psf = psf / np.sum(psf)
     if psf.ndim == 2:
         psf = psf[np.newaxis, :, :]
@@ -303,7 +304,7 @@ def generate_proj_psf(
     y = y - psf.shape[2] / 2
     x, y = np.meshgrid(x, y)
     r = np.sqrt(np.power(x, 2) + np.power(y, 2))
-    sigma = 10
+    sigma = 15
     filter = np.exp(-np.power(r, 2) / (2 * sigma**2))
     filter = filter / np.max(filter)
 
@@ -380,39 +381,11 @@ def generate_skewed_psf(
 
     psf_grid = create_psf_silicone_100x(dxy, dz, nxy, nz, em_wvl, pz)
 
-    if plot:
-    # plot gridded psf
-        figh1 = plt.figure()
-        ax11 = plt.subplot(2, 2, 1) # noqa: F841
-        plt.imshow(psf_grid[psf_grid.shape[0]//2])
-
-        ax12 = plt.subplot(2, 2, 2) # noqa: F841
-        plt.imshow(psf_grid[:, psf_grid.shape[1]//2, :])
-
-        ax13 = plt.subplot(2, 2, 3) # noqa: F841
-        plt.imshow(psf_grid[:, :, psf_grid.shape[2]//2])
-
     # get value from interpolation
     skewed_psf = np.zeros(roi_skewed_size)
     for ii in range(nz):
         skewed_psf[:, ii, :] = interp2d(xg, yg, psf_grid[ii], kind="linear")(x.ravel(), y[:, ii].ravel())
     
-    if plot:
-        # plot gridded psf
-        figh2 = plt.figure()
-        ax21 = plt.subplot(2, 2, 1) # noqa: F841
-        plt.imshow(skewed_psf[skewed_psf.shape[0]//2])
-
-        ax22 = plt.subplot(2, 2, 2) # noqa: F841
-        plt.imshow(skewed_psf[:, skewed_psf.shape[1]//2, :])
-
-        ax23 = plt.subplot(2, 2, 3) # noqa: F841
-        plt.imshow(skewed_psf[:, :, skewed_psf.shape[2]//2])
-
-        figh1.show()
-        figh2.show()
-    plt.show()
-
     return skewed_psf
 
 def ASI_generate_skewed_psf(
@@ -485,37 +458,9 @@ def ASI_generate_skewed_psf(
 
     psf_grid = create_psf_water_40x(dxy, dz, nxy, nz, em_wvl, pz)
 
-    if plot:
-    # plot gridded psf
-        figh1 = plt.figure()
-        ax11 = plt.subplot(2, 2, 1) # noqa: F841
-        plt.imshow(psf_grid[psf_grid.shape[0]//2])
-
-        ax12 = plt.subplot(2, 2, 2) # noqa: F841
-        plt.imshow(psf_grid[:, psf_grid.shape[1]//2, :])
-
-        ax13 = plt.subplot(2, 2, 3) # noqa: F841
-        plt.imshow(psf_grid[:, :, psf_grid.shape[2]//2])
-
     # get value from interpolation
     skewed_psf = np.zeros(roi_skewed_size)
     for ii in range(nz):
         skewed_psf[:, ii, :] = interp2d(xg, yg, psf_grid[ii], kind="linear")(x.ravel(), y[:, ii].ravel())
-    
-    if plot:
-        # plot gridded psf
-        figh2 = plt.figure()
-        ax21 = plt.subplot(2, 2, 1) # noqa: F841
-        plt.imshow(skewed_psf[skewed_psf.shape[0]//2])
-
-        ax22 = plt.subplot(2, 2, 2) # noqa: F841
-        plt.imshow(skewed_psf[:, skewed_psf.shape[1]//2, :])
-
-        ax23 = plt.subplot(2, 2, 3) # noqa: F841
-        plt.imshow(skewed_psf[:, :, skewed_psf.shape[2]//2])
-
-        figh1.show()
-        figh2.show()
-    plt.show()
 
     return skewed_psf

@@ -295,7 +295,7 @@ def rlgc_biggs(
         kld2 = kl_div(Hu, split2)
 
         if not(eager_mode):
-            if (kld1 > prev_kld1) or (kld2 > prev_kld2) or (kld1 < 1e-1) or (kld2 < 1e-1):
+            if (kld1 > prev_kld1) or (kld2 > prev_kld2) or (kld1 < 1e-4) or (kld2 < 1e-4):
                 recon[...] = previous_recon
                 if DEBUG:
                     total_time = timeit.default_timer() - start_time
@@ -305,7 +305,7 @@ def rlgc_biggs(
                     )
                 break
         else:
-            if ((kld1 > prev_kld1) and (kld2 > prev_kld2)) or (kld1 < 1e-1) or (kld2 < 1e-1):
+            if ((kld1 > prev_kld1) and (kld2 > prev_kld2)) or (kld1 < 1e-4) or (kld2 < 1e-4):
                 recon[...] = previous_recon
                 if DEBUG:
                     total_time = timeit.default_timer() - start_time

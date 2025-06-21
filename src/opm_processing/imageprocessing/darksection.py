@@ -20,28 +20,28 @@ def window_sum_filter(image2d: cp.ndarray, r: int) -> cp.ndarray:
     cp.ndarray
         Summed image of same shape as input.
     """
-    size = 2 * r + 1
-    kernel = cp.ones((size, size), dtype=image2d.dtype)
-    return convolve(image2d, kernel, mode='reflect')
-    # m, n = image2d.shape
-    # im_cum = cp.cumsum(image2d, axis=0)
-    # sum_img = cp.empty_like(image2d)
-    # sum_img[:r+1, :] = im_cum[r:2*r+1, :]
-    # sum_img[r+1:m-r, :] = im_cum[2*r+1:m, :] - im_cum[:m-2*r-1, :]
-    # sum_img[m-r:m, :] = (
-    #     im_cum[m-1, :][None, :].repeat(r, axis=0)
-    #     - im_cum[m-2*r-1:m-r-1, :]
-    # )
-    # im_cum2 = cp.cumsum(sum_img, axis=1)
-    # sum_img[:, :r+1] = im_cum2[:, r:2*r+1]
-    # sum_img[:, r+1:n-r] = (
-    #     im_cum2[:, 2*r+1:n] - im_cum2[:, :n-2*r-1]
-    # )
-    # sum_img[:, n-r:n] = (
-    #     im_cum2[:, n-1][:, None].repeat(r, axis=1)
-    #     - im_cum2[:, n-2*r-1:n-r-1]
-    # )
-    # return sum_img
+    # size = 2 * r + 1
+    # kernel = cp.ones((size, size), dtype=image2d.dtype)
+    # return convolve(image2d, kernel, mode='reflect')
+    m, n = image2d.shape
+    im_cum = cp.cumsum(image2d, axis=0)
+    sum_img = cp.empty_like(image2d)
+    sum_img[:r+1, :] = im_cum[r:2*r+1, :]
+    sum_img[r+1:m-r, :] = im_cum[2*r+1:m, :] - im_cum[:m-2*r-1, :]
+    sum_img[m-r:m, :] = (
+        im_cum[m-1, :][None, :].repeat(r, axis=0)
+        - im_cum[m-2*r-1:m-r-1, :]
+    )
+    im_cum2 = cp.cumsum(sum_img, axis=1)
+    sum_img[:, :r+1] = im_cum2[:, r:2*r+1]
+    sum_img[:, r+1:n-r] = (
+        im_cum2[:, 2*r+1:n] - im_cum2[:, :n-2*r-1]
+    )
+    sum_img[:, n-r:n] = (
+        im_cum2[:, n-1][:, None].repeat(r, axis=1)
+        - im_cum2[:, n-2*r-1:n-r-1]
+    )
+    return sum_img
 
 
 def lpgauss(h: int, w: int, sigma: float) -> cp.ndarray:
@@ -490,8 +490,8 @@ def dark_sectioning(
         'factor': factor
     }
     background = False
-    thres = 120
-    divide = 0.25
+    thres = 70
+    divide = 0.5
 
     if background:
         maxtime = 2

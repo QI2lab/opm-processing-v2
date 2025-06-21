@@ -14,7 +14,7 @@ def main():
             emwavelength = 525,
             na = 1.49,
             pixel_size = 65,
-            factor = 1
+            factor = 2
         )
     processed_path = Path("/home/qi2lab/Downloads/Mito/Result/Mito_Darkraw.tif")
     processed_data = imread(processed_path)

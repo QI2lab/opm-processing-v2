@@ -19,30 +19,41 @@ BASE_PIP_DEPS = [
     "tqdm",
     "ryomen",
     "tensorstore",
-    "ml_dtypes",
-    "typer",
     "cmap",
     "napari[all]",
     "zarr>=3.0.8",
     "psfmodels",
-    "cupy-cuda12x",
-    "fastrlock",
     "tifffile>=2025.6.1",
     "nvidia-cuda-runtime-cu12==12.8.*",
+    "jax[cuda12_local]==0.4.38",
     "basicpy @ git+https://github.com/QI2lab/BaSiCPy.git@main",
     "ome-zarr @ git+https://github.com/ome/ome-zarr-py.git@refs/pull/404/head",
 ]
 
 # CUDA conda pkgs
-CONDA_CUDA_PKGS = [
+LINUX_CONDA_CUDA_PKGS = [
     "'cuda-version=12.8'",
     "'cuda-toolkit=12.8'",
+    "cuda-cudart",
+    "'cucim=25.06'",
+    "cupy",
+    "scikit-image",
+    "cudnn",
+    "cutensor",
+    "nccl"
 ]
 
-# Extra cucim Git URL for Windows
-LINUX_CUCIM_GIT = (
-    "cucim-cu12"
-)
+WINDOWS_CONDA_CUDA_PKGS = [
+    "'cuda-version=12.8'",
+    "'cuda-toolkit=12.8'",
+    "cuda-cudart",
+    "cupy",
+    "scikit-image",
+    "cudnn",
+    "cutensor",
+    "nccl"
+]
+
 
 # Extra cucim Git URL for Windows
 WINDOWS_CUCIM_GIT = (
@@ -71,7 +82,10 @@ def setup_cuda():
         raise typer.Exit(1)
 
     is_windows = platform.system() == "Windows"
-    run(f"{installer} install -y -c rapidsai -c conda-forge -c nvidia {' '.join(CONDA_CUDA_PKGS)}")
+    if is_windows:
+        run(f"{installer} install -y -c rapidsai -c conda-forge -c nvidia {' '.join(WINDOWS_CONDA_CUDA_PKGS)}")
+    else:
+        run(f"{installer} install -y -c rapidsai -c conda-forge -c nvidia {' '.join(LINUX_CONDA_CUDA_PKGS)}")
 
     # Clear existing hooks
     activate_dir = Path(prefix) / "etc" / "conda" / "activate.d"
@@ -121,14 +135,15 @@ export CCCL_IGNORE_DEPRECATED_CPP_DIALECT="1"
     pip_deps = BASE_PIP_DEPS.copy()
     if is_windows:
         pip_deps.append(WINDOWS_CUCIM_GIT)
-    else:
-        pip_deps.append(LINUX_CUCIM_GIT)
     deps_str = " ".join(shlex.quote(d) for d in pip_deps)
-    run(f"pip install --no-deps {deps_str}")
+    run(f"pip install {deps_str}")
     
-    run("python -m cupyx.tools.install_library --cuda 12.x --library cutensor")
-    run("python -m cupyx.tools.install_library --cuda 12.x --library nccl")
-    run("python -m cupyx.tools.install_library --cuda 12.x --library cudnn")
+    try:
+        run("python -m cupyx.tools.install_library --cuda 12.x --library cutensor")
+        run("python -m cupyx.tools.install_library --cuda 12.x --library nccl")
+        run("python -m cupyx.tools.install_library --cuda 12.x --library cudnn")
+    except Exception:
+        pass
 
     typer.echo(f"\nsetup complete!  Please 'conda deactivate' then 'conda activate {env_lib}' to apply changes.")
 

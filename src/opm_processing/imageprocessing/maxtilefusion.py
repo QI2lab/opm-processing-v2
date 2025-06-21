@@ -156,7 +156,7 @@ class MaxTileFusion:
             time_to_use = self.time_range[1] - self.time_range[0]
         else:
             time_to_use = self.time_dim
-
+            
         config = {
                 "driver": "zarr3",
                 "kvstore": {
@@ -216,7 +216,7 @@ class MaxTileFusion:
             refresh_position_iterator = False
             
         pos_iterator = enumerate(tqdm(self.tile_positions, desc="p",leave=False))
-        
+
         for time_idx in time_iterator:
             for tile_idx, (y, x) in pos_iterator:
                 # Read tile correctly from its respective position
