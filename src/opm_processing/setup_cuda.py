@@ -25,7 +25,6 @@ BASE_PIP_DEPS = [
     "psfmodels",
     "tifffile>=2025.6.1",
     "nvidia-cuda-runtime-cu12==12.8.*",
-    "jax[cuda12_local]==0.4.38",
     "basicpy @ git+https://github.com/QI2lab/BaSiCPy.git@main",
     "ome-zarr @ git+https://github.com/ome/ome-zarr-py.git@refs/pull/404/head",
 ]
@@ -54,6 +53,9 @@ WINDOWS_CONDA_CUDA_PKGS = [
     "nccl"
 ]
 
+LINUX_JAX_LIB = {
+    "jax[cuda12_local]==0.4.38"
+}
 
 # Extra cucim Git URL for Windows
 WINDOWS_CUCIM_GIT = (
@@ -133,10 +135,14 @@ export CCCL_IGNORE_DEPRECATED_CPP_DIALECT="1"
 
     # Single pip install for all deps
     pip_deps = BASE_PIP_DEPS.copy()
-    if is_windows:
-        pip_deps.append(WINDOWS_CUCIM_GIT)
     deps_str = " ".join(shlex.quote(d) for d in pip_deps)
     run(f"pip install {deps_str}")
+    if is_windows:
+        windows_dep_str = " ".join(shlex.quote(d) for d in WINDOWS_CUCIM_GIT)
+        run(f"pip install -e {windows_dep_str}")
+    else:
+        linux_dep_str = " ".join(shlex.quote(d) for d in LINUX_JAX_LIB)
+        run(f"pip install {linux_dep_str}")
     
     try:
         run("python -m cupyx.tools.install_library --cuda 12.x --library cutensor")

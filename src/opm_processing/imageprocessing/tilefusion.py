@@ -1228,17 +1228,17 @@ class TileFusion:
 
         self.optimize_shifts(
             method="TWO_ROUND_ITERATIVE",
-            rel_thresh=1.5,
-            abs_thresh=2.5,
+            rel_thresh=.5,
+            abs_thresh=1.5,
             iterative=True
         )
         gc.collect()
         cp.get_default_memory_pool().free_all_blocks()
         cp.get_default_pinned_memory_pool().free_all_blocks()
 
-        self.tile_positions = [
+        self._tile_positions = [
             tuple(np.array(pos) + off * np.array(self._pixel_size))
-            for pos, off in zip(self.tile_positions, self.global_offsets)
+            for pos, off in zip(self._tile_positions, self.global_offsets)
         ]
 
         # Fusion

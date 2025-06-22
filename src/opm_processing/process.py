@@ -113,7 +113,7 @@ def process(
             )
         elif "projection" in opm_mode:
             write_fused_max_projection_tiff = True
-            write_bkd_corrected_fused_max_projection_tiff = True
+            write_bkd_corrected_fused_max_projection_tiff = False
             deconvolve = True
             flatfield_correction = True
             process_projection(
