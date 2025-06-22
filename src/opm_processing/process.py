@@ -426,12 +426,15 @@ def process_skewed(
                     # viewer.add_image(camera_corrected_data)
                     # napari.run()
                     # ------------------------------------
-                    if camera_corrected_data.shape[1]==256:
+                    if camera_corrected_data.shape[1]<=256:
                         chunk_size = 256
                         overlap_size = 32
-                    elif camera_corrected_data.shape[1]==512:
+                    elif camera_corrected_data.shape[1]<=512:
                         chunk_size = 128
                         overlap_size = 32
+                    else:
+                        chunk_size = 64
+                        overlap_size = 16
                     if flyback_crop is not None:
                         deconvolved_data = chunked_rlgc(
                             camera_corrected_data[excess_scan_positions:-flyback_crop,:,:],

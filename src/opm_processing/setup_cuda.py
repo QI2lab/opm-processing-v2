@@ -6,6 +6,7 @@ import shutil
 import platform
 from pathlib import Path
 import typer
+import sys
 
 app = typer.Typer()
 app.pretty_exceptions_enable = False
@@ -50,7 +51,7 @@ WINDOWS_CONDA_CUDA_PKGS = [
     "scikit-image",
     "cudnn",
     "cutensor",
-    "nccl"
+    "cuda-nvcc",
 ]
 
 LINUX_JAX_LIB = {
@@ -99,20 +100,45 @@ def setup_cuda():
             pass
 
     if is_windows:
-        # Windows batch hook only
+# 1) Write the activation hook + which.bat shim
         bat_hook = activate_dir / "cuda_override.bat"
-        bat_hook.write_text(f"""@echo off
-REM Point at the conda-installed CUDA toolkit
-set "CUDA_PATH={prefix}\\Library\\bin"
-set "CUDA_HOME=%CUDA_PATH%"
+        content = (
+            f"@echo off\n"
+            f"REM Point at the conda-installed CUDA toolkit\n"
+            f"set \"CUDA_PATH={prefix}\\Library\\bin\"\n"
+            f"set \"CUDA_HOME=%CUDA_PATH%\"\n"
+            f"REM Prepend CUDA bin and lib to PATH\n"
+            f"set \"PATH=%CUDA_PATH%;{prefix}\\Library\\lib;%PATH%\"\n"
+            f"REM NVRTC must compile with C++17 and ignore deprecated dialect\n"
+            f"set \"NVRTC_OPTIONS=--std=c++17\"\n"
+            f"set \"CCCL_IGNORE_DEPRECATED_CPP_DIALECT=1\"\n"
+            f"REM which.bat shim for rapids-build-backend\n"
+            f"echo @echo off > \"{prefix}\\Scripts\\which.bat\"\n"
+            f"echo where %%* >> \"{prefix}\\Scripts\\which.bat\"\n"
+        )
+        bat_hook.write_text(content, encoding="utf-8")
 
-REM Prepend CUDA bin and lib to PATH
-set "PATH=%CUDA_PATH%;{prefix}\\Library\\lib;%PATH%"
+        # 2) Apply the same env changes right now
+        os.environ["CUDA_PATH"] = f"{prefix}\\Library\\bin"
+        os.environ["CUDA_HOME"] = os.environ["CUDA_PATH"]
+        os.environ["PATH"] = (
+            os.environ["CUDA_PATH"] + ";" +
+            f"{prefix}\\Library\\lib;" +
+            os.environ.get("PATH", "")
+        )
+        os.environ["NVRTC_OPTIONS"] = "--std=c++17"
+        os.environ["CCCL_IGNORE_DEPRECATED_CPP_DIALECT"] = "1"
 
-REM NVRTC must compile with C++17 and ignore deprecated dialect
-set "NVRTC_OPTIONS=--std=c++17"
-set "CCCL_IGNORE_DEPRECATED_CPP_DIALECT=1"
-""")
+        system_where = Path(os.environ["WINDIR"]) / "System32" / "where.exe"
+        dest_which = Path(prefix) / "Scripts" / "which.exe"
+
+        # only copy if it doesn't already exist
+        if not dest_which.exists():
+            shutil.copy(system_where, dest_which)
+
+        # Ensure Scripts/ is at the front of PATH for the current process
+        scripts_dir = str(Path(prefix) / "Scripts")
+        os.environ["PATH"] = scripts_dir + os.pathsep + os.environ.get("PATH","")
     else:
         # Linux shell hook only
         sh_hook = activate_dir / "cuda_override.sh"
@@ -134,24 +160,37 @@ export CCCL_IGNORE_DEPRECATED_CPP_DIALECT="1"
         sh_hook.chmod(sh_hook.stat().st_mode | stat.S_IEXEC)
 
     # Single pip install for all deps
-    pip_deps = BASE_PIP_DEPS.copy()
-    deps_str = " ".join(shlex.quote(d) for d in pip_deps)
-    run(f"pip install {deps_str}")
     if is_windows:
-        windows_dep_str = " ".join(shlex.quote(d) for d in WINDOWS_CUCIM_GIT)
-        run(f"pip install -e {windows_dep_str}")
+        
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", *BASE_PIP_DEPS],
+            check=True
+        )
+        
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", "-e", WINDOWS_CUCIM_GIT],
+                check=True
+            )
+        except Exception:
+            pass
+        
+        try:
+            run("python -m cupyx.tools.install_library --cuda 12.x --library nccl")
+        except Exception:
+            pass
+        
     else:
+        pip_deps = BASE_PIP_DEPS.copy()
+        deps_str = " ".join(shlex.quote(d) for d in pip_deps)
+        run(f"pip install {deps_str}")
+        
         linux_dep_str = " ".join(shlex.quote(d) for d in LINUX_JAX_LIB)
         run(f"pip install {linux_dep_str}")
-    
-    try:
-        run("python -m cupyx.tools.install_library --cuda 12.x --library cutensor")
-        run("python -m cupyx.tools.install_library --cuda 12.x --library nccl")
-        run("python -m cupyx.tools.install_library --cuda 12.x --library cudnn")
-    except Exception:
-        pass
-
-    typer.echo(f"\nsetup complete!  Please 'conda deactivate' then 'conda activate {env_lib}' to apply changes.")
+    if is_windows:
+        typer.echo(f"\nsetup complete!  Please 'conda deactivate' then 'conda activate env_name' to apply changes.")
+    else:
+        typer.echo(f"\nsetup complete!  Please 'conda deactivate' then 'conda activate {env_lib}' to apply changes.")
 
 
 def main():
