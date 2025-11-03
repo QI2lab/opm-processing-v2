@@ -16,7 +16,7 @@ The goal is provide highly performant data I/O via [Tensorstore](https://google.
 
 We rely on [BaSiCPy](https://github.com/peng-lab/BaSiCPy) to post-hoc estimate illumination profiles and a modified version of [gradient consensus Richardson-Lucy deconvolution](https://zenodo.org/records/10278919) to perform 3D deconvolution.
 
-## Installation
+##1 Installation
 
 Create a python 3.12 environment,
 ```bash
