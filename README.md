@@ -28,12 +28,21 @@ activate the environment,
 conda activate opmprocessing
 ```
 
-install the repository and register the local cuda code. On Windows, this will also install the `skimage` portion of `cucim`.
+install the repository and register the local CUDA installation. On Linux, this will finish the installation. On Windows, further steps are needed.
 ```bash
 pip install "opm-processing-v2 @ git+https://github.com/QI2lab/opm-processing-v2"
 setup-cuda
 conda deactivate opmprocessing
 ```
+
+On Windows, it is currently not possible to install [cuCIM](https://github.com/rapidsai/cucim) via the standard approach. The [current work-around](https://github.com/rapidsai/cucim/issues/454#issuecomment-3001600887) involves the following:
+1. Ensure you have followed the above steps through `setup-cuda`.
+2. Launch a terminal with administrative privileges.
+3. Activate the conda environment, `conda activate opmprocessing`.
+4. Allow symbolic links, `git config --global --add core.symlinks true`.
+5. Install cuCIM, `pip install -e "git+https://github.com/rapidsai/cucim.git@v25.04.00#egg=cucim-cu12&subdirectory=python/cucim"`.
+
+We will update installation instructions if the Windows installation is fixed.
 
 ## Usage
 
@@ -71,11 +80,10 @@ There are three `to_display` options that correspond to the three datastores des
 1. full
 2. max-z
 3. fused-max-z
-4. fused-full
 
 To register and fuse optionally deconvolved and desekwed data into an ome-ngff v0.5 datastore,
 ```bash
 fuse "/path/to/qi2lab_acquisition.zarr"
 ```
 
-The registered, optionally deconvolved, and fused data will be in `/path/to/qi2lab_acquisition_fused_deskewed.ome.zarr`
+The registered, optionally deconvolved, and fused data will be in `/path/to/qi2lab_acquisition_fused_deskewed.ome.zarr`. This data can be viewed by dragging and dropping the folder into napari and selecting the `napari-ome-zarr` plugin for viewing.
