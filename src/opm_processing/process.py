@@ -6,29 +6,49 @@ This file deskews and creates maximum projections of raw qi2lab OPM data.
 
 import multiprocessing as mp
 import sys
+
 if sys.platform.startswith("linux"):
     mp.set_start_method("forkserver", force=True)
 elif sys.platform.startswith("win"):
     mp.set_start_method("spawn", force=True)
 
 import warnings
+
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.simplefilter("ignore", category=FutureWarning)
 
-from pathlib import Path
-import tensorstore as ts
-from opm_processing.imageprocessing.opmpsf import generate_skewed_psf, generate_proj_psf, ASI_generate_skewed_psf
-from opm_processing.imageprocessing.rlgc import chunked_rlgc, rlgc_biggs
-from opm_processing.imageprocessing.opmtools import orthogonal_deskew, deskew_shape_estimator
-from opm_processing.imageprocessing.maxtilefusion import MaxTileFusion
-from opm_processing.imageprocessing.darksection import dark_sectioning
-from opm_processing.dataio.metadata import extract_channels, find_key, extract_stage_positions, update_global_metadata, update_per_index_metadata
-from opm_processing.dataio.zarr_handlers import create_via_tensorstore, write_via_tensorstore
 import json
+from pathlib import Path
+
 import numpy as np
-from tqdm import tqdm
+import tensorstore as ts
 import typer
-from tifffile import TiffWriter, imread, TiffFile
+from tifffile import TiffFile, TiffWriter, imread
+from tqdm import tqdm
+
+from opm_processing.dataio.metadata import (
+    extract_channels,
+    extract_stage_positions,
+    find_key,
+    update_global_metadata,
+    update_per_index_metadata,
+)
+from opm_processing.dataio.zarr_handlers import (
+    create_via_tensorstore,
+    write_via_tensorstore,
+)
+from opm_processing.imageprocessing.darksection import dark_sectioning
+from opm_processing.imageprocessing.maxtilefusion import MaxTileFusion
+from opm_processing.imageprocessing.opmpsf import (
+    ASI_generate_skewed_psf,
+    generate_proj_psf,
+    generate_skewed_psf,
+)
+from opm_processing.imageprocessing.opmtools import (
+    deskew_shape_estimator,
+    orthogonal_deskew,
+)
+from opm_processing.imageprocessing.rlgc import chunked_rlgc, rlgc_biggs
 
 app = typer.Typer()
 app.pretty_exceptions_enable = False
@@ -994,7 +1014,9 @@ def process_projection(
                 )
                 
     if write_bkd_corrected_fused_max_projection_tiff:
-        from opm_processing.imageprocessing.rolling_ball_gpu import subtract_background_tpczyx
+        from opm_processing.imageprocessing.rolling_ball_gpu import (
+            subtract_background_tpczyx,
+        )
         tiff_dir_path = fused_output_path.parent / Path("fused_tiff_output")
         tiff_dir_path.mkdir(exist_ok=True)
         max_spec = {
@@ -1118,8 +1140,9 @@ def process_ASI_SCOPE(
         Range of stage positions to reconstruct.     
     """
     
-    import zarr
     import re
+
+    import zarr
     
     store = imread(root_path, aszarr=True)
     datastore = zarr.open(store,mode="r")
@@ -1534,6 +1557,7 @@ def process_ASI_SCOPE(
         else:
             tile_positions = stage_positions[:,1:]
         
+        # apply max-tile-fusion
         tile_fusion = MaxTileFusion(
             ts_dataset = max_z_ts_store,
             tile_positions = tile_positions,
