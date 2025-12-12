@@ -10,11 +10,12 @@ from opm_processing.dataio.metadata import find_key
 
 
 def save_raw_with_yaml(data_array, output_path):
+    print("Saving Yaml")
     if output_path.suffix != '.raw':
         print('Output path is not a .raw, creating one now...')
         output_path = output_path.parent / (output_path.stem + '.raw')
     yml_path = output_path.parent / (output_path.stem + '.yaml')
-
+    print(data_array.shape)
     data_array.tofile(output_path)
 
     meta = {
@@ -105,15 +106,14 @@ def save_as_tiff(data_array, pixel_size_um, output_path):
             metadata=metadata
         )
 
-data_dirs = None
-zarr_dir = Path(
-    r"E:\20250923_DNApaint\20250923_155243_200k_timepoints_multiposition\200k_timepoints_multiposition.zarr"
-)
-
-
+data_dirs = [
+    Path(r"E:\20251106_DNApaint\20251106_204843_50pM_timelapse_restarted"), 
+    Path(r"E:\20251106_DNApaint\20251107_112433_80pM_timelapse") 
+]
+zarr_dir = None
 mirror_pos_range = None
 stage_pos_range = None 
-fov_range = [300, 650]
+fov_range = [300, 800]
 time_range = None
 create_raw = True
 create_time_projection = False
@@ -122,12 +122,12 @@ create_tiff = False
 zarr_dirs = []
 # Batch processing over all directories
 if data_dirs:
-    # Directory parsing for batch applications
-    for dir in data_dirs.iterdir():
-        if dir.is_dir():
-            for zarr_dir in dir.iterdir():
-                if zarr_dir.is_dir() and zarr_dir.name.endswith("zarr"):
-                    zarr_dirs.append(zarr_dir)
+    for data_dir in data_dirs:
+        # Directory parsing for batch applications
+        for dir in data_dir.iterdir():
+            if dir.is_dir():
+                if dir.is_dir() and dir.name.endswith("zarr"):
+                    zarr_dirs.append(dir)
 # Process single directory
 elif zarr_dir is not None:
     zarr_dirs.append(zarr_dir)
@@ -234,14 +234,15 @@ for zarr_dir in zarr_dirs:
 
             # Save raw file
             if create_raw:
+                print("Creating RAW")
                 save_raw_with_yaml(current_pos_arr, raw_file_path)
 
             # Save time proejection
             if create_time_projection:
+                print("Creating time-projection")
                 save_time_projection(current_pos_arr, pixel_size_um, time_proj_path)
 
             # Save timelapse as tiff
             if create_tiff:
+                print("Saving timelapse as TIFF")
                 save_as_tiff(current_pos_arr, pixel_size_um, big_tiff_path)
-
-
