@@ -15,16 +15,51 @@ from typing import List, Sequence, Tuple, Union, Any, Dict, Optional
 
 import numpy as np
 import tensorstore as ts
-from cucim.skimage.exposure import match_histograms
-from cucim.skimage.measure import block_reduce
-from cucim.skimage.registration import phase_cross_correlation
 from numba import njit, prange
-import cupy as cp
-from cupyx.scipy.ndimage import shift as cp_shift
-from opm_processing.imageprocessing.ssim_cuda import (
-    structural_similarity_cupy_sep_shared as ssim_cuda
-)
 from tqdm import trange
+
+try:
+    import cupy as cp  # type: ignore
+    from cupyx.scipy.ndimage import shift as cp_shift  # type: ignore
+    from cucim.skimage.exposure import match_histograms  # type: ignore
+    from cucim.skimage.measure import block_reduce  # type: ignore
+    from cucim.skimage.registration import phase_cross_correlation  # type: ignore
+    from opm_processing.imageprocessing.ssim_cuda import (  # type: ignore
+        structural_similarity_cupy_sep_shared as ssim_cuda,
+    )
+
+    xp = cp
+    USING_GPU = True
+except Exception:
+    cp = None  # type: ignore
+    cp_shift = None  # type: ignore
+    from skimage.exposure import match_histograms  # type: ignore
+    from skimage.measure import block_reduce  # type: ignore
+    from skimage.registration import phase_cross_correlation  # type: ignore
+    from scipy.ndimage import shift as _shift_cpu  # type: ignore
+    from skimage.metrics import structural_similarity as _ssim_cpu  # type: ignore
+
+    xp = np
+    USING_GPU = False
+
+
+def _shift_array(arr: Any, shift_vec: Any) -> Any:
+    """Shift array using GPU if available, else CPU fallback."""
+    if USING_GPU and cp_shift is not None:
+        return cp_shift(arr, shift=shift_vec, order=1, prefilter=False)
+    return _shift_cpu(arr, shift=shift_vec, order=1, prefilter=False)
+
+
+def _ssim(arr1: Any, arr2: Any, win_size: int) -> float:
+    """SSIM wrapper that routes to GPU kernel or CPU skimage."""
+    if USING_GPU and 'ssim_cuda' in globals():
+        return float(ssim_cuda(arr1, arr2, win_size=win_size))
+    arr1_np = np.asarray(arr1)
+    arr2_np = np.asarray(arr2)
+    data_range = float(arr1_np.max() - arr1_np.min())
+    if data_range == 0:
+        data_range = 1.0
+    return float(_ssim_cpu(arr1_np, arr2_np, win_size=win_size, data_range=data_range))
 
 
 @njit(parallel=True)
@@ -171,7 +206,7 @@ class TileFusion:
         Downsampling factors for multiscale.
     resolution_multiples : sequence of int or tuple
         Spatial resolution multiples per axis.
-    max_workers : int
+        max_workers : int
         Maximum parallel I/O workers.
     debug : bool
         If True, prints debug info.
@@ -179,6 +214,8 @@ class TileFusion:
         Filename for storing registration metrics.
     channel_to_use : int
         Channel index for registration.
+    multiscale_downsample : str
+        Either "stride" (default) or "block_mean" to control multiscale reduction.
     """
 
     def __init__(
@@ -195,7 +232,8 @@ class TileFusion:
         max_workers: int = 8,
         debug: bool = False,
         metrics_filename: str = "metrics.json",
-        channel_to_use: int = 0
+        channel_to_use: int = 0,
+        multiscale_downsample: str = "stride",
     ):
 
         self.root = Path(root_path)
@@ -236,11 +274,12 @@ class TileFusion:
         self.metrics_filename = metrics_filename
         self._blend_pixels = tuple(blend_pixels)
         self.channel_to_use = channel_to_use
+        if multiscale_downsample not in ("stride", "block_mean"):
+            raise ValueError('multiscale_downsample must be "stride" or "block_mean".')
+        self.multiscale_downsample = multiscale_downsample
 
         spec = {
             "context": {
-                "file_io_memmap": True,
-                "file_io_sync": False,
                 "file_io_concurrency": {"limit": self._max_workers},
                 "data_copy_concurrency": {"limit": self._max_workers},
             },
@@ -250,14 +289,23 @@ class TileFusion:
         ts_full = ts.open(spec, create=False, open=True).result()
         self.ts = ts_full
 
-        (
-            self.time_dim,
-            self.position_dim,
-            self.channels,
-            self.z_dim,
-            self.Y,
-            self.X,
-        ) = self.ts.shape
+        shape = self.ts.shape
+        if len(shape) == 6:
+            (
+                self.time_dim,
+                self.position_dim,
+                self.channels,
+                self.z_dim,
+                self.Y,
+                self.X,
+            ) = shape
+        elif len(shape) == 5:
+            self.time_dim, self.position_dim, self.channels, self.Y, self.X = shape
+            self.z_dim = 1
+        else:
+            raise ValueError(f"Unsupported data rank {len(shape)}; expected 5 or 6.")
+
+        self._is_2d = self.z_dim == 1
 
         self._update_profiles()
         self.chunk_shape = (1, 1, 1, 1024, 1024)
@@ -361,6 +409,7 @@ class TileFusion:
         prof : (length,) float32
             Linear profile.
         """
+        blend = min(blend, length)
         prof = np.ones(length, dtype=np.float32)
         if blend > 0:
             ramp = np.linspace(0, 1, blend, endpoint=False, dtype=np.float32)
@@ -368,10 +417,31 @@ class TileFusion:
             prof[-blend:] = ramp[::-1]
         return prof
 
+    def _read_tile_volume(
+        self,
+        tile_idx: int,
+        ch_sel: Union[int, slice],
+        z_slice: slice,
+        y_slice: slice,
+        x_slice: slice,
+    ) -> np.ndarray:
+        """
+        Read a tile subvolume, padding 2D data with a singleton z axis.
+        """
+        if self._is_2d:
+            arr = self.ts[0, tile_idx, ch_sel, y_slice, x_slice].read().result()
+            if arr.ndim == 2:
+                arr = arr[None, None, :, :]
+            elif arr.ndim == 3:
+                arr = arr[:, None, :, :]
+        else:
+            arr = self.ts[0, tile_idx, ch_sel, z_slice, y_slice, x_slice].read().result()
+        return arr.astype(np.float32)
+
     @staticmethod
     def register_and_score(
-        g1: cp.ndarray,
-        g2: cp.ndarray,
+        g1: Any,
+        g2: Any,
         win_size: int,
         debug: bool = True,
     ) -> Union[Tuple[Tuple[float, float, float], float], Tuple[None, None]]:
@@ -380,7 +450,7 @@ class TileFusion:
 
         Parameters
         ----------
-        g1, g2 : GPU arrays
+        g1, g2 : array-like
             Fixed and moving patches (ZYX).
         win_size : int
             SSIM window.
@@ -394,51 +464,32 @@ class TileFusion:
         ssim_val : float
             SSIM score.
         """
-        try:
-            # first, match histograms
-            g2m = match_histograms(g2, g1)
-            
-            # next, register z max projections
-            g2_zmax = cp.max(g2m, axis=0)
-            g1_zmax = cp.max(g1, axis=0)
-            
-            shift_zmax, _, _ = phase_cross_correlation(
-                g1_zmax, 
-                g2_zmax, 
-                disambiguate=True, 
-                normalization="phase", 
-                upsample_factor=10,
-                overlap_ratio=1.0
-            )
-            if debug:
-                print(f"shift_zmax: {shift_zmax}")
-            shift_zmax_expanded = np.array(
-                [0,shift_zmax[0],shift_zmax[1]], 
-                dtype=np.float32
-            )
-            if debug:
-                print(f"shift_zmax_expanded: {shift_zmax_expanded}")
-            
-            g2s_zmax = cp_shift(g2m, shift=shift_zmax_expanded, order=1, prefilter=False)
-            
-            shift, _, _ = phase_cross_correlation(
-                g1, 
-                g2s_zmax,  
-                disambiguate=True, 
-                normalization="phase", 
-                upsample_factor=10,
-                overlap_ratio=1.0
-            )
+        arr1 = xp.asarray(g1, dtype=xp.float32)
+        arr2 = xp.asarray(g2, dtype=xp.float32)
+        # squeeze leading singleton channel if present
+        while arr1.ndim > 2 and arr1.shape[0] == 1:
+            arr1 = arr1[0]
+            arr2 = arr2[0]
 
-            final_shift = np.array(shift_zmax_expanded+shift, dtype=np.float32)
-            if debug:
-                print(f"final_shift: {final_shift}")            
-            g2s = cp_shift(g2m, shift=final_shift, order=1, prefilter=False)
-            
-            ssim_val = ssim_cuda(g1, g2s, win_size=win_size)
-            return tuple(float(s) for s in final_shift), float(ssim_val)
-        except Exception:
-            return None, None
+        arr2 = match_histograms(arr2, arr1)
+        shift, _, _ = phase_cross_correlation(
+            arr1,
+            arr2,
+            disambiguate=True,
+            normalization="phase",
+            upsample_factor=10,
+            overlap_ratio=0.5,
+        )
+        if arr1.ndim == 2 and len(shift) == 2:
+            shift_apply = xp.asarray(shift, dtype=xp.float32)
+            shift_ret = xp.asarray([0.0, shift[0], shift[1]], dtype=xp.float32)
+        else:
+            shift_apply = xp.asarray(shift, dtype=xp.float32)
+            shift_ret = shift_apply
+        g2s = _shift_array(arr2, shift_vec=shift_apply)
+        ssim_val = _ssim(arr1, g2s, win_size=win_size)
+        out_shift = cp.asnumpy(shift_ret) if USING_GPU else np.asarray(shift_ret)
+        return tuple(float(s) for s in out_shift), float(ssim_val)
     
     def refine_tile_positions_with_cross_correlation(
         self,
@@ -462,6 +513,14 @@ class TileFusion:
             SSIM threshold to accept a link.
         """
         df = downsample_factors or self.downsample_factors
+        if len(df) == 3:
+            df = (1, *df[1:]) if self.z_dim == 1 else tuple(df)
+        elif len(df) == 4:
+            df = tuple(df)
+        else:
+            raise ValueError("downsample_factors must have length 3 or 4")
+        # Ensure block size aligns with channel-first arrays (C, Z, Y, X)
+        reduce_block = None
         sw = ssim_window       or self.ssim_window
         th = threshold         or self.threshold
         self.pairwise_metrics.clear()
@@ -495,23 +554,38 @@ class TileFusion:
                         z0, z1 = bnds[0]
                         y0, y1 = bnds[1]
                         x0, x1 = bnds[2]
-                        return (self.ts[0, idx, ch_idx,
-                                        z0:z1, y0:y1, x0:x1]
-                                .read().result()
-                                .astype(np.float32))
+                        return self._read_tile_volume(
+                            idx,
+                            ch_idx,
+                            slice(z0, z1),
+                            slice(y0, y1),
+                            slice(x0, x1),
+                        )
 
                     patch_i = executor.submit(read_patch, i, bounds_i).result()
                     patch_j = executor.submit(read_patch, j, bounds_j).result()
 
-                    g1 = block_reduce(cp.asarray(patch_i), df, cp.mean)
-                    g2 = block_reduce(cp.asarray(patch_j), df, cp.mean)
+                    arr_i = xp.asarray(patch_i)
+                    arr_j = xp.asarray(patch_j)
+                    if reduce_block is None:
+                        # prepend 1 for channel axis if needed
+                        reduce_block = (
+                            (1,) + tuple(df)
+                            if arr_i.ndim == len(df) + 1
+                            else tuple(df)
+                        )
+                    g1 = block_reduce(arr_i, reduce_block, xp.mean)
+                    g2 = block_reduce(arr_j, reduce_block, xp.mean)
                     shift_ds, ssim_val = self.register_and_score(
                         g1, g2, win_size=sw, debug=self._debug
                     )
-                    if shift_ds is None or (ssim_val < th and th != 0.0):
+                    if shift_ds is None:
+                        continue
+                    score = float(max(ssim_val, 1e-6))
+                    if th != 0.0 and score < th:
                         continue
 
-                    dz_s, dy_s, dx_s = [int(shift_ds[k] * df[k]) for k in range(3)]
+                    dz_s, dy_s, dx_s = [int(np.round(shift_ds[k] * df[k])) for k in range(3)]
                     max_shift = (20, 50, 100)  # adjust to your expected maximum neighbor‐tile displacement
 
                     if abs(dz_s) > max_shift[0] or abs(dy_s) > max_shift[1] or abs(dx_s) > max_shift[2]:
@@ -520,7 +594,7 @@ class TileFusion:
                         continue
 
                     self.pairwise_metrics[(i, j)] = (
-                        dz_s, dy_s, dx_s, round(ssim_val, 3)
+                        dz_s, dy_s, dx_s, round(score, 3)
                     )
 
         executor.shutdown(wait=True)
@@ -631,6 +705,9 @@ class TileFusion:
                 't': np.array(v[:3], dtype=np.float64),
                 'w': np.sqrt(v[3])
             })
+        if not links:
+            self.global_offsets = np.zeros((self.position_dim, 3), dtype=np.float64)
+            return
 
         n = len(self._tile_positions)
         fixed = [0]  # by default, fix tile index 0 at zero shift
@@ -745,8 +822,6 @@ class TileFusion:
             "context": {
                 "file_io_concurrency": {"limit": self.max_workers},
                 "data_copy_concurrency": {"limit": self.max_workers},
-                "file_io_memmap": True,
-                "file_io_sync": False,
             },
             "driver": "zarr3",
             "kvstore": {"driver": "file", "path": str(out)},
@@ -850,16 +925,20 @@ class TileFusion:
         oz_i, oy_i, ox_i = offsets[i]
         oz_j, oy_j, ox_j = offsets[j]
 
-        sub_i = (self.ts[0, i, slice(None),
-                         slice(z0 - oz_i, z1 - oz_i),
-                         slice(y0 - oy_i, y1 - oy_i),
-                         slice(x0 - ox_i, x1 - ox_i)]
-                 .read().result().astype(np.float32))
-        sub_j = (self.ts[0, j, slice(None),
-                         slice(z0 - oz_j, z1 - oz_j),
-                         slice(y0 - oy_j, y1 - oy_j),
-                         slice(x0 - ox_j, x1 - ox_j)]
-                 .read().result().astype(np.float32))
+        sub_i = self._read_tile_volume(
+            i,
+            slice(None),
+            slice(z0 - oz_i, z1 - oz_i),
+            slice(y0 - oy_i, y1 - oy_i),
+            slice(x0 - ox_i, x1 - ox_i),
+        )
+        sub_j = self._read_tile_volume(
+            j,
+            slice(None),
+            slice(z0 - oz_j, z1 - oz_j),
+            slice(y0 - oy_j, y1 - oy_j),
+            slice(x0 - ox_j, x1 - ox_j),
+        )
 
         C, dz, dy, dx = sub_i.shape
         fused = np.empty((C, dz, dy, dx), dtype=np.float32)
@@ -969,11 +1048,13 @@ class TileFusion:
         for (z0, z1, y0, y1, x0, x1) in regions:
             if z1 <= z0 or y1 <= y0 or x1 <= x0:
                 continue
-            block = (self.ts[0, idx, slice(None),
-                             slice(z0-oz, z1-oz),
-                             slice(y0-oy, y1-oy),
-                             slice(x0-ox, x1-ox)]
-                     .read().result().astype(np.uint16))
+            block = self._read_tile_volume(
+                idx,
+                slice(None),
+                slice(z0 - oz, z1 - oz),
+                slice(y0 - oy, y1 - oy),
+                slice(x0 - ox, x1 - ox),
+            ).astype(np.uint16)
             self.fused_ts[
                 0, slice(None),
                 slice(z0, z1),
@@ -1019,12 +1100,12 @@ class TileFusion:
 
                     local_z0, local_z1 = tz0 - oz, tz1 - oz
                     # read only channel c
-                    sub = (
-                        self.ts[0, t_idx, slice(c, c+1),
-                                slice(local_z0, local_z1),
-                                slice(0, self.Y),
-                                slice(0, self.X)]
-                        .read().result().astype(np.float32)
+                    sub = self._read_tile_volume(
+                        t_idx,
+                        slice(c, c + 1),
+                        slice(local_z0, local_z1),
+                        slice(0, self.Y),
+                        slice(0, self.X),
                     )
 
                     wz = self.z_profile[local_z0:local_z1]
@@ -1052,8 +1133,9 @@ class TileFusion:
                 # immediate cleanup
                 del fused_block, weight_sum
                 gc.collect()
-                cp.get_default_memory_pool().free_all_blocks()
-                cp.get_default_pinned_memory_pool().free_all_blocks()
+                if USING_GPU and cp is not None:
+                    cp.get_default_memory_pool().free_all_blocks()
+                    cp.get_default_pinned_memory_pool().free_all_blocks()
 
         # wait for all writes to finish
         for fut in futures:
@@ -1091,7 +1173,9 @@ class TileFusion:
             factor_to_use = (factors[idx] // factors[idx-1]
                              if idx > 0 else factors[0])
             _, _, Z, Y, X = inp.shape
-            new_z, new_y, new_x = Z // factor_to_use, Y // factor_to_use, X // factor_to_use
+            z_factor = factor_to_use if not self._is_2d else 1
+            new_z = max(1, Z // z_factor)
+            new_y, new_x = Y // factor_to_use, X // factor_to_use
             shard_z = min(z_slices_per_shard, new_z)
 
             # choose chunk_y, chunk_x
@@ -1110,16 +1194,26 @@ class TileFusion:
 
             for z0 in trange(0, new_z, shard_z, desc=f'scale{idx+1}', leave=True):
                 bz = min(shard_z, new_z - z0)
-                in_z0, in_z1 = z0 * factor_to_use, (z0 + bz) * factor_to_use
+                in_z0 = z0 * z_factor
+                in_z1 = min(Z, (z0 + bz) * z_factor)
                 for y0 in range(0, new_y, chunk_y):
                     by = min(chunk_y, new_y - y0)
-                    in_y0, in_y1 = y0 * factor_to_use, (y0 + by) * factor_to_use
+                    in_y0 = y0 * factor_to_use
+                    in_y1 = min(Y, (y0 + by) * factor_to_use)
                     for x0 in range(0, new_x, chunk_x):
                         bx = min(chunk_x, new_x - x0)
-                        in_x0, in_x1 = x0 * factor_to_use, (x0 + bx) * factor_to_use
+                        in_x0 = x0 * factor_to_use
+                        in_x1 = min(X, (x0 + bx) * factor_to_use)
 
                         slab = inp[:, :, in_z0:in_z1, in_y0:in_y1, in_x0:in_x1].read().result()
-                        down = slab[..., ::factor_to_use, ::factor_to_use, ::factor_to_use]
+                        if self.multiscale_downsample == "stride":
+                            down = slab[..., ::z_factor, ::factor_to_use, ::factor_to_use]
+                        else:
+                            arr = xp.asarray(slab)
+                            block = (1, 1, z_factor, factor_to_use, factor_to_use)
+                            down_arr = block_reduce(arr, block_size=block, func=xp.mean)
+                            down = cp.asnumpy(down_arr) if USING_GPU and cp is not None else np.asarray(down_arr)
+                        down = down.astype(slab.dtype, copy=False)
                         self.fused_ts[
                             :, :,
                             z0:z0 + bz,
@@ -1221,9 +1315,9 @@ class TileFusion:
             self.optimize_shifts()
         except FileNotFoundError:
             self.refine_tile_positions_with_cross_correlation(
-                downsample_factors=(5,3,3),
+                downsample_factors=self.downsample_factors,
                 ch_idx=self.channel_to_use,
-                threshold=0.7)
+                threshold=self.threshold)
             self.save_pairwise_metrics(metrics_path)
 
         self.optimize_shifts(
@@ -1233,8 +1327,9 @@ class TileFusion:
             iterative=True
         )
         gc.collect()
-        cp.get_default_memory_pool().free_all_blocks()
-        cp.get_default_pinned_memory_pool().free_all_blocks()
+        if USING_GPU and cp is not None:
+            cp.get_default_memory_pool().free_all_blocks()
+            cp.get_default_pinned_memory_pool().free_all_blocks()
 
         self._tile_positions = [
             tuple(np.array(pos) + off * np.array(self._pixel_size))
@@ -1250,6 +1345,7 @@ class TileFusion:
         self._fuse_by_shard()
 
         # Write NGFF JSON for scale0
+        Path(omezarr / "scale0").mkdir(parents=True, exist_ok=True)
         ngff = {
             "attributes": {"_ARRAY_DIMENSIONS": ["t", "c", "z", "y", "x"]},
             "zarr_format": 3,
