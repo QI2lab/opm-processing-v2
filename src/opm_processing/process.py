@@ -18,8 +18,7 @@ warnings.simplefilter("ignore", category=FutureWarning)
 from pathlib import Path
 import tensorstore as ts
 from opm_processing.imageprocessing.opmpsf import generate_skewed_psf, generate_proj_psf, ASI_generate_skewed_psf
-from opm_processing.imageprocessing.rlgc import chunked_rlgc, rlgc_biggs
-from opm_processing.imageprocessing.rglc_nc import chunked_rlgc_nc
+from opm_processing.imageprocessing.rlgc import chunked_rlgc
 from opm_processing.imageprocessing.opmtools import orthogonal_deskew, deskew_shape_estimator
 from opm_processing.imageprocessing.maxtilefusion import MaxTileFusion
 from opm_processing.imageprocessing.darksection import dark_sectioning
@@ -412,54 +411,47 @@ def process_skewed(
                             psfs.append(psf)
 
                     if camera_corrected_data.shape[1]<=256:
-                        chunk_size = 256
+                        chunk_size = 512
                         overlap_size = 32
                     elif camera_corrected_data.shape[1]<=512:
-                        chunk_size = 128
+                        chunk_size = 256
                         overlap_size = 32
                     else:
-                        chunk_size = 64
-                        overlap_size = 16
+                        chunk_size = 128
+                        overlap_size = 32
 
                     # # This code is for debugging RLGC deconvolution
                     # # ------------------------------------
                     # decon_temp = chunked_rlgc(
                     #     camera_corrected_data, 
                     #     psf,
-                    #     scan_chunk_size=256,
-                    #     scan_overlap_size=32,
-                    #     bkd=0
-                    # )
-
-                    # decon_temp_nc = chunked_rlgc_nc(
-                    #     camera_corrected_data, 
-                    #     psf,
-                    #     scan_chunk_size=256,
-                    #     scan_overlap_size=32,
-                    #     bkd=0
+                    #     crop_z=256,
+                    #     overlap_z=32,
+                    #     verbose=1
                     # )
                     
                     # import napari
                     # viewer = napari.Viewer()
                     # viewer.add_image(decon_temp,name="decon_temp")
-                    # viewer.add_image(decon_temp_nc,name="decon_temp_nc")
                     # viewer.add_image(camera_corrected_data)
                     # napari.run()
-                    # # ------------------------------------
+                    # ------------------------------------
 
                     if flyback_crop is not None:
                         deconvolved_data = chunked_rlgc(
                             camera_corrected_data[excess_scan_positions:-flyback_crop,:,:],
                             np.asarray(psfs[chan_idx]),
-                            scan_chunk_size=chunk_size,
-                            scan_overlap_size=overlap_size
+                            crop_z=chunk_size,
+                            overlap_z=overlap_size,
+                            verbose=1
                         )
                     else:
                         deconvolved_data = chunked_rlgc(
                             camera_corrected_data[excess_scan_positions:,:,:],
                             np.asarray(psfs[chan_idx]),
-                            scan_chunk_size=chunk_size,
-                            scan_overlap_size=overlap_size
+                            crop_z=chunk_size,
+                            overlap_z=overlap_size,
+                            verbose=1
                         )
                     deskewed = orthogonal_deskew(
                         deconvolved_data,
