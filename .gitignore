@@ -111,3 +111,4 @@ ENV/
 .idea/
 src/opm_processing/test_flatfield.py
 tests/test_symlink.py
+src/cucim-cu12/

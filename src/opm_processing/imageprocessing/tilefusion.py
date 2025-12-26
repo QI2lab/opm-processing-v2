@@ -25,6 +25,7 @@ from opm_processing.imageprocessing.ssim_cuda import (
     structural_similarity_cupy_sep_shared as ssim_cuda
 )
 from tqdm import trange
+import SimpleITK as sitk
 
 
 @njit(parallel=True)
@@ -367,6 +368,109 @@ class TileFusion:
             prof[:blend] = ramp
             prof[-blend:] = ramp[::-1]
         return prof
+    
+    @staticmethod
+    def register_with_sitk(
+        fixed: np.ndarray,
+        moving: np.ndarray,
+        voxel_size: tuple[float, float, float],
+        init_offset: tuple[float, float, float],
+        debug: bool = False
+    ) -> tuple[tuple[float, float, float], np.ndarray]:
+        """
+        Register `moving` → `fixed` with SimpleITK Translation + Mattes MI,
+        initializing from a provided physical offset, and correctly handling
+        a CompositeTransform by extracting the optimized translation.
+
+        Parameters
+        ----------
+        fixed : np.ndarray
+            Fixed image block, shape (Z, Y, X).
+        moving : np.ndarray
+            Moving image block, shape (Z, Y, X).
+        voxel_size : tuple[float, float, float]
+            Voxel size in (z, y, x).
+        init_offset : tuple[float, float, float]
+            Initial translation (x, y, z) in physical units.
+        debug : bool, optional
+            If True, print iteration metrics, by default False.
+
+        Returns
+        -------
+        shift_vox : tuple[float, float, float]
+            The translation (dz, dy, dx) in full-resolution voxels.
+        aligned : np.ndarray
+            The moving image resampled onto the fixed image grid.
+        """
+        # Wrap arrays as SITK images (np Z,Y,X → image X,Y,Z)
+        fixed_img  = sitk.GetImageFromArray(fixed)
+        moving_img = sitk.GetImageFromArray(moving)
+        spacing = (voxel_size[2], voxel_size[1], voxel_size[0])
+        fixed_img.SetSpacing(spacing)
+        moving_img.SetSpacing(spacing)
+
+        # Configure registration
+        reg = sitk.ImageRegistrationMethod()
+        reg.SetMetricAsANTSNeighborhoodCorrelation(5)
+        # reg.SetMetricSamplingPercentage(0.1)
+        # reg.SetMetricSamplingStrategy(reg.SAMPLING_RANDOM)
+        # reg.SetShrinkFactorsPerLevel([4,2,1])
+        # reg.SetSmoothingSigmasPerLevel([4,2,0])
+        # reg.SmoothingSigmasAreSpecifiedInPhysicalUnitsOn()
+        reg.SetOptimizerAsRegularStepGradientDescent(
+            learningRate=1.0, minStep=1e-4, numberOfIterations=100
+        )
+        reg.SetInterpolator(sitk.sitkLinear)
+
+        # Initialize with provided offset
+        init_tx = sitk.TranslationTransform(3)
+        init_tx.SetOffset(init_offset)
+        reg.SetInitialTransform(init_tx, inPlace=False)
+
+        if debug:
+            reg.AddCommand(
+                sitk.sitkIterationEvent,
+                lambda: print(f"[SITK] Iter {reg.GetOptimizerIteration():3d} Metric={reg.GetMetricValue():.4f}")
+            )
+
+        try:
+            final_tx = reg.Execute(fixed_img, moving_img)
+        except RuntimeError as e:
+            msg = str(e)
+            if "All samples map outside moving image buffer" in msg:
+                if debug:
+                    print("[SITK] Mattes MI failed—using init_offset only.")
+                final_tx = init_tx
+            else:
+                raise
+
+        # Extract the optimized translation
+        if isinstance(final_tx, sitk.CompositeTransform):
+            # The second transform is typically the optimizer result
+            idx = 1 if final_tx.GetNumberOfTransforms() > 1 else 0
+            opt_tx = final_tx.GetNthTransform(idx)
+            try:
+                disp_phys = opt_tx.GetOffset()
+            except AttributeError:
+                # Fallback for transforms without GetOffset()
+                disp_phys = tuple(opt_tx.GetParameters())
+        else:
+            disp_phys = final_tx.GetOffset()
+
+        # Convert physical (x,y,z) → voxels (dz,dy,dx)
+        dz = disp_phys[2] / voxel_size[0]
+        dy = disp_phys[1] / voxel_size[1]
+        dx = disp_phys[0] / voxel_size[2]
+        shift_vox = (dz, dy, dx)
+
+        # Resample moving onto fixed grid
+        resampled = sitk.Resample(
+            moving_img, fixed_img, final_tx,
+            sitk.sitkLinear, 0.0, moving_img.GetPixelID()
+        )
+        aligned = sitk.GetArrayFromImage(resampled).astype(np.float32)
+
+        return shift_vox, aligned
 
     @staticmethod
     def register_and_score(
@@ -440,69 +544,59 @@ class TileFusion:
         except Exception:
             return None, None
     
+
     def refine_tile_positions_with_cross_correlation(
         self,
-        downsample_factors: Tuple[int, int, int] = None,
+        downsample_factors: tuple[int, int, int] = None,
         ssim_window: int = None,
         ch_idx: int = 0,
-        threshold: float = None
+        threshold: float = None,
+        use_sitk_refinement: bool = False,
     ) -> None:
         """
-        Detect and score overlaps between each tile pair via cross-correlation.
-
-        Parameters
-        ----------
-        downsample_factors : tuple of int, optional
-            Block-reduce factors for registration.
-        ssim_window : int, optional
-            Window size for SSIM.
-        ch_idx : int, optional
-            Channel to use.
-        threshold : float, optional
-            SSIM threshold to accept a link.
+        1) GPU cross-correlation → coarse shift (shift_ds).
+        2) If requested, apply that shift to patch_j via CuPy, then refine with SITK.
         """
         df = downsample_factors or self.downsample_factors
         sw = ssim_window       or self.ssim_window
         th = threshold         or self.threshold
         self.pairwise_metrics.clear()
         n_pos = self.position_dim
-        executor = ThreadPoolExecutor(max_workers=2)
+        executor = ThreadPoolExecutor(max_workers=self._max_workers)
 
         def bounds_1d(off, length):
             return max(0, off), min(length, off + length)
 
         for t in range(self.time_dim):
             base = t * n_pos
-            for i_pos in trange(n_pos, desc="register", leave=True):
+            for i_pos in trange(n_pos,desc="register", leave=True):
                 i = base + i_pos
                 for j_pos in range(i_pos + 1, n_pos):
                     j = base + j_pos
+
                     phys = (np.array(self._tile_positions[j]) -
                             np.array(self._tile_positions[i]))
                     vox_off = np.round(phys / np.array(self._pixel_size)).astype(int)
-                    dz, dy, dx = vox_off
-                    bounds_i = [bounds_1d(dz, self.z_dim),
-                                bounds_1d(dy, self.Y),
-                                bounds_1d(dx, self.X)]
-                    bounds_j = [bounds_1d(-dz, self.z_dim),
-                                bounds_1d(-dy, self.Y),
-                                bounds_1d(-dx, self.X)]
+                    dz0, dy0, dx0 = vox_off
 
-                    if any(hi <= lo for lo, hi in bounds_i):
+                    b_i = [bounds_1d(dz0, self.z_dim),
+                           bounds_1d(dy0, self.Y),
+                           bounds_1d(dx0, self.X)]
+                    b_j = [bounds_1d(-dz0, self.z_dim),
+                           bounds_1d(-dy0, self.Y),
+                           bounds_1d(-dx0, self.X)]
+                    if any(hi <= lo for lo, hi in b_i):
                         continue
 
                     def read_patch(idx, bnds):
-                        z0, z1 = bnds[0]
-                        y0, y1 = bnds[1]
-                        x0, x1 = bnds[2]
-                        return (self.ts[0, idx, ch_idx,
-                                        z0:z1, y0:y1, x0:x1]
-                                .read().result()
-                                .astype(np.float32))
+                        z0, z1 = bnds[0]; y0, y1 = bnds[1]; x0, x1 = bnds[2]
+                        return (self.ts[0, idx, ch_idx, z0:z1, y0:y1, x0:x1]
+                                .read().result().astype(np.float32))
 
-                    patch_i = executor.submit(read_patch, i, bounds_i).result()
-                    patch_j = executor.submit(read_patch, j, bounds_j).result()
+                    patch_i = executor.submit(read_patch, i, b_i).result()
+                    patch_j = executor.submit(read_patch, j, b_j).result()
 
+                    # GPU-based registration (downsampled)
                     g1 = block_reduce(cp.asarray(patch_i), df, cp.mean)
                     g2 = block_reduce(cp.asarray(patch_j), df, cp.mean)
                     shift_ds, ssim_val = self.register_and_score(
@@ -511,12 +605,51 @@ class TileFusion:
                     if shift_ds is None or (ssim_val < th and th != 0.0):
                         continue
 
-                    dz_s, dy_s, dx_s = [int(shift_ds[k] * df[k]) for k in range(3)]
-                    max_shift = (20, 50, 100)  # adjust to your expected maximum neighbor‐tile displacement
+                    # upscale coarse shift to full-res voxels
+                    coarse_full = [shift_ds[k] * df[k] for k in range(3)]
 
-                    if abs(dz_s) > max_shift[0] or abs(dy_s) > max_shift[1] or abs(dx_s) > max_shift[2]:
+                    if use_sitk_refinement:
+                        # apply coarse_full to patch_j on GPU
+                        pj_gpu = cp.asarray(patch_j)
+                        pj_shifted_gpu = cp_shift(
+                            pj_gpu,
+                            shift=tuple(coarse_full),
+                            order=1,
+                            prefilter=False
+                        )
+                        patch_j_shifted = cp.asnumpy(pj_shifted_gpu)
+
+                        # refine the already-shifted patch_j
+                        sitk_shift, _ = self.register_with_sitk(
+                            patch_i,
+                            patch_j_shifted,
+                            voxel_size=self._pixel_size,
+                            init_offset=(0.0, 0.0, 0.0),
+                            debug=self._debug
+                        )
+
+                        total_shift = [
+                            coarse_full[k] + sitk_shift[k]
+                            for k in range(3)
+                        ]
+                    else:
+                        total_shift = coarse_full
+
+                    dz_s, dy_s, dx_s = (
+                        int(round(total_shift[0])),
+                        int(round(total_shift[1])),
+                        int(round(total_shift[2]))
+                    )
+
+                    max_shift = (50, 200, 200)
+                    if (abs(dz_s) > max_shift[0] or
+                        abs(dy_s) > max_shift[1] or
+                        abs(dx_s) > max_shift[2]):
                         if self._debug:
-                            print(f"Dropping link {(i,j)} shift={(dz_s,dy_s,dx_s)} — exceeds max {max_shift}")
+                            print(
+                                f"Dropping link {(i, j)} shift={(dz_s, dy_s, dx_s)} "
+                                f"exceeds {max_shift}"
+                            )
                         continue
 
                     self.pairwise_metrics[(i, j)] = (
@@ -524,6 +657,91 @@ class TileFusion:
                     )
 
         executor.shutdown(wait=True)
+
+    # def refine_tile_positions_with_cross_correlation(
+    #     self,
+    #     downsample_factors: Tuple[int, int, int] = None,
+    #     ssim_window: int = None,
+    #     ch_idx: int = 0,
+    #     threshold: float = None
+    # ) -> None:
+    #     """
+    #     Detect and score overlaps between each tile pair via cross-correlation.
+
+    #     Parameters
+    #     ----------
+    #     downsample_factors : tuple of int, optional
+    #         Block-reduce factors for registration.
+    #     ssim_window : int, optional
+    #         Window size for SSIM.
+    #     ch_idx : int, optional
+    #         Channel to use.
+    #     threshold : float, optional
+    #         SSIM threshold to accept a link.
+    #     """
+    #     df = downsample_factors or self.downsample_factors
+    #     sw = ssim_window       or self.ssim_window
+    #     th = threshold         or self.threshold
+    #     self.pairwise_metrics.clear()
+    #     n_pos = self.position_dim
+    #     executor = ThreadPoolExecutor(max_workers=2)
+
+    #     def bounds_1d(off, length):
+    #         return max(0, off), min(length, off + length)
+
+    #     for t in range(self.time_dim):
+    #         base = t * n_pos
+    #         for i_pos in trange(n_pos, desc="register", leave=True):
+    #             i = base + i_pos
+    #             for j_pos in range(i_pos + 1, n_pos):
+    #                 j = base + j_pos
+    #                 phys = (np.array(self._tile_positions[j]) -
+    #                         np.array(self._tile_positions[i]))
+    #                 vox_off = np.round(phys / np.array(self._pixel_size)).astype(int)
+    #                 dz, dy, dx = vox_off
+    #                 bounds_i = [bounds_1d(dz, self.z_dim),
+    #                             bounds_1d(dy, self.Y),
+    #                             bounds_1d(dx, self.X)]
+    #                 bounds_j = [bounds_1d(-dz, self.z_dim),
+    #                             bounds_1d(-dy, self.Y),
+    #                             bounds_1d(-dx, self.X)]
+
+    #                 if any(hi <= lo for lo, hi in bounds_i):
+    #                     continue
+
+    #                 def read_patch(idx, bnds):
+    #                     z0, z1 = bnds[0]
+    #                     y0, y1 = bnds[1]
+    #                     x0, x1 = bnds[2]
+    #                     return (self.ts[0, idx, ch_idx,
+    #                                     z0:z1, y0:y1, x0:x1]
+    #                             .read().result()
+    #                             .astype(np.float32))
+
+    #                 patch_i = executor.submit(read_patch, i, bounds_i).result()
+    #                 patch_j = executor.submit(read_patch, j, bounds_j).result()
+
+    #                 g1 = block_reduce(cp.asarray(patch_i), df, cp.mean)
+    #                 g2 = block_reduce(cp.asarray(patch_j), df, cp.mean)
+    #                 shift_ds, ssim_val = self.register_and_score(
+    #                     g1, g2, win_size=sw, debug=self._debug
+    #                 )
+    #                 if shift_ds is None or (ssim_val < th and th != 0.0):
+    #                     continue
+
+    #                 dz_s, dy_s, dx_s = [int(shift_ds[k] * df[k]) for k in range(3)]
+    #                 max_shift = (20, 50, 100)  # adjust to your expected maximum neighbor‐tile displacement
+
+    #                 if abs(dz_s) > max_shift[0] or abs(dy_s) > max_shift[1] or abs(dx_s) > max_shift[2]:
+    #                     if self._debug:
+    #                         print(f"Dropping link {(i,j)} shift={(dz_s,dy_s,dx_s)} — exceeds max {max_shift}")
+    #                     continue
+
+    #                 self.pairwise_metrics[(i, j)] = (
+    #                     dz_s, dy_s, dx_s, round(ssim_val, 3)
+    #                 )
+
+    #     executor.shutdown(wait=True)
 
     @staticmethod
     def _solve_global(
@@ -633,7 +851,7 @@ class TileFusion:
             })
 
         n = len(self._tile_positions)
-        fixed = [0]  # by default, fix tile index 0 at zero shift
+        fixed = [n-1]  # by default, fix tile index 0 at zero shift
 
         if method == 'ONE_ROUND':
             d_opt = self._solve_global(links, n, fixed)
@@ -685,24 +903,35 @@ class TileFusion:
 
     def _compute_fused_image_space(self) -> None:
         """
-        Compute fused volume physical shape and offset based on tile positions.
+        Compute the fused volume’s physical extents from tile centers plus half-tile size,
+        so that the bounding box exactly covers your data without extra zeros.
         """
-        pos = np.array(self._tile_positions)
-        min_z, min_y, min_x = pos.min(axis=0)
-        max_z = pos[:, 0].max() + self.z_dim * self._pixel_size[0]
-        max_y = pos[:, 1].max() + self.Y    * self._pixel_size[1]
-        max_x = pos[:, 2].max() + self.X    * self._pixel_size[2]
+        pos = np.array(self._tile_positions)  # shape (n_tiles, 3): (z, y, x) in physical units
 
+        # half-size of one tile along each axis in physical units
+        half_z = (self.z_dim * self._pixel_size[0]) / 2.0
+        half_y = (self.Y     * self._pixel_size[1]) / 2.0
+        half_x = (self.X     * self._pixel_size[2]) / 2.0
+
+        # compute global min/max by subtracting/adding half-sizes
+        min_z = pos[:, 0].min() - half_z
+        max_z = pos[:, 0].max() + half_z
+        min_y = pos[:, 1].min() - half_y
+        max_y = pos[:, 1].max() + half_y
+        min_x = pos[:, 2].min() - half_x
+        max_x = pos[:, 2].max() + half_x
+
+        # convert physical extents to integer voxel counts
         sz = int(np.ceil((max_z - min_z) / self._pixel_size[0]))
         sy = int(np.ceil((max_y - min_y) / self._pixel_size[1]))
         sx = int(np.ceil((max_x - min_x) / self._pixel_size[2]))
 
         self.unpadded_shape = (sz, sy, sx)
-        self.offset = (min_z, min_y, min_x)
-        self.center = (
-            (max_x - min_x) / 2,
-            (max_y - min_y) / 2,
-            (max_z - min_z) / 2
+        self.offset         = (min_z, min_y, min_x)
+        self.center         = (
+            (max_x - min_x) / 2.0,
+            (max_y - min_y) / 2.0,
+            (max_z - min_z) / 2.0,
         )
 
     def _pad_to_chunk_multiple(self) -> None:
@@ -1221,15 +1450,16 @@ class TileFusion:
             self.optimize_shifts()
         except FileNotFoundError:
             self.refine_tile_positions_with_cross_correlation(
-                downsample_factors=(5,3,3),
+                downsample_factors=(3,5,5),
                 ch_idx=self.channel_to_use,
-                threshold=0.7)
+                threshold=0.1,
+                use_sitk_refinement=True)
             self.save_pairwise_metrics(metrics_path)
 
         self.optimize_shifts(
             method="TWO_ROUND_ITERATIVE",
-            rel_thresh=.5,
-            abs_thresh=1.5,
+            rel_thresh=1.5,
+            abs_thresh=3.5,
             iterative=True
         )
         gc.collect()
