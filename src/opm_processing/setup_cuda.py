@@ -29,7 +29,7 @@ BASE_PIP_DEPS = [
     "napari-ome-zarr",
     "simpleitk",
     "basicpy @ git+https://github.com/QI2lab/BaSiCPy.git@main",
-    "ome-zarr @ git+https://github.com/ome/ome-zarr-py.git@refs/pull/404/head",
+    "ome-zarr"
 ]
 
 # CUDA conda pkgs
