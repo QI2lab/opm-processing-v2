@@ -6,27 +6,30 @@ This file displays deskewed qi2lab OPM data.
 
 import multiprocessing as mp
 import sys
+
 if sys.platform.startswith("linux"):
     mp.set_start_method("forkserver", force=True)
 elif sys.platform.startswith("win"):
     mp.set_start_method("spawn", force=True)
     
 import warnings
+
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.simplefilter("ignore", category=FutureWarning)
 
 
-from pathlib import Path
-import tensorstore as ts
-import napari
 import json
-from opm_processing.dataio.metadata import find_key, extract_stage_positions
+from pathlib import Path
+
+import napari
 import numpy as np
-from napari.experimental import link_layers
-from cmap import Colormap
+import tensorstore as ts
 import typer
+from cmap import Colormap
+from napari.experimental import link_layers
 from tqdm import tqdm
 
+from opm_processing.dataio.metadata import extract_stage_positions, find_key
 
 app = typer.Typer()
 app.pretty_exceptions_enable = False
@@ -95,14 +98,22 @@ def display(
         for pos_idx, _ in enumerate(stage_positions):
             stage_positions[pos_idx,0] = stage_z_max - stage_positions[pos_idx,0]
     
+    # Search data paths for deconvolution, include in filename if found
+    all_zarr_paths = [p for p in root_path.parents[0].glob("*.zarr")]
+    is_decon = any([str(p).find("decon")>=0 for p in all_zarr_paths]) 
+    if is_decon:
+        decon_str = "_decon"
+    else:
+        decon_str = ""
+
     if to_display == "max-z":
-        data_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_z_deskewed.zarr")
+        data_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_z"+decon_str+"_deskewed.zarr")
         scale_to_use = [pixel_size_um,pixel_size_um]
     if to_display == "fused-max-z":
         data_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_z_fused.zarr")
         scale_to_use = [pixel_size_um,pixel_size_um]
     elif to_display == "full":
-        data_path = root_path.parents[0] / Path(str(root_path.stem)+"_deskewed.zarr")
+        data_path = root_path.parents[0] / Path(str(root_path.stem)+decon_str+"_deskewed.zarr")
         scale_to_use = [pixel_size_um*2,pixel_size_um,pixel_size_um]
         
     # open datastore on disk
@@ -122,8 +133,7 @@ def display(
         Colormap("chrisluts:bop_orange").to_napari(),
     ]
     viewer = napari.Viewer()
-    
-    
+        
     if time_range is not None:
         time_iterator = tqdm(range(time_range[0],time_range[1]),desc="t")
     else:
@@ -164,7 +174,7 @@ def display(
                     name = "p"+str(pos_idx).zfill(3)+"_c"+str(chan_idx),
                     blending="additive",
                     colormap=colormaps[chan_idx],
-                    contrast_limits = [10,500]
+                    # contrast_limits = [10,500] # SJS: Commented out to automatically set contrast limits
                 )
                 
                 channel_layers[chan_idx].append(layer)
