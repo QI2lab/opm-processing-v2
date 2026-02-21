@@ -48,7 +48,7 @@ from opm_processing.imageprocessing.opmtools import (
     deskew_shape_estimator,
     orthogonal_deskew,
 )
-from opm_processing.imageprocessing.rlgc import chunked_rlgc, rlgc_biggs
+from opm_processing.imageprocessing.rlgc import chunked_rlgc, rlgc_biggs_ba
 
 app = typer.Typer()
 app.pretty_exceptions_enable = False
@@ -114,7 +114,7 @@ def process(
             zattrs = json.load(f)
 
         opm_mode = str(find_key(zattrs, "mode"))
-        
+        print(f"Processing OPM mode: {opm_mode}")
         if "mirror" in opm_mode or "stage" in opm_mode:
             process_skewed(
                 root_path,
@@ -135,7 +135,7 @@ def process(
             write_fused_max_projection_tiff = True
             write_bkd_corrected_fused_max_projection_tiff = False
             deconvolve = True
-            flatfield_correction = True
+            # flatfield_correction = True # S
             process_projection(
                 root_path,
                 zattrs, 
@@ -888,10 +888,14 @@ def process_projection(
                                 )
                                 psfs.append(psf)
 
-                        deconvolved_data = rlgc_biggs(
+                        if eager_deconvolution:
+                            safe_stop = False
+                        else:
+                            safe_stop = True
+                        deconvolved_data = rlgc_biggs_ba(
                             dark_section_data,
                             np.asarray(psfs[chan_idx]),
-                            eager_mode=eager_deconvolution
+                            safe_mode=safe_stop,
                         )
                     else:
                         deconvolved_data = dark_section_data.copy()
@@ -906,7 +910,7 @@ def process_projection(
                     ts_writes.append(
                         write_via_tensorstore(
                             ts_store = ts_store,
-                            data = deconvolved_data,
+                            data = deconvolved_data.astype(np.uint16),
                             data_location = [t_idx,pos_idx,chan_idx]
                         )
                     )
@@ -936,7 +940,7 @@ def process_projection(
                     "flatfield_corrected": flatfield_correction,
                 }
         )
-    
+        
         del deconvolved_data, ts_write, ts_store
         
         print("\nFusing using stage positions...")
@@ -980,7 +984,7 @@ def process_projection(
 
             max_projection = np.squeeze(np.asarray(max_proj_datastore.read().result()))
             
-            
+            print(f"maxprojection dimensions: {max_projection.ndim}")
             if max_projection.ndim == 3:
                 if datastore.shape[0] > 1 and datastore.shape[2] == 1:
                     axes = "TYX"
@@ -988,6 +992,8 @@ def process_projection(
                     axes = "CYX"
             elif max_projection.ndim == 4:
                 axes = "TCYX"
+            elif max_projection.ndim == 2:
+                axes = "YX"
             
             with TiffWriter(filename_path, bigtiff=True) as tif:
                 metadata={

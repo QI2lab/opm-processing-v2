@@ -138,7 +138,7 @@ def display(
         time_iterator = tqdm(range(time_range[0],time_range[1]),desc="t")
     else:
         time_iterator = tqdm(range(datastore.shape[0]),desc="t")
-    
+
     if not(to_display == "fused-max-z"):
         if pos_range is not None:
             pos_iterator = tqdm(range(pos_range[0],pos_range[1]),desc="p",leave=False)
@@ -166,7 +166,6 @@ def display(
                         (np.max(stage_positions[:,1]) - np.min(stage_positions[:,1]))/2,
                         (np.max(stage_positions[:,2]) - np.min(stage_positions[:,2]))/2
                     ]
-                    
                 layer = viewer.add_image(
                     datastore[time_idx,pos_idx,chan_idx,:],
                     scale=scale_to_use,
