@@ -794,7 +794,7 @@ def process_projection(
            
     # create tensorstore object for writing. This is NOT compatible with OME-NGFF!
     if deconvolve:
-        output_path = root_path.parents[0] / Path(str(root_path.stem)+"_projection_deconvolved.zarr")
+        output_path = root_path.parents[0] / Path(str(root_path.stem)+"_decon_projection.zarr")
     else:
         output_path = root_path.parents[0] / Path(str(root_path.stem)+"_projection.zarr")
     if not(output_path.exists()) or overwrite:
