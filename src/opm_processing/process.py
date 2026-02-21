@@ -37,7 +37,6 @@ from opm_processing.dataio.zarr_handlers import (
     create_via_tensorstore,
     write_via_tensorstore,
 )
-from opm_processing.imageprocessing.darksection import dark_sectioning
 from opm_processing.imageprocessing.maxtilefusion import MaxTileFusion
 from opm_processing.imageprocessing.opmpsf import (
     ASI_generate_skewed_psf,
@@ -67,7 +66,6 @@ def process(
     pos_range: tuple[int,int] = None,
     excess_overide: int = None,
     flyback_crop: int = None,
-    dark_section: bool = False,
     eager_mode: bool = False
 ):
     """Postprocess qi2lab OPM dataset.
@@ -101,8 +99,6 @@ def process(
         Range of timepoints to reconstruct.
     pos_range: list[int,int], default = None
         Range of stage positions to reconstruct.
-    dark_section: bool, default = False
-        Perform dark section background subtraction with default parameters.
     eager_mode: bool, default = False
         Use stricter iteration cutoff, potentially leading to over-fitting.
     """
@@ -132,20 +128,15 @@ def process(
                 flyback_crop
             )
         elif "projection" in opm_mode:
-            write_fused_max_projection_tiff = True
-            write_bkd_corrected_fused_max_projection_tiff = False
-            deconvolve = True
-            # flatfield_correction = True # S
+
             process_projection(
                 root_path,
                 zattrs, 
                 deconvolve,
                 flatfield_correction,
                 write_fused_max_projection_tiff,
-                write_bkd_corrected_fused_max_projection_tiff,
                 time_range,
                 pos_range,
-                dark_section,
                 eager_mode
             )
     elif root_path.suffixes[-2:] == [".ome", ".tif"]:
@@ -706,10 +697,8 @@ def process_projection(
     deconvolve: bool = True,
     flatfield_correction: bool = True,
     write_fused_max_projection_tiff: bool = True,
-    write_bkd_corrected_fused_max_projection_tiff: bool = True,
     time_range: tuple[int,int] = None,
     pos_range: tuple[int,int] = None,
-    dark_section: bool = False,
     eager_deconvolution: bool = False,
     overwrite: bool = False
 ):
@@ -745,8 +734,6 @@ def process_projection(
         Range of timepoints to process.
     pos_range: list[int,int], default = None
         Range of stage positions to process.
-    dark_section: bool, default = False
-        Perform dark section background substraction
     eager_mode: bool, default = False
         Use stricter iteration cutoff, potentially leading to over-fitting.
     """
@@ -806,7 +793,10 @@ def process_projection(
     datastore = datastore[:,:,:,None,:,:]
            
     # create tensorstore object for writing. This is NOT compatible with OME-NGFF!
-    output_path = root_path.parents[0] / Path(str(root_path.stem)+"_deconvolved.zarr")
+    if deconvolve:
+        output_path = root_path.parents[0] / Path(str(root_path.stem)+"_projection_deconvolved.zarr")
+    else:
+        output_path = root_path.parents[0] / Path(str(root_path.stem)+"_projection.zarr")
     if not(output_path.exists()) or overwrite:
         ts_store = create_via_tensorstore(output_path,datastore.shape)
     
@@ -867,16 +857,6 @@ def process_projection(
             for pos_idx in pos_iterator:
                 for chan_idx in tqdm(range(datastore.shape[2]),desc="c",leave=False):
                     camera_corrected_data = (((np.squeeze(datastore[t_idx,pos_idx,chan_idx,:].read().result()).astype(np.float32)-camera_offset)*camera_conversion)/flatfields[chan_idx,:].astype(np.float32)).clip(0,2**16-1).astype(np.uint16)
-                    if dark_section:
-                        dark_section_data = dark_sectioning(
-                            input_image = camera_corrected_data,
-                            emwavelength = float(int(str(channels[chan_idx]).rstrip("nm"))),
-                            na = 1.35,
-                            pixel_size = pixel_size_um * 1000,
-                            factor = 2           
-                        )
-                    else:
-                        dark_section_data = camera_corrected_data.copy()
                     
                     if deconvolve:
                         if pos_idx == 0 and chan_idx == 0:
@@ -893,12 +873,12 @@ def process_projection(
                         else:
                             safe_stop = True
                         deconvolved_data = rlgc_biggs_ba(
-                            dark_section_data,
+                            camera_corrected_data,
                             np.asarray(psfs[chan_idx]),
                             safe_mode=safe_stop,
                         )
                     else:
-                        deconvolved_data = dark_section_data.copy()
+                        deconvolved_data = camera_corrected_data.copy()
 
                     update_per_index_metadata(
                         ts_store = ts_store, 
@@ -1022,71 +1002,7 @@ def process_projection(
                     **options,
                     metadata=metadata
                 )
-                
-    if write_bkd_corrected_fused_max_projection_tiff:
-        from opm_processing.imageprocessing.rolling_ball_gpu import (
-            subtract_background_tpczyx,
-        )
-        tiff_dir_path = fused_output_path.parent / Path("fused_tiff_output")
-        tiff_dir_path.mkdir(exist_ok=True)
-        max_spec = {
-            "driver" : "zarr3",
-            "kvstore" : {
-                "driver" : "file",
-                "path" : str(fused_output_path)
-            }
-        }
-        max_proj_datastore = ts.open(max_spec).result()
-        
-        filename = Path("bkd_corrected_deconvolved_stagefused.ome.tiff")
-        filename_path = tiff_dir_path /  Path(filename)
-        
-        if not(filename.exists()) or overwrite:
 
-            max_projection_bkd = np.squeeze(
-                subtract_background_tpczyx(
-                    max_proj_datastore,
-                    radius = 300
-                )
-            )
-            
-            
-            
-            if max_projection_bkd.ndim == 3:
-                if datastore.shape[0] > 1 and datastore.shape[2] == 1:
-                    axes = "TYX"
-                elif datastore.shape[2] > 1 and datastore.shape[0] == 1:
-                    axes = "CYX"
-            elif max_projection_bkd.ndim == 4:
-                axes = "TCYX"
-            
-            with TiffWriter(filename_path, bigtiff=True) as tif:
-                metadata={
-                    'axes': axes,
-                    'SignificantBits': 16,
-                    'PhysicalSizeX': pixel_size_um,
-                    'PhysicalSizeXUnit': 'µm',
-                    'PhysicalSizeY': pixel_size_um,
-                    'PhysicalSizeYUnit': 'µm',
-                    'PhysicalSizeZ': 1.0,
-                    'PhysicalSizeZUnit': 'µm',
-                }
-                options = dict(
-                    compression='zlib',
-                    compressionargs={'level': 8},
-                    predictor=True,
-                    photometric='minisblack',
-                    resolutionunit='CENTIMETER',
-                )
-                tif.write(
-                    max_projection_bkd,
-                    resolution=(
-                        1e4 / pixel_size_um,
-                        1e4 / pixel_size_um
-                    ),
-                    **options,
-                    metadata=metadata
-                )
             
 def process_ASI_SCOPE(
     root_path: Path,
