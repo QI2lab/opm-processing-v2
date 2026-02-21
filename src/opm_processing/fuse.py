@@ -28,13 +28,15 @@ def register_and_fuse(
     root_path: Path,
     chan_idx: int = 0,
 ):
-    """Register and fuse deskewed OPM data.
+    """Register and fuse processed OPM data.
     
-    This code assumes data is already deskewed and on disk.
+    This code assumes data is already processed and on disk.
     
     Usage: `fuse "/path/to/qi2lab_acquisition.zarr"
     
-    Output will be in `/path/to/qi2lab_acquisition_fused_deskewed.ome.zarr`
+    Output will be in `/path/to/qi2lab_acquisition_fused_<acq_type>.ome.zarr`
+    
+    <acq_type> will be either deskewed or projection depending on OPM mode.
     
     Parameters
     ----------
