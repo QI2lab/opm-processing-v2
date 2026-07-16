@@ -13,9 +13,15 @@ import logging
 import timeit
 from collections.abc import Callable
 
-import cupy as cp
 import numpy as np
-from cupy import ElementwiseKernel
+
+from opm_processing.cuda import preload_cuda_libraries
+
+
+preload_cuda_libraries()
+
+import cupy as cp  # noqa: E402
+from cupy import ElementwiseKernel  # noqa: E402
 
 # -----------------------------------------------------------------------------
 # CUDA kernel: multiplicative RL step gated by consensus (reference-accurate)

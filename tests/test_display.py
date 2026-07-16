@@ -32,7 +32,7 @@ class FakeViewer:
 def _create_collection(tmp_path):
     raw_path = tmp_path / "sample.zarr"
     raw_path.mkdir()
-    data_path = tmp_path / "sample_deskewed.zarr"
+    data_path = tmp_path / "sample_deskewed.ome.zarr"
     create_position_collection(
         data_path,
         (2, 2, 2, 3, 4, 5),
@@ -84,3 +84,16 @@ def test_display_delegates_root_open_to_napari_plugin(tmp_path, monkeypatch):
     assert layers[2].visible is True
     assert layers[2].translate == (0.0, 4.0, 5.0, 6.0)
     assert layers[2].data[0].shape == (1, 3, 4, 5)
+
+
+def test_resolve_data_path_prefers_ome_suffix_with_legacy_fallback(tmp_path):
+    raw_path = tmp_path / "sample.zarr"
+    legacy_path = tmp_path / "sample_deskewed.zarr"
+    legacy_path.mkdir()
+
+    assert display_module._resolve_data_path(raw_path, "full") == legacy_path
+
+    ome_path = tmp_path / "sample_deskewed.ome.zarr"
+    ome_path.mkdir()
+
+    assert display_module._resolve_data_path(raw_path, "full") == ome_path

@@ -1,5 +1,11 @@
-import cupy as cp
 import math
+
+from opm_processing.cuda import preload_cuda_libraries
+
+
+preload_cuda_libraries()
+
+import cupy as cp  # noqa: E402
 
 # --------------------------------------------------------------------------------
 # 1) Separable 1D box‐filter kernels with shared memory (unchanged)

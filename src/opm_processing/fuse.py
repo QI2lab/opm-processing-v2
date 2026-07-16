@@ -34,7 +34,7 @@ def register_and_fuse(
     
     Usage: `fuse "/path/to/qi2lab_acquisition.zarr"
     
-    Output will be in `/path/to/qi2lab_acquisition_fused_<acq_type>.ome.zarr`
+    Output will be in `/path/to/qi2lab_acquisition_fused.ome.zarr`
     
     <acq_type> will be either deskewed or projection depending on OPM mode.
     

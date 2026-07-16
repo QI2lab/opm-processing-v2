@@ -18,14 +18,21 @@ def _resolve_data_path(root_path: Path, to_display: str) -> Path:
     stem = root_path.stem
     candidates = {
         "max-z": (
+            base / f"{stem}_max_z_decon_deskewed.ome.zarr",
+            base / f"{stem}_max_z_deskewed.ome.zarr",
             base / f"{stem}_max_z_decon_deskewed.zarr",
             base / f"{stem}_max_z_deskewed.zarr",
         ),
         "full": (
+            base / f"{stem}_decon_deskewed.ome.zarr",
+            base / f"{stem}_deskewed.ome.zarr",
             base / f"{stem}_decon_deskewed.zarr",
             base / f"{stem}_deskewed.zarr",
         ),
-        "fused-max-z": (base / f"{stem}_max_z_fused.zarr",),
+        "fused-max-z": (
+            base / f"{stem}_max_z_fused.ome.zarr",
+            base / f"{stem}_max_z_fused.zarr",
+        ),
         "fused-full": (base / f"{stem}_fused.ome.zarr",),
     }
     if to_display not in candidates:

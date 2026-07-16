@@ -37,6 +37,7 @@ from tqdm import trange
 from yaozarrs import v05
 from yaozarrs.write.v05 import prepare_image
 
+from opm_processing.cuda import preload_cuda_libraries
 from opm_processing.dataio.position_collection import open_position_collection
 
 
@@ -57,6 +58,8 @@ _shift_cpu: Any | None = None
 _ssim_cpu: Any | None = None
 
 xp: Any = np
+
+preload_cuda_libraries()
 
 try:
     import cupy as _cp  # type: ignore
@@ -252,8 +255,9 @@ class TileFusion:
     ----------
     root_path : str or pathlib.Path
         Path used to infer the processed datastore location. The code searches for:
-        `{stem}_decon_deskewed.zarr`, `{stem}_deskewed.zarr`,
-        `{stem}_decon_projection.zarr`, `{stem}_projection.zarr`.
+        `{stem}_decon_deskewed.ome.zarr`, `{stem}_deskewed.ome.zarr`,
+        `{stem}_decon_projection.ome.zarr`, `{stem}_projection.ome.zarr`,
+        followed by their legacy `.zarr` names.
     blend_pixels : tuple[int, int, int], default=(20, 600, 400)
         Feather ramp widths (bz, by, bx) used to build 1D weight profiles.
     downsample_factors : tuple[int, int, int], default=(3, 5, 5)
@@ -310,15 +314,20 @@ class TileFusion:
         base = self.root.parents[0]
         stem = self.root.stem
 
-        data_path = base / f"{stem}_decon_deskewed.zarr"
-        if not data_path.exists():
-            data_path = base / f"{stem}_deskewed.zarr"
-            if not data_path.exists():
-                data_path = base / f"{stem}_decon_projection.zarr"
-                if not data_path.exists():
-                    data_path = base / f"{stem}_projection.zarr"
-                    if not data_path.exists():
-                        raise FileNotFoundError("Processed data store not found.")
+        candidates = (
+            base / f"{stem}_decon_deskewed.ome.zarr",
+            base / f"{stem}_deskewed.ome.zarr",
+            base / f"{stem}_decon_projection.ome.zarr",
+            base / f"{stem}_projection.ome.zarr",
+            base / f"{stem}_decon_deskewed.zarr",
+            base / f"{stem}_deskewed.zarr",
+            base / f"{stem}_decon_projection.zarr",
+            base / f"{stem}_projection.zarr",
+        )
+        data_path = next((path for path in candidates if path.exists()), None)
+        if data_path is None:
+            checked = ", ".join(str(path) for path in candidates)
+            raise FileNotFoundError(f"Processed data store not found. Checked: {checked}")
         self.data = data_path
 
         collection = open_position_collection(self.data)
@@ -1352,7 +1361,7 @@ class TileFusion:
         -------
         None
             Writes the fused NGFF store to:
-            `{base}/{stem}_fused_deskewed.ome.zarr`
+            `{base}/{stem}_fused.ome.zarr`
 
         Raises
         ------

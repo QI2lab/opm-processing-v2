@@ -12,7 +12,7 @@ This package is the 2nd generation of the Arizona State University Quantitative 
 
 The core algorithms can be used for any microscope that acquires data at a skewed angle, including diSPIM, LLSM, or OPM. Please open an issue if you would like help adapting the code to work with your microscope, we are happy to assist.
 
-The pipeline reads legacy acquisition stores with [TensorStore](https://google.github.io/tensorstore/) and writes OME-Zarr v0.5 images with [yaozarrs](https://github.com/dpshepherd/yaozarrs). Multi-position outputs use yaozarrs' Bio-Formats2Raw collection layout, with one `TCZYX` image series per position. Image processing (illumination correction, deconvolution, deskewing, downsampling, maximum Z projection, and 3D stitching and fusion) uses [Numba](https://numba.pydata.org/), [CuPy](https://cupy.dev/), and [cuCIM](https://github.com/rapidsai/cucim?tab=readme-ov-file).
+The pipeline reads legacy acquisition stores with [TensorStore](https://google.github.io/tensorstore/) and writes [OME-Zarr v0.5](https://ngff.openmicroscopy.org/0.5/) metadata in Zarr v3 stores with [yaozarrs](https://github.com/imaging-formats/yaozarrs/). Multi-position outputs use the Bio-Formats2Raw collection layout, with one `TCZYX` OME-Zarr image series per position and a validated `OME/METADATA.ome.xml` companion. Fused outputs are single `TCZYX` OME-Zarr images. All arrays use regular chunks without sharding. Image processing (illumination correction, deconvolution, deskewing, downsampling, maximum Z projection, and 3D stitching and fusion) uses [Numba](https://numba.pydata.org/), [CuPy](https://cupy.dev/), and [cuCIM](https://github.com/rapidsai/cucim?tab=readme-ov-file).
 
 We rely on [BaSiCPy](https://github.com/peng-lab/BaSiCPy) to post-hoc estimate illumination profiles and a modified version of [gradient consensus Richardson-Lucy deconvolution](https://zenodo.org/records/10278919) to perform 3D deconvolution.
 
@@ -62,42 +62,70 @@ extra, install cuCIM from source in an administrator terminal,
 2. Install cuCIM into the UV environment:
 
 ```bash
-uv pip install -e "git+https://github.com/rapidsai/cucim.git@v25.04.00#egg=cucim-cu12&subdirectory=python/cucim"
+uv pip install -e "git+https://github.com/rapidsai/cucim.git@v26.06.00#egg=cucim-cu12&subdirectory=python/cucim"
 ```
 
 ## Usage
 
-To deskew raw data,
+Process a raw acquisition with:
+
 ```bash
 uv run process "/path/to/qi2lab_acquisition.zarr"
 ```
 
-The defaults parameters generate different outputs depending if it acquisition is of oblique or projection data.
+The source acquisition remains unchanged. Processing creates OME-Zarr v0.5 outputs next to it. Per-position outputs are Bio-Formats2Raw collections; the position is represented by a separate `TCZYX` image series rather than a `P` axis inside an array. Maximum projections retain a singleton `Z` axis.
 
-For oblique data, there are three zarr3 compliant datastores:
-1. Full 3D data (`/path/to/qi2lab_acquisition_deskewed.zarr`) with dimensions `tpczyx`.
-2. Maximum Z projections (`/path/to/qi2lab_acquisition_max_z_deskewed.zarr`) with dimensions `tpcyx`. 
-3. Stage-position fused maximum z projections (`/path/to/qi2lab_acquisition_maxz.zarr`) with dimensions `tcyx`.
+For an oblique acquisition with stem `qi2lab_acquisition`, processing can create:
 
-For projection data, there are two zarr3 compliant datastores:
-1. Full 2D projection data (`/path/to/qi2lab_acquisition_deconvolved.zarr`) with dimensions `tpczyx`.
-2. Stage-position fused 2D projection data (`/path/to/qi2lab_acquisition_fused.zarr`) with dimensions `tcyx`.
+| Output | Contents |
+| --- | --- |
+| `qi2lab_acquisition_deskewed.ome.zarr` | Deskewed per-position `TCZYX` collection |
+| `qi2lab_acquisition_decon_deskewed.ome.zarr` | Deconvolved and deskewed per-position `TCZYX` collection |
+| `qi2lab_acquisition_max_z_deskewed.ome.zarr` | Per-position maximum-Z projections |
+| `qi2lab_acquisition_max_z_decon_deskewed.ome.zarr` | Deconvolved per-position maximum-Z projections |
+| `qi2lab_acquisition_max_z_fused.ome.zarr` | Stage-position fused maximum-Z image |
 
-All datastores are camera offset and gain corrected. The fused datastore uses the provided stage positions, without optimization.
+The `decon` filenames are selected when `--deconvolve` is enabled. Maximum-Z
+outputs are controlled by `--max-projection` and
+`--create-fused-max-projection`.
 
-To display deskewed data, 
+For a projection acquisition, processing can create:
+
+| Output | Contents |
+| --- | --- |
+| `qi2lab_acquisition_projection.ome.zarr` | Per-position `TCZYX` collection with singleton `Z` |
+| `qi2lab_acquisition_decon_projection.ome.zarr` | Deconvolved per-position collection with singleton `Z` |
+| `qi2lab_acquisition_stagefused.ome.zarr` | Stage-position fused projection image |
+
+Per-position collections include axis, physical scale, channel, processing, and stage-position metadata. Their image and stage metadata is also represented in `OME/METADATA.ome.xml`. Fused images retain their `TCZYX` axes and physical scales in OME-Zarr metadata.
+
+### Display
+
+Open processed data through the `napari-ome-zarr` reader with:
+
 ```bash
-uv run display "/path/to/qi2lab_acquisition.zarr" --to_display full
+uv run display "/path/to/qi2lab_acquisition.zarr" --to-display full
 ```
 
-There are three `to_display` options that correspond to the three datastores described above,
-1. full
-2. max-z
-3. fused-max-z
+The command passes the OME-Zarr path directly to `napari-ome-zarr`; it does not load the complete array before opening napari. Use one of these views:
 
-To register and fuse optionally deconvolved and desekwed data into an ome-ngff v0.5 datastore,
+| `--to-display` | Output selected |
+| --- | --- |
+| `full` | Deskewed per-position collection |
+| `max-z` | Per-position maximum-Z collection (default) |
+| `fused-max-z` | Stage-position fused maximum-Z image |
+| `fused-full` | Registered and fused multiscale image |
+
+For collection views, `--time-range START STOP` and `--pos-range START STOP`
+limit the visible range. Position layers retain their stage translations, and
+channel display settings are linked across positions.
+
+### Registration And Fusion
+
+Register and fuse processed tiles into a multiscale OME-Zarr v0.5 image with:
+
 ```bash
 uv run fuse "/path/to/qi2lab_acquisition.zarr"
 ```
 
-The registered, optionally deconvolved, and fused data will be in `/path/to/qi2lab_acquisition_fused_deskewed.ome.zarr`. This data can be viewed by dragging and dropping the folder into napari and selecting the `napari-ome-zarr` plugin for viewing.
+The command discovers the corresponding deskewed or projection collection and writes `/path/to/qi2lab_acquisition_fused.ome.zarr`. Registration is optimized per timepoint, and fusion writes a single chunked `TCZYX` image with an OME-Zarr multiscale pyramid. Open it with `--to-display fused-full`, or open the `.ome.zarr` directory directly in napari with the `napari-ome-zarr` reader.

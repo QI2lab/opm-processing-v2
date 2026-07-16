@@ -2,8 +2,14 @@ import builtins
 import gc
 
 import numpy as np
-import torch
-from basicpy import BaSiC
+
+from opm_processing.cuda import preload_cuda_libraries
+
+
+preload_cuda_libraries()
+
+import torch  # noqa: E402
+from basicpy import BaSiC  # noqa: E402
 
 
 def no_op(*args, **kwargs):

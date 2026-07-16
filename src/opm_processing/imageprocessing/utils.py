@@ -16,6 +16,11 @@ import numpy as np
 import gc
 from numpy.typing import NDArray
 
+from opm_processing.cuda import preload_cuda_libraries
+
+
+preload_cuda_libraries()
+
 # GPU
 CUPY_AVIALABLE = True
 try:

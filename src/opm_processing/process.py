@@ -189,11 +189,11 @@ def process_skewed(
     
     Outputs are in:
     - Deskewed 3D individual deskewed tiles: \
-        `"/path/to/qi2lab_acquisition_deskewed.zarr"`
+        `"/path/to/qi2lab_acquisition_deskewed.ome.zarr"`
     - Maximum Z projected individual deskewed tiles: \
-        `"/path/to/qi2lab_acquisition_max_z_deskewed.zarr"`
+        `"/path/to/qi2lab_acquisition_max_z_deskewed.ome.zarr"`
     - Maximum Z projection fused deskewed tiles: \
-        `"/path/to/qi2lab_acquisition_max_z_fused.zarr"`
+        `"/path/to/qi2lab_acquisition_max_z_fused.ome.zarr"`
     
     Parameters
     ----------
@@ -339,9 +339,9 @@ def process_skewed(
     }
 
     if not(deconvolve):
-        output_path = root_path.parents[0] / Path(str(root_path.stem)+"_deskewed.zarr")
+        output_path = root_path.parents[0] / Path(str(root_path.stem)+"_deskewed.ome.zarr")
     else:
-        output_path = root_path.parents[0] / Path(str(root_path.stem)+"_decon_deskewed.zarr")
+        output_path = root_path.parents[0] / Path(str(root_path.stem)+"_decon_deskewed.ome.zarr")
     output_collection = create_position_collection(
         output_path,
         datastore_shape,
@@ -369,9 +369,9 @@ def process_skewed(
         )
 
         if not(deconvolve):
-            max_z_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_z_deskewed.zarr")
+            max_z_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_z_deskewed.ome.zarr")
         else:
-            max_z_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_z_decon_deskewed.zarr")
+            max_z_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_z_decon_deskewed.ome.zarr")
         max_z_metadata = {
             **processing_metadata,
             "deskewed_voxel_size_um": [pixel_size_um, pixel_size_um, pixel_size_um],
@@ -541,13 +541,13 @@ def process_skewed(
     if create_fused_max_projection:
         
         if deconvolve:
-            max_z_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_z_decon_deskewed.zarr")
+            max_z_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_z_decon_deskewed.ome.zarr")
         else:
-            max_z_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_z_deskewed.zarr")
+            max_z_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_z_deskewed.ome.zarr")
         max_z_ts_store = open_position_collection(max_z_output_path).arrays
         
         print("\nFusing max projection using stage positions...")
-        fused_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_z_fused.zarr")
+        fused_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_z_fused.ome.zarr")
         
         if pos_range is not None:
             tile_positions = stage_positions[pos_range[0]:pos_range[1],1:]
@@ -629,9 +629,9 @@ def process_projection(
     
     Outputs are in:
     - Deconvolved individual projection tiles: \
-        `"/path/to/qi2lab_acquisition_deconvolved.zarr"`
+        `"/path/to/qi2lab_acquisition_decon_projection.ome.zarr"`
     - Stage position fused projection tiles: \
-        `"/path/to/qi2lab_acquisition_deconvolved_stagefused.zarr"`
+        `"/path/to/qi2lab_acquisition_stagefused.ome.zarr"`
     
     Parameters
     ----------
@@ -710,9 +710,9 @@ def process_projection(
     datastore = datastore[:,:,:,None,:,:]
            
     if deconvolve:
-        output_path = root_path.parents[0] / Path(str(root_path.stem)+"_decon_projection.zarr")
+        output_path = root_path.parents[0] / Path(str(root_path.stem)+"_decon_projection.ome.zarr")
     else:
-        output_path = root_path.parents[0] / Path(str(root_path.stem)+"_projection.zarr")
+        output_path = root_path.parents[0] / Path(str(root_path.stem)+"_projection.ome.zarr")
     if not(output_path.exists()) or overwrite:
         processing_metadata = {
             "raw_pixel_size_um": pixel_size_um,
@@ -836,7 +836,7 @@ def process_projection(
             ts_write.result()
 
         print("\nFusing using stage positions...")
-        fused_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_stagefused.zarr")
+        fused_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_stagefused.ome.zarr")
         
         if pos_range is not None:
             tile_positions = stage_positions[pos_range[0]:pos_range[1],1:]
@@ -858,7 +858,7 @@ def process_projection(
         try:
             tiff_dir_path = fused_output_path.parent / Path("fused_tiff_output")
         except Exception:
-            fused_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_stagefused.zarr")
+            fused_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_stagefused.ome.zarr")
             tiff_dir_path = fused_output_path.parent / Path("fused_tiff_output")
         tiff_dir_path.mkdir(exist_ok=True)
         max_proj_datastore = open_image_array(fused_output_path)
@@ -938,11 +938,11 @@ def process_ASI_SCOPE(
     
     Outputs are in:
     - Deskewed 3D individual deskewed tiles: \
-        `"/path/to/qi2lab_acquisition_deskewed.zarr"`
+        `"/path/to/qi2lab_acquisition_deskewed.ome.zarr"`
     - Maximum Z projected individual deskewed tiles: \
-        `"/path/to/qi2lab_acquisition_max_z_deskewed.zarr"`
+        `"/path/to/qi2lab_acquisition_max_z_deskewed.ome.zarr"`
     - Maximum Z projection fused deskewed tiles: \
-        `"/path/to/qi2lab_acquisition_max_z_fused.zarr"`
+        `"/path/to/qi2lab_acquisition_max_z_fused.ome.zarr"`
     
     Parameters
     ----------
@@ -1111,9 +1111,9 @@ def process_ASI_SCOPE(
     }
 
     if not(deconvolve):
-        output_path = root_path.parents[0] / Path(str(root_path.stem)+"_deskewed.zarr")
+        output_path = root_path.parents[0] / Path(str(root_path.stem)+"_deskewed.ome.zarr")
     else:
-        output_path = root_path.parents[0] / Path(str(root_path.stem)+"_decon_deskewed.zarr")
+        output_path = root_path.parents[0] / Path(str(root_path.stem)+"_decon_deskewed.ome.zarr")
     output_collection = create_position_collection(
         output_path,
         datastore_shape,
@@ -1141,9 +1141,9 @@ def process_ASI_SCOPE(
         )
 
         if not(deconvolve):
-            max_z_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_z_deskewed.zarr")
+            max_z_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_z_deskewed.ome.zarr")
         else:
-            max_z_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_z_decon_deskewed.zarr")
+            max_z_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_z_decon_deskewed.ome.zarr")
         max_z_metadata = {
             **processing_metadata,
             "deskewed_voxel_size_um": [pixel_size_um, pixel_size_um, pixel_size_um],
@@ -1301,13 +1301,13 @@ def process_ASI_SCOPE(
     if create_fused_max_projection:
         
         if deconvolve:
-            max_z_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_z_decon_deskewed.zarr")
+            max_z_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_z_decon_deskewed.ome.zarr")
         else:
-            max_z_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_z_deskewed.zarr")
+            max_z_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_z_deskewed.ome.zarr")
         max_z_ts_store = open_position_collection(max_z_output_path).arrays
         
         print("\nFusing max projection using stage positions...")
-        fused_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_z_fused.zarr")
+        fused_output_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_z_fused.ome.zarr")
         
         if pos_range is not None:
             tile_positions = stage_positions[pos_range[0]:pos_range[1],1:]
@@ -1420,6 +1420,10 @@ def run_estimate_illuminations(datastore, camera_offset, camera_conversion, conn
     conn: Pipe
         Pipe connection to send the result back to the main process.
     """
+    from opm_processing.cuda import preload_cuda_libraries
+
+    preload_cuda_libraries()
+
     from opm_processing.imageprocessing.flatfield import estimate_illuminations
 
     try:
