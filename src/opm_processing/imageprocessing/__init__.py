@@ -1,2 +1,2 @@
-from . import opmtools
-from . import utils
+from . import opmtools as opmtools
+from . import utils as utils

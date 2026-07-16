@@ -9,7 +9,6 @@ History:
 """
 
 import numpy as np
-import json
 
 def extract_stage_positions(data):
     """Extract stage positions from qi2lab tensostore.
@@ -132,63 +131,6 @@ def find_key(data: dict, target_key: str) -> dict | list | None:
             if found is not None:
                 return found
     return None
-
-def update_global_metadata(ts_store, global_metadata):
-    """Update global metadata inside a Zarr v3 array/group.
-    
-    Parameters
-    ----------
-    ts_store : tensorstore.TensorStore
-        TensorStore object to update.
-    global_metadata : dict
-        Global metadata dictionary.
-    """
-    
-    # Read existing metadata
-    read_result = ts_store.kvstore.read("zarr.json").result()
-    if read_result.state == 'missing':
-        existing_metadata = {}
-    else:
-        existing_metadata = json.loads(read_result.value.decode("utf-8"))
-
-    # Update global metadata
-    global_metadata = convert_metadata(global_metadata)
-    existing_metadata.setdefault("attributes", {}).update(global_metadata)
-
-    # Write updated metadata back to zarr.json
-    ts_store.kvstore.write("zarr.json", json.dumps(existing_metadata).encode("utf-8")).result()
-
-def update_per_index_metadata(ts_store, metadata, index_location):
-    """Update per-index metadata inside a Zarr v3 array/group.
-    
-    Parameters
-    ----------
-    ts_store : tensorstore.TensorStore
-        TensorStore object to update.
-    metadata : dict
-        Metadata dictionary for this specific (t_idx, pos_idx, chan_idx).
-    index_location : tuple
-        Tuple of (t_idx, pos_idx, chan_idx).
-    """
-
-    # Read existing metadata
-    read_result = ts_store.kvstore.read("zarr.json").result()
-    if read_result.state == 'missing':
-        existing_metadata = {}
-    else:
-        existing_metadata = json.loads(read_result.value.decode("utf-8"))
-
-    # Ensure per-index metadata structure inside attributes
-    attributes = existing_metadata.setdefault("attributes", {})
-    per_index_metadata = attributes.setdefault("per_index_metadata", {})
-
-    t_dict = per_index_metadata.setdefault(str(index_location[0]), {})
-    pos_dict = t_dict.setdefault(str(index_location[1]), {})
-    metadata = convert_metadata(metadata)
-    pos_dict[str(index_location[2])] = metadata
-
-    # Write updated metadata back to zarr.json
-    ts_store.kvstore.write("zarr.json", json.dumps(existing_metadata).encode("utf-8")).result()
 
 def convert_metadata(obj):
     """Ensure all metadata entries can be serialized.

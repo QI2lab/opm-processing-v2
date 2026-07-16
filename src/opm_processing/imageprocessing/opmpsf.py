@@ -10,7 +10,21 @@ Last updated: Shepherd 05/25
 
 import psfmodels as psfm
 import numpy as np
-from scipy.interpolate import interp2d
+from scipy.interpolate import RegularGridInterpolator
+
+
+def _interpolate_psf_plane(x_grid, y_grid, values, x_coords, y_coords):
+    """Interpolate one regular-grid PSF plane onto an output XY grid."""
+    interpolator = RegularGridInterpolator(
+        (y_grid, x_grid),
+        values,
+        method="linear",
+        bounds_error=False,
+        fill_value=0.0,
+    )
+    target_y, target_x = np.meshgrid(y_coords, x_coords, indexing="ij")
+    points = np.column_stack((target_y.ravel(), target_x.ravel()))
+    return interpolator(points).reshape(target_y.shape)
 
 
 # ROI tools
@@ -384,7 +398,13 @@ def generate_skewed_psf(
     # get value from interpolation
     skewed_psf = np.zeros(roi_skewed_size)
     for ii in range(nz):
-        skewed_psf[:, ii, :] = interp2d(xg, yg, psf_grid[ii], kind="linear")(x.ravel(), y[:, ii].ravel())
+        skewed_psf[:, ii, :] = _interpolate_psf_plane(
+            xg,
+            yg,
+            psf_grid[ii],
+            x.ravel(),
+            y[:, ii].ravel(),
+        )
     
     return skewed_psf
 
@@ -461,6 +481,12 @@ def ASI_generate_skewed_psf(
     # get value from interpolation
     skewed_psf = np.zeros(roi_skewed_size)
     for ii in range(nz):
-        skewed_psf[:, ii, :] = interp2d(xg, yg, psf_grid[ii], kind="linear")(x.ravel(), y[:, ii].ravel())
+        skewed_psf[:, ii, :] = _interpolate_psf_plane(
+            xg,
+            yg,
+            psf_grid[ii],
+            x.ravel(),
+            y[:, ii].ravel(),
+        )
 
     return skewed_psf

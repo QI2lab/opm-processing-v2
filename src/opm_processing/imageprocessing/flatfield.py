@@ -1,10 +1,9 @@
-from basicpy import BaSiC
 import builtins
-import jax
-import numpy as np
 import gc
 
-jax.config.update("jax_enable_compilation_cache", False)
+import numpy as np
+import torch
+from basicpy import BaSiC
 
 
 def no_op(*args, **kwargs):
@@ -60,20 +59,23 @@ def estimate_illuminations(datastore, camera_offset,camera_conversion):
         images = images.reshape(n_pos_samples*n_image_batches,images.shape[-2],images.shape[-1])
         original_print = builtins.print
         builtins.print= no_op
-        basic = BaSiC(
-            get_darkfield=False,
-            darkfield=np.zeros((temp_images.shape[-2]//4,temp_images.shape[-1]//4),dtype=np.float64),
-            flatfield=np.zeros((temp_images.shape[-2]//4,temp_images.shape[-1]//4),dtype=np.float64)
-        )
-        basic.autotune(images)
-        basic.fit(images)
-        builtins.print = original_print
+        try:
+            basic = BaSiC(
+                get_darkfield=False,
+                darkfield=np.zeros((temp_images.shape[-2]//4,temp_images.shape[-1]//4),dtype=np.float64),
+                flatfield=np.zeros((temp_images.shape[-2]//4,temp_images.shape[-1]//4),dtype=np.float64)
+            )
+            basic.autotune(images)
+            basic.fit(images)
+        finally:
+            builtins.print = original_print
         flatfields[chan_idx,:] = np.squeeze(basic.flatfield).astype(np.float32)
         
         del basic, images, temp_images
 
         gc.collect()
-        jax.clear_caches()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         gc.collect()
 
     return flatfields

@@ -1,7 +1,9 @@
 import numpy as np
-import tensorstore as ts
 from pathlib import Path
 from tqdm import tqdm
+
+from yaozarrs import DimSpec, v05
+from yaozarrs.write.v05 import prepare_image
 
 class MaxTileFusion:
     """
@@ -34,22 +36,18 @@ class MaxTileFusion:
         self.pad_y = pad_yx[0]
         self.pad_x = pad_yx[1]
 
-        if self.pad_y > 0 and self.pad_x > 0:
-            self.ts_dataset = ts_dataset[:,:,:,:,self.pad_y:-self.pad_y,self.pad_x:-self.pad_x]
-        elif self.pad_y > 0:
-            self.ts_dataset = ts_dataset[:,:,:,:,self.pad_y:-self.pad_y,:]
-        elif self.pad_x > 0:
-            self.ts_dataset = ts_dataset[:,:,:,:,:,self.pad_x:-self.pad_x]
-        else:
-            self.ts_dataset = ts_dataset
+        self.ts_dataset = tuple(ts_dataset)
 
         self.tile_positions = np.array(tile_positions)
         self.output_path = Path(output_path)
         self.pixel_size = pixel_size
         
-        self.time_dim, self.position_dim, self.channels, self.z_dim, height, width = self.ts_dataset.shape
+        self.time_dim, self.channels, self.z_dim, height, width = self.ts_dataset[0].shape
+        self.position_dim = len(self.ts_dataset)
+        height -= 2 * self.pad_y
+        width -= 2 * self.pad_x
         
-        self.chunks_per_shard = 8  # Number of chunks per shard in the fused image
+        self.padding_multiple = 8
         self.chunk_size = 512
         
         self.tile_shape = (height, width)
@@ -57,7 +55,7 @@ class MaxTileFusion:
 
         self.fused_shape, self.offset = self.compute_fused_image_space()
         self.weight_mask = self.generate_blending_weights()
-        self.fused_ts = self.create_fused_tensorstore()
+        self.fused_ts = self.create_fused_image()
         
         
 
@@ -83,8 +81,14 @@ class MaxTileFusion:
             int((max_x - min_x) / self.pixel_size[1])
         )
         
-        pad_y = (self.chunks_per_shard - (fused_shape_unpadded[0] % self.chunks_per_shard)) % self.chunks_per_shard  
-        pad_x = (self.chunks_per_shard - (fused_shape_unpadded[1] % self.chunks_per_shard)) % self.chunks_per_shard
+        pad_y = (
+            self.padding_multiple
+            - (fused_shape_unpadded[0] % self.padding_multiple)
+        ) % self.padding_multiple
+        pad_x = (
+            self.padding_multiple
+            - (fused_shape_unpadded[1] % self.padding_multiple)
+        ) % self.padding_multiple
         padded_final_ny = fused_shape_unpadded[0] + pad_y 
         padded_final_nx = fused_shape_unpadded[1] + pad_x
         
@@ -136,66 +140,32 @@ class MaxTileFusion:
 
         return weight_mask
 
-    def create_fused_tensorstore(self):
-        """
-        Create a new TensorStore dataset for the fused image.
-
-        Returns
-        -------
-        tensorstore.TensorStore
-            A TensorStore dataset for storing the fused image.
-        """
-                
-        # Define chunk shape based on tile size
-        chunk_shape = [1, 1, 1, 1, self.chunk_size , self.chunk_size]
-
-        # Define shard shape as one full tile
-        shard_shape = [1, 1, self.channels, 1, self.chunks_per_shard*self.chunk_size, self.chunks_per_shard*self.chunk_size]  
-        
+    def create_fused_image(self):
+        """Create the fused TCZYX image through yaozarrs."""
         if self.time_range is not None:
             time_to_use = self.time_range[1] - self.time_range[0]
         else:
             time_to_use = self.time_dim
-            
-        config = {
-                "driver": "zarr3",
-                "kvstore": {
-                    "driver": "file",
-                    "path": str(self.output_path)
-                },
-                "metadata": {
-                    "shape": [time_to_use, 1, self.channels, 1, *self.fused_shape],
-                    "chunk_grid": {
-                        "name": "regular",
-                        "configuration": {
-                            "chunk_shape": shard_shape
-                        }
-                    },
-                    "chunk_key_encoding": {"name": "default"},
-                    "codecs": [
-                        {
-                            "name": "sharding_indexed",
-                            "configuration": {
-                                "chunk_shape": chunk_shape,
-                                "codecs": [
-                                    {"name": "bytes", "configuration": {"endian": "little"}},
-                                    {"name": "blosc", "configuration": {"cname": "zstd", "clevel": 5, "shuffle": "bitshuffle"}}
-                                ],
-                                "index_codecs": [
-                                    {"name": "bytes", "configuration": {"endian": "little"}},
-                                    {"name": "crc32c"}
-                                ],
-                                "index_location": "end"
-                            }
-                        }
-                    ],
-                    "data_type": "uint16"
-                }
-            }
-
-        ts_store = ts.open(config, create=True, open=True).result()
-        
-        return ts_store
+        shape = (time_to_use, self.channels, 1, *self.fused_shape)
+        dims = [
+            DimSpec(name="t", size=time_to_use),
+            DimSpec(name="c", size=self.channels),
+            DimSpec(name="z", size=1, scale=1.0, unit="micrometer"),
+            DimSpec(name="y", size=self.fused_shape[0], scale=self.pixel_size[0], unit="micrometer"),
+            DimSpec(name="x", size=self.fused_shape[1], scale=self.pixel_size[1], unit="micrometer"),
+        ]
+        image = v05.Image(
+            multiscales=[v05.Multiscale.from_dims(dims, name="fused-max-projection")]
+        )
+        _, arrays = prepare_image(
+            self.output_path,
+            image,
+            (shape, np.uint16),
+            chunks=(1, 1, 1, self.chunk_size, self.chunk_size),
+            writer="tensorstore",
+            overwrite=True,
+        )
+        return arrays["0"]
 
     def fuse_tiles(self):
         """
@@ -220,7 +190,10 @@ class MaxTileFusion:
         for time_idx in time_iterator:
             for tile_idx, (y, x) in pos_iterator:
                 # Read tile correctly from its respective position
-                tile_data = self.ts_dataset[time_idx, tile_idx, :, 0, :, :].read().result().astype(np.float32)  # Shape: (C, H_tile, W_tile)
+                tile = self.ts_dataset[tile_idx]
+                y_slice = slice(self.pad_y, -self.pad_y or None)
+                x_slice = slice(self.pad_x, -self.pad_x or None)
+                tile_data = tile[time_idx, :, 0, y_slice, x_slice].read().result().astype(np.float32)
 
                 # Ensure tile_data has explicit Z-dimension
                 tile_data = tile_data[:, np.newaxis, :, :]  # Shape: (C, 1, H_tile, W_tile)
@@ -235,16 +208,14 @@ class MaxTileFusion:
                 weight_mask_reshaped = np.broadcast_to(self.weight_mask, (self.channels, 1, *self.weight_mask.shape))
 
                 # **Read existing fused image region before modifying**
-                existing_fused = self.fused_ts[time_idx, :, :, :, y_start:y_end, x_start:x_end].read().result().astype(np.float32)
-                if existing_fused.ndim == 5:
-                    existing_fused = existing_fused[np.newaxis, ...]
+                existing_fused = self.fused_ts[time_idx, :, :, y_start:y_end, x_start:x_end].read().result().astype(np.float32)
                 existing_weight_sum = np.ones_like(existing_fused)  # Initialize weight sum if uninitialized
 
                 # **Ensure weighted_tile shape matches existing_fused**
-                weighted_tile = (tile_data * weight_mask_reshaped)[np.newaxis, np.newaxis, :, :, :, :]  # Shape: (1,1,C,1,H_tile,W_tile)
+                weighted_tile = tile_data * weight_mask_reshaped
                 
                 existing_fused += weighted_tile
-                existing_weight_sum += weight_mask_reshaped[np.newaxis, np.newaxis, :, :, :, :]
+                existing_weight_sum += weight_mask_reshaped
 
                 existing_weight_sum[existing_weight_sum == 0] = 1
                 existing_fused /= existing_weight_sum
@@ -253,7 +224,7 @@ class MaxTileFusion:
                 fused_patch = np.clip(existing_fused, 0, 65535).astype(np.uint16)
                 
                 # **Asynchronously write the normalized region**
-                future = self.fused_ts[time_idx, :, :, :, y_start:y_end, x_start:x_end].write(fused_patch[0, :, :, :, :, :])
+                future = self.fused_ts[time_idx, :, :, y_start:y_end, x_start:x_end].write(fused_patch)
                 write_futures.append(future)
 
             # **Wait for all writes to complete**

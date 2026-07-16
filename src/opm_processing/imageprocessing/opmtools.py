@@ -11,7 +11,6 @@ History:
 - **2024/07**: Initial commit.
 """
 
-from opm_processing.imageprocessing.utils import downsample_axis
 from tqdm import tqdm
 import numpy as np
 from numpy.typing import ArrayLike
@@ -258,7 +257,7 @@ def lab2cam(
     return xp, yp, stage_pos
 
 
-def chunk_indices(length: int, chunk_size: int) -> Sequence[int]:
+def chunk_indices(length: int, chunk_size: int) -> list[tuple[int, int]]:
     """Calculate indices for evenly distributed chunks.
 
     Parameters
@@ -274,16 +273,30 @@ def chunk_indices(length: int, chunk_size: int) -> Sequence[int]:
         chunk indices
     """
 
-    indices = []
-    for i in range(0, length - chunk_size, chunk_size):
-        indices.append((i, i + chunk_size))
-    if length % chunk_size != 0:
-        indices.append((length - chunk_size, length))
-    return indices
+    if length <= 0:
+        raise ValueError("length must be greater than 0")
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be greater than 0")
+    return [
+        (start, min(start + chunk_size, length))
+        for start in range(0, length, chunk_size)
+    ]
+
+
+def _deconvolve_oblique_chunk(
+    image: np.ndarray, psf: np.ndarray, crop_y: int
+) -> np.ndarray:
+    """Run nested Y-only RLGC without importing CuPy for deskew-only use."""
+    from opm_processing.imageprocessing.rlgc import chunked_rlgc
+
+    return chunked_rlgc(image=image, psf=psf, crop_y=crop_y)
 
 
 def chunked_orthogonal_deskew(
     oblique_image: ArrayLike,
+    psf_data: ArrayLike | None = None,
+    deconvolve: bool = False,
+    decon_chunk_size: int = 2048,
     chunk_size: int = 15000,
     overlap_size: int = 550,
     scan_crop: int = 700,
@@ -294,14 +307,20 @@ def chunked_orthogonal_deskew(
 ) -> ArrayLike:
     """Chunked orthogonal deskew of oblique data.
 
-    Optionally performs deconvolution on each chunk.
+    Optionally performs nested Y-chunked deconvolution on each outer deskew
+    chunk. Deconvolution always receives the chunk's full Z and X extents.
     
     Parameters
     ----------
     oblique_image: ArrayLike
         oblique image stack
     psf_data: ArrayLike
-        PSF data for deconvolution
+        PSF data for deconvolution. Required when ``deconvolve`` is True.
+    deconvolve: bool
+        Run RLGC before deskewing each outer chunk.
+    decon_chunk_size: int
+        Retained Y size for nested RLGC chunks. This is independent of the
+        outer deskew ``chunk_size``.
     chunk_size: int
         size of chunks
     overlap_size: int
@@ -323,9 +342,19 @@ def chunked_orthogonal_deskew(
         deskewed image stack
     """
 
-    output_shape = deskew_shape_estimator(oblique_image.shape)
+    if deconvolve and psf_data is None:
+        raise ValueError("psf_data is required when deconvolve=True")
+    if decon_chunk_size <= 0:
+        raise ValueError("decon_chunk_size must be greater than 0")
+
+    estimated_shape, _, _, _ = deskew_shape_estimator(
+        oblique_image.shape, crop_after_deskew=False
+    )
+    output_shape = list(estimated_shape)
     output_shape[0] = output_shape[0] // z_downsample_level
     output_shape[1] = output_shape[1] - scan_crop
+    if output_shape[1] <= 0:
+        raise ValueError("scan_crop must be smaller than the deskewed Y size")
     deskewed_image = np.zeros(output_shape, dtype=np.uint16)
 
     if chunk_size < output_shape[1]:
@@ -371,7 +400,15 @@ def chunked_orthogonal_deskew(
         raw_data = raw_data - camera_bkd
         raw_data[raw_data < 0.0] = 0.0
         raw_data = ((raw_data * camera_cf) / camera_qe).astype(np.uint16)
-        temp_deskew = orthogonal_deskew(raw_data).astype(np.uint16)
+        if deconvolve:
+            raw_data = _deconvolve_oblique_chunk(
+                raw_data,
+                np.asarray(psf_data),
+                crop_y=decon_chunk_size,
+            )
+        temp_deskew = orthogonal_deskew(
+            raw_data, downsample_factor=z_downsample_level
+        ).astype(np.uint16)
 
         if crop_start and crop_end:
             crop_deskew = temp_deskew[:, overlap_size:-overlap_size, :]
@@ -380,25 +417,30 @@ def chunked_orthogonal_deskew(
         elif crop_end:
             crop_deskew = temp_deskew[:, 0:-overlap_size, :]
         else:
-            crop_deskew = temp_deskew[:, 0:-scan_crop, :]
+            y_stop = -scan_crop if scan_crop > 0 else None
+            crop_deskew = temp_deskew[:, 0:y_stop, :]
 
-        if crop_deskew.shape[1] > (chunk_size):
-            diff = crop_deskew.shape[1] - (chunk_size)
+        target_size = idx[1] - idx[0]
+        if crop_deskew.shape[1] > target_size:
+            diff = crop_deskew.shape[1] - target_size
             crop_deskew = crop_deskew[:, :-diff, :]
-        elif crop_deskew.shape[1] < (chunk_size):
-            diff = (chunk_size) - crop_deskew.shape[1]
+        elif crop_deskew.shape[1] < target_size:
+            diff = target_size - crop_deskew.shape[1]
 
             if crop_start and crop_end:
                 crop_deskew = temp_deskew[:, overlap_size : -overlap_size + diff, :]
             elif crop_start:
                 crop_deskew = temp_deskew[:, overlap_size - diff : -1, :]
 
-        if z_downsample_level > 1:
-            deskewed_image[:, idx[0] : idx[1], :] = downsample_axis(
-                image=crop_deskew, level=z_downsample_level, axis=0
+        if crop_deskew.shape[1] > target_size:
+            crop_deskew = crop_deskew[:, :target_size, :]
+        elif crop_deskew.shape[1] < target_size:
+            crop_deskew = np.pad(
+                crop_deskew,
+                ((0, 0), (0, target_size - crop_deskew.shape[1]), (0, 0)),
             )
-        else:
-            deskewed_image[:, idx[0] : idx[1], :] = crop_deskew
+
+        deskewed_image[:, idx[0] : idx[1], :] = crop_deskew
 
     del temp_deskew, oblique_image
     gc.collect()
