@@ -7,8 +7,9 @@ import numpy as np
 
 
 def _import_rlgc(monkeypatch):
+    rlgc = None
     try:
-        return importlib.import_module("opm_processing.imageprocessing.rlgc")
+        rlgc = importlib.import_module("opm_processing.imageprocessing.rlgc")
     except ModuleNotFoundError as error:
         if error.name != "cupy":
             raise
@@ -29,9 +30,15 @@ def _import_rlgc(monkeypatch):
         Device=Device,
         memory=types.SimpleNamespace(OutOfMemoryError=MemoryError),
     )
-    monkeypatch.setitem(sys.modules, "cupy", cupy)
-    sys.modules.pop("opm_processing.imageprocessing.rlgc", None)
-    return importlib.import_module("opm_processing.imageprocessing.rlgc")
+    if rlgc is None:
+        monkeypatch.setitem(sys.modules, "cupy", cupy)
+        sys.modules.pop("opm_processing.imageprocessing.rlgc", None)
+        rlgc = importlib.import_module("opm_processing.imageprocessing.rlgc")
+    else:
+        # These are backend-independent chunking tests. Keep them isolated from
+        # an installed CuPy package and from whether this host exposes a GPU.
+        monkeypatch.setattr(rlgc, "cp", cupy)
+    return rlgc
 
 
 def test_chunked_rlgc_uses_y_only_chunking_api(monkeypatch):
@@ -89,3 +96,27 @@ def test_oom_fallback_reduces_only_crop_y(monkeypatch):
     assert attempted == [(512, 5, 700), (384, 5, 700)]
     assert successful == [384]
     np.testing.assert_array_equal(result, image)
+
+
+def test_oom_fallback_step_is_configurable(monkeypatch):
+    rlgc = _import_rlgc(monkeypatch)
+    attempted = []
+
+    def fake_chunked_once(image, psf, **kwargs):
+        del psf
+        attempted.append(kwargs["crop_y"])
+        if len(attempted) == 1:
+            raise MemoryError("simulated GPU OOM")
+        return image.astype(np.float32)
+
+    monkeypatch.setattr(rlgc, "_chunked_rlgc_once", fake_chunked_once)
+    monkeypatch.setattr(rlgc, "clear_rlgc_caches", lambda **_kwargs: None)
+
+    rlgc.chunked_rlgc(
+        np.ones((3, 800, 20), dtype=np.uint16),
+        np.ones((3, 21, 19), dtype=np.float32),
+        crop_y=500,
+        fallback_step_y=50,
+    )
+
+    assert attempted == [500, 450]

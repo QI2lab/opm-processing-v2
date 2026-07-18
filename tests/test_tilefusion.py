@@ -101,6 +101,18 @@ def test_max_projection_fusion_uses_chunks_without_sharding(tmp_path):
     assert all(codec["name"] != "sharding_indexed" for codec in metadata["codecs"])
 
 
+def test_max_projection_fusion_operational_settings_are_configurable():
+    fusion = MaxTileFusion.__new__(MaxTileFusion)
+    fusion.tile_shape = (20, 30)
+    fusion.blend_pixels = (3, 5)
+
+    weights = fusion.generate_blending_weights()
+
+    assert weights.shape == fusion.tile_shape
+    assert np.all(weights > 0)
+    np.testing.assert_allclose(weights[10, 15], 1.0)
+
+
 def test_fusion_block_shape_respects_memory_budget(monkeypatch):
     fusion = TileFusion.__new__(TileFusion)
     fusion.fusion_ram_fraction = 0.5
