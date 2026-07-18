@@ -50,6 +50,22 @@ from opm_processing.imageprocessing.opmtools import (
 app = typer.Typer()
 app.pretty_exceptions_enable = False
 
+
+def _apply_stage_axis_flips(
+    stage_positions: np.ndarray,
+    axis_flips_xyz: tuple[bool, bool, bool],
+) -> np.ndarray:
+    """Apply configured camera-to-stage orientation flips to ZXY positions."""
+    if len(axis_flips_xyz) != 3:
+        raise ValueError("axis_flips_xyz must contain X, Y, and Z flags")
+    transformed = np.asarray(stage_positions, dtype=float).copy()
+    for should_flip, column in zip(axis_flips_xyz, (2, 1, 0)):
+        if should_flip and transformed.shape[0] > 0:
+            transformed[:, column] = (
+                np.max(transformed[:, column]) - transformed[:, column]
+            )
+    return transformed
+
 @app.command()
 def process(
     root_path: Path,
@@ -64,7 +80,23 @@ def process(
     pos_range: tuple[int,int] = None,
     excess_overide: int = None,
     flyback_crop: int = None,
-    eager_mode: bool = False
+    eager_mode: bool = False,
+    decon_crop_y: int = 2048,
+    decon_gpu_id: int = 0,
+    decon_verbose: int = 0,
+    decon_fallback_step_y: int = 128,
+    decon_psf_paths: list[Path] | None = None,
+    asi_camera_conversion: float | None = None,
+    write_fused_tiff: bool = False,
+    stage_x_flipped: bool = False,
+    stage_y_flipped: bool = True,
+    stage_z_flipped: bool = True,
+    flatfield_max_images: int = 5000,
+    flatfield_image_batches: int = 25,
+    flatfield_position_samples: int = 15,
+    flatfield_position_margin: int = 5,
+    flatfield_model_downsample: int = 4,
+    flatfield_rng_seed: int | None = None,
 ):
     """Postprocess qi2lab OPM dataset.
     
@@ -99,7 +131,23 @@ def process(
         Range of stage positions to reconstruct.
     eager_mode: bool, default = False
         Use stricter iteration cutoff, potentially leading to over-fitting.
+    decon_psf_paths: list[Path] or None, default = None
+        Optional channel-ordered ``.npy`` or image PSFs. When omitted,
+        wavelength-specific theoretical skewed PSFs are generated.
     """
+    flatfield_options = {
+        "max_images": flatfield_max_images,
+        "image_batches": flatfield_image_batches,
+        "position_samples": flatfield_position_samples,
+        "position_margin": flatfield_position_margin,
+        "model_downsample": flatfield_model_downsample,
+        "rng_seed": flatfield_rng_seed,
+    }
+    stage_axis_flips = (
+        stage_x_flipped,
+        stage_y_flipped,
+        stage_z_flipped,
+    )
     
     if root_path.suffix == ".zarr":
         # Read metadata
@@ -111,31 +159,44 @@ def process(
         print(f"Processing OPM mode: {opm_mode}")
         if "mirror" in opm_mode or "stage" in opm_mode:
             process_skewed(
-                root_path,
-                zattrs, 
-                deconvolve,
-                max_projection,
-                flatfield_correction,
-                create_fused_max_projection,
-                write_fused_max_projection_tiff,
-                z_downsample_level,
-                crop_after_deskew,
-                time_range,
-                pos_range,
-                excess_overide,
-                flyback_crop
+                root_path=root_path,
+                zattrs=zattrs,
+                deconvolve=deconvolve,
+                max_projection=max_projection,
+                flatfield_correction=flatfield_correction,
+                create_fused_max_projection=create_fused_max_projection,
+                write_fused_max_projection_tiff=write_fused_max_projection_tiff,
+                z_downsample_level=z_downsample_level,
+                crop_after_deskew=crop_after_deskew,
+                time_range=time_range,
+                pos_range=pos_range,
+                excess_overide=excess_overide,
+                flyback_crop=flyback_crop,
+                decon_crop_y=decon_crop_y,
+                decon_gpu_id=decon_gpu_id,
+                decon_verbose=decon_verbose,
+                decon_fallback_step_y=decon_fallback_step_y,
+                decon_psf_paths=decon_psf_paths,
+                stage_axis_flips=stage_axis_flips,
+                flatfield_options=flatfield_options,
             )
         elif "projection" in opm_mode:
 
             process_projection(
-                root_path,
-                zattrs, 
-                deconvolve,
-                flatfield_correction,
-                write_fused_max_projection_tiff,
-                time_range,
-                pos_range,
-                eager_mode
+                root_path=root_path,
+                zattrs=zattrs,
+                deconvolve=deconvolve,
+                flatfield_correction=flatfield_correction,
+                write_fused_max_projection_tiff=write_fused_max_projection_tiff,
+                time_range=time_range,
+                pos_range=pos_range,
+                eager_deconvolution=eager_mode,
+                decon_crop_y=decon_crop_y,
+                decon_gpu_id=decon_gpu_id,
+                decon_verbose=decon_verbose,
+                decon_fallback_step_y=decon_fallback_step_y,
+                stage_axis_flips=stage_axis_flips,
+                flatfield_options=flatfield_options,
             )
     elif root_path.suffixes[-2:] == [".ome", ".tif"]:
         with TiffFile(root_path) as tif:
@@ -143,23 +204,28 @@ def process(
             all_metadata = dict(tif.micromanager_metadata)
             micromanager_metadata = all_metadata["Summary"]
             asi_metadata = json.loads(all_metadata['Summary']["SPIMAcqSettings"])
-            write_fused_tiff = True
-            z_downsample_level = 4
             process_ASI_SCOPE(
-                root_path,
-                axes,
-                micromanager_metadata,
-                asi_metadata,
-                deconvolve,
-                max_projection,
-                flatfield_correction,
-                create_fused_max_projection,
-                write_fused_max_projection_tiff,
-                write_fused_tiff,
-                z_downsample_level,
-                crop_after_deskew,
-                time_range,
-                pos_range,
+                root_path=root_path,
+                axes=axes,
+                micromanager_metadata=micromanager_metadata,
+                asi_metadata=asi_metadata,
+                deconvolve=deconvolve,
+                max_projection=max_projection,
+                flatfield_correction=flatfield_correction,
+                create_fused_max_projection=create_fused_max_projection,
+                write_fused_max_projection_tiff=write_fused_max_projection_tiff,
+                write_fused_tiff=write_fused_tiff,
+                z_downsample_level=z_downsample_level,
+                crop_after_deskew=crop_after_deskew,
+                time_range=time_range,
+                pos_range=pos_range,
+                decon_crop_y=decon_crop_y,
+                decon_gpu_id=decon_gpu_id,
+                decon_verbose=decon_verbose,
+                decon_fallback_step_y=decon_fallback_step_y,
+                camera_conversion_override=asi_camera_conversion,
+                stage_axis_flips=stage_axis_flips,
+                flatfield_options=flatfield_options,
             )
     
 def process_skewed(
@@ -176,6 +242,13 @@ def process_skewed(
     pos_range: tuple[int,int] = None,
     excess_overide: int = None,
     flyback_crop: int = None,
+    decon_crop_y: int = 2048,
+    decon_gpu_id: int = 0,
+    decon_verbose: int = 0,
+    decon_fallback_step_y: int = 128,
+    decon_psf_paths: list[Path] | None = None,
+    stage_axis_flips: tuple[bool, bool, bool] = (False, True, True),
+    flatfield_options: dict | None = None,
 ):
     """Postprocess qi2lab OPM dataset.
     
@@ -217,6 +290,9 @@ def process_skewed(
         Range of timepoints to reconstruct.
     pos_range: list[int,int], default = None
         Range of stage positions to reconstruct.     
+    decon_psf_paths: list[Path] or None, default = None
+        Optional channel-ordered ``.npy`` or image PSFs. When omitted,
+        wavelength-specific theoretical skewed PSFs are generated.
     """
     if deconvolve:
         from opm_processing.imageprocessing.rlgc import chunked_rlgc
@@ -250,36 +326,32 @@ def process_skewed(
     camera_conversion = float(find_key(zattrs,"e_to_ADU"))
 
     channels = extract_channels(zattrs)
-    stage_positions = extract_stage_positions(zattrs)
-    # TO DO: start writing these in metadata!
-    stage_x_flipped = False
-    stage_y_flipped = True
-    stage_z_flipped = True
-
-    # flip x positions w.r.t. camera <-> stage orientation
-    # TO DO: this axis is probably affected by the scan_flip flag, need to think
-    #        about that.
-    if stage_x_flipped:
-        stage_x_max = np.max(stage_positions[:,2])
-        for pos_idx, _ in enumerate(stage_positions):
-            stage_positions[pos_idx,2] = stage_x_max - stage_positions[pos_idx,2]
-    
-    # flip y positions w.r.t. camera <-> stage orientation
-    if stage_y_flipped:
-        stage_y_max = np.max(stage_positions[:,1])
-        for pos_idx, _ in enumerate(stage_positions):
-            stage_positions[pos_idx,1] = stage_y_max - stage_positions[pos_idx,1]
-    
-    # flip z positions w.r.t. camera <-> stage orientation
-    if stage_z_flipped:
-        stage_z_max = np.max(stage_positions[:,0])
-        for pos_idx, _ in enumerate(stage_positions):
-            stage_positions[pos_idx,0] = stage_z_max - stage_positions[pos_idx,0]
+    if decon_psf_paths is not None:
+        if len(decon_psf_paths) != len(channels):
+            raise ValueError("decon_psf_paths must contain one PSF per channel")
+        psfs = [
+            (
+                np.load(path)
+                if Path(path).suffix == ".npy"
+                else np.asarray(imread(path))
+            )
+            for path in decon_psf_paths
+        ]
+    else:
+        psfs = None
+    stage_positions = _apply_stage_axis_flips(
+        extract_stage_positions(zattrs), stage_axis_flips
+    )
+    stage_x_flipped, stage_y_flipped, stage_z_flipped = stage_axis_flips
     
     # # estimate shape of one deskewed volume
     if flyback_crop is not None:
         deskewed_shape, pad_y, pad_x, crop_y = deskew_shape_estimator(
-            [datastore.shape[-3]-excess_scan_positions-flyback_crop,datastore.shape[-2],datastore.shape[-1]],
+            (
+                datastore.shape[-3] - excess_scan_positions - flyback_crop,
+                datastore.shape[-2],
+                datastore.shape[-1],
+            ),
             theta=opm_tilt_deg,
             distance=scan_axis_step_um,
             pixel_size=pixel_size_um,
@@ -287,7 +359,11 @@ def process_skewed(
         )
     else:
         deskewed_shape, pad_y, pad_x, crop_y = deskew_shape_estimator(
-            [datastore.shape[-3]-excess_scan_positions,datastore.shape[-2],datastore.shape[-1]],
+            (
+                datastore.shape[-3] - excess_scan_positions,
+                datastore.shape[-2],
+                datastore.shape[-1],
+            ),
             theta=opm_tilt_deg,
             distance=scan_axis_step_um,
             pixel_size=pixel_size_um,
@@ -393,7 +469,12 @@ def process_skewed(
         if flatfield_path.exists():
             flatfields = imread(flatfield_path).astype(np.float32)
         else:
-            flatfields = call_estimate_illuminations(datastore, camera_offset, camera_conversion)
+            flatfields = call_estimate_illuminations(
+                datastore,
+                camera_offset,
+                camera_conversion,
+                **(flatfield_options or {}),
+            )
             with TiffWriter(flatfield_path, bigtiff=True) as tif:
                 metadata={
                     'axes': "CYX",
@@ -447,53 +528,43 @@ def process_skewed(
                     camera_corrected_data = np.flip(camera_corrected_data,axis=0)
                     
                 if deconvolve:
-                    if pos_idx == 0 and chan_idx == 0:
+                    if psfs is None:
                         psfs = []
                         for psf_idx in range(datastore.shape[2]):
                             psf = generate_skewed_psf(
                                 em_wvl=float(int(str(channels[psf_idx]).rstrip("nm")) / 1000),
                                 pixel_size_um=pixel_size_um,
                                 scan_axis_step_um=scan_axis_step_um,
+                                theta_deg=opm_tilt_deg,
                                 pz=0.0,
                                 plot=False
                             )
                             psfs.append(psf)
 
-                    # # This code is for debugging RLGC deconvolution
-                    # # ------------------------------------
-                    # decon_temp = chunked_rlgc(
-                    #     camera_corrected_data, 
-                    #     psf,
-                    #     crop_y=2048,
-                    #     verbose=1
-                    # )
-                    
-                    # import napari
-                    # viewer = napari.Viewer()
-                    # viewer.add_image(decon_temp,name="decon_temp")
-                    # viewer.add_image(camera_corrected_data)
-                    # napari.run()
-                    # ------------------------------------
-
                     if flyback_crop is not None:
                         deconvolved_data = chunked_rlgc(
                             camera_corrected_data[excess_scan_positions:-flyback_crop,:,:],
                             np.asarray(psfs[chan_idx]),
-                            crop_y=2048,
-                            verbose=1
+                            crop_y=decon_crop_y,
+                            gpu_id=decon_gpu_id,
+                            verbose=decon_verbose,
+                            fallback_step_y=decon_fallback_step_y,
                         )
                     else:
                         deconvolved_data = chunked_rlgc(
                             camera_corrected_data[excess_scan_positions:,:,:],
                             np.asarray(psfs[chan_idx]),
-                            crop_y=2048,
-                            verbose=1
+                            crop_y=decon_crop_y,
+                            gpu_id=decon_gpu_id,
+                            verbose=decon_verbose,
+                            fallback_step_y=decon_fallback_step_y,
                         )
                     deskewed = orthogonal_deskew(
                         deconvolved_data,
                         theta = opm_tilt_deg,
                         distance = scan_axis_step_um,
-                        pixel_size = pixel_size_um
+                        pixel_size = pixel_size_um,
+                        downsample_factor=z_downsample_level,
                     )
                 else:        
                     if flyback_crop is not None:
@@ -501,14 +572,16 @@ def process_skewed(
                             camera_corrected_data[excess_scan_positions:-flyback_crop,:,:],
                             theta = opm_tilt_deg,
                             distance = scan_axis_step_um,
-                            pixel_size = pixel_size_um
+                            pixel_size = pixel_size_um,
+                            downsample_factor=z_downsample_level,
                         )
                     else:
                         deskewed = orthogonal_deskew(
                             camera_corrected_data[excess_scan_positions:,:,:],
                             theta = opm_tilt_deg,
                             distance = scan_axis_step_um,
-                            pixel_size = pixel_size_um
+                            pixel_size = pixel_size_um,
+                            downsample_factor=z_downsample_level,
                         )
 
                 if crop_after_deskew:
@@ -615,7 +688,13 @@ def process_projection(
     time_range: tuple[int,int] = None,
     pos_range: tuple[int,int] = None,
     eager_deconvolution: bool = False,
-    overwrite: bool = False
+    overwrite: bool = False,
+    decon_crop_y: int = 2048,
+    decon_gpu_id: int = 0,
+    decon_verbose: int = 0,
+    decon_fallback_step_y: int = 128,
+    stage_axis_flips: tuple[bool, bool, bool] = (False, True, True),
+    flatfield_options: dict | None = None,
 ):
     """Postprocess qi2lab OPM dataset.
     
@@ -671,31 +750,10 @@ def process_projection(
     camera_conversion = float(find_key(zattrs,"e_to_ADU"))
 
     channels = extract_channels(zattrs)
-    stage_positions = extract_stage_positions(zattrs)
-    # TO DO: start writing these in metadata!
-    stage_x_flipped = False
-    stage_y_flipped = True
-    stage_z_flipped = True
-
-    # flip x positions w.r.t. camera <-> stage orientation
-    # TO DO: this axis is probably affected by the scan_flip flag, need to think
-    #        about that.
-    if stage_x_flipped:
-        stage_x_max = np.max(stage_positions[:,2])
-        for pos_idx, _ in enumerate(stage_positions):
-            stage_positions[pos_idx,2] = stage_x_max - stage_positions[pos_idx,2]
-    
-    # flip y positions w.r.t. camera <-> stage orientation
-    if stage_y_flipped:
-        stage_y_max = np.max(stage_positions[:,1])
-        for pos_idx, _ in enumerate(stage_positions):
-            stage_positions[pos_idx,1] = stage_y_max - stage_positions[pos_idx,1]
-    
-    # flip z positions w.r.t. camera <-> stage orientation
-    if stage_z_flipped:
-        stage_z_max = np.max(stage_positions[:,0])
-        for pos_idx, _ in enumerate(stage_positions):
-            stage_positions[pos_idx,0] = stage_z_max - stage_positions[pos_idx,0]
+    stage_positions = _apply_stage_axis_flips(
+        extract_stage_positions(zattrs), stage_axis_flips
+    )
+    stage_x_flipped, stage_y_flipped, stage_z_flipped = stage_axis_flips
                         
     if time_range is not None:
         time_shape = time_range[1]
@@ -743,7 +801,12 @@ def process_projection(
             if flatfield_path.exists():
                 flatfields = imread(flatfield_path).astype(np.float32)
             else:
-                flatfields = call_estimate_illuminations(datastore, camera_offset, camera_conversion)
+                flatfields = call_estimate_illuminations(
+                    datastore,
+                    camera_offset,
+                    camera_conversion,
+                    **(flatfield_options or {}),
+                )
                 with TiffWriter(flatfield_path, bigtiff=True) as tif:
                     metadata={
                         'axes': "CYX",
@@ -812,7 +875,10 @@ def process_projection(
                         deconvolved_data = chunked_rlgc(
                             image=camera_corrected_data,
                             psf=np.asarray(psfs[chan_idx]),
-                            crop_y=2048,
+                            crop_y=decon_crop_y,
+                            gpu_id=decon_gpu_id,
+                            verbose=decon_verbose,
+                            fallback_step_y=decon_fallback_step_y,
                             safe_mode=safe_stop,
                         )
                     else:
@@ -924,7 +990,14 @@ def process_ASI_SCOPE(
     z_downsample_level: int = 4,
     crop_after_deskew: bool = False,
     time_range: tuple[int,int] = None,
-    pos_range: tuple[int,int] = None
+    pos_range: tuple[int,int] = None,
+    decon_crop_y: int = 2048,
+    decon_gpu_id: int = 0,
+    decon_verbose: int = 0,
+    decon_fallback_step_y: int = 128,
+    camera_conversion_override: float | None = None,
+    stage_axis_flips: tuple[bool, bool, bool] = (False, True, True),
+    flatfield_options: dict | None = None,
 ):
     """Postprocess ASI SCOPE OPM dataset.
     
@@ -996,14 +1069,15 @@ def process_ASI_SCOPE(
     tif = TiffFile(root_path,is_mmstack=False)
     per_image_metadata = dict(tif.series[0].pages[0].tags['MicroManagerMetadata'].value)
     camera_offset = float(per_image_metadata["pvcam-Offset"])
-    if "Dynamic Range" in str(per_image_metadata["pvcam-Port"]):
-        camera_conversion = 0.23
-    elif "Speed" in str(per_image_metadata["pvcam-Port"]):
-        camera_conversion = 0.85
-    elif "Sensitivity" in str(per_image_metadata["pvcam-Port"]):
-        camera_conversion = 0.25
-    elif "Sub-Electron" in str(per_image_metadata["pvcam-Port"]):
-        camera_conversion = 0.015
+    if camera_conversion_override is not None:
+        camera_conversion = float(camera_conversion_override)
+    elif "e_to_ADU" in per_image_metadata:
+        camera_conversion = float(per_image_metadata["e_to_ADU"])
+    else:
+        raise ValueError(
+            "ASI camera conversion is absent from metadata; pass "
+            "--asi-camera-conversion explicitly."
+        )
     del tif
         
     asi_step_um = float(micromanager_metadata["z-step_um"])
@@ -1032,30 +1106,8 @@ def process_ASI_SCOPE(
         ]
     ])
   
-    # TO DO: start writing these in metadata!
-    stage_x_flipped = False
-    stage_y_flipped = True
-    stage_z_flipped = True
-
-    # flip x positions w.r.t. camera <-> stage orientation
-    # TO DO: this axis is probably affected by the scan_flip flag, need to think
-    #        about that.
-    if stage_x_flipped:
-        stage_x_max = np.max(stage_positions[:,2])
-        for pos_idx, _ in enumerate(stage_positions):
-            stage_positions[pos_idx,2] = stage_x_max - stage_positions[pos_idx,2]
-    
-    # flip y positions w.r.t. camera <-> stage orientation
-    if stage_y_flipped:
-        stage_y_max = np.max(stage_positions[:,1])
-        for pos_idx, _ in enumerate(stage_positions):
-            stage_positions[pos_idx,1] = stage_y_max - stage_positions[pos_idx,1]
-    
-    # flip z positions w.r.t. camera <-> stage orientation
-    if stage_z_flipped:
-        stage_z_max = np.max(stage_positions[:,0])
-        for pos_idx, _ in enumerate(stage_positions):
-            stage_positions[pos_idx,0] = stage_z_max - stage_positions[pos_idx,0]
+    stage_positions = _apply_stage_axis_flips(stage_positions, stage_axis_flips)
+    stage_x_flipped, stage_y_flipped, stage_z_flipped = stage_axis_flips
     
     # estimate shape of one deskewed volume
     deskewed_shape, pad_y, pad_x, crop_y = deskew_shape_estimator(
@@ -1167,7 +1219,12 @@ def process_ASI_SCOPE(
         if flatfield_path.exists():
             flatfields = imread(flatfield_path).astype(np.float32)
         else:
-            flatfields = call_estimate_illuminations(datastore, camera_offset, camera_conversion)
+            flatfields = call_estimate_illuminations(
+                datastore,
+                camera_offset,
+                camera_conversion,
+                **(flatfield_options or {}),
+            )
             with TiffWriter(flatfield_path, bigtiff=True) as tif:
                 metadata={
                     'axes': "CYX",
@@ -1234,25 +1291,13 @@ def process_ASI_SCOPE(
                             )
                             psfs.append(psf)
 
-                    # This code is for debugging RLGC deconvolution
-                    # ------------------------------------
-                    # decon_temp = chunked_rlgc(
-                    #     camera_corrected_data, 
-                    #     psf,
-                    #     crop_y=2048,
-                    # )
-                    
-                    # import napari
-                    # viewer = napari.Viewer()
-                    # viewer.add_image(decon_temp)
-                    # viewer.add_image(camera_corrected_data)
-                    # napari.run()
-                    # ------------------------------------
                     deconvolved_data = chunked_rlgc(
                         camera_corrected_data,
                         np.asarray(psfs[chan_idx]),
-                        crop_y=2048,
-                        verbose=1,
+                        crop_y=decon_crop_y,
+                        gpu_id=decon_gpu_id,
+                        verbose=decon_verbose,
+                        fallback_step_y=decon_fallback_step_y,
                     )
     
                     deskewed = orthogonal_deskew(
@@ -1403,7 +1448,9 @@ def process_ASI_SCOPE(
                         metadata=metadata
                     )
 
-def run_estimate_illuminations(datastore, camera_offset, camera_conversion, conn):
+def run_estimate_illuminations(
+    datastore, camera_offset, camera_conversion, flatfield_options, conn
+):
     """Helper function to run estimate_illuminations in a subprocess.
     
     BaSiCPy uses PyTorch on the GPU, so the fit runs in an isolated process to
@@ -1427,14 +1474,21 @@ def run_estimate_illuminations(datastore, camera_offset, camera_conversion, conn
     from opm_processing.imageprocessing.flatfield import estimate_illuminations
 
     try:
-        flatfields = estimate_illuminations(datastore, camera_offset, camera_conversion)
+        flatfields = estimate_illuminations(
+            datastore,
+            camera_offset,
+            camera_conversion,
+            **flatfield_options,
+        )
         conn.send(flatfields)
     except Exception as e:
         conn.send(e)
     finally:
         conn.close()
     
-def call_estimate_illuminations(datastore, camera_offset, camera_conversion):
+def call_estimate_illuminations(
+    datastore, camera_offset, camera_conversion, **flatfield_options
+):
     """Helper function to call estimate_illuminations in a subprocess.
     
     BaSiCPy uses PyTorch on the GPU, so the fit runs in an isolated process to
@@ -1457,7 +1511,13 @@ def call_estimate_illuminations(datastore, camera_offset, camera_conversion):
     parent_conn, child_conn = mp.Pipe()
     p = mp.Process(
         target=run_estimate_illuminations,
-        args=(datastore, camera_offset, camera_conversion, child_conn)
+        args=(
+            datastore,
+            camera_offset,
+            camera_conversion,
+            flatfield_options,
+            child_conn,
+        )
     )
     p.start()
     result = parent_conn.recv()

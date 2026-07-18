@@ -303,7 +303,10 @@ def chunked_orthogonal_deskew(
     camera_bkd: int = 100,
     camera_cf: float = 0.24,
     camera_qe: float = 0.9,
-    z_downsample_level=2
+    z_downsample_level: int = 2,
+    theta_deg: float = 30.0,
+    scan_axis_step_um: float = 0.4,
+    pixel_size_um: float = 0.115,
 ) -> ArrayLike:
     """Chunked orthogonal deskew of oblique data.
 
@@ -335,6 +338,12 @@ def chunked_orthogonal_deskew(
         camera quantum efficiency
     z_downsample_level: int
         z downsample level
+    theta_deg: float
+        OPM tilt angle in degrees.
+    scan_axis_step_um: float
+        Physical scan-axis step in micrometers.
+    pixel_size_um: float
+        Camera pixel size in micrometers.
     
     Returns
     -------
@@ -346,9 +355,17 @@ def chunked_orthogonal_deskew(
         raise ValueError("psf_data is required when deconvolve=True")
     if decon_chunk_size <= 0:
         raise ValueError("decon_chunk_size must be greater than 0")
+    if scan_axis_step_um <= 0 or pixel_size_um <= 0:
+        raise ValueError("scan_axis_step_um and pixel_size_um must be positive")
+    if camera_qe <= 0:
+        raise ValueError("camera_qe must be positive")
 
     estimated_shape, _, _, _ = deskew_shape_estimator(
-        oblique_image.shape, crop_after_deskew=False
+        oblique_image.shape,
+        theta=theta_deg,
+        distance=scan_axis_step_um,
+        pixel_size=pixel_size_um,
+        crop_after_deskew=False,
     )
     output_shape = list(estimated_shape)
     output_shape[0] = output_shape[0] // z_downsample_level
@@ -366,32 +383,31 @@ def chunked_orthogonal_deskew(
     for idx in tqdm(idxs):
         if idx[0] > 0:
             tile_px_start = idx[0] - overlap_size
-            crop_start = True
         else:
             tile_px_start = idx[0]
-            crop_start = False
 
         if idx[1] < output_shape[1]:
             tile_px_end = idx[1] + overlap_size
-            crop_end = True
         else:
             if overlap_size == 0:
                 tile_px_end = idx[1] + scan_crop
-                crop_end = False
             else:
                 tile_px_end = idx[1]
-                crop_end = False
 
         xp, yp, sp_start = lab2cam(
-            oblique_image.shape[2], tile_px_start, 0, 30.0 * np.pi / 180.0
+            oblique_image.shape[2], tile_px_start, 0, np.deg2rad(theta_deg)
         )
 
         xp, yp, sp_stop = lab2cam(
-            oblique_image.shape[2], tile_px_end, 0, 30.0 * np.pi / 180.0
+            oblique_image.shape[2], tile_px_end, 0, np.deg2rad(theta_deg)
         )
-        scan_px_start = np.maximum(0, np.int64(np.ceil(sp_start * (0.115 / 0.4))))
+        camera_to_scan = pixel_size_um / scan_axis_step_um
+        scan_px_start = np.maximum(
+            0, np.int64(np.ceil(sp_start * camera_to_scan))
+        )
         scan_px_stop = np.minimum(
-            oblique_image.shape[0], np.int64(np.ceil(sp_stop * (0.115 / 0.4)))
+            oblique_image.shape[0],
+            np.int64(np.ceil(sp_stop * camera_to_scan)),
         )
 
         raw_data = np.array(oblique_image[scan_px_start:scan_px_stop, :]).astype(
@@ -407,34 +423,21 @@ def chunked_orthogonal_deskew(
                 crop_y=decon_chunk_size,
             )
         temp_deskew = orthogonal_deskew(
-            raw_data, downsample_factor=z_downsample_level
+            raw_data,
+            theta=theta_deg,
+            distance=scan_axis_step_um,
+            pixel_size=pixel_size_um,
+            downsample_factor=z_downsample_level,
         ).astype(np.uint16)
 
-        if crop_start and crop_end:
-            crop_deskew = temp_deskew[:, overlap_size:-overlap_size, :]
-        elif crop_start:
-            crop_deskew = temp_deskew[:, overlap_size:-1, :]
-        elif crop_end:
-            crop_deskew = temp_deskew[:, 0:-overlap_size, :]
-        else:
-            y_stop = -scan_crop if scan_crop > 0 else None
-            crop_deskew = temp_deskew[:, 0:y_stop, :]
-
         target_size = idx[1] - idx[0]
-        if crop_deskew.shape[1] > target_size:
-            diff = crop_deskew.shape[1] - target_size
-            crop_deskew = crop_deskew[:, :-diff, :]
-        elif crop_deskew.shape[1] < target_size:
-            diff = target_size - crop_deskew.shape[1]
-
-            if crop_start and crop_end:
-                crop_deskew = temp_deskew[:, overlap_size : -overlap_size + diff, :]
-            elif crop_start:
-                crop_deskew = temp_deskew[:, overlap_size - diff : -1, :]
-
-        if crop_deskew.shape[1] > target_size:
-            crop_deskew = crop_deskew[:, :target_size, :]
-        elif crop_deskew.shape[1] < target_size:
+        pixel_step = scan_axis_step_um / pixel_size_um
+        chunk_global_y_origin = float(scan_px_start) * pixel_step
+        local_y_start = int(np.rint(float(idx[0]) - chunk_global_y_origin))
+        local_y_start = max(0, local_y_start)
+        local_y_stop = local_y_start + target_size
+        crop_deskew = temp_deskew[:, local_y_start:local_y_stop, :]
+        if crop_deskew.shape[1] < target_size:
             crop_deskew = np.pad(
                 crop_deskew,
                 ((0, 0), (0, target_size - crop_deskew.shape[1]), (0, 0)),

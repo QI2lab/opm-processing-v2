@@ -330,6 +330,7 @@ def generate_skewed_psf(
     em_wvl: float,
     pixel_size_um: float = 0.115,
     scan_axis_step_um: float = 0.4,
+    theta_deg: float = 30.0,
     pz : float = 0.0,
     plot=False):
     """
@@ -343,6 +344,8 @@ def generate_skewed_psf(
         pixel size in microns
     scan_axis_step_um: float
         step size in microns
+    theta_deg: float
+        OPM tilt angle in degrees.
     pz: float
         distance above coverslip in microns
     plot: bool
@@ -358,7 +361,7 @@ def generate_skewed_psf(
     na = 1.35
     ni = 1.4
     dstage = scan_axis_step_um
-    theta = 30 * np.pi/180
+    theta = np.deg2rad(theta_deg)
 
     xy_res = 1.6163399561827614 / np.pi * em_wvl / na
     z_res = 2.355*(np.sqrt(6) / np.pi * ni * em_wvl / na ** 2)

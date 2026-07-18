@@ -991,6 +991,7 @@ def chunked_rlgc(
     logger: logging.Logger | None = None,
     log_prefix: str = "",
     on_successful_crop_y: Callable[[int], None] | None = None,
+    fallback_step_y: int = 128,
 ) -> np.ndarray:
     """
     Y-chunked RLGC deconvolution with automatic chunk fallback.
@@ -1034,6 +1035,8 @@ def chunked_rlgc(
         Structured prefix prepended to emitted log lines.
     on_successful_crop_y : Callable[[int], None] or None, default=None
         Optional callback receiving the crop size that completed successfully.
+    fallback_step_y : int, default=128
+        Number of retained Y pixels removed after each allocation failure.
 
     Returns
     -------
@@ -1049,7 +1052,8 @@ def chunked_rlgc(
     else:
         raise ValueError(f"Expected a 2D or 3D image, got shape {image_arr.shape}")
 
-    fallback_step = 128
+    if fallback_step_y < 1:
+        raise ValueError("fallback_step_y must be at least 1")
     min_crop_y = int(np.asarray(psf).shape[-2])
     attempted_crop_y = min(int(crop_y), int(image_y))
 
@@ -1092,7 +1096,7 @@ def chunked_rlgc(
                 raise
 
             clear_rlgc_caches(clear_memory_pool=True)
-            next_crop_y = attempted_crop_y - fallback_step
+            next_crop_y = attempted_crop_y - fallback_step_y
             if next_crop_y < min_crop_y:
                 raise RuntimeError(
                     "RLGC failed due to GPU memory constraints even at the "

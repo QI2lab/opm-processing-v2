@@ -119,6 +119,9 @@ ignore = ["E402"]
 [tool.pytest.ini_options]
 minversion = "7.0"
 testpaths = ["tests"]
+markers = [
+    "gpu: correctness tests that execute CUDA code on a real NVIDIA GPU",
+]
 filterwarnings = [
     "error",
     "ignore::pydantic.warnings.PydanticDeprecatedSince20",

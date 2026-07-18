@@ -27,6 +27,16 @@ app.pretty_exceptions_enable = False
 def register_and_fuse(
     root_path: Path,
     chan_idx: int = 0,
+    blend_pixels: tuple[int, int, int] = (20, 600, 400),
+    downsample_factors: tuple[int, int, int] = (3, 5, 5),
+    ssim_window: int = 15,
+    registration_threshold: float = 0.7,
+    chunk_shape_yx: tuple[int, int] = (1024, 1024),
+    fusion_ram_fraction: float = 0.25,
+    max_in_flight_writes: int = 2,
+    optimization_rel_threshold: float = 0.5,
+    optimization_abs_threshold: float = 1.5,
+    max_registration_shift_zyx: tuple[int, int, int] = (20, 50, 100),
 ):
     """Register and fuse processed OPM data.
     
@@ -50,7 +60,20 @@ def register_and_fuse(
     """
     
     # Open zarr using tensorstore
-    tile_fuser = TileFusion(root_path=root_path,channel_to_use=chan_idx)    
+    tile_fuser = TileFusion(
+        root_path=root_path,
+        channel_to_use=chan_idx,
+        blend_pixels=blend_pixels,
+        downsample_factors=downsample_factors,
+        ssim_window=ssim_window,
+        threshold=registration_threshold,
+        chunk_shape_yx=chunk_shape_yx,
+        fusion_ram_fraction=fusion_ram_fraction,
+        max_in_flight_writes=max_in_flight_writes,
+        optimization_rel_threshold=optimization_rel_threshold,
+        optimization_abs_threshold=optimization_abs_threshold,
+        max_registration_shift_zyx=max_registration_shift_zyx,
+    )
     tile_fuser.run()
     
 # entry for point for CLI        

@@ -205,18 +205,3 @@ def structural_similarity_cupy_sep_shared(
 
     # mean over all voxels (or pixels)
     return float(cp.mean(S))
-
-
-# --------------------------------------------------------------------------------
-# 4) Quick test
-# --------------------------------------------------------------------------------
-if __name__ == "__main__":
-    # 2D example
-    a2 = cp.random.rand(256,256).astype(cp.float32)
-    b2 = cp.clip(a2 + cp.random.normal(0,0.02,a2.shape), 0,1).astype(cp.float32)
-    print("2D SSIM:", structural_similarity_cupy_sep_shared(a2, b2, win_size=11))
-
-    # 3D example
-    a3 = cp.random.rand(16,128,128).astype(cp.float32)
-    b3 = cp.clip(a3 + cp.random.normal(0,0.02,a3.shape), 0,1).astype(cp.float32)
-    print("3D SSIM:", structural_similarity_cupy_sep_shared(a3, b3, win_size=11))

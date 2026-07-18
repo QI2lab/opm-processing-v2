@@ -49,6 +49,15 @@ On a machine with a compatible NVIDIA GPU and driver, include the GPU extra,
 uv sync --extra gpu
 ```
 
+Run the substantive CUDA correctness tests with GPU availability required,
+```bash
+OPM_REQUIRE_GPU=1 uv run --extra gpu --group dev pytest -m gpu -v
+```
+
+Without ``OPM_REQUIRE_GPU=1`` the same tests skip cleanly on CPU-only machines.
+The required mode is intended for GPU workstations and GPU CI so a missing
+driver, CuPy, or cuCIM cannot produce a silently green test run.
+
 For development tools, include the `dev` group. Add `--extra gpu` on a GPU
 workstation,
 ```bash

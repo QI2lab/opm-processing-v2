@@ -309,6 +309,10 @@ class TileFusion:
         multiscale_downsample: str = "stride",
         fusion_ram_fraction: float = 0.25,
         max_in_flight_writes: int = 2,
+        chunk_shape_yx: tuple[int, int] = (1024, 1024),
+        optimization_rel_threshold: float = 0.5,
+        optimization_abs_threshold: float = 1.5,
+        max_registration_shift_zyx: tuple[int, int, int] = (20, 50, 100),
     ) -> None:
         self.root = Path(root_path)
         base = self.root.parents[0]
@@ -364,6 +368,22 @@ class TileFusion:
             raise ValueError("max_in_flight_writes must be at least 1")
         self.fusion_ram_fraction = float(fusion_ram_fraction)
         self.max_in_flight_writes = int(max_in_flight_writes)
+        if len(chunk_shape_yx) != 2 or any(value < 1 for value in chunk_shape_yx):
+            raise ValueError("chunk_shape_yx must contain two positive values")
+        if optimization_rel_threshold < 0 or optimization_abs_threshold < 0:
+            raise ValueError("optimization thresholds must be nonnegative")
+        self.chunk_y, self.chunk_x = (int(value) for value in chunk_shape_yx)
+        self.optimization_rel_threshold = float(optimization_rel_threshold)
+        self.optimization_abs_threshold = float(optimization_abs_threshold)
+        if len(max_registration_shift_zyx) != 3 or any(
+            value < 0 for value in max_registration_shift_zyx
+        ):
+            raise ValueError(
+                "max_registration_shift_zyx must contain three nonnegative values"
+            )
+        self.max_registration_shift_zyx = tuple(
+            int(value) for value in max_registration_shift_zyx
+        )
 
         (
             self.time_dim,
@@ -376,9 +396,6 @@ class TileFusion:
         self._is_2d = self.z_dim == 1
 
         self._update_profiles()
-
-        self.chunk_y = 1024
-        self.chunk_x = 1024
 
         self.pairwise_metrics: dict[tuple[int, int], tuple[int, int, int, float]] = {}
         self.global_offsets: np.ndarray | None = None
@@ -760,7 +777,7 @@ class TileFusion:
                         dy_s = int(np.round(shift_ds[1] * df_zyx_eff[1]))
                         dx_s = int(np.round(shift_ds[2] * df_zyx_eff[2]))
 
-                        max_shift = (20, 50, 100)
+                        max_shift = self.max_registration_shift_zyx
                         if (
                             abs(dz_s) > max_shift[0]
                             or abs(dy_s) > max_shift[1]
@@ -1381,7 +1398,11 @@ class TileFusion:
             )
             self.save_pairwise_metrics(metrics_path)
 
-        self.optimize_shifts(method="TWO_ROUND_ITERATIVE", rel_thresh=0.5, abs_thresh=1.5)
+        self.optimize_shifts(
+            method="TWO_ROUND_ITERATIVE",
+            rel_thresh=self.optimization_rel_threshold,
+            abs_thresh=self.optimization_abs_threshold,
+        )
 
         gc.collect()
         if USING_GPU and cp is not None:
@@ -1403,8 +1424,3 @@ class TileFusion:
         self.fused_ts, self.write_block_shape = self._prepare_fused_image(omezarr)
         self._fuse_by_blocks()
         self._write_multiscales()
-
-
-if __name__ == "__main__":
-    fusion = TileFusion("/mnt/data2/qi2lab/20250513_human_OB/whole_OB_slice_polya.zarr")
-    fusion.run()
