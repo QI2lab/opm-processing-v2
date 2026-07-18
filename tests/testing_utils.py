@@ -32,9 +32,7 @@ def masked_correlation(
     sample_count = int(np.count_nonzero(supported))
     if sample_count < 2:
         return CorrelationMeasurement(float("nan"), sample_count)
-    value = float(
-        np.corrcoef(candidate_array[supported], truth_array[supported])[0, 1]
-    )
+    value = float(np.corrcoef(candidate_array[supported], truth_array[supported])[0, 1])
     return CorrelationMeasurement(value, sample_count)
 
 

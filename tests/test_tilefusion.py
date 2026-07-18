@@ -1,3 +1,5 @@
+"""Test tiled registration, fusion, and multiscale writing."""
+
 import json
 from types import MethodType, SimpleNamespace
 
@@ -12,39 +14,52 @@ from opm_processing.imageprocessing.tilefusion import TileFusion
 
 
 class _TrackedFuture:
+    """Track pending asynchronous writes for backpressure tests."""
+
     def __init__(self, tracker):
+        """Register a newly pending write."""
         self.tracker = tracker
         self.pending = True
         tracker["active"] += 1
         tracker["maximum"] = max(tracker["maximum"], tracker["active"])
 
     def result(self):
+        """Resolve the write and update the pending-write count."""
         if self.pending:
             self.pending = False
             self.tracker["active"] -= 1
 
 
 class _ArrayView:
+    """Writable view into an in-memory array store."""
+
     def __init__(self, store, key):
+        """Initialize a keyed array view."""
         self.store = store
         self.key = key
 
     def write(self, value):
+        """Write a value and return a tracked future."""
         self.store.data[self.key] = value
         self.store.tracker["writes"] += 1
         return _TrackedFuture(self.store.tracker)
 
 
 class _ArrayStore:
+    """In-memory TensorStore test double."""
+
     def __init__(self, shape):
+        """Allocate the array and write counters."""
         self.data = np.zeros(shape, dtype=np.uint16)
         self.tracker = {"active": 0, "maximum": 0, "writes": 0}
 
     def __getitem__(self, key):
+        """Return a writable view for an array selection."""
         return _ArrayView(self, key)
 
 
 def test_prepare_fused_image_uses_ngff_multiscales(tmp_path):
+    """Verify fused outputs use NGFF multiscale metadata and chunks."""
     fusion = TileFusion.__new__(TileFusion)
     fusion.padded_shape = (8, 16, 20)
     fusion.offset_um = (3.0, 4.0, 5.0)
@@ -72,13 +87,16 @@ def test_prepare_fused_image_uses_ngff_multiscales(tmp_path):
         8,
         8,
     ]
-    assert all(codec["name"] != "sharding_indexed" for codec in scale0_metadata["codecs"])
+    assert all(
+        codec["name"] != "sharding_indexed" for codec in scale0_metadata["codecs"]
+    )
 
     multiscale = open_group(path).ome_metadata().multiscales[0]
     assert [dataset.path for dataset in multiscale.datasets] == ["0", "1", "2"]
 
 
 def test_max_projection_fusion_uses_chunks_without_sharding(tmp_path):
+    """Verify maximum projections use ordinary chunks without sharding."""
     fusion = MaxTileFusion.__new__(MaxTileFusion)
     fusion.time_range = None
     fusion.time_dim = 1
@@ -102,6 +120,7 @@ def test_max_projection_fusion_uses_chunks_without_sharding(tmp_path):
 
 
 def test_max_projection_fusion_operational_settings_are_configurable():
+    """Verify maximum-projection blending settings are configurable."""
     fusion = MaxTileFusion.__new__(MaxTileFusion)
     fusion.tile_shape = (20, 30)
     fusion.blend_pixels = (3, 5)
@@ -114,6 +133,7 @@ def test_max_projection_fusion_operational_settings_are_configurable():
 
 
 def test_fusion_block_shape_respects_memory_budget(monkeypatch):
+    """Verify fusion block sizing respects the host-memory budget."""
     fusion = TileFusion.__new__(TileFusion)
     fusion.fusion_ram_fraction = 0.5
     fusion.chunk_y = 4
@@ -130,6 +150,7 @@ def test_fusion_block_shape_respects_memory_budget(monkeypatch):
 
 
 def test_fusion_uses_spatial_blocks_and_bounded_writes(monkeypatch):
+    """Verify fusion uses spatial blocks and bounded pending writes."""
     fusion = TileFusion.__new__(TileFusion)
     fusion.fused_ts = _ArrayStore((1, 1, 2, 3, 6))
     fusion.write_block_shape = [1, 1, 1, 2, 2]
@@ -156,6 +177,7 @@ def test_fusion_uses_spatial_blocks_and_bounded_writes(monkeypatch):
     ]
 
     def read_tile(self, tile_idx, ch_sel, z_slice, y_slice, x_slice):
+        """Read a selected region from an in-memory tile."""
         return tiles[tile_idx][ch_sel, z_slice, y_slice, x_slice]
 
     fusion._read_tile_volume = MethodType(read_tile, fusion)
@@ -178,6 +200,7 @@ def test_fusion_uses_spatial_blocks_and_bounded_writes(monkeypatch):
 
 @pytest.mark.parametrize("downsample_method", ["stride", "block_mean"])
 def test_multiscales_are_generated_in_spatial_blocks(tmp_path, downsample_method):
+    """Verify pyramid levels are generated correctly in spatial blocks."""
     fusion = TileFusion.__new__(TileFusion)
     fusion.padded_shape = (4, 8, 8)
     fusion.offset_um = (0.0, 0.0, 0.0)
@@ -216,6 +239,7 @@ def test_multiscales_are_generated_in_spatial_blocks(tmp_path, downsample_method
 
 
 def test_iterative_optimization_handles_all_links_rejected():
+    """Verify optimization remains defined when all links are rejected."""
     fusion = TileFusion.__new__(TileFusion)
     links = [
         {
@@ -239,6 +263,7 @@ def test_iterative_optimization_handles_all_links_rejected():
 
 
 def test_register_and_score_identical_3d_patches():
+    """Verify identical 3D patches register with a near-perfect score."""
     rng = np.random.default_rng(42)
     patch = rng.normal(size=(9, 17, 17)).astype(np.float32)
 

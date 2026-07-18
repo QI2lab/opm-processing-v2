@@ -112,7 +112,11 @@ fuse = "opm_processing.fuse:main"
 [tool.ruff]
 
 [tool.ruff.lint]
+extend-select = ["D"]
 ignore = ["E402"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
 
 
 # https://docs.pytest.org/

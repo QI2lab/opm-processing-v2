@@ -1,3 +1,5 @@
+"""Test OPM deskew geometry and chunked processing."""
+
 from dataclasses import dataclass
 
 import numpy as np
@@ -72,10 +74,9 @@ def chunked_deskew_sample(chunked_deskew_config) -> ChunkedDeskewSample:
     scan, camera_y, camera_x = np.indices(skewed_shape, dtype=np.float32)
     theta = np.deg2rad(config.theta_deg)
     sample_z = camera_y * np.sin(theta)
-    sample_y = (
-        scan * (config.scan_axis_step_um / config.pixel_size_um)
-        + camera_y * np.cos(theta)
-    )
+    sample_y = scan * (
+        config.scan_axis_step_um / config.pixel_size_um
+    ) + camera_y * np.cos(theta)
     sharp = ndimage.map_coordinates(
         ground_truth,
         (sample_z, sample_y, camera_x),
@@ -86,9 +87,9 @@ def chunked_deskew_sample(chunked_deskew_config) -> ChunkedDeskewSample:
     ).astype(np.uint16)
 
     pz, py, px = np.mgrid[-2:3, -3:4, -3:4]
-    psf = np.exp(
-        -(pz**2 / 1.0**2 + py**2 / 1.5**2 + px**2 / 1.5**2) / 2
-    ).astype(np.float32)
+    psf = np.exp(-(pz**2 / 1.0**2 + py**2 / 1.5**2 + px**2 / 1.5**2) / 2).astype(
+        np.float32
+    )
     psf /= psf.sum()
     blurred = rng.poisson(
         ndimage.convolve(sharp.astype(np.float32), psf, mode="constant")
@@ -110,6 +111,7 @@ def _chunked_deskew(
     psf=None,
     deconvolve=False,
 ):
+    """Run chunked deskewing with shared test configuration."""
     return opmtools.chunked_orthogonal_deskew(
         image,
         psf_data=psf,
@@ -137,6 +139,7 @@ def _chunked_deskew(
     ids=("exact-multiple", "remainder"),
 )
 def test_chunk_indices_cover_full_length(length, expected):
+    """Verify chunk indices cover each input element exactly once."""
     assert opmtools.chunk_indices(length, 15_000) == expected
 
 
@@ -144,6 +147,7 @@ def test_chunked_deskew_matches_direct_deskew_without_deconvolution(
     chunked_deskew_sample,
     chunked_deskew_config,
 ):
+    """Verify chunked deskewing matches direct deskewing without deconvolution."""
     sample = chunked_deskew_sample
     config = chunked_deskew_config
 
@@ -182,6 +186,7 @@ def test_chunked_deskew_with_gpu_deconvolution_improves_ground_truth(
     chunked_deskew_config,
     cupy_gpu,
 ):
+    """Verify GPU deconvolution improves shell recovery during chunked deskew."""
     del cupy_gpu  # Shared fixture has already proved CUDA execution.
     sample = chunked_deskew_sample
     config = chunked_deskew_config
@@ -203,8 +208,7 @@ def test_chunked_deskew_with_gpu_deconvolution_improves_ground_truth(
         with_deconvolution[support], sample.ground_truth[support]
     )[0, 1]
     assert (
-        correlation_with
-        > correlation_without + config.minimum_decon_correlation_gain
+        correlation_with > correlation_without + config.minimum_decon_correlation_gain
     )
 
     wall_x = sample.center_zyx[2] + sample.radii_zyx[2]
@@ -231,6 +235,7 @@ def test_chunked_deskew_with_gpu_deconvolution_improves_ground_truth(
 
 
 def test_chunked_deskew_nests_y_only_deconvolution(monkeypatch):
+    """Verify chunked deskew delegates nested Y-only deconvolution."""
     decon_calls = []
     deskew_calls = []
 
@@ -241,12 +246,12 @@ def test_chunked_deskew_nests_y_only_deconvolution(monkeypatch):
     )
 
     def fake_decon(image, psf, crop_y):
+        """Record the deconvolution input and return it unchanged."""
         decon_calls.append((image.shape, psf.shape, crop_y))
         return image.astype(np.float32)
 
-    def fake_deskew(
-        image, *, theta, distance, pixel_size, downsample_factor
-    ):
+    def fake_deskew(image, *, theta, distance, pixel_size, downsample_factor):
+        """Record the deskew input and return a sentinel volume."""
         deskew_calls.append(
             (image.shape, theta, distance, pixel_size, downsample_factor)
         )
@@ -274,6 +279,7 @@ def test_chunked_deskew_nests_y_only_deconvolution(monkeypatch):
 
 
 def test_chunked_deskew_requires_psf_for_deconvolution():
+    """Verify deconvolution requires an explicit point-spread function."""
     with pytest.raises(ValueError, match="psf_data is required"):
         opmtools.chunked_orthogonal_deskew(
             np.ones((2, 3, 4), dtype=np.uint16),

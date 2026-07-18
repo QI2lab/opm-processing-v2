@@ -94,6 +94,7 @@ except Exception:  # noqa: BLE001
     _ssim_cpu = _cpu_ssim
     USING_GPU = False
 
+
 def _shift_array(arr: Any, shift_vec: Any) -> Any:
     """
     Shift an array using GPU if available, else CPU fallback.
@@ -314,6 +315,47 @@ class TileFusion:
         optimization_abs_threshold: float = 1.5,
         max_registration_shift_zyx: tuple[int, int, int] = (20, 50, 100),
     ) -> None:
+        """Initialize registration and fusion for a processed acquisition.
+
+        Parameters
+        ----------
+        root_path
+            Original acquisition path used to discover processed collections.
+        blend_pixels
+            Feathering width in ZYX voxels.
+        downsample_factors
+            Registration downsampling factors in ZYX order.
+        ssim_window
+            Structural-similarity window width.
+        threshold
+            Minimum accepted pairwise registration score.
+        multiscale_factors
+            Downsampling factors for pyramid levels.
+        resolution_multiples
+            NGFF spatial scale multiples for pyramid levels.
+        max_workers
+            Maximum TensorStore I/O worker count.
+        debug
+            Whether to emit diagnostic messages.
+        metrics_filename
+            Pairwise-registration metrics filename.
+        channel_to_use
+            Channel index used for registration.
+        multiscale_downsample
+            Pyramid downsampling method.
+        fusion_ram_fraction
+            Fraction of available host RAM allocated to fusion buffers.
+        max_in_flight_writes
+            Maximum number of pending TensorStore writes.
+        chunk_shape_yx
+            Spatial output chunk shape.
+        optimization_rel_threshold
+            Relative residual threshold for registration outliers.
+        optimization_abs_threshold
+            Absolute residual threshold for registration outliers.
+        max_registration_shift_zyx
+            Maximum accepted registration correction in ZYX voxels.
+        """
         self.root = Path(root_path)
         base = self.root.parents[0]
         stem = self.root.stem
@@ -331,7 +373,9 @@ class TileFusion:
         data_path = next((path for path in candidates if path.exists()), None)
         if data_path is None:
             checked = ", ".join(str(path) for path in candidates)
-            raise FileNotFoundError(f"Processed data store not found. Checked: {checked}")
+            raise FileNotFoundError(
+                f"Processed data store not found. Checked: {checked}"
+            )
         self.data = data_path
 
         collection = open_position_collection(self.data)
@@ -555,24 +599,32 @@ class TileFusion:
             )
 
         if self._is_2d:
-            arr = self.position_arrays[pos_idx][
-                t_idx, ch_sel, 0, y_slice, x_slice
-            ].read().result()
+            arr = (
+                self.position_arrays[pos_idx][t_idx, ch_sel, 0, y_slice, x_slice]
+                .read()
+                .result()
+            )
             if arr.ndim == 2:
                 arr = arr[None, None, :, :]
             elif arr.ndim == 3:
                 arr = arr[:, None, :, :]
             else:
-                raise ValueError(f"Unexpected 2D tile ndim={arr.ndim}, shape={arr.shape}")
+                raise ValueError(
+                    f"Unexpected 2D tile ndim={arr.ndim}, shape={arr.shape}"
+                )
             return arr.astype(np.float32, copy=False)
 
-        arr = self.position_arrays[pos_idx][
-            t_idx, ch_sel, z_slice, y_slice, x_slice
-        ].read().result()
+        arr = (
+            self.position_arrays[pos_idx][t_idx, ch_sel, z_slice, y_slice, x_slice]
+            .read()
+            .result()
+        )
         return arr.astype(np.float32, copy=False)
 
     @staticmethod
-    def register_and_score(g1: Any, g2: Any, win_size: int) -> tuple[tuple[float, float, float], float]:
+    def register_and_score(
+        g1: Any, g2: Any, win_size: int
+    ) -> tuple[tuple[float, float, float], float]:
         """
         Register `g2` to `g1` and compute an SSIM score.
 
@@ -671,7 +723,11 @@ class TileFusion:
         - Links never cross timepoints; i and j always belong to the same t.
         - For 2D data, dz is forced to 0 and overlap gating ignores z.
         """
-        df_in = self.downsample_factors if downsample_factors is None else downsample_factors
+        df_in = (
+            self.downsample_factors
+            if downsample_factors is None
+            else downsample_factors
+        )
         sw = self.ssim_window if ssim_window is None else int(ssim_window)
         th = self.threshold if threshold is None else float(threshold)
 
@@ -679,9 +735,13 @@ class TileFusion:
         n_pos = int(self.position_dim)
 
         def bounds_1d(off: int, length: int) -> tuple[int, int]:
+            """Clip a shifted interval to one array dimension."""
             return max(0, off), min(length, off + length)
 
-        def effective_df_for_patch(patch: Any, df_zyx: tuple[int, int, int]) -> tuple[int, int, int]:
+        def effective_df_for_patch(
+            patch: Any, df_zyx: tuple[int, int, int]
+        ) -> tuple[int, int, int]:
+            """Clamp downsampling factors to the available patch shape."""
             arr = np.asarray(patch)
             if arr.ndim == 4:
                 zyx = (arr.shape[1], arr.shape[2], arr.shape[3])
@@ -713,8 +773,12 @@ class TileFusion:
                     for j_pos in range(i_pos + 1, n_pos):
                         j = base + j_pos
 
-                        phys = np.array(self._tile_positions[j]) - np.array(self._tile_positions[i])
-                        vox_off = np.round(phys / np.array(self._pixel_size)).astype(int)
+                        phys = np.array(self._tile_positions[j]) - np.array(
+                            self._tile_positions[i]
+                        )
+                        vox_off = np.round(phys / np.array(self._pixel_size)).astype(
+                            int
+                        )
 
                         dz = int(vox_off[0])
                         dy = int(vox_off[1])
@@ -737,7 +801,10 @@ class TileFusion:
                         if any(hi <= lo for (lo, hi) in bounds_i):
                             continue
 
-                        def read_patch(gidx: int, bnds: list[tuple[int, int]]) -> np.ndarray:
+                        def read_patch(
+                            gidx: int, bnds: list[tuple[int, int]]
+                        ) -> np.ndarray:
+                            """Read one bounded tile patch for pairwise registration."""
                             z0, z1 = bnds[0]
                             y0, y1 = bnds[1]
                             x0, x1 = bnds[2]
@@ -762,7 +829,9 @@ class TileFusion:
                         elif arr_i.ndim == 3:
                             reduce_block = df_zyx_eff
                         else:
-                            raise ValueError(f"Unexpected patch ndim={arr_i.ndim}, shape={arr_i.shape}")
+                            raise ValueError(
+                                f"Unexpected patch ndim={arr_i.ndim}, shape={arr_i.shape}"
+                            )
 
                         g1 = block_reduce(arr_i, block_size=reduce_block, func=xp.mean)
                         g2 = block_reduce(arr_j, block_size=reduce_block, func=xp.mean)
@@ -793,10 +862,17 @@ class TileFusion:
                                 )
                             continue
 
-                        self.pairwise_metrics[(i, j)] = (dz_s, dy_s, dx_s, round(score, 3))
+                        self.pairwise_metrics[(i, j)] = (
+                            dz_s,
+                            dy_s,
+                            dx_s,
+                            round(score, 3),
+                        )
 
     @staticmethod
-    def _solve_global(links: list[dict[str, Any]], n_tiles: int, fixed_indices: list[int]) -> np.ndarray:
+    def _solve_global(
+        links: list[dict[str, Any]], n_tiles: int, fixed_indices: list[int]
+    ) -> np.ndarray:
         """
         Solve dense least-squares shifts per-axis with fixed tile constraints.
 
@@ -880,6 +956,7 @@ class TileFusion:
         shifts = self._solve_global(links, n_tiles, fixed_indices)
 
         def residuals(ls: list[dict[str, Any]], sh: np.ndarray) -> np.ndarray:
+            """Calculate Euclidean residuals for registration links."""
             return np.array(
                 [
                     np.linalg.norm(sh[link["j"]] - sh[link["i"]] - link["t"])
@@ -1209,7 +1286,9 @@ class TileFusion:
             or self.offset_um is None
             or self.padded_shape is None
         ):
-            raise RuntimeError("Fusion not initialized: compute fused space and create output store first.")
+            raise RuntimeError(
+                "Fusion not initialized: compute fused space and create output store first."
+            )
 
         n_pos = int(self.position_dim)
         n_t = int(self.time_dim)
@@ -1336,13 +1415,26 @@ class TileFusion:
                             y1 = min(y0 + block_y, out_y)
                             for x0 in range(0, out_x, block_x):
                                 x1 = min(x0 + block_x, out_x)
-                                slab = inp[
-                                    t,
-                                    c,
-                                    slice(z0 * z_factor, min(int(inp.shape[2]), z1 * z_factor)),
-                                    slice(y0 * factor, min(int(inp.shape[3]), y1 * factor)),
-                                    slice(x0 * factor, min(int(inp.shape[4]), x1 * factor)),
-                                ].read().result()
+                                slab = (
+                                    inp[
+                                        t,
+                                        c,
+                                        slice(
+                                            z0 * z_factor,
+                                            min(int(inp.shape[2]), z1 * z_factor),
+                                        ),
+                                        slice(
+                                            y0 * factor,
+                                            min(int(inp.shape[3]), y1 * factor),
+                                        ),
+                                        slice(
+                                            x0 * factor,
+                                            min(int(inp.shape[4]), x1 * factor),
+                                        ),
+                                    ]
+                                    .read()
+                                    .result()
+                                )
                                 if self.multiscale_downsample == "stride":
                                     down = slab[::z_factor, ::factor, ::factor]
                                 else:

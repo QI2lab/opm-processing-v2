@@ -1,3 +1,5 @@
+"""Test GPU deconvolution chunking and memory fallback behavior."""
+
 import importlib
 import inspect
 import sys
@@ -7,6 +9,7 @@ import numpy as np
 
 
 def _import_rlgc(monkeypatch):
+    """Import RLGC with a CPU-backed CuPy test double when necessary."""
     rlgc = None
     try:
         rlgc = importlib.import_module("opm_processing.imageprocessing.rlgc")
@@ -18,9 +21,11 @@ def _import_rlgc(monkeypatch):
         id = 0
 
         def __init__(self, *_args):
+            """Initialize a simulated CUDA device."""
             pass
 
         def use(self):
+            """Simulate selecting the CUDA device."""
             pass
 
     cupy = types.ModuleType("cupy")
@@ -42,6 +47,7 @@ def _import_rlgc(monkeypatch):
 
 
 def test_chunked_rlgc_uses_y_only_chunking_api(monkeypatch):
+    """Verify chunked RLGC exposes only Y-axis chunk sizing."""
     rlgc = _import_rlgc(monkeypatch)
     parameters = inspect.signature(rlgc.chunked_rlgc).parameters
 
@@ -51,10 +57,12 @@ def test_chunked_rlgc_uses_y_only_chunking_api(monkeypatch):
 
 
 def test_y_tiles_keep_full_z_and_x(monkeypatch):
+    """Verify Y chunks retain the complete Z and X dimensions."""
     rlgc = _import_rlgc(monkeypatch)
     solver_shapes = []
 
     def fake_solver(image, _psf, *_args, **_kwargs):
+        """Record each solver tile shape and return its image."""
         solver_shapes.append(image.shape)
         return image.astype(np.float32)
 
@@ -72,11 +80,13 @@ def test_y_tiles_keep_full_z_and_x(monkeypatch):
 
 
 def test_oom_fallback_reduces_only_crop_y(monkeypatch):
+    """Verify an OOM retry reduces only the Y crop size."""
     rlgc = _import_rlgc(monkeypatch)
     attempted = []
     successful = []
 
     def fake_chunked_once(image, psf, **kwargs):
+        """Raise one simulated OOM before returning the image."""
         del psf
         attempted.append((kwargs["crop_y"], image.shape[0], image.shape[2]))
         if len(attempted) == 1:
@@ -99,10 +109,12 @@ def test_oom_fallback_reduces_only_crop_y(monkeypatch):
 
 
 def test_oom_fallback_step_is_configurable(monkeypatch):
+    """Verify the Y-crop fallback decrement is configurable."""
     rlgc = _import_rlgc(monkeypatch)
     attempted = []
 
     def fake_chunked_once(image, psf, **kwargs):
+        """Raise one simulated OOM and record crop sizes."""
         del psf
         attempted.append(kwargs["crop_y"])
         if len(attempted) == 1:

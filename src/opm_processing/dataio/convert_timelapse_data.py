@@ -22,6 +22,7 @@ app = typer.Typer()
 
 
 def _with_suffix(path: Path, suffix: str) -> Path:
+    """Return a path with the requested suffix."""
     return path if path.suffix == suffix else path.with_suffix(suffix)
 
 
@@ -47,11 +48,13 @@ def _camera_correct(
     camera_offset: float,
     camera_conversion: float,
 ) -> np.ndarray:
+    """Apply offset and gain correction while clipping to uint16 limits."""
     corrected = (data_array.astype(np.float32) - camera_offset) * camera_conversion
     return np.clip(corrected, 0, np.iinfo(np.uint16).max)
 
 
 def _tiff_metadata(axes: str, pixel_size_um: float) -> dict[str, object]:
+    """Build physical-size metadata for an OME-TIFF image."""
     return {
         "axes": axes,
         "SignificantBits": np.iinfo(np.uint16).bits,
@@ -86,6 +89,7 @@ def _write_tiff(
     pixel_size_um: float,
     output_path: Path,
 ) -> None:
+    """Write an array as a compressed OME-TIFF image."""
     output_path = _with_suffix(Path(output_path), ".tiff")
     resolution = 1e4 / pixel_size_um
     with TiffWriter(output_path, bigtiff=True) as tif:
@@ -112,6 +116,7 @@ def save_as_tiff(
 
 
 def _open_datastore(zarr_dir: Path) -> ts.TensorStore:
+    """Open a Zarr v2 or v3 acquisition as a TensorStore."""
     last_error: Exception | None = None
     for driver in ("zarr3", "zarr"):
         try:
@@ -131,6 +136,7 @@ def _selection_bounds(
     length: int,
     name: str,
 ) -> tuple[int, int]:
+    """Validate and normalize a half-open selection range."""
     if requested is None:
         return 0, length
     start, stop = requested
@@ -174,12 +180,12 @@ def convert_timelapse(
     p0, p1 = _selection_bounds(stage_range, datastore.shape[1], "stage_range")
     z0, z1 = _selection_bounds(scan_range, datastore.shape[3], "scan_range")
     x0, x1 = _selection_bounds(fov_x_range, datastore.shape[5], "fov_x_range")
-    destination = Path(output_dir) if output_dir else zarr_dir.parent / "converted_files"
+    destination = (
+        Path(output_dir) if output_dir else zarr_dir.parent / "converted_files"
+    )
     destination.mkdir(parents=True, exist_ok=True)
 
-    if create_time_projection and (
-        camera_offset is None or camera_conversion is None
-    ):
+    if create_time_projection and (camera_offset is None or camera_conversion is None):
         raise ValueError(
             "Time projection requires camera offset and conversion in metadata "
             "or as explicit arguments."

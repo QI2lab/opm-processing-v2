@@ -1,3 +1,5 @@
+"""Compute structural similarity for 2D and 3D CuPy arrays."""
+
 import math
 
 from opm_processing.cuda import preload_cuda_libraries
@@ -10,7 +12,7 @@ import cupy as cp  # noqa: E402
 # --------------------------------------------------------------------------------
 # 1) Separable 1D box‐filter kernels with shared memory (unchanged)
 # --------------------------------------------------------------------------------
-_separable_kernels_shared = r'''
+_separable_kernels_shared = r"""
 extern "C" {
 
 __global__ void box_filter_x_shared(
@@ -101,18 +103,32 @@ __global__ void box_filter_z_shared(
 }
 
 }  // extern "C"
-'''
+"""
 
-_mod_sep = cp.RawModule(code=_separable_kernels_shared, options=('-std=c++11',))
-_filt_x = _mod_sep.get_function('box_filter_x_shared')
-_filt_y = _mod_sep.get_function('box_filter_y_shared')
-_filt_z = _mod_sep.get_function('box_filter_z_shared')
+_mod_sep = cp.RawModule(code=_separable_kernels_shared, options=("-std=c++11",))
+_filt_x = _mod_sep.get_function("box_filter_x_shared")
+_filt_y = _mod_sep.get_function("box_filter_y_shared")
+_filt_z = _mod_sep.get_function("box_filter_z_shared")
 
 
 # --------------------------------------------------------------------------------
 # 2) Helper: separable shared‐mem box filter on a 3D buffer
 # --------------------------------------------------------------------------------
 def _box_filter_3d_shared(inp: cp.ndarray, win_size: int) -> cp.ndarray:
+    """Apply a separable 3D box filter using CUDA shared memory.
+
+    Parameters
+    ----------
+    inp
+        Input ZYX CuPy array.
+    win_size
+        Odd box-filter window size.
+
+    Returns
+    -------
+    cupy.ndarray
+        Filtered array with the same shape as the input.
+    """
     D, H, W = inp.shape
     r = win_size // 2
 
@@ -122,29 +138,23 @@ def _box_filter_3d_shared(inp: cp.ndarray, win_size: int) -> cp.ndarray:
     # choose thread‐counts to respect dims
     tx = min(64, W)
     ty = min(16, H)
-    tz = min(8,  D)
+    tz = min(8, D)
 
     gx = math.ceil(W / tx)
     gy = math.ceil(H / ty)
     gz = math.ceil(D / tz)
 
     # X-pass
-    shared_x = (tx + 2*r) * cp.dtype(cp.float32).itemsize
-    _filt_x((gx, H, D), (tx, 1, 1),
-            (inp, buf1, W, H, D, r),
-            shared_mem=shared_x)
+    shared_x = (tx + 2 * r) * cp.dtype(cp.float32).itemsize
+    _filt_x((gx, H, D), (tx, 1, 1), (inp, buf1, W, H, D, r), shared_mem=shared_x)
 
     # Y-pass
-    shared_y = (ty + 2*r) * cp.dtype(cp.float32).itemsize
-    _filt_y((W, gy, D), (1, ty, 1),
-            (buf1, buf2, W, H, D, r),
-            shared_mem=shared_y)
+    shared_y = (ty + 2 * r) * cp.dtype(cp.float32).itemsize
+    _filt_y((W, gy, D), (1, ty, 1), (buf1, buf2, W, H, D, r), shared_mem=shared_y)
 
     # Z-pass
-    shared_z = (tz + 2*r) * cp.dtype(cp.float32).itemsize
-    _filt_z((W, H, gz), (1, 1, tz),
-            (buf2, buf1, W, H, D, r),
-            shared_mem=shared_z)
+    shared_z = (tz + 2 * r) * cp.dtype(cp.float32).itemsize
+    _filt_z((W, H, gz), (1, 1, tz), (buf2, buf1, W, H, D, r), shared_mem=shared_z)
 
     return buf1
 
@@ -161,12 +171,12 @@ def structural_similarity_cupy_sep_shared(
     K1: float = 0.01,
     K2: float = 0.03,
 ) -> float:
-    """
-    Mean SSIM for 2D (Y×X) or 3D (Z×Y×X) float32 CuPy arrays,
+    """Calculate mean SSIM for 2D or 3D float32 CuPy arrays.
+
+    Supports 2D (Y×X) or 3D (Z×Y×X) arrays,
     using separable box filters with shared memory.
     Always assumes zyx ordering.
     """
-
     # promote 2D to a single‐slice 3D volume
     if img1.ndim == 2:
         img1 = img1[None, ...]
@@ -181,27 +191,27 @@ def structural_similarity_cupy_sep_shared(
 
     if data_range is None:
         data_range = float(img1.max() - img1.min())
-    C1 = (K1 * data_range)**2
-    C2 = (K2 * data_range)**2
+    C1 = (K1 * data_range) ** 2
+    C2 = (K2 * data_range) ** 2
 
     # compute local means and second moments
-    mu1  = _box_filter_3d_shared(img1,       win_size)
-    mu2  = _box_filter_3d_shared(img2,       win_size)
-    mu11 = _box_filter_3d_shared(img1*img1,  win_size)
-    mu22 = _box_filter_3d_shared(img2*img2,  win_size)
-    mu12 = _box_filter_3d_shared(img1*img2,  win_size)
+    mu1 = _box_filter_3d_shared(img1, win_size)
+    mu2 = _box_filter_3d_shared(img2, win_size)
+    mu11 = _box_filter_3d_shared(img1 * img1, win_size)
+    mu22 = _box_filter_3d_shared(img2 * img2, win_size)
+    mu12 = _box_filter_3d_shared(img1 * img2, win_size)
 
     # unbiased covariances
-    N = win_size**(img1.ndim)
+    N = win_size ** (img1.ndim)
     factor = N / float(N - 1)
-    vx  = (mu11 - mu1*mu1) * factor
-    vy  = (mu22 - mu2*mu2) * factor
-    vxy = (mu12 - mu1*mu2) * factor
+    vx = (mu11 - mu1 * mu1) * factor
+    vy = (mu22 - mu2 * mu2) * factor
+    vxy = (mu12 - mu1 * mu2) * factor
 
     # SSIM map
-    num   = (2*mu1*mu2 + C1) * (2*vxy + C2)
-    denom = (mu1*mu1 + mu2*mu2 + C1) * (vx + vy + C2)
-    S     = num / denom
+    num = (2 * mu1 * mu2 + C1) * (2 * vxy + C2)
+    denom = (mu1 * mu1 + mu2 * mu2 + C1) * (vx + vy + C2)
+    S = num / denom
 
     # mean over all voxels (or pixels)
     return float(cp.mean(S))

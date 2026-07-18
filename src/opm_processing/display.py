@@ -14,6 +14,27 @@ app = typer.Typer(pretty_exceptions_enable=False)
 
 
 def _resolve_data_path(root_path: Path, to_display: str) -> Path:
+    """Resolve a display mode to the first existing processed dataset.
+
+    Parameters
+    ----------
+    root_path
+        Original acquisition path used to derive output names.
+    to_display
+        Requested processed-data display mode.
+
+    Returns
+    -------
+    pathlib.Path
+        Existing processed dataset path.
+
+    Raises
+    ------
+    ValueError
+        If the display mode is unsupported.
+    FileNotFoundError
+        If no output exists for the requested mode.
+    """
     base = root_path.parent
     stem = root_path.stem
     candidates = {
@@ -110,6 +131,7 @@ def display(
 
 
 def main() -> None:
+    """Run the display command-line application."""
     app()
 
 

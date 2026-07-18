@@ -71,6 +71,7 @@ def _measure_correlation(
     truth: np.ndarray,
     config: ReconstructionTestConfig,
 ) -> float:
+    """Measure masked correlation and enforce sufficient support."""
     measurement = masked_correlation(
         candidate,
         truth,
@@ -86,6 +87,7 @@ def _measure_shell_width(
     wall_x: float,
     config: ReconstructionTestConfig,
 ) -> float:
+    """Measure the reconstructed hollow-ellipsoid shell width."""
     return shell_line_width_x(
         volume,
         center_zyx=center_zyx,
@@ -148,12 +150,15 @@ def _assert_tiled_reconstruction(
         deskewed = deskewed_collection.arrays[position][0, 0].read().result()
         deconvolved = deconvolved_collection.arrays[position][0, 0].read().result()
         deskewed_scores.append(_measure_correlation(deskewed, truth_tile, config))
-        deconvolved_scores.append(
-            _measure_correlation(deconvolved, truth_tile, config)
-        )
-        for center_z, center_y, center_x, _, _, radius_x in (
-            fixture.ellipsoids_zyx_radii
-        ):
+        deconvolved_scores.append(_measure_correlation(deconvolved, truth_tile, config))
+        for (
+            center_z,
+            center_y,
+            center_x,
+            _,
+            _,
+            radius_x,
+        ) in fixture.ellipsoids_zyx_radii:
             for wall_x in (center_x - radius_x, center_x + radius_x):
                 local_center_z = center_z - z_offset
                 local_center_y = center_y - y_offset
@@ -166,15 +171,9 @@ def _assert_tiled_reconstruction(
                 ):
                     center = (local_center_z, local_center_y, local_center_x)
                     widths = (
-                        _measure_shell_width(
-                            truth_tile, center, local_wall_x, config
-                        ),
-                        _measure_shell_width(
-                            deskewed, center, local_wall_x, config
-                        ),
-                        _measure_shell_width(
-                            deconvolved, center, local_wall_x, config
-                        ),
+                        _measure_shell_width(truth_tile, center, local_wall_x, config),
+                        _measure_shell_width(deskewed, center, local_wall_x, config),
+                        _measure_shell_width(deconvolved, center, local_wall_x, config),
                     )
                     if np.all(np.isfinite(widths)):
                         truth_width, deskewed_width, deconvolved_width = widths
@@ -217,17 +216,13 @@ def _assert_tiled_reconstruction(
     fused_path = fixture.path.parent / f"{fixture.path.stem}_fused.ome.zarr"
     fused = open_image_array(fused_path).read().result()[0, 0]
     truth_shape = fixture.ground_truth.shape
-    reconstructed = fused[
-        : truth_shape[0], : truth_shape[1], : truth_shape[2]
-    ]
+    reconstructed = fused[: truth_shape[0], : truth_shape[1], : truth_shape[2]]
     assert (
         _measure_correlation(reconstructed, fixture.ground_truth, config)
         > config.minimum_fused_correlation
     )
     fused_line_widths = []
-    for center_z, center_y, center_x, _, _, radius_x in (
-        fixture.ellipsoids_zyx_radii
-    ):
+    for center_z, center_y, center_x, _, _, radius_x in fixture.ellipsoids_zyx_radii:
         for wall_x in (center_x - radius_x, center_x + radius_x):
             if 5 <= wall_x < reconstructed.shape[2] - 5:
                 width = _measure_shell_width(

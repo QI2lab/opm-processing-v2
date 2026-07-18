@@ -13,6 +13,7 @@ from opm_processing.process import process
 
 
 def test_opm_v2_fixture_matches_handler_storage_schema(opm_v2_projection_zarr):
+    """Verify the synthetic fixture matches the opm-v2 storage schema."""
     fixture = opm_v2_projection_zarr
     zarray = json.loads((fixture.path / ".zarray").read_text())
     zattrs = json.loads((fixture.path / ".zattrs").read_text())
@@ -30,6 +31,7 @@ def test_opm_v2_fixture_matches_handler_storage_schema(opm_v2_projection_zarr):
 def test_process_runs_end_to_end_on_opm_v2_projection_zarr(
     opm_v2_projection_zarr,
 ):
+    """Verify projection acquisitions process and fuse end to end."""
     fixture = opm_v2_projection_zarr
 
     process(
@@ -66,6 +68,7 @@ def test_process_runs_end_to_end_on_opm_v2_projection_zarr(
 
 
 def test_process_runs_normal_skewed_opm_v2_acquisition(opm_v2_skewed_zarr):
+    """Verify mirror- and stage-scanned skewed acquisitions process correctly."""
     fixture = opm_v2_skewed_zarr
 
     process(
@@ -96,9 +99,7 @@ def test_process_runs_normal_skewed_opm_v2_acquisition(opm_v2_skewed_zarr):
     deskewed_path = fixture.path.parent / f"{fixture.path.stem}_deskewed.ome.zarr"
     deskewed_collection = open_position_collection(deskewed_path)
     assert deskewed_collection.shape == (1, 1, 1, *expected_zyx)
-    assert deskewed_collection.attributes["channels"] == list(
-        fixture.channel_names
-    )
+    assert deskewed_collection.attributes["channels"] == list(fixture.channel_names)
     assert deskewed_collection.attributes["scan_axis_step_um"] == (
         fixture.scan_axis_step_um
     )

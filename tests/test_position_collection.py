@@ -1,3 +1,5 @@
+"""Test Bio-Formats2Raw-compatible position collections."""
+
 import json
 
 import numpy as np
@@ -9,6 +11,7 @@ from opm_processing.dataio.position_collection import (
 
 
 def test_bf2raw_position_collection_round_trip(tmp_path):
+    """Verify position collections round-trip data and metadata."""
     path = tmp_path / "positions.ome.zarr"
     collection = create_position_collection(
         path,
@@ -38,4 +41,6 @@ def test_bf2raw_position_collection_round_trip(tmp_path):
     array_metadata = json.loads((path / "0" / "0" / "zarr.json").read_text())
     assert root_metadata["attributes"]["ome"]["bioformats2raw.layout"] == 3
     assert ome_metadata["attributes"]["ome"]["series"] == ["0", "1", "2"]
-    assert all(codec["name"] != "sharding_indexed" for codec in array_metadata["codecs"])
+    assert all(
+        codec["name"] != "sharding_indexed" for codec in array_metadata["codecs"]
+    )

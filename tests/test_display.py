@@ -1,3 +1,5 @@
+"""Test processed-data display path resolution and napari integration."""
+
 import importlib
 
 import numpy as np
@@ -10,7 +12,10 @@ display_module = importlib.import_module("opm_processing.display")
 
 
 class FakeLayer:
+    """Minimal napari layer test double."""
+
     def __init__(self):
+        """Initialize layer state used by display tests."""
         self.data = [np.zeros((2, 3, 4, 5), dtype=np.uint16)]
         self.multiscale = True
         self.visible = True
@@ -20,16 +25,21 @@ class FakeLayer:
 
 
 class FakeViewer:
+    """Minimal napari viewer test double."""
+
     def __init__(self, layers):
+        """Initialize the viewer with predefined layers."""
         self.layers = layers
         self.open_calls = []
 
     def open(self, path, *, plugin):
+        """Record a plugin open request and return predefined layers."""
         self.open_calls.append((path, plugin))
         return self.layers
 
 
 def _create_collection(tmp_path):
+    """Create a small processed position-collection fixture."""
     raw_path = tmp_path / "sample.zarr"
     raw_path.mkdir()
     data_path = tmp_path / "sample_deskewed.ome.zarr"
@@ -44,6 +54,7 @@ def _create_collection(tmp_path):
 
 
 def test_bf2raw_has_valid_ome_xml_and_root_plugin_reader(tmp_path):
+    """Verify generated OME metadata and root-level plugin reading."""
     _, data_path = _create_collection(tmp_path)
     xml_path = data_path / "OME" / "METADATA.ome.xml"
 
@@ -64,6 +75,7 @@ def test_bf2raw_has_valid_ome_xml_and_root_plugin_reader(tmp_path):
 
 
 def test_display_delegates_root_open_to_napari_plugin(tmp_path, monkeypatch):
+    """Verify display delegates collection opening to napari-ome-zarr."""
     raw_path, data_path = _create_collection(tmp_path)
     layers = [FakeLayer() for _ in range(4)]
     viewer = FakeViewer(layers)
@@ -87,6 +99,7 @@ def test_display_delegates_root_open_to_napari_plugin(tmp_path, monkeypatch):
 
 
 def test_resolve_data_path_prefers_ome_suffix_with_legacy_fallback(tmp_path):
+    """Verify OME-Zarr paths take precedence over legacy Zarr paths."""
     raw_path = tmp_path / "sample.zarr"
     legacy_path = tmp_path / "sample_deskewed.zarr"
     legacy_path.mkdir()

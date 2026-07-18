@@ -1,17 +1,19 @@
 """
-Fuse qi2lab OPM data
+Fuse qi2lab OPM data.
 
 This file registers and fuses deskewed qi2lab OPM data.
 """
 
 import multiprocessing as mp
 import sys
+
 if sys.platform.startswith("linux"):
     mp.set_start_method("forkserver", force=True)
 elif sys.platform.startswith("win"):
     mp.set_start_method("spawn", force=True)
-    
+
 import warnings
+
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.simplefilter("ignore", category=FutureWarning)
 
@@ -22,6 +24,7 @@ from opm_processing.imageprocessing.tilefusion import TileFusion
 
 app = typer.Typer()
 app.pretty_exceptions_enable = False
+
 
 @app.command()
 def register_and_fuse(
@@ -39,15 +42,15 @@ def register_and_fuse(
     max_registration_shift_zyx: tuple[int, int, int] = (20, 50, 100),
 ):
     """Register and fuse processed OPM data.
-    
+
     This code assumes data is already processed and on disk.
-    
+
     Usage: `fuse "/path/to/qi2lab_acquisition.zarr"
-    
+
     Output will be in `/path/to/qi2lab_acquisition_fused.ome.zarr`
-    
+
     <acq_type> will be either deskewed or projection depending on OPM mode.
-    
+
     Parameters
     ----------
     root_path: Path
@@ -58,7 +61,6 @@ def register_and_fuse(
         If there are multiple channels, this should be the index of the channel
         to use for registration.
     """
-    
     # Open zarr using tensorstore
     tile_fuser = TileFusion(
         root_path=root_path,
@@ -75,10 +77,13 @@ def register_and_fuse(
         max_registration_shift_zyx=max_registration_shift_zyx,
     )
     tile_fuser.run()
-    
-# entry for point for CLI        
+
+
+# entry for point for CLI
 def main():
+    """Run the registration and fusion command-line application."""
     app()
+
 
 if __name__ == "__main__":
     main()

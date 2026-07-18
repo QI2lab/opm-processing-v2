@@ -20,6 +20,7 @@ def cupy_gpu():
     """Return CuPy after proving CUDA execution, or honor GPU skip policy."""
 
     def unavailable(message: str) -> None:
+        """Fail required GPU runs or skip optional GPU runs."""
         if os.environ.get("OPM_REQUIRE_GPU") == "1":
             pytest.fail(message, pytrace=False)
         pytest.skip(message)
@@ -239,9 +240,7 @@ def opm_v2_projection_zarr(tmp_path) -> OpmV2ProjectionFixture:
     raw_data = np.empty(shape, dtype=np.uint16)
     for time in range(shape[0]):
         for channel in range(shape[2]):
-            raw_data[time, 0, channel] = (
-                200 + 50 * time + 25 * channel + 2 * yy + xx
-            )
+            raw_data[time, 0, channel] = 200 + 50 * time + 25 * channel + 2 * yy + xx
 
     camera_offset = 100.0
     camera_conversion = 0.25
@@ -370,9 +369,7 @@ def opm_v2_skewed_zarr(request, tmp_path) -> OpmV2SkewedFixture:
                     "x_pos": stage_x,
                     "y_pos": stage_positions_zxy[0, 2],
                     "z_pos": stage_positions_zxy[0, 0],
-                    "excess_image": (
-                        mode == "stage" and scan < excess_scan_positions
-                    ),
+                    "excess_image": (mode == "stage" and scan < excess_scan_positions),
                 },
                 camera_shape_yx=shape[-2:],
                 pixel_size_um=pixel_size_um,
@@ -415,9 +412,7 @@ def _create_opm_v2_tiled_ground_truth_zarr(
     camera planes used by OPM and convolves each skewed stack with the same
     compact PSF supplied to processing.
     """
-    if len(config.tile_offsets_zyx_px) != len(
-        config.recorded_position_errors_zyx_px
-    ):
+    if len(config.tile_offsets_zyx_px) != len(config.recorded_position_errors_zyx_px):
         raise ValueError("Each tile must have one recorded position error")
     mode = config.mode
     path = tmp_path / f"opm_v2_{mode}_{config.name}.zarr"
@@ -444,8 +439,7 @@ def _create_opm_v2_tiled_ground_truth_zarr(
     )
     max_offsets = np.max(np.asarray(config.tile_offsets_zyx_px), axis=0)
     ground_truth_shape = tuple(
-        int(tile_size + offset)
-        for tile_size, offset in zip(tile_zyx, max_offsets)
+        int(tile_size + offset) for tile_size, offset in zip(tile_zyx, max_offsets)
     )
 
     rng = np.random.default_rng(config.rng_seed)
@@ -473,30 +467,29 @@ def _create_opm_v2_tiled_ground_truth_zarr(
                     )
     ellipsoids_zyx_radii = tuple(ellipsoids)
     zz, yy, xx = np.indices(ground_truth_shape, dtype=np.float32)
-    for center_z, center_y, center_x, radius_z, radius_y, radius_x in (
-        ellipsoids_zyx_radii
-    ):
+    for (
+        center_z,
+        center_y,
+        center_x,
+        radius_z,
+        radius_y,
+        radius_x,
+    ) in ellipsoids_zyx_radii:
         elliptical_radius = np.sqrt(
             ((zz - center_z) / radius_z) ** 2
             + ((yy - center_y) / radius_y) ** 2
             + ((xx - center_x) / radius_x) ** 2
         )
-        ground_truth += 6500.0 * np.exp(
-            -0.5 * ((elliptical_radius - 1.0) / 0.13) ** 2
-        )
+        ground_truth += 6500.0 * np.exp(-0.5 * ((elliptical_radius - 1.0) / 0.13) ** 2)
     ground_truth = np.clip(ground_truth, 0.0, 40_000.0)
 
     scan, camera_y, camera_x = np.indices(camera_shape, dtype=np.float32)
     theta_rad = np.deg2rad(theta_deg)
     sample_z = camera_y * np.sin(theta_rad)
-    sample_y = (
-        scan * (scan_axis_step_um / pixel_size_um)
-        + camera_y * np.cos(theta_rad)
-    )
+    sample_y = scan * (scan_axis_step_um / pixel_size_um) + camera_y * np.cos(theta_rad)
     psf_z, psf_y, psf_x = np.mgrid[-2:3, -3:4, -3:4]
     psf = np.exp(
-        -(psf_z**2 / 1.0**2 + psf_y**2 / 1.6**2 + psf_x**2 / 1.6**2)
-        / 2
+        -(psf_z**2 / 1.0**2 + psf_y**2 / 1.6**2 + psf_x**2 / 1.6**2) / 2
     ).astype(np.float32)
     psf /= psf.sum()
     psf_path = tmp_path / f"{mode}_synthetic_psf.npy"
@@ -556,9 +549,7 @@ def _create_opm_v2_tiled_ground_truth_zarr(
                 daq_metadata.update(
                     {
                         "image_mirror_position": float(stored_scan),
-                        "image_mirror_range_um": (
-                            camera_shape[0] * scan_axis_step_um
-                        ),
+                        "image_mirror_range_um": (camera_shape[0] * scan_axis_step_um),
                         "image_mirror_step_um": scan_axis_step_um,
                     }
                 )
@@ -588,8 +579,7 @@ def _create_opm_v2_tiled_ground_truth_zarr(
                         "y_pos": recorded_stage_positions_zxy[position, 2],
                         "z_pos": recorded_stage_positions_zxy[position, 0],
                         "excess_image": (
-                            mode == "stage"
-                            and stored_scan < excess_scan_positions
+                            mode == "stage" and stored_scan < excess_scan_positions
                         ),
                     },
                     camera_shape_yx=camera_shape[1:],
@@ -626,9 +616,7 @@ def _create_opm_v2_tiled_ground_truth_zarr(
 
 
 @pytest.fixture(params=("mirror", "stage"), ids=("mirror-tiled", "stage-tiled"))
-def opm_v2_tiled_ground_truth_zarr(
-    request, tmp_path
-) -> OpmV2TiledGroundTruthFixture:
+def opm_v2_tiled_ground_truth_zarr(request, tmp_path) -> OpmV2TiledGroundTruthFixture:
     """Create the original two-tile X-overlap acquisition in both scan modes."""
     return _create_opm_v2_tiled_ground_truth_zarr(
         tmp_path,

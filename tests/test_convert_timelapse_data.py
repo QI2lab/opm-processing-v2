@@ -1,3 +1,5 @@
+"""Test timelapse conversion without import-time side effects."""
+
 import importlib
 import sys
 
@@ -5,7 +7,10 @@ import numpy as np
 
 
 def test_conversion_module_import_performs_no_io(monkeypatch):
+    """Verify importing the conversion module performs no I/O."""
+
     def unexpected_io(*_args, **_kwargs):
+        """Fail if import unexpectedly attempts file or datastore I/O."""
         raise AssertionError("module import attempted acquisition I/O")
 
     monkeypatch.setattr("tensorstore.open", unexpected_io)
@@ -15,9 +20,8 @@ def test_conversion_module_import_performs_no_io(monkeypatch):
 
 
 def test_time_projection_uses_explicit_camera_calibration(monkeypatch, tmp_path):
-    conversion = importlib.import_module(
-        "opm_processing.dataio.convert_timelapse_data"
-    )
+    """Verify time projections use caller-provided camera calibration."""
+    conversion = importlib.import_module("opm_processing.dataio.convert_timelapse_data")
     captured = {}
     monkeypatch.setattr(
         conversion,

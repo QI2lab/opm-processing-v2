@@ -61,11 +61,9 @@ def _ssim_nearest_reference(
     c1 = (0.01 * data_range) ** 2
     c2 = (0.03 * data_range) ** 2
     score = (
-        (2 * mean_a * mean_b + c1) * (2 * covariance + c2)
-        / (
-            (mean_a * mean_a + mean_b * mean_b + c1)
-            * (variance_a + variance_b + c2)
-        )
+        (2 * mean_a * mean_b + c1)
+        * (2 * covariance + c2)
+        / ((mean_a * mean_a + mean_b * mean_b + c1) * (variance_a + variance_b + c2))
     )
     return float(np.mean(score))
 
@@ -103,8 +101,7 @@ def test_custom_cuda_ssim_matches_scipy_reference(cupy_gpu, shape):
     rng = np.random.default_rng(14)
     reference = rng.random(shape, dtype=np.float32)
     comparison = np.clip(
-        reference * np.float32(0.91)
-        + rng.normal(0, 0.035, shape).astype(np.float32),
+        reference * np.float32(0.91) + rng.normal(0, 0.035, shape).astype(np.float32),
         0,
         1,
     )
@@ -219,6 +216,7 @@ def test_rlgc_gpu_deconvolution_improves_synthetic_point_sample(cupy_gpu):
     assert restored.min() >= -1e-4
 
     def scale_invariant_rmse(candidate):
+        """Measure RMSE after fitting a scalar intensity correction."""
         scale = float(np.vdot(candidate, truth) / np.vdot(candidate, candidate))
         return float(np.sqrt(np.mean((candidate * scale - truth) ** 2)))
 

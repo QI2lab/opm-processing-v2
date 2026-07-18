@@ -18,6 +18,7 @@ from typing import Sequence, Tuple
 from numba import njit, prange
 import gc
 
+
 @njit
 def deskew_shape_estimator(
     input_shape: Sequence[int],
@@ -25,11 +26,11 @@ def deskew_shape_estimator(
     distance: float = 0.4,
     pixel_size: float = 0.115,
     crop_after_deskew: bool = True,
-    divisble_by: int = 4
+    divisble_by: int = 4,
 ):
     """Generate shape of orthogonal interpolation output array.
-    
-    This function automatically pads the YX dimensions to be 
+
+    This function automatically pads the YX dimensions to be
     an integer divisble by `divisble_by`.
 
     Parameters
@@ -48,7 +49,6 @@ def deskew_shape_estimator(
     output_shape: Sequence[int]
         shape of deskewed array
     """
-
     # change step size from physical space (nm) to camera space (pixels)
     pixel_step = distance / pixel_size  # (pixels)
 
@@ -63,17 +63,17 @@ def deskew_shape_estimator(
         np.ceil(input_shape[1] * np.sin(theta * np.pi / 180))
     )  # (pixels)
     final_nx = np.int64(input_shape[2])
-    
+
     if crop_after_deskew:
         crop_y = int(np.ceil(input_shape[1] * np.cos(theta * np.pi / 180)))
-        final_ny = final_ny - int(crop_y*2)
+        final_ny = final_ny - int(crop_y * 2)
     else:
         crop_y = 0
-    
+
     # pad YX array size to make sure it is divisble by 4
-    pad_y = (divisble_by - (final_ny % divisble_by)) % divisble_by  
+    pad_y = (divisble_by - (final_ny % divisble_by)) % divisble_by
     pad_x = (divisble_by - (final_nx % divisble_by)) % divisble_by
-    padded_final_ny = final_ny + pad_y 
+    padded_final_ny = final_ny + pad_y
     padded_final_nx = final_nx + pad_x
 
     return [final_nz, padded_final_ny, padded_final_nx], pad_y, pad_x, crop_y
@@ -85,13 +85,13 @@ def orthogonal_deskew(
     theta: float = 30.0,
     distance: float = 0.4,
     pixel_size: float = 0.115,
-    reverse_deskewed_z = False,
+    reverse_deskewed_z=False,
     divisible_by: int = 4,
-    downsample_factor: int = 2
+    downsample_factor: int = 2,
 ):
     """Numba accelerated orthogonal interpolation for oblique data.
-    
-    This function automatically pads the YX array dimensions to be 
+
+    This function automatically pads the YX array dimensions to be
     integer divisble by `divisble_by`.
 
     Parameters
@@ -107,7 +107,7 @@ def orthogonal_deskew(
     flip_scan: bool, default = False
         flip direction of scan stack w.r.t deskew direction
     reverse_deskewed_z: bool, default = False
-        flip output z direction to match camera <-> stage orientation 
+        flip output z direction to match camera <-> stage orientation
     divisible_by: int, default = 4
         amount to ensure data is divisible by for chunked storage
     downsample_factor: int, default = 2
@@ -118,7 +118,6 @@ def orthogonal_deskew(
     output: ArrayLike
         image stack of deskewed OPM planes on uniform grid
     """
-
     num_images, ny, nx = data.shape
     pixel_step = distance / pixel_size
     scan_end = num_images * pixel_step
@@ -142,7 +141,9 @@ def orthogonal_deskew(
     padded_final_nx = final_nx + pad_x
 
     # Allocate output array
-    output = np.zeros((final_nz_downsampled, padded_final_ny, padded_final_nx), dtype=np.float32)
+    output = np.zeros(
+        (final_nz_downsampled, padded_final_ny, padded_final_nx), dtype=np.float32
+    )
 
     # Precompute division to avoid redundant division in the loop
     inv_pixel_step = 1 / pixel_step
@@ -155,7 +156,7 @@ def orthogonal_deskew(
         temp_buffer = np.zeros((padded_final_ny, padded_final_nx), dtype=np.float32)
 
         for z in range(z_start, z_end):
-            for y in prange(final_ny):  
+            for y in prange(final_ny):
                 virtual_plane = y - z / tantheta
                 plane_before = int(np.floor(virtual_plane * inv_pixel_step))
                 plane_after = plane_before + 1
@@ -165,15 +166,25 @@ def orthogonal_deskew(
                     continue  # Skip invalid interpolation points
 
                 za = z / sintheta
-                virtual_pos_before = za + (virtual_plane - plane_before * pixel_step) * costheta
-                virtual_pos_after = za - (pixel_step - (virtual_plane - plane_before * pixel_step)) * costheta
+                virtual_pos_before = (
+                    za + (virtual_plane - plane_before * pixel_step) * costheta
+                )
+                virtual_pos_after = (
+                    za
+                    - (pixel_step - (virtual_plane - plane_before * pixel_step))
+                    * costheta
+                )
 
                 pos_before = int(np.floor(virtual_pos_before))
                 pos_after = int(np.floor(virtual_pos_after))
 
                 # Strict position index check
-                if (pos_before < 0 or pos_after < 0 or
-                    pos_before + 1 >= ny or pos_after + 1 >= ny):
+                if (
+                    pos_before < 0
+                    or pos_after < 0
+                    or pos_before + 1 >= ny
+                    or pos_after + 1 >= ny
+                ):
                     continue  # Skip out-of-bounds pixels
 
                 dz_before = virtual_pos_before - pos_before
@@ -187,8 +198,10 @@ def orthogonal_deskew(
 
                 # **Fix: If all surrounding pixels are zero, skip accumulation**
                 if (
-                    np.all(pixel_1 == 0) and np.all(pixel_2 == 0) and
-                    np.all(pixel_3 == 0) and np.all(pixel_4 == 0)
+                    np.all(pixel_1 == 0)
+                    and np.all(pixel_2 == 0)
+                    and np.all(pixel_3 == 0)
+                    and np.all(pixel_4 == 0)
                 ):
                     continue  # Prevents division by zero and artifacts
 
@@ -201,13 +214,17 @@ def orthogonal_deskew(
                 ) * inv_pixel_step
 
                 # Prevent small floating-point errors from accumulating
-                new_values = np.clip(new_values, 0, 65534)  
+                new_values = np.clip(new_values, 0, 65534)
 
                 # Accumulate safely
-                temp_buffer[y, :final_nx] = np.clip(temp_buffer[y, :final_nx] + new_values, 0, 65534)
+                temp_buffer[y, :final_nx] = np.clip(
+                    temp_buffer[y, :final_nx] + new_values, 0, 65534
+                )
 
         # Store the averaged downsampled z-slice
-        output[z_ds] = np.clip(temp_buffer / downsample_factor, 0, 65534)  # Prevent overflow after division
+        output[z_ds] = np.clip(
+            temp_buffer / downsample_factor, 0, 65534
+        )  # Prevent overflow after division
 
     # Explicitly zero out padding before conversion
     if pad_y > 0:
@@ -250,7 +267,6 @@ def lab2cam(
     stage_pos: int
         distance of leading edge of camera frame from the y-axis
     """
-
     xp = x
     stage_pos = y - z / np.tan(theta)
     yp = z / np.sin(theta)
@@ -272,7 +288,6 @@ def chunk_indices(length: int, chunk_size: int) -> list[tuple[int, int]]:
     indices: Sequence[int,...]
         chunk indices
     """
-
     if length <= 0:
         raise ValueError("length must be greater than 0")
     if chunk_size <= 0:
@@ -312,7 +327,7 @@ def chunked_orthogonal_deskew(
 
     Optionally performs nested Y-chunked deconvolution on each outer deskew
     chunk. Deconvolution always receives the chunk's full Z and X extents.
-    
+
     Parameters
     ----------
     oblique_image: ArrayLike
@@ -344,13 +359,12 @@ def chunked_orthogonal_deskew(
         Physical scan-axis step in micrometers.
     pixel_size_um: float
         Camera pixel size in micrometers.
-    
+
     Returns
     -------
     deskewed_image: ArrayLike
         deskewed image stack
     """
-
     if deconvolve and psf_data is None:
         raise ValueError("psf_data is required when deconvolve=True")
     if decon_chunk_size <= 0:
@@ -402,9 +416,7 @@ def chunked_orthogonal_deskew(
             oblique_image.shape[2], tile_px_end, 0, np.deg2rad(theta_deg)
         )
         camera_to_scan = pixel_size_um / scan_axis_step_um
-        scan_px_start = np.maximum(
-            0, np.int64(np.ceil(sp_start * camera_to_scan))
-        )
+        scan_px_start = np.maximum(0, np.int64(np.ceil(sp_start * camera_to_scan)))
         scan_px_stop = np.minimum(
             oblique_image.shape[0],
             np.int64(np.ceil(sp_stop * camera_to_scan)),

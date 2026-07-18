@@ -91,9 +91,7 @@ def create_position_collection(
     array_spec = ((t, c, z, y, x), np.dtype(dtype))
     for position in range(positions):
         image = v05.Image(
-            multiscales=[
-                v05.Multiscale.from_dims(dims, name=f"position-{position}")
-            ]
+            multiscales=[v05.Multiscale.from_dims(dims, name=f"position-{position}")]
         )
         builder.add_series(str(position), image, array_spec)
 

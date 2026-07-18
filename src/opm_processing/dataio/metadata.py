@@ -1,5 +1,6 @@
-"""
-Metadata tools for qi2lab OPM tensorstore datastores. The instrument produces a zarr2 store
+"""Metadata tools for qi2lab OPM tensorstore datastores.
+
+The instrument produces a zarr2 store
 with full micro-manager metadata in the .zattrs. The processed data produces a zarr3 store
 with minimal metadata, sufficient for downstream processing.
 
@@ -10,17 +11,18 @@ History:
 
 import numpy as np
 
+
 def extract_stage_positions(data):
     """Extract stage positions from qi2lab tensostore.
-    
+
     Extracts x_pos, y_pos, and z_pos from the 'Stage' metadata where 'p' values are unique.
     Returns a sorted array of positions in ascending order of 'p'.
-    
+
     Parameters
     ----------
     data : dict
         metadata from .zattrs
-        
+
     Returns
     -------
     stage_positions: np.ndarray
@@ -71,6 +73,7 @@ def extract_stage_positions(data):
 
     return sorted_positions
 
+
 def extract_channels(data: dict) -> list:
     """Extract channel names from qi2lab tensorstore metadata in order.
 
@@ -86,15 +89,15 @@ def extract_channels(data: dict) -> list:
     """
     seen = set()
     channels = []
-    
+
     frame_metadatas = data.get("frame_metadatas", [])
-    
+
     for frame in frame_metadatas:
         mda_event = frame.get("mda_event", {})
         metadata = mda_event.get("metadata", {})
         daq = metadata.get("DAQ", {})
         channel = daq.get("current_channel")
-        
+
         if channel and channel not in seen:
             seen.add(channel)
             channels.append(channel)
@@ -104,20 +107,19 @@ def extract_channels(data: dict) -> list:
 
 def find_key(data: dict, target_key: str) -> dict | list | None:
     """Recursively find the first occurrence of target_key in a nested structure.
-    
+
     Parameters
     ----------
     data : dict
         Nested dictionary or list to search.
     target_key : str
         Key to search for.
-        
+
     Returns
     -------
     key_data :
         dict | list | None
     """
-
     if isinstance(data, dict):
         for key, value in data.items():
             if key == target_key:
@@ -132,14 +134,15 @@ def find_key(data: dict, target_key: str) -> dict | list | None:
                 return found
     return None
 
+
 def convert_metadata(obj):
     """Ensure all metadata entries can be serialized.
-    
+
     Parameters
     ----------
     obj: dict
         Metadata dict that may or may not serialize.
-        
+
     Returns
     -------
     obj: dict
