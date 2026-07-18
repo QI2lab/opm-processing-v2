@@ -35,7 +35,18 @@ class ReconstructionTestConfig:
     maximum_registration_shift_zyx: tuple[int, int, int] = (2, 2, 4)
 
     def processing_options(self) -> dict[str, object]:
-        """Options shared by deskew-only and deconvolved processing calls."""
+        """Options shared by deskew-only and deconvolved processing calls.
+
+        Parameters
+        ----------
+        None
+            This callable has no parameters.
+
+        Returns
+        -------
+        dict[str, object]
+            Result produced by the callable.
+        """
         return {
             "max_projection": False,
             "flatfield_correction": False,
@@ -47,7 +58,18 @@ class ReconstructionTestConfig:
         }
 
     def fusion_options(self) -> dict[str, object]:
-        """Small-data registration and fusion settings for synthetic tiles."""
+        """Small-data registration and fusion settings for synthetic tiles.
+
+        Parameters
+        ----------
+        None
+            This callable has no parameters.
+
+        Returns
+        -------
+        dict[str, object]
+            Result produced by the callable.
+        """
         return {
             "blend_pixels": self.blend_pixels_zyx,
             "downsample_factors": self.registration_downsample_zyx,
@@ -62,7 +84,18 @@ class ReconstructionTestConfig:
 
 @pytest.fixture
 def reconstruction_config() -> ReconstructionTestConfig:
-    """Return one immutable configuration shared by all tiled cases."""
+    """Return one immutable configuration shared by all tiled cases.
+
+    Parameters
+    ----------
+    None
+        This callable has no parameters.
+
+    Returns
+    -------
+    ReconstructionTestConfig
+        Result produced by the callable.
+    """
     return ReconstructionTestConfig()
 
 
@@ -71,7 +104,22 @@ def _measure_correlation(
     truth: np.ndarray,
     config: ReconstructionTestConfig,
 ) -> float:
-    """Measure masked correlation and enforce sufficient support."""
+    """Measure masked correlation and enforce sufficient support.
+
+    Parameters
+    ----------
+    candidate : np.ndarray
+        Value supplied for ``candidate``.
+    truth : np.ndarray
+        Value supplied for ``truth``.
+    config : ReconstructionTestConfig
+        Value supplied for ``config``.
+
+    Returns
+    -------
+    float
+        Result produced by the callable.
+    """
     measurement = masked_correlation(
         candidate,
         truth,
@@ -87,7 +135,24 @@ def _measure_shell_width(
     wall_x: float,
     config: ReconstructionTestConfig,
 ) -> float:
-    """Measure the reconstructed hollow-ellipsoid shell width."""
+    """Measure the reconstructed hollow-ellipsoid shell width.
+
+    Parameters
+    ----------
+    volume : np.ndarray
+        Value supplied for ``volume``.
+    center_zyx : tuple[float, float, float]
+        Value supplied for ``center zyx``.
+    wall_x : float
+        Value supplied for ``wall x``.
+    config : ReconstructionTestConfig
+        Value supplied for ``config``.
+
+    Returns
+    -------
+    float
+        Result produced by the callable.
+    """
     return shell_line_width_x(
         volume,
         center_zyx=center_zyx,
@@ -101,7 +166,22 @@ def _assert_tiled_reconstruction(
     config: ReconstructionTestConfig,
     cupy_gpu,
 ):
-    """Run and validate deskew, deconvolution, registration, and fusion."""
+    """Run and validate deskew, deconvolution, registration, and fusion.
+
+    Parameters
+    ----------
+    fixture : object
+        Value supplied for ``fixture``.
+    config : ReconstructionTestConfig
+        Value supplied for ``config``.
+    cupy_gpu : object
+        Value supplied for ``cupy gpu``.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
     assert tilefusion_module.USING_GPU
     assert tilefusion_module.xp is cupy_gpu
     processing_options = config.processing_options()
@@ -243,7 +323,22 @@ def test_tiled_opm_v2_reconstructs_registered_ground_truth(
     reconstruction_config,
     cupy_gpu,
 ):
-    """Recover the original X-overlap acquisition in mirror and stage modes."""
+    """Recover the original X-overlap acquisition in mirror and stage modes.
+
+    Parameters
+    ----------
+    opm_v2_tiled_ground_truth_zarr : object
+        Value supplied for ``opm v2 tiled ground truth zarr``.
+    reconstruction_config : object
+        Value supplied for ``reconstruction config``.
+    cupy_gpu : object
+        Value supplied for ``cupy gpu``.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
     _assert_tiled_reconstruction(
         opm_v2_tiled_ground_truth_zarr,
         reconstruction_config,
@@ -256,7 +351,22 @@ def test_spatial_tiling_reconstructs_registered_ground_truth(
     reconstruction_config,
     cupy_gpu,
 ):
-    """Validate YX-grid, Z-staggered, and combined configurations."""
+    """Validate YX-grid, Z-staggered, and combined configurations.
+
+    Parameters
+    ----------
+    opm_v2_spatial_tiling_ground_truth_zarr : object
+        Value supplied for ``opm v2 spatial tiling ground truth zarr``.
+    reconstruction_config : object
+        Value supplied for ``reconstruction config``.
+    cupy_gpu : object
+        Value supplied for ``cupy gpu``.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
     _assert_tiled_reconstruction(
         opm_v2_spatial_tiling_ground_truth_zarr,
         reconstruction_config,

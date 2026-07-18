@@ -74,7 +74,24 @@ def _configure_collection_layers(
     pos_range: tuple[int, int] | None,
     time_range: tuple[int, int] | None,
 ) -> None:
-    """Apply collection selections to plugin-created lazy layers."""
+    """Apply collection selections to plugin-created lazy layers.
+
+    Parameters
+    ----------
+    data_path : Path
+        Value supplied for ``data path``.
+    layers : list[Any]
+        Value supplied for ``layers``.
+    pos_range : tuple[int, int] | None
+        Value supplied for ``pos range``.
+    time_range : tuple[int, int] | None
+        Value supplied for ``time range``.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
     if time_range is not None:
         time_start, time_stop = time_range
         if time_start < 0 or time_start >= time_stop:
@@ -112,7 +129,24 @@ def display(
     time_range: tuple[int, int] | None = None,
     pos_range: tuple[int, int] | None = None,
 ) -> None:
-    """Display processed OPM data using the napari-ome-zarr reader."""
+    """Display processed OPM data using the napari-ome-zarr reader.
+
+    Parameters
+    ----------
+    root_path : Path
+        Value supplied for ``root path``.
+    to_display : str
+        Value supplied for ``to display``.
+    time_range : tuple[int, int] | None
+        Value supplied for ``time range``.
+    pos_range : tuple[int, int] | None
+        Value supplied for ``pos range``.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
     data_path = _resolve_data_path(root_path, to_display)
 
     viewer = napari.Viewer()
@@ -131,7 +165,18 @@ def display(
 
 
 def main() -> None:
-    """Run the display command-line application."""
+    """Run the display command-line application.
+
+    Parameters
+    ----------
+    None
+        This callable has no parameters.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
     app()
 
 

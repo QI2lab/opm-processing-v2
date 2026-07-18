@@ -21,7 +21,22 @@ def masked_correlation(
     *,
     truth_percentile: float,
 ) -> CorrelationMeasurement:
-    """Measure correlation where both reconstruction and truth are supported."""
+    """Measure correlation where both reconstruction and truth are supported.
+
+    Parameters
+    ----------
+    candidate : np.ndarray
+        Value supplied for ``candidate``.
+    truth : np.ndarray
+        Value supplied for ``truth``.
+    truth_percentile : float
+        Value supplied for ``truth percentile``.
+
+    Returns
+    -------
+    CorrelationMeasurement
+        Result produced by the callable.
+    """
     candidate_array = np.asarray(candidate)
     truth_array = np.asarray(truth)
     if candidate_array.shape != truth_array.shape:
@@ -37,7 +52,20 @@ def masked_correlation(
 
 
 def scale_invariant_rmse(candidate: np.ndarray, truth: np.ndarray) -> float:
-    """Return RMSE after fitting one nonnegative candidate intensity scale."""
+    """Return RMSE after fitting one nonnegative candidate intensity scale.
+
+    Parameters
+    ----------
+    candidate : np.ndarray
+        Value supplied for ``candidate``.
+    truth : np.ndarray
+        Value supplied for ``truth``.
+
+    Returns
+    -------
+    float
+        Result produced by the callable.
+    """
     candidate_array = np.asarray(candidate, dtype=np.float64)
     truth_array = np.asarray(truth, dtype=np.float64)
     denominator = float(np.sum(candidate_array**2))
@@ -55,7 +83,24 @@ def shell_line_width_x(
     wall_x: float,
     half_window: int,
 ) -> float:
-    """Measure discrete FWHM of an ellipsoidal shell along its X normal."""
+    """Measure discrete FWHM of an ellipsoidal shell along its X normal.
+
+    Parameters
+    ----------
+    volume : np.ndarray
+        Value supplied for ``volume``.
+    center_zyx : tuple[float, float, float]
+        Value supplied for ``center zyx``.
+    wall_x : float
+        Value supplied for ``wall x``.
+    half_window : int
+        Value supplied for ``half window``.
+
+    Returns
+    -------
+    float
+        Result produced by the callable.
+    """
     z_index = int(round(center_zyx[0]))
     y_index = int(round(center_zyx[1]))
     x_index = int(round(wall_x))

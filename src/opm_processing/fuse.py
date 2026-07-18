@@ -60,6 +60,32 @@ def register_and_fuse(
         If there is only one channel, this should be 0.
         If there are multiple channels, this should be the index of the channel
         to use for registration.
+
+    blend_pixels : tuple[int, int, int]
+        Value supplied for ``blend pixels``.
+    downsample_factors : tuple[int, int, int]
+        Value supplied for ``downsample factors``.
+    ssim_window : int
+        Value supplied for ``ssim window``.
+    registration_threshold : float
+        Value supplied for ``registration threshold``.
+    chunk_shape_yx : tuple[int, int]
+        Value supplied for ``chunk shape yx``.
+    fusion_ram_fraction : float
+        Value supplied for ``fusion ram fraction``.
+    max_in_flight_writes : int
+        Value supplied for ``max in flight writes``.
+    optimization_rel_threshold : float
+        Value supplied for ``optimization rel threshold``.
+    optimization_abs_threshold : float
+        Value supplied for ``optimization abs threshold``.
+    max_registration_shift_zyx : tuple[int, int, int]
+        Value supplied for ``max registration shift zyx``.
+
+    Returns
+    -------
+    None
+        No value is returned.
     """
     # Open zarr using tensorstore
     tile_fuser = TileFusion(
@@ -81,7 +107,18 @@ def register_and_fuse(
 
 # entry for point for CLI
 def main():
-    """Run the registration and fusion command-line application."""
+    """Run the registration and fusion command-line application.
+
+    Parameters
+    ----------
+    None
+        This callable has no parameters.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
     app()
 
 

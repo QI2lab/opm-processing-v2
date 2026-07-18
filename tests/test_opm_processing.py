@@ -6,7 +6,18 @@ from opm_processing.process import _apply_stage_axis_flips
 
 
 def test_stage_orientation_is_driven_by_explicit_axis_configuration():
-    """Verify explicit axis flips determine stage-position orientation."""
+    """Verify explicit axis flips determine stage-position orientation.
+
+    Parameters
+    ----------
+    None
+        This callable has no parameters.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
     positions = np.array(
         [
             [2.0, 10.0, 100.0],

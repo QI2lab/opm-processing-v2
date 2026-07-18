@@ -33,7 +33,18 @@ class PositionCollection:
 
     @property
     def shape(self) -> tuple[int, ...]:
-        """Return the logical TPCZYX shape of the collection."""
+        """Return the logical TPCZYX shape of the collection.
+
+        Parameters
+        ----------
+        None
+            This callable has no parameters.
+
+        Returns
+        -------
+        tuple[int, ...]
+            Result produced by the callable.
+        """
         t, c, z, y, x = self.arrays[0].shape
         return int(t), len(self.arrays), int(c), int(z), int(y), int(x)
 
@@ -50,7 +61,34 @@ def create_position_collection(
     chunks: tuple[int, ...] | str | None = "auto",
     overwrite: bool = True,
 ) -> PositionCollection:
-    """Create a Bf2Raw collection with one TCZYX image per position."""
+    """Create a Bf2Raw collection with one TCZYX image per position.
+
+    Parameters
+    ----------
+    output_path : str | Path
+        Value supplied for ``output path``.
+    shape : Sequence[int]
+        Value supplied for ``shape``.
+    voxel_size_um : Sequence[float]
+        Value supplied for ``voxel size um``.
+    dtype : np.dtype | str
+        Value supplied for ``dtype``.
+    stage_positions : Sequence[Sequence[float]] | None
+        Value supplied for ``stage positions``.
+    channels : Sequence[str] | None
+        Value supplied for ``channels``.
+    attributes : dict[str, Any] | None
+        Value supplied for ``attributes``.
+    chunks : tuple[int, ...] | str | None
+        Value supplied for ``chunks``.
+    overwrite : bool
+        Value supplied for ``overwrite``.
+
+    Returns
+    -------
+    PositionCollection
+        Result produced by the callable.
+    """
     if len(shape) != 6:
         raise ValueError(f"Expected a TPCZYX shape, received {tuple(shape)}")
     if len(voxel_size_um) != 3:
@@ -107,7 +145,26 @@ def _build_ome_xml(
     stage_positions: Sequence[Sequence[float]] | None,
     channels: Sequence[str] | None,
 ) -> str:
-    """Build a validated OME-XML companion for a Bf2Raw collection."""
+    """Build a validated OME-XML companion for a Bf2Raw collection.
+
+    Parameters
+    ----------
+    shape : tuple[int, int, int, int, int, int]
+        Value supplied for ``shape``.
+    dtype : np.dtype
+        Value supplied for ``dtype``.
+    voxel_size_um : Sequence[float]
+        Value supplied for ``voxel size um``.
+    stage_positions : Sequence[Sequence[float]] | None
+        Value supplied for ``stage positions``.
+    channels : Sequence[str] | None
+        Value supplied for ``channels``.
+
+    Returns
+    -------
+    str
+        Result produced by the callable.
+    """
     t, positions, c, z, y, x = shape
     channel_names = list(channels or (f"channel-{index}" for index in range(c)))
     if len(channel_names) != c:
@@ -167,7 +224,18 @@ def _build_ome_xml(
 
 
 def open_position_collection(path: str | Path) -> PositionCollection:
-    """Open a yaozarrs Bf2Raw collection as ordered TensorStore arrays."""
+    """Open a yaozarrs Bf2Raw collection as ordered TensorStore arrays.
+
+    Parameters
+    ----------
+    path : str | Path
+        Value supplied for ``path``.
+
+    Returns
+    -------
+    PositionCollection
+        Result produced by the callable.
+    """
     root = open_group(path)
     if "bioformats2raw.layout" not in root.attrs.get("ome", {}):
         raise ValueError(f"Not a Bio-Formats2Raw collection: {path}")
@@ -185,5 +253,18 @@ def open_position_collection(path: str | Path) -> PositionCollection:
 
 
 def open_image_array(path: str | Path, level: str = "0") -> Any:
-    """Open one dataset from a yaozarrs Image group."""
+    """Open one dataset from a yaozarrs Image group.
+
+    Parameters
+    ----------
+    path : str | Path
+        Value supplied for ``path``.
+    level : str
+        Value supplied for ``level``.
+
+    Returns
+    -------
+    Any
+        Result produced by the callable.
+    """
     return open_group(path)[level].to_tensorstore()

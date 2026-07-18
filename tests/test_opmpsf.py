@@ -6,7 +6,18 @@ from opm_processing.imageprocessing.opmpsf import _interpolate_psf_plane
 
 
 def test_interpolate_psf_plane_preserves_interp2d_axis_order():
-    """Verify PSF interpolation preserves the historical axis order."""
+    """Verify PSF interpolation preserves the historical axis order.
+
+    Parameters
+    ----------
+    None
+        This callable has no parameters.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
     x_grid = np.array([0.0, 1.0, 2.0])
     y_grid = np.array([0.0, 2.0])
     values = y_grid[:, None] + 2.0 * x_grid[None, :]
@@ -26,7 +37,18 @@ def test_interpolate_psf_plane_preserves_interp2d_axis_order():
 
 
 def test_interpolate_psf_plane_fills_out_of_bounds_with_zero():
-    """Verify PSF interpolation fills out-of-bounds samples with zero."""
+    """Verify PSF interpolation fills out-of-bounds samples with zero.
+
+    Parameters
+    ----------
+    None
+        This callable has no parameters.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
     result = _interpolate_psf_plane(
         x_grid=np.array([0.0, 1.0]),
         y_grid=np.array([0.0, 1.0]),

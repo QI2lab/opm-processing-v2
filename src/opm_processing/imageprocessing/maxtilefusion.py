@@ -63,6 +63,11 @@ class MaxTileFusion:
             Spatial output chunk size.
         padding_multiple
             Multiple to which the fused shape is padded.
+
+        Returns
+        -------
+        None
+            No value is returned.
         """
         self.pad_y = pad_yx[0]
         self.pad_x = pad_yx[1]
@@ -98,8 +103,12 @@ class MaxTileFusion:
         self.fused_ts = self.create_fused_image()
 
     def compute_fused_image_space(self):
-        """
-        Compute the overall fused image size in yx given tile positions.
+        """Compute the overall fused image size in yx given tile positions.
+
+        Parameters
+        ----------
+        None
+            This callable has no parameters.
 
         Returns
         -------
@@ -136,8 +145,7 @@ class MaxTileFusion:
         return fused_shape, (min_y, min_x)
 
     def generate_blending_weights(self, blend_pixels: tuple[int, int] | None = None):
-        """
-        Generate a feathered blending weight mask for a tile.
+        """Generate a feathered blending weight mask for a tile.
 
         Parameters
         ----------
@@ -180,7 +188,18 @@ class MaxTileFusion:
         return np.maximum(weight_mask, np.finfo(np.float32).eps)
 
     def create_fused_image(self):
-        """Create the fused TCZYX image through yaozarrs."""
+        """Create the fused TCZYX image through yaozarrs.
+
+        Parameters
+        ----------
+        None
+            This callable has no parameters.
+
+        Returns
+        -------
+        object
+            Result produced by the callable.
+        """
         if self.time_range is not None:
             time_to_use = self.time_range[1] - self.time_range[0]
         else:
@@ -220,6 +239,16 @@ class MaxTileFusion:
         """Fuse all tiles using weighted averaging and asynchronous writes.
 
         This method ensures that all channels are fused separately and blended correctly.
+
+        Parameters
+        ----------
+        None
+            This callable has no parameters.
+
+        Returns
+        -------
+        None
+            No value is returned.
         """
         if self.time_range is not None:
             source_times = range(self.time_range[0], self.time_range[1])
@@ -279,5 +308,16 @@ class MaxTileFusion:
             ).result()
 
     def run(self):
-        """Run the full fusion pipeline."""
+        """Run the full fusion pipeline.
+
+        Parameters
+        ----------
+        None
+            This callable has no parameters.
+
+        Returns
+        -------
+        None
+            No value is returned.
+        """
         self.fuse_tiles()

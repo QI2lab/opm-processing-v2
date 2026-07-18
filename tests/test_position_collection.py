@@ -11,7 +11,18 @@ from opm_processing.dataio.position_collection import (
 
 
 def test_bf2raw_position_collection_round_trip(tmp_path):
-    """Verify position collections round-trip data and metadata."""
+    """Verify position collections round-trip data and metadata.
+
+    Parameters
+    ----------
+    tmp_path : object
+        Value supplied for ``tmp path``.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
     path = tmp_path / "positions.ome.zarr"
     collection = create_position_collection(
         path,

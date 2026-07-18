@@ -42,13 +42,35 @@ class ChunkedDeskewSample:
 
 @pytest.fixture(scope="module")
 def chunked_deskew_config() -> ChunkedDeskewTestConfig:
-    """Return immutable deskew geometry and quantitative thresholds."""
+    """Return immutable deskew geometry and quantitative thresholds.
+
+    Parameters
+    ----------
+    None
+        This callable has no parameters.
+
+    Returns
+    -------
+    ChunkedDeskewTestConfig
+        Result produced by the callable.
+    """
     return ChunkedDeskewTestConfig()
 
 
 @pytest.fixture(scope="module")
 def chunked_deskew_sample(chunked_deskew_config) -> ChunkedDeskewSample:
-    """Forward-project a lab-frame hollow ellipsoid into skewed OPM data."""
+    """Forward-project a lab-frame hollow ellipsoid into skewed OPM data.
+
+    Parameters
+    ----------
+    chunked_deskew_config : object
+        Value supplied for ``chunked deskew config``.
+
+    Returns
+    -------
+    ChunkedDeskewSample
+        Result produced by the callable.
+    """
     rng = np.random.default_rng(91)
     config = chunked_deskew_config
     skewed_shape = config.skewed_shape_zyx
@@ -111,7 +133,24 @@ def _chunked_deskew(
     psf=None,
     deconvolve=False,
 ):
-    """Run chunked deskewing with shared test configuration."""
+    """Run chunked deskewing with shared test configuration.
+
+    Parameters
+    ----------
+    image : object
+        Value supplied for ``image``.
+    config : ChunkedDeskewTestConfig
+        Value supplied for ``config``.
+    psf : object
+        Value supplied for ``psf``.
+    deconvolve : object
+        Value supplied for ``deconvolve``.
+
+    Returns
+    -------
+    object
+        Result produced by the callable.
+    """
     return opmtools.chunked_orthogonal_deskew(
         image,
         psf_data=psf,
@@ -139,7 +178,20 @@ def _chunked_deskew(
     ids=("exact-multiple", "remainder"),
 )
 def test_chunk_indices_cover_full_length(length, expected):
-    """Verify chunk indices cover each input element exactly once."""
+    """Verify chunk indices cover each input element exactly once.
+
+    Parameters
+    ----------
+    length : object
+        Value supplied for ``length``.
+    expected : object
+        Value supplied for ``expected``.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
     assert opmtools.chunk_indices(length, 15_000) == expected
 
 
@@ -147,7 +199,20 @@ def test_chunked_deskew_matches_direct_deskew_without_deconvolution(
     chunked_deskew_sample,
     chunked_deskew_config,
 ):
-    """Verify chunked deskewing matches direct deskewing without deconvolution."""
+    """Verify chunked deskewing matches direct deskewing without deconvolution.
+
+    Parameters
+    ----------
+    chunked_deskew_sample : object
+        Value supplied for ``chunked deskew sample``.
+    chunked_deskew_config : object
+        Value supplied for ``chunked deskew config``.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
     sample = chunked_deskew_sample
     config = chunked_deskew_config
 
@@ -186,7 +251,22 @@ def test_chunked_deskew_with_gpu_deconvolution_improves_ground_truth(
     chunked_deskew_config,
     cupy_gpu,
 ):
-    """Verify GPU deconvolution improves shell recovery during chunked deskew."""
+    """Verify GPU deconvolution improves shell recovery during chunked deskew.
+
+    Parameters
+    ----------
+    chunked_deskew_sample : object
+        Value supplied for ``chunked deskew sample``.
+    chunked_deskew_config : object
+        Value supplied for ``chunked deskew config``.
+    cupy_gpu : object
+        Value supplied for ``cupy gpu``.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
     del cupy_gpu  # Shared fixture has already proved CUDA execution.
     sample = chunked_deskew_sample
     config = chunked_deskew_config
@@ -235,7 +315,18 @@ def test_chunked_deskew_with_gpu_deconvolution_improves_ground_truth(
 
 
 def test_chunked_deskew_nests_y_only_deconvolution(monkeypatch):
-    """Verify chunked deskew delegates nested Y-only deconvolution."""
+    """Verify chunked deskew delegates nested Y-only deconvolution.
+
+    Parameters
+    ----------
+    monkeypatch : object
+        Value supplied for ``monkeypatch``.
+
+    Returns
+    -------
+    object
+        Result produced by the callable.
+    """
     decon_calls = []
     deskew_calls = []
 
@@ -246,12 +337,46 @@ def test_chunked_deskew_nests_y_only_deconvolution(monkeypatch):
     )
 
     def fake_decon(image, psf, crop_y):
-        """Record the deconvolution input and return it unchanged."""
+        """Record the deconvolution input and return it unchanged.
+
+        Parameters
+        ----------
+        image : object
+            Value supplied for ``image``.
+        psf : object
+            Value supplied for ``psf``.
+        crop_y : object
+            Value supplied for ``crop y``.
+
+        Returns
+        -------
+        object
+            Result produced by the callable.
+        """
         decon_calls.append((image.shape, psf.shape, crop_y))
         return image.astype(np.float32)
 
     def fake_deskew(image, *, theta, distance, pixel_size, downsample_factor):
-        """Record the deskew input and return a sentinel volume."""
+        """Record the deskew input and return a sentinel volume.
+
+        Parameters
+        ----------
+        image : object
+            Value supplied for ``image``.
+        theta : object
+            Value supplied for ``theta``.
+        distance : object
+            Value supplied for ``distance``.
+        pixel_size : object
+            Value supplied for ``pixel size``.
+        downsample_factor : object
+            Value supplied for ``downsample factor``.
+
+        Returns
+        -------
+        object
+            Result produced by the callable.
+        """
         deskew_calls.append(
             (image.shape, theta, distance, pixel_size, downsample_factor)
         )
@@ -279,7 +404,18 @@ def test_chunked_deskew_nests_y_only_deconvolution(monkeypatch):
 
 
 def test_chunked_deskew_requires_psf_for_deconvolution():
-    """Verify deconvolution requires an explicit point-spread function."""
+    """Verify deconvolution requires an explicit point-spread function.
+
+    Parameters
+    ----------
+    None
+        This callable has no parameters.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
     with pytest.raises(ValueError, match="psf_data is required"):
         opmtools.chunked_orthogonal_deskew(
             np.ones((2, 3, 4), dtype=np.uint16),

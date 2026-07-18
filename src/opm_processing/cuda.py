@@ -23,7 +23,18 @@ _CUDA_PRELOAD_ATTEMPTED = False
 
 
 def _nvidia_library_roots() -> tuple[Path, ...]:
-    """Return possible roots for NVIDIA runtime wheels in this environment."""
+    """Return possible roots for NVIDIA runtime wheels in this environment.
+
+    Parameters
+    ----------
+    None
+        This callable has no parameters.
+
+    Returns
+    -------
+    tuple[Path, ...]
+        Result produced by the callable.
+    """
     candidates = (
         Path(sysconfig.get_path("purelib")) / "nvidia",
         Path(sys.prefix)
@@ -41,6 +52,16 @@ def preload_cuda_libraries() -> None:
     Linux NVIDIA wheels keep shared libraries in package-specific ``lib``
     directories that are not always visible to the dynamic linker. Missing
     libraries are ignored so CPU-only environments continue to import normally.
+
+    Parameters
+    ----------
+    None
+        This callable has no parameters.
+
+    Returns
+    -------
+    None
+        No value is returned.
     """
     global _CUDA_PRELOAD_ATTEMPTED
 

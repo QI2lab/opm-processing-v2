@@ -13,7 +13,18 @@ from opm_processing.process import process
 
 
 def test_opm_v2_fixture_matches_handler_storage_schema(opm_v2_projection_zarr):
-    """Verify the synthetic fixture matches the opm-v2 storage schema."""
+    """Verify the synthetic fixture matches the opm-v2 storage schema.
+
+    Parameters
+    ----------
+    opm_v2_projection_zarr : object
+        Value supplied for ``opm v2 projection zarr``.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
     fixture = opm_v2_projection_zarr
     zarray = json.loads((fixture.path / ".zarray").read_text())
     zattrs = json.loads((fixture.path / ".zattrs").read_text())
@@ -31,7 +42,18 @@ def test_opm_v2_fixture_matches_handler_storage_schema(opm_v2_projection_zarr):
 def test_process_runs_end_to_end_on_opm_v2_projection_zarr(
     opm_v2_projection_zarr,
 ):
-    """Verify projection acquisitions process and fuse end to end."""
+    """Verify projection acquisitions process and fuse end to end.
+
+    Parameters
+    ----------
+    opm_v2_projection_zarr : object
+        Value supplied for ``opm v2 projection zarr``.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
     fixture = opm_v2_projection_zarr
 
     process(
@@ -68,7 +90,18 @@ def test_process_runs_end_to_end_on_opm_v2_projection_zarr(
 
 
 def test_process_runs_normal_skewed_opm_v2_acquisition(opm_v2_skewed_zarr):
-    """Verify mirror- and stage-scanned skewed acquisitions process correctly."""
+    """Verify mirror- and stage-scanned skewed acquisitions process correctly.
+
+    Parameters
+    ----------
+    opm_v2_skewed_zarr : object
+        Value supplied for ``opm v2 skewed zarr``.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
     fixture = opm_v2_skewed_zarr
 
     process(

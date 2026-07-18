@@ -7,10 +7,34 @@ import numpy as np
 
 
 def test_conversion_module_import_performs_no_io(monkeypatch):
-    """Verify importing the conversion module performs no I/O."""
+    """Verify importing the conversion module performs no I/O.
+
+    Parameters
+    ----------
+    monkeypatch : object
+        Value supplied for ``monkeypatch``.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
 
     def unexpected_io(*_args, **_kwargs):
-        """Fail if import unexpectedly attempts file or datastore I/O."""
+        """Fail if import unexpectedly attempts file or datastore I/O.
+
+        Parameters
+        ----------
+        _args : tuple
+            Value supplied for ``args``.
+        _kwargs : dict
+            Value supplied for ``kwargs``.
+
+        Returns
+        -------
+        None
+            No value is returned.
+        """
         raise AssertionError("module import attempted acquisition I/O")
 
     monkeypatch.setattr("tensorstore.open", unexpected_io)
@@ -20,7 +44,20 @@ def test_conversion_module_import_performs_no_io(monkeypatch):
 
 
 def test_time_projection_uses_explicit_camera_calibration(monkeypatch, tmp_path):
-    """Verify time projections use caller-provided camera calibration."""
+    """Verify time projections use caller-provided camera calibration.
+
+    Parameters
+    ----------
+    monkeypatch : object
+        Value supplied for ``monkeypatch``.
+    tmp_path : object
+        Value supplied for ``tmp path``.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
     conversion = importlib.import_module("opm_processing.dataio.convert_timelapse_data")
     captured = {}
     monkeypatch.setattr(

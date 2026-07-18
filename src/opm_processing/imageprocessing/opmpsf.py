@@ -12,7 +12,26 @@ from scipy.interpolate import RegularGridInterpolator
 
 
 def _interpolate_psf_plane(x_grid, y_grid, values, x_coords, y_coords):
-    """Interpolate one regular-grid PSF plane onto an output XY grid."""
+    """Interpolate one regular-grid PSF plane onto an output XY grid.
+
+    Parameters
+    ----------
+    x_grid : object
+        Value supplied for ``x grid``.
+    y_grid : object
+        Value supplied for ``y grid``.
+    values : object
+        Value supplied for ``values``.
+    x_coords : object
+        Value supplied for ``x coords``.
+    y_coords : object
+        Value supplied for ``y coords``.
+
+    Returns
+    -------
+    object
+        Result produced by the callable.
+    """
     interpolator = RegularGridInterpolator(
         (y_grid, x_grid),
         values,
@@ -27,8 +46,7 @@ def _interpolate_psf_plane(x_grid, y_grid, values, x_coords, y_coords):
 
 # ROI tools
 def get_skewed_roi_size(sizes, theta, dc, dstep, ensure_odd=True):
-    """
-    Calculate the ROI size in the OPM matrix to include sufficient xy and z points.
+    """Calculate the ROI size in the OPM matrix to include sufficient xy and z points.
 
     Parameters
     ----------
@@ -72,8 +90,7 @@ def get_skewed_roi_size(sizes, theta, dc, dstep, ensure_odd=True):
 
 # coordinate transformations between OPM and coverslip frames
 def get_skewed_coords(sizes, dc, ds, theta, scan_direction="lateral"):
-    """
-    Get laboratory coordinates (i.e., coverslip coordinates) for a stage-scanning OPM set.
+    """Get laboratory coordinates (i.e., coverslip coordinates) for a stage-scanning OPM set.
 
     Parameters
     ----------
@@ -140,8 +157,7 @@ def get_skewed_coords(sizes, dc, ds, theta, scan_direction="lateral"):
 def create_psf_silicone_100x(
     dxy: float, dz: float, nxy: float, nz: float, em_wvl: float, pz: float
 ) -> np.ndarray:
-    """
-    Create OPM PSF in coverslip coordinates.
+    """Create OPM PSF in coverslip coordinates.
 
     Parameters
     ----------
@@ -212,8 +228,7 @@ def create_psf_silicone_100x(
 def create_psf_water_40x(
     dxy: float, dz: float, nxy: float, nz: float, em_wvl: float, pz: float
 ) -> np.ndarray:
-    """
-    Create OPM PSF in coverslip coordinates.
+    """Create OPM PSF in coverslip coordinates.
 
     Parameters
     ----------
@@ -344,8 +359,7 @@ def generate_skewed_psf(
     pz: float = 0.0,
     plot=False,
 ):
-    """
-    Create OPM PSF in skewed coordinates.
+    """Create OPM PSF in skewed coordinates.
 
     Parameters
     ----------
@@ -434,8 +448,7 @@ def ASI_generate_skewed_psf(
     pz: float = 0.0,
     plot=False,
 ):
-    """
-    Create OPM PSF in skewed coordinates.
+    """Create OPM PSF in skewed coordinates.
 
     Parameters
     ----------
@@ -449,6 +462,9 @@ def ASI_generate_skewed_psf(
         distance above coverslip in microns
     plot: bool
         whether to plot the PSF
+
+    theta_deg : object
+        Value supplied for ``theta deg``.
 
     Returns
     -------

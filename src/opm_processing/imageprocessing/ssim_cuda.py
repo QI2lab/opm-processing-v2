@@ -176,6 +176,26 @@ def structural_similarity_cupy_sep_shared(
     Supports 2D (Y×X) or 3D (Z×Y×X) arrays,
     using separable box filters with shared memory.
     Always assumes zyx ordering.
+
+    Parameters
+    ----------
+    img1 : cp.ndarray
+        Value supplied for ``img1``.
+    img2 : cp.ndarray
+        Value supplied for ``img2``.
+    win_size : int
+        Value supplied for ``win size``.
+    data_range : float
+        Value supplied for ``data range``.
+    K1 : float
+        Value supplied for ``K1``.
+    K2 : float
+        Value supplied for ``K2``.
+
+    Returns
+    -------
+    float
+        Result produced by the callable.
     """
     # promote 2D to a single‐slice 3D volume
     if img1.ndim == 2:

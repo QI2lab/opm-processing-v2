@@ -23,6 +23,11 @@ def no_op(*args, **kwargs):
         positional arguments
     kwargs: Any
         keyword arguments
+
+    Returns
+    -------
+    None
+        No value is returned.
     """
     pass
 

@@ -9,7 +9,18 @@ import numpy as np
 
 
 def _import_rlgc(monkeypatch):
-    """Import RLGC with a CPU-backed CuPy test double when necessary."""
+    """Import RLGC with a CPU-backed CuPy test double when necessary.
+
+    Parameters
+    ----------
+    monkeypatch : object
+        Value supplied for ``monkeypatch``.
+
+    Returns
+    -------
+    object
+        Result produced by the callable.
+    """
     rlgc = None
     try:
         rlgc = importlib.import_module("opm_processing.imageprocessing.rlgc")
@@ -21,11 +32,33 @@ def _import_rlgc(monkeypatch):
         id = 0
 
         def __init__(self, *_args):
-            """Initialize a simulated CUDA device."""
+            """Initialize a simulated CUDA device.
+
+            Parameters
+            ----------
+            _args : tuple
+                Value supplied for ``args``.
+
+            Returns
+            -------
+            None
+                No value is returned.
+            """
             pass
 
         def use(self):
-            """Simulate selecting the CUDA device."""
+            """Simulate selecting the CUDA device.
+
+            Parameters
+            ----------
+            None
+                This callable has no parameters.
+
+            Returns
+            -------
+            None
+                No value is returned.
+            """
             pass
 
     cupy = types.ModuleType("cupy")
@@ -47,7 +80,18 @@ def _import_rlgc(monkeypatch):
 
 
 def test_chunked_rlgc_uses_y_only_chunking_api(monkeypatch):
-    """Verify chunked RLGC exposes only Y-axis chunk sizing."""
+    """Verify chunked RLGC exposes only Y-axis chunk sizing.
+
+    Parameters
+    ----------
+    monkeypatch : object
+        Value supplied for ``monkeypatch``.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
     rlgc = _import_rlgc(monkeypatch)
     parameters = inspect.signature(rlgc.chunked_rlgc).parameters
 
@@ -57,12 +101,40 @@ def test_chunked_rlgc_uses_y_only_chunking_api(monkeypatch):
 
 
 def test_y_tiles_keep_full_z_and_x(monkeypatch):
-    """Verify Y chunks retain the complete Z and X dimensions."""
+    """Verify Y chunks retain the complete Z and X dimensions.
+
+    Parameters
+    ----------
+    monkeypatch : object
+        Value supplied for ``monkeypatch``.
+
+    Returns
+    -------
+    object
+        Result produced by the callable.
+    """
     rlgc = _import_rlgc(monkeypatch)
     solver_shapes = []
 
     def fake_solver(image, _psf, *_args, **_kwargs):
-        """Record each solver tile shape and return its image."""
+        """Record each solver tile shape and return its image.
+
+        Parameters
+        ----------
+        image : object
+            Value supplied for ``image``.
+        _psf : object
+            Value supplied for ``psf``.
+        _args : tuple
+            Value supplied for ``args``.
+        _kwargs : dict
+            Value supplied for ``kwargs``.
+
+        Returns
+        -------
+        object
+            Result produced by the callable.
+        """
         solver_shapes.append(image.shape)
         return image.astype(np.float32)
 
@@ -80,13 +152,39 @@ def test_y_tiles_keep_full_z_and_x(monkeypatch):
 
 
 def test_oom_fallback_reduces_only_crop_y(monkeypatch):
-    """Verify an OOM retry reduces only the Y crop size."""
+    """Verify an OOM retry reduces only the Y crop size.
+
+    Parameters
+    ----------
+    monkeypatch : object
+        Value supplied for ``monkeypatch``.
+
+    Returns
+    -------
+    object
+        Result produced by the callable.
+    """
     rlgc = _import_rlgc(monkeypatch)
     attempted = []
     successful = []
 
     def fake_chunked_once(image, psf, **kwargs):
-        """Raise one simulated OOM before returning the image."""
+        """Raise one simulated OOM before returning the image.
+
+        Parameters
+        ----------
+        image : object
+            Value supplied for ``image``.
+        psf : object
+            Value supplied for ``psf``.
+        kwargs : dict
+            Value supplied for ``kwargs``.
+
+        Returns
+        -------
+        object
+            Result produced by the callable.
+        """
         del psf
         attempted.append((kwargs["crop_y"], image.shape[0], image.shape[2]))
         if len(attempted) == 1:
@@ -109,12 +207,38 @@ def test_oom_fallback_reduces_only_crop_y(monkeypatch):
 
 
 def test_oom_fallback_step_is_configurable(monkeypatch):
-    """Verify the Y-crop fallback decrement is configurable."""
+    """Verify the Y-crop fallback decrement is configurable.
+
+    Parameters
+    ----------
+    monkeypatch : object
+        Value supplied for ``monkeypatch``.
+
+    Returns
+    -------
+    object
+        Result produced by the callable.
+    """
     rlgc = _import_rlgc(monkeypatch)
     attempted = []
 
     def fake_chunked_once(image, psf, **kwargs):
-        """Raise one simulated OOM and record crop sizes."""
+        """Raise one simulated OOM and record crop sizes.
+
+        Parameters
+        ----------
+        image : object
+            Value supplied for ``image``.
+        psf : object
+            Value supplied for ``psf``.
+        kwargs : dict
+            Value supplied for ``kwargs``.
+
+        Returns
+        -------
+        object
+            Result produced by the callable.
+        """
         del psf
         attempted.append(kwargs["crop_y"])
         if len(attempted) == 1:

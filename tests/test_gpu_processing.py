@@ -21,7 +21,20 @@ pytestmark = pytest.mark.gpu
 
 
 def _direct_circular_convolution(image: np.ndarray, kernel: np.ndarray) -> np.ndarray:
-    """Small, deliberately direct reference for FFT circular convolution."""
+    """Small, deliberately direct reference for FFT circular convolution.
+
+    Parameters
+    ----------
+    image : np.ndarray
+        Value supplied for ``image``.
+    kernel : np.ndarray
+        Value supplied for ``kernel``.
+
+    Returns
+    -------
+    np.ndarray
+        Result produced by the callable.
+    """
     result = np.zeros_like(image, dtype=np.float64)
     for kernel_index in np.argwhere(kernel != 0):
         index = tuple(int(value) for value in kernel_index)
@@ -38,7 +51,22 @@ def _ssim_nearest_reference(
     image_b: np.ndarray,
     win_size: int,
 ) -> float:
-    """NumPy/SciPy reference matching the CUDA kernel's nearest-edge boxes."""
+    """NumPy/SciPy reference matching the CUDA kernel's nearest-edge boxes.
+
+    Parameters
+    ----------
+    image_a : np.ndarray
+        Value supplied for ``image a``.
+    image_b : np.ndarray
+        Value supplied for ``image b``.
+    win_size : int
+        Value supplied for ``win size``.
+
+    Returns
+    -------
+    float
+        Result produced by the callable.
+    """
     if image_a.ndim == 2:
         image_a = image_a[None]
         image_b = image_b[None]
@@ -69,7 +97,18 @@ def _ssim_nearest_reference(
 
 
 def test_fft_convolution_matches_direct_reference(cupy_gpu):
-    """Exercise cuFFT and validate all voxels against direct convolution."""
+    """Exercise cuFFT and validate all voxels against direct convolution.
+
+    Parameters
+    ----------
+    cupy_gpu : object
+        Value supplied for ``cupy gpu``.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
     cp = cupy_gpu
     rlgc = importlib.import_module("opm_processing.imageprocessing.rlgc")
     rng = np.random.default_rng(8)
@@ -95,7 +134,20 @@ def test_fft_convolution_matches_direct_reference(cupy_gpu):
 
 @pytest.mark.parametrize("shape", [(31, 37), (7, 23, 29)])
 def test_custom_cuda_ssim_matches_scipy_reference(cupy_gpu, shape):
-    """Validate the custom RawModule kernels for both 2D and 3D images."""
+    """Validate the custom RawModule kernels for both 2D and 3D images.
+
+    Parameters
+    ----------
+    cupy_gpu : object
+        Value supplied for ``cupy gpu``.
+    shape : object
+        Value supplied for ``shape``.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
     cp = cupy_gpu
     ssim_module = importlib.import_module("opm_processing.imageprocessing.ssim_cuda")
     rng = np.random.default_rng(14)
@@ -124,7 +176,18 @@ def test_custom_cuda_ssim_matches_scipy_reference(cupy_gpu, shape):
 
 
 def test_gpu_hot_pixel_replacement_matches_synthetic_sample(cupy_gpu):
-    """Exercise cupyx median filtering on a representative camera defect."""
+    """Exercise cupyx median filtering on a representative camera defect.
+
+    Parameters
+    ----------
+    cupy_gpu : object
+        Value supplied for ``cupy gpu``.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
     cp = cupy_gpu
     utils = importlib.import_module("opm_processing.imageprocessing.utils")
     if not utils.CUPY_AVIALABLE or utils.xp is not cp:
@@ -147,7 +210,18 @@ def test_gpu_hot_pixel_replacement_matches_synthetic_sample(cupy_gpu):
 
 
 def test_gpu_registration_recovers_known_3d_translation(cupy_gpu):
-    """Run cuCIM registration plus CUDA SSIM on a translated sample volume."""
+    """Run cuCIM registration plus CUDA SSIM on a translated sample volume.
+
+    Parameters
+    ----------
+    cupy_gpu : object
+        Value supplied for ``cupy gpu``.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
     cp = cupy_gpu
     try:
         import cucim  # noqa: F401
@@ -185,7 +259,18 @@ def test_gpu_registration_recovers_known_3d_translation(cupy_gpu):
 
 
 def test_rlgc_gpu_deconvolution_improves_synthetic_point_sample(cupy_gpu):
-    """End-to-end GPU deconvolution must improve recovery of point emitters."""
+    """End-to-end GPU deconvolution must improve recovery of point emitters.
+
+    Parameters
+    ----------
+    cupy_gpu : object
+        Value supplied for ``cupy gpu``.
+
+    Returns
+    -------
+    object
+        Result produced by the callable.
+    """
     del cupy_gpu  # The fixture has already proved that device 0 executes CUDA.
     rlgc = importlib.import_module("opm_processing.imageprocessing.rlgc")
     rng = np.random.default_rng(31)
@@ -216,7 +301,18 @@ def test_rlgc_gpu_deconvolution_improves_synthetic_point_sample(cupy_gpu):
     assert restored.min() >= -1e-4
 
     def scale_invariant_rmse(candidate):
-        """Measure RMSE after fitting a scalar intensity correction."""
+        """Measure RMSE after fitting a scalar intensity correction.
+
+        Parameters
+        ----------
+        candidate : object
+            Value supplied for ``candidate``.
+
+        Returns
+        -------
+        object
+            Result produced by the callable.
+        """
         scale = float(np.vdot(candidate, truth) / np.vdot(candidate, candidate))
         return float(np.sqrt(np.mean((candidate * scale - truth) ** 2)))
 

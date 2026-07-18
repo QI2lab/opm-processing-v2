@@ -46,6 +46,9 @@ def replace_hot_pixels(
     data: NDArray
         ND data [broadcast_dim,z,y,x]
 
+    threshold : float
+        Value supplied for ``threshold``.
+
     Returns
     -------
     data: NDArray

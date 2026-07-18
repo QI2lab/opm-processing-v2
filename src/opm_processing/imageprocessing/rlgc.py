@@ -43,8 +43,7 @@ _fft_cache_3d: dict[tuple[int, int, int, int], cp.ndarray] = {}
 
 
 def clear_rlgc_caches(clear_memory_pool: bool = False) -> None:
-    """
-    Clear cached FFT resources used by RLGC helper functions.
+    """Clear cached FFT resources used by RLGC helper functions.
 
     Parameters
     ----------
@@ -76,8 +75,7 @@ def clear_rlgc_caches(clear_memory_pool: bool = False) -> None:
 
 
 def next_gpu_fft_size(x: int) -> int:
-    """
-    Return the smallest FFT-friendly size >= ``x`` with prime factors in {2, 3}.
+    """Return the smallest FFT-friendly size >= ``x`` with prime factors in {2, 3}.
 
     Parameters
     ----------
@@ -109,8 +107,7 @@ def _axis_linear_fft_padding(
     *,
     halo_multiplier: int = 1,
 ) -> tuple[int, int]:
-    """
-    Calculate symmetric linear-convolution padding for one axis.
+    """Calculate symmetric linear-convolution padding for one axis.
 
     Parameters
     ----------
@@ -142,8 +139,7 @@ def pad_for_linear_fft(
     psf_shape: tuple[int, int, int],
     pad_yx: bool = True,
 ) -> tuple[np.ndarray, tuple[tuple[int, int], tuple[int, int], tuple[int, int]]]:
-    """
-    Pad a 3D image for linear FFT convolution with ``ndimage(..., mode="reflect")`` edges.
+    """Pad a 3D image for linear FFT convolution with ``ndimage(..., mode="reflect")`` edges.
 
     Z is always padded by the PSF support. Y/X are padded by the PSF support and
     expanded to FFT-friendly sizes only when ``pad_yx`` is True.
@@ -183,8 +179,7 @@ def remove_padding_zyx(
     padded_image: cp.ndarray | np.ndarray,
     pad_width: tuple[tuple[int, int], tuple[int, int], tuple[int, int]],
 ) -> cp.ndarray | np.ndarray:
-    """
-    Remove per-axis padding added by :func:`pad_for_linear_fft`.
+    """Remove per-axis padding added by :func:`pad_for_linear_fft`.
 
     Parameters
     ----------
@@ -211,8 +206,7 @@ def _symmetric_padded_axis_indices(
     pad_before: int,
     pad_after: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Return source indices for a symmetric extension of one padded axis.
+    """Return source indices for a symmetric extension of one padded axis.
 
     Parameters
     ----------
@@ -237,8 +231,7 @@ def enforce_symmetric_boundary(
     image: cp.ndarray,
     pad_width: tuple[tuple[int, int], tuple[int, int], tuple[int, int]],
 ) -> None:
-    """
-    Constrain padded samples to be a symmetric extension of observed samples.
+    """Constrain padded samples to be a symmetric extension of observed samples.
 
     Parameters
     ----------
@@ -282,8 +275,7 @@ def pad_psf(
     image_shape: tuple[int, int, int],
     normalize: bool = True,
 ) -> cp.ndarray:
-    """
-    Pad and center a PSF to match the target image shape.
+    """Pad and center a PSF to match the target image shape.
 
     Parameters
     ----------
@@ -322,8 +314,7 @@ def pad_psf(
 def fft_conv(
     image: cp.ndarray, H: cp.ndarray, shape: tuple[int, int, int]
 ) -> cp.ndarray:
-    """
-    Linear convolution via FFT with cached buffers (no clipping).
+    """Linear convolution via FFT with cached buffers (no clipping).
 
     This computes ``irfftn(rfftn(image) * H, s=shape)`` with preallocated
     work buffers. No clipping is applied here-this matches the reference
@@ -360,8 +351,7 @@ def _observed_region_mask(
     shape: tuple[int, int, int],
     pad_width: tuple[tuple[int, int], tuple[int, int], tuple[int, int]],
 ) -> cp.ndarray:
-    """
-    Build a mask that is one in the original image and zero in padding.
+    """Build a mask that is one in the original image and zero in padding.
 
     Parameters
     ----------
@@ -386,8 +376,7 @@ def _observed_region_mask(
 
 
 def kl_div(p: cp.ndarray, q: cp.ndarray, mask: cp.ndarray | None = None) -> float:
-    """
-    Compute Kullback-Leibler divergence between two distributions.
+    """Compute Kullback-Leibler divergence between two distributions.
 
     Parameters
     ----------
@@ -419,8 +408,7 @@ def kl_div(p: cp.ndarray, q: cp.ndarray, mask: cp.ndarray | None = None) -> floa
 
 
 def _child_log_prefix(base_prefix: str, suffix: str) -> str:
-    """
-    Append one structured suffix to an RLGC log prefix.
+    """Append one structured suffix to an RLGC log prefix.
 
     Parameters
     ----------
@@ -443,8 +431,7 @@ def _resolve_tiled_axis_geometry(
     psf_support: int,
     axis_name: str,
 ) -> tuple[int, int]:
-    """
-    Resolve retained crop size and discarded processing halo for one axis.
+    """Resolve retained crop size and discarded processing halo for one axis.
 
     Parameters
     ----------
@@ -474,8 +461,7 @@ def _resolve_tiled_axis_geometry(
 
 
 def _axis_retained_bounds(retained_size: int, image_size: int) -> list[tuple[int, int]]:
-    """
-    Build non-overlapping retained tile bounds that exactly cover one axis.
+    """Build non-overlapping retained tile bounds that exactly cover one axis.
 
     Parameters
     ----------
@@ -514,8 +500,7 @@ def rlgc(
     logger: logging.Logger | None = None,
     log_prefix: str = "",
 ) -> np.ndarray:
-    """
-    Richardson-Lucy Gradient Consensus deconvolution.
+    """Richardson-Lucy Gradient Consensus deconvolution.
 
     The implementation follows the non-accelerated reference loop with
     split-KLD stopping and the consensus-gated multiplicative update.
@@ -764,8 +749,7 @@ def rlgc(
 
 
 def _is_gpu_memory_error(exc: BaseException) -> bool:
-    """
-    Identify CUDA allocation failures that should trigger chunk fallback.
+    """Identify CUDA allocation failures that should trigger chunk fallback.
 
     Parameters
     ----------
@@ -801,8 +785,7 @@ def _chunked_rlgc_once(
     logger: logging.Logger | None = None,
     log_prefix: str = "",
 ) -> np.ndarray:
-    """
-    Run one chunked RLGC attempt without GPU-memory fallback retries.
+    """Run one chunked RLGC attempt without GPU-memory fallback retries.
 
     This function performs either full-frame RLGC or Y-only tiling for the
     requested crop size. Every tile keeps the full Z and X extents.
@@ -980,8 +963,7 @@ def chunked_rlgc(
     on_successful_crop_y: Callable[[int], None] | None = None,
     fallback_step_y: int = 128,
 ) -> np.ndarray:
-    """
-    Y-chunked RLGC deconvolution with automatic chunk fallback.
+    """Y-chunked RLGC deconvolution with automatic chunk fallback.
 
     The solver first attempts the requested ``crop_y``. If CUDA memory
     allocation fails, it retries with Y chunks reduced by 128 pixels at a time.

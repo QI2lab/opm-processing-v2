@@ -17,14 +17,36 @@ class _TrackedFuture:
     """Track pending asynchronous writes for backpressure tests."""
 
     def __init__(self, tracker):
-        """Register a newly pending write."""
+        """Register a newly pending write.
+
+        Parameters
+        ----------
+        tracker : object
+            Value supplied for ``tracker``.
+
+        Returns
+        -------
+        None
+            No value is returned.
+        """
         self.tracker = tracker
         self.pending = True
         tracker["active"] += 1
         tracker["maximum"] = max(tracker["maximum"], tracker["active"])
 
     def result(self):
-        """Resolve the write and update the pending-write count."""
+        """Resolve the write and update the pending-write count.
+
+        Parameters
+        ----------
+        None
+            This callable has no parameters.
+
+        Returns
+        -------
+        None
+            No value is returned.
+        """
         if self.pending:
             self.pending = False
             self.tracker["active"] -= 1
@@ -34,12 +56,36 @@ class _ArrayView:
     """Writable view into an in-memory array store."""
 
     def __init__(self, store, key):
-        """Initialize a keyed array view."""
+        """Initialize a keyed array view.
+
+        Parameters
+        ----------
+        store : object
+            Value supplied for ``store``.
+        key : object
+            Value supplied for ``key``.
+
+        Returns
+        -------
+        None
+            No value is returned.
+        """
         self.store = store
         self.key = key
 
     def write(self, value):
-        """Write a value and return a tracked future."""
+        """Write a value and return a tracked future.
+
+        Parameters
+        ----------
+        value : object
+            Value supplied for ``value``.
+
+        Returns
+        -------
+        object
+            Result produced by the callable.
+        """
         self.store.data[self.key] = value
         self.store.tracker["writes"] += 1
         return _TrackedFuture(self.store.tracker)
@@ -49,17 +95,50 @@ class _ArrayStore:
     """In-memory TensorStore test double."""
 
     def __init__(self, shape):
-        """Allocate the array and write counters."""
+        """Allocate the array and write counters.
+
+        Parameters
+        ----------
+        shape : object
+            Value supplied for ``shape``.
+
+        Returns
+        -------
+        None
+            No value is returned.
+        """
         self.data = np.zeros(shape, dtype=np.uint16)
         self.tracker = {"active": 0, "maximum": 0, "writes": 0}
 
     def __getitem__(self, key):
-        """Return a writable view for an array selection."""
+        """Return a writable view for an array selection.
+
+        Parameters
+        ----------
+        key : object
+            Value supplied for ``key``.
+
+        Returns
+        -------
+        object
+            Result produced by the callable.
+        """
         return _ArrayView(self, key)
 
 
 def test_prepare_fused_image_uses_ngff_multiscales(tmp_path):
-    """Verify fused outputs use NGFF multiscale metadata and chunks."""
+    """Verify fused outputs use NGFF multiscale metadata and chunks.
+
+    Parameters
+    ----------
+    tmp_path : object
+        Value supplied for ``tmp path``.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
     fusion = TileFusion.__new__(TileFusion)
     fusion.padded_shape = (8, 16, 20)
     fusion.offset_um = (3.0, 4.0, 5.0)
@@ -96,7 +175,18 @@ def test_prepare_fused_image_uses_ngff_multiscales(tmp_path):
 
 
 def test_max_projection_fusion_uses_chunks_without_sharding(tmp_path):
-    """Verify maximum projections use ordinary chunks without sharding."""
+    """Verify maximum projections use ordinary chunks without sharding.
+
+    Parameters
+    ----------
+    tmp_path : object
+        Value supplied for ``tmp path``.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
     fusion = MaxTileFusion.__new__(MaxTileFusion)
     fusion.time_range = None
     fusion.time_dim = 1
@@ -120,7 +210,18 @@ def test_max_projection_fusion_uses_chunks_without_sharding(tmp_path):
 
 
 def test_max_projection_fusion_operational_settings_are_configurable():
-    """Verify maximum-projection blending settings are configurable."""
+    """Verify maximum-projection blending settings are configurable.
+
+    Parameters
+    ----------
+    None
+        This callable has no parameters.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
     fusion = MaxTileFusion.__new__(MaxTileFusion)
     fusion.tile_shape = (20, 30)
     fusion.blend_pixels = (3, 5)
@@ -133,7 +234,18 @@ def test_max_projection_fusion_operational_settings_are_configurable():
 
 
 def test_fusion_block_shape_respects_memory_budget(monkeypatch):
-    """Verify fusion block sizing respects the host-memory budget."""
+    """Verify fusion block sizing respects the host-memory budget.
+
+    Parameters
+    ----------
+    monkeypatch : object
+        Value supplied for ``monkeypatch``.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
     fusion = TileFusion.__new__(TileFusion)
     fusion.fusion_ram_fraction = 0.5
     fusion.chunk_y = 4
@@ -150,7 +262,18 @@ def test_fusion_block_shape_respects_memory_budget(monkeypatch):
 
 
 def test_fusion_uses_spatial_blocks_and_bounded_writes(monkeypatch):
-    """Verify fusion uses spatial blocks and bounded pending writes."""
+    """Verify fusion uses spatial blocks and bounded pending writes.
+
+    Parameters
+    ----------
+    monkeypatch : object
+        Value supplied for ``monkeypatch``.
+
+    Returns
+    -------
+    object
+        Result produced by the callable.
+    """
     fusion = TileFusion.__new__(TileFusion)
     fusion.fused_ts = _ArrayStore((1, 1, 2, 3, 6))
     fusion.write_block_shape = [1, 1, 1, 2, 2]
@@ -177,7 +300,26 @@ def test_fusion_uses_spatial_blocks_and_bounded_writes(monkeypatch):
     ]
 
     def read_tile(self, tile_idx, ch_sel, z_slice, y_slice, x_slice):
-        """Read a selected region from an in-memory tile."""
+        """Read a selected region from an in-memory tile.
+
+        Parameters
+        ----------
+        tile_idx : object
+            Value supplied for ``tile idx``.
+        ch_sel : object
+            Value supplied for ``ch sel``.
+        z_slice : object
+            Value supplied for ``z slice``.
+        y_slice : object
+            Value supplied for ``y slice``.
+        x_slice : object
+            Value supplied for ``x slice``.
+
+        Returns
+        -------
+        object
+            Result produced by the callable.
+        """
         return tiles[tile_idx][ch_sel, z_slice, y_slice, x_slice]
 
     fusion._read_tile_volume = MethodType(read_tile, fusion)
@@ -200,7 +342,20 @@ def test_fusion_uses_spatial_blocks_and_bounded_writes(monkeypatch):
 
 @pytest.mark.parametrize("downsample_method", ["stride", "block_mean"])
 def test_multiscales_are_generated_in_spatial_blocks(tmp_path, downsample_method):
-    """Verify pyramid levels are generated correctly in spatial blocks."""
+    """Verify pyramid levels are generated correctly in spatial blocks.
+
+    Parameters
+    ----------
+    tmp_path : object
+        Value supplied for ``tmp path``.
+    downsample_method : object
+        Value supplied for ``downsample method``.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
     fusion = TileFusion.__new__(TileFusion)
     fusion.padded_shape = (4, 8, 8)
     fusion.offset_um = (0.0, 0.0, 0.0)
@@ -239,7 +394,18 @@ def test_multiscales_are_generated_in_spatial_blocks(tmp_path, downsample_method
 
 
 def test_iterative_optimization_handles_all_links_rejected():
-    """Verify optimization remains defined when all links are rejected."""
+    """Verify optimization remains defined when all links are rejected.
+
+    Parameters
+    ----------
+    None
+        This callable has no parameters.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
     fusion = TileFusion.__new__(TileFusion)
     links = [
         {
@@ -263,7 +429,18 @@ def test_iterative_optimization_handles_all_links_rejected():
 
 
 def test_register_and_score_identical_3d_patches():
-    """Verify identical 3D patches register with a near-perfect score."""
+    """Verify identical 3D patches register with a near-perfect score.
+
+    Parameters
+    ----------
+    None
+        This callable has no parameters.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
     rng = np.random.default_rng(42)
     patch = rng.normal(size=(9, 17, 17)).astype(np.float32)
 

@@ -6,10 +6,34 @@ import opm_processing.cuda as cuda
 
 
 def test_preload_cuda_libraries_is_a_noop_off_linux(monkeypatch):
-    """Verify CUDA preloading does nothing on non-Linux platforms."""
+    """Verify CUDA preloading does nothing on non-Linux platforms.
+
+    Parameters
+    ----------
+    monkeypatch : object
+        Value supplied for ``monkeypatch``.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
 
     def unexpected_cdll(*args, **kwargs):
-        """Fail if the non-Linux path attempts to load a library."""
+        """Fail if the non-Linux path attempts to load a library.
+
+        Parameters
+        ----------
+        args : tuple
+            Value supplied for ``args``.
+        kwargs : dict
+            Value supplied for ``kwargs``.
+
+        Returns
+        -------
+        None
+            No value is returned.
+        """
         raise AssertionError("ctypes.CDLL should not be called off Linux")
 
     monkeypatch.setattr(cuda.sys, "platform", "win32")
@@ -22,7 +46,20 @@ def test_preload_cuda_libraries_is_a_noop_off_linux(monkeypatch):
 
 
 def test_preload_cuda_libraries_loads_existing_libraries_once(tmp_path, monkeypatch):
-    """Verify existing CUDA libraries are loaded once in dependency order."""
+    """Verify existing CUDA libraries are loaded once in dependency order.
+
+    Parameters
+    ----------
+    tmp_path : object
+        Value supplied for ``tmp path``.
+    monkeypatch : object
+        Value supplied for ``monkeypatch``.
+
+    Returns
+    -------
+    object
+        Result produced by the callable.
+    """
     root = tmp_path / "nvidia"
     first = _touch_library(root, "runtime", "libfirst.so")
     second = _touch_library(root, "math", "libsecond.so")
@@ -31,7 +68,20 @@ def test_preload_cuda_libraries_loads_existing_libraries_once(tmp_path, monkeypa
     calls = []
 
     def fake_cdll(path, mode):
-        """Record a simulated shared-library load."""
+        """Record a simulated shared-library load.
+
+        Parameters
+        ----------
+        path : object
+            Value supplied for ``path``.
+        mode : object
+            Value supplied for ``mode``.
+
+        Returns
+        -------
+        object
+            Result produced by the callable.
+        """
         library_path = Path(path)
         calls.append((library_path, mode))
         if library_path == failed:
@@ -63,7 +113,22 @@ def test_preload_cuda_libraries_loads_existing_libraries_once(tmp_path, monkeypa
 
 
 def _touch_library(root: Path, package: str, name: str) -> Path:
-    """Create an empty package-local shared-library fixture."""
+    """Create an empty package-local shared-library fixture.
+
+    Parameters
+    ----------
+    root : Path
+        Value supplied for ``root``.
+    package : str
+        Value supplied for ``package``.
+    name : str
+        Value supplied for ``name``.
+
+    Returns
+    -------
+    Path
+        Result produced by the callable.
+    """
     library = root / package / "lib" / name
     library.parent.mkdir(parents=True, exist_ok=True)
     library.touch()

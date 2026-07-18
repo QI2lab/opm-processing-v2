@@ -44,6 +44,11 @@ def deskew_shape_estimator(
     pixel_size: float
         in-plane camera pixel size in OPM coordinates
 
+    crop_after_deskew : bool
+        Value supplied for ``crop after deskew``.
+    divisble_by : int
+        Value supplied for ``divisble by``.
+
     Returns
     -------
     output_shape: Sequence[int]
@@ -301,7 +306,22 @@ def chunk_indices(length: int, chunk_size: int) -> list[tuple[int, int]]:
 def _deconvolve_oblique_chunk(
     image: np.ndarray, psf: np.ndarray, crop_y: int
 ) -> np.ndarray:
-    """Run nested Y-only RLGC without importing CuPy for deskew-only use."""
+    """Run nested Y-only RLGC without importing CuPy for deskew-only use.
+
+    Parameters
+    ----------
+    image : np.ndarray
+        Value supplied for ``image``.
+    psf : np.ndarray
+        Value supplied for ``psf``.
+    crop_y : int
+        Value supplied for ``crop y``.
+
+    Returns
+    -------
+    np.ndarray
+        Result produced by the callable.
+    """
     from opm_processing.imageprocessing.rlgc import chunked_rlgc
 
     return chunked_rlgc(image=image, psf=psf, crop_y=crop_y)

@@ -15,7 +15,18 @@ class FakeLayer:
     """Minimal napari layer test double."""
 
     def __init__(self):
-        """Initialize layer state used by display tests."""
+        """Initialize layer state used by display tests.
+
+        Parameters
+        ----------
+        None
+            This callable has no parameters.
+
+        Returns
+        -------
+        None
+            No value is returned.
+        """
         self.data = [np.zeros((2, 3, 4, 5), dtype=np.uint16)]
         self.multiscale = True
         self.visible = True
@@ -28,18 +39,53 @@ class FakeViewer:
     """Minimal napari viewer test double."""
 
     def __init__(self, layers):
-        """Initialize the viewer with predefined layers."""
+        """Initialize the viewer with predefined layers.
+
+        Parameters
+        ----------
+        layers : object
+            Value supplied for ``layers``.
+
+        Returns
+        -------
+        None
+            No value is returned.
+        """
         self.layers = layers
         self.open_calls = []
 
     def open(self, path, *, plugin):
-        """Record a plugin open request and return predefined layers."""
+        """Record a plugin open request and return predefined layers.
+
+        Parameters
+        ----------
+        path : object
+            Value supplied for ``path``.
+        plugin : object
+            Value supplied for ``plugin``.
+
+        Returns
+        -------
+        object
+            Result produced by the callable.
+        """
         self.open_calls.append((path, plugin))
         return self.layers
 
 
 def _create_collection(tmp_path):
-    """Create a small processed position-collection fixture."""
+    """Create a small processed position-collection fixture.
+
+    Parameters
+    ----------
+    tmp_path : object
+        Value supplied for ``tmp path``.
+
+    Returns
+    -------
+    object
+        Result produced by the callable.
+    """
     raw_path = tmp_path / "sample.zarr"
     raw_path.mkdir()
     data_path = tmp_path / "sample_deskewed.ome.zarr"
@@ -54,7 +100,18 @@ def _create_collection(tmp_path):
 
 
 def test_bf2raw_has_valid_ome_xml_and_root_plugin_reader(tmp_path):
-    """Verify generated OME metadata and root-level plugin reading."""
+    """Verify generated OME metadata and root-level plugin reading.
+
+    Parameters
+    ----------
+    tmp_path : object
+        Value supplied for ``tmp path``.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
     _, data_path = _create_collection(tmp_path)
     xml_path = data_path / "OME" / "METADATA.ome.xml"
 
@@ -75,7 +132,20 @@ def test_bf2raw_has_valid_ome_xml_and_root_plugin_reader(tmp_path):
 
 
 def test_display_delegates_root_open_to_napari_plugin(tmp_path, monkeypatch):
-    """Verify display delegates collection opening to napari-ome-zarr."""
+    """Verify display delegates collection opening to napari-ome-zarr.
+
+    Parameters
+    ----------
+    tmp_path : object
+        Value supplied for ``tmp path``.
+    monkeypatch : object
+        Value supplied for ``monkeypatch``.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
     raw_path, data_path = _create_collection(tmp_path)
     layers = [FakeLayer() for _ in range(4)]
     viewer = FakeViewer(layers)
@@ -99,7 +169,18 @@ def test_display_delegates_root_open_to_napari_plugin(tmp_path, monkeypatch):
 
 
 def test_resolve_data_path_prefers_ome_suffix_with_legacy_fallback(tmp_path):
-    """Verify OME-Zarr paths take precedence over legacy Zarr paths."""
+    """Verify OME-Zarr paths take precedence over legacy Zarr paths.
+
+    Parameters
+    ----------
+    tmp_path : object
+        Value supplied for ``tmp path``.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
     raw_path = tmp_path / "sample.zarr"
     legacy_path = tmp_path / "sample_deskewed.zarr"
     legacy_path.mkdir()

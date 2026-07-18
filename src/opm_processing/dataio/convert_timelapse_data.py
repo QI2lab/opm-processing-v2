@@ -22,12 +22,38 @@ app = typer.Typer()
 
 
 def _with_suffix(path: Path, suffix: str) -> Path:
-    """Return a path with the requested suffix."""
+    """Return a path with the requested suffix.
+
+    Parameters
+    ----------
+    path : Path
+        Value supplied for ``path``.
+    suffix : str
+        Value supplied for ``suffix``.
+
+    Returns
+    -------
+    Path
+        Result produced by the callable.
+    """
     return path if path.suffix == suffix else path.with_suffix(suffix)
 
 
 def save_raw_with_yaml(data_array: np.ndarray, output_path: Path) -> None:
-    """Write a uint16 RAW array and its shape/byte-order sidecar."""
+    """Write a uint16 RAW array and its shape/byte-order sidecar.
+
+    Parameters
+    ----------
+    data_array : np.ndarray
+        Value supplied for ``data array``.
+    output_path : Path
+        Value supplied for ``output path``.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
     output_path = _with_suffix(Path(output_path), ".raw")
     yml_path = output_path.with_suffix(".yaml")
     np.asarray(data_array, dtype=np.uint16).tofile(output_path)
@@ -48,13 +74,41 @@ def _camera_correct(
     camera_offset: float,
     camera_conversion: float,
 ) -> np.ndarray:
-    """Apply offset and gain correction while clipping to uint16 limits."""
+    """Apply offset and gain correction while clipping to uint16 limits.
+
+    Parameters
+    ----------
+    data_array : np.ndarray
+        Value supplied for ``data array``.
+    camera_offset : float
+        Value supplied for ``camera offset``.
+    camera_conversion : float
+        Value supplied for ``camera conversion``.
+
+    Returns
+    -------
+    np.ndarray
+        Result produced by the callable.
+    """
     corrected = (data_array.astype(np.float32) - camera_offset) * camera_conversion
     return np.clip(corrected, 0, np.iinfo(np.uint16).max)
 
 
 def _tiff_metadata(axes: str, pixel_size_um: float) -> dict[str, object]:
-    """Build physical-size metadata for an OME-TIFF image."""
+    """Build physical-size metadata for an OME-TIFF image.
+
+    Parameters
+    ----------
+    axes : str
+        Value supplied for ``axes``.
+    pixel_size_um : float
+        Value supplied for ``pixel size um``.
+
+    Returns
+    -------
+    dict[str, object]
+        Result produced by the callable.
+    """
     return {
         "axes": axes,
         "SignificantBits": np.iinfo(np.uint16).bits,
@@ -73,7 +127,26 @@ def save_time_projection(
     camera_offset: float,
     camera_conversion: float,
 ) -> None:
-    """Save a mean time projection after explicit camera calibration."""
+    """Save a mean time projection after explicit camera calibration.
+
+    Parameters
+    ----------
+    data_array : np.ndarray
+        Value supplied for ``data array``.
+    pixel_size_um : float
+        Value supplied for ``pixel size um``.
+    output_path : Path
+        Value supplied for ``output path``.
+    camera_offset : float
+        Value supplied for ``camera offset``.
+    camera_conversion : float
+        Value supplied for ``camera conversion``.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
     output_path = _with_suffix(Path(output_path), ".tiff")
     projection = _camera_correct(
         data_array,
@@ -89,7 +162,24 @@ def _write_tiff(
     pixel_size_um: float,
     output_path: Path,
 ) -> None:
-    """Write an array as a compressed OME-TIFF image."""
+    """Write an array as a compressed OME-TIFF image.
+
+    Parameters
+    ----------
+    data_array : np.ndarray
+        Value supplied for ``data array``.
+    axes : str
+        Value supplied for ``axes``.
+    pixel_size_um : float
+        Value supplied for ``pixel size um``.
+    output_path : Path
+        Value supplied for ``output path``.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
     output_path = _with_suffix(Path(output_path), ".tiff")
     resolution = 1e4 / pixel_size_um
     with TiffWriter(output_path, bigtiff=True) as tif:
@@ -111,12 +201,40 @@ def save_as_tiff(
     *,
     axes: str = "TYX",
 ) -> None:
-    """Save selected timelapse data as OME-TIFF."""
+    """Save selected timelapse data as OME-TIFF.
+
+    Parameters
+    ----------
+    data_array : np.ndarray
+        Value supplied for ``data array``.
+    pixel_size_um : float
+        Value supplied for ``pixel size um``.
+    output_path : Path
+        Value supplied for ``output path``.
+    axes : str
+        Value supplied for ``axes``.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
     _write_tiff(data_array, axes, pixel_size_um, output_path)
 
 
 def _open_datastore(zarr_dir: Path) -> ts.TensorStore:
-    """Open a Zarr v2 or v3 acquisition as a TensorStore."""
+    """Open a Zarr v2 or v3 acquisition as a TensorStore.
+
+    Parameters
+    ----------
+    zarr_dir : Path
+        Value supplied for ``zarr dir``.
+
+    Returns
+    -------
+    ts.TensorStore
+        Result produced by the callable.
+    """
     last_error: Exception | None = None
     for driver in ("zarr3", "zarr"):
         try:
@@ -136,7 +254,22 @@ def _selection_bounds(
     length: int,
     name: str,
 ) -> tuple[int, int]:
-    """Validate and normalize a half-open selection range."""
+    """Validate and normalize a half-open selection range.
+
+    Parameters
+    ----------
+    requested : tuple[int, int] | None
+        Value supplied for ``requested``.
+    length : int
+        Value supplied for ``length``.
+    name : str
+        Value supplied for ``name``.
+
+    Returns
+    -------
+    tuple[int, int]
+        Result produced by the callable.
+    """
     if requested is None:
         return 0, length
     start, stop = requested
@@ -159,7 +292,38 @@ def convert_timelapse(
     camera_offset: float | None = None,
     camera_conversion: float | None = None,
 ) -> list[Path]:
-    """Convert selected TPCZYX positions from one acquisition datastore."""
+    """Convert selected TPCZYX positions from one acquisition datastore.
+
+    Parameters
+    ----------
+    zarr_dir : Path
+        Value supplied for ``zarr dir``.
+    output_dir : Path | None
+        Value supplied for ``output dir``.
+    time_range : tuple[int, int] | None
+        Value supplied for ``time range``.
+    stage_range : tuple[int, int] | None
+        Value supplied for ``stage range``.
+    scan_range : tuple[int, int] | None
+        Value supplied for ``scan range``.
+    fov_x_range : tuple[int, int] | None
+        Value supplied for ``fov x range``.
+    create_raw : bool
+        Value supplied for ``create raw``.
+    create_time_projection : bool
+        Value supplied for ``create time projection``.
+    create_tiff : bool
+        Value supplied for ``create tiff``.
+    camera_offset : float | None
+        Value supplied for ``camera offset``.
+    camera_conversion : float | None
+        Value supplied for ``camera conversion``.
+
+    Returns
+    -------
+    list[Path]
+        Result produced by the callable.
+    """
     zarr_dir = Path(zarr_dir)
     datastore = _open_datastore(zarr_dir)
     if datastore.rank != 6:
@@ -242,7 +406,38 @@ def main(
     camera_offset: float | None = None,
     camera_conversion: float | None = None,
 ) -> None:
-    """Convert a selected acquisition; no paths or calibration are implicit."""
+    """Convert a selected acquisition; no paths or calibration are implicit.
+
+    Parameters
+    ----------
+    zarr_dir : Path
+        Value supplied for ``zarr dir``.
+    output_dir : Path | None
+        Value supplied for ``output dir``.
+    time_range : tuple[int, int] | None
+        Value supplied for ``time range``.
+    stage_range : tuple[int, int] | None
+        Value supplied for ``stage range``.
+    scan_range : tuple[int, int] | None
+        Value supplied for ``scan range``.
+    fov_x_range : tuple[int, int] | None
+        Value supplied for ``fov x range``.
+    create_raw : bool
+        Value supplied for ``create raw``.
+    create_time_projection : bool
+        Value supplied for ``create time projection``.
+    create_tiff : bool
+        Value supplied for ``create tiff``.
+    camera_offset : float | None
+        Value supplied for ``camera offset``.
+    camera_conversion : float | None
+        Value supplied for ``camera conversion``.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
     convert_timelapse(
         zarr_dir,
         output_dir=output_dir,

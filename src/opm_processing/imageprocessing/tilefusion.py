@@ -96,8 +96,7 @@ except Exception:  # noqa: BLE001
 
 
 def _shift_array(arr: Any, shift_vec: Any) -> Any:
-    """
-    Shift an array using GPU if available, else CPU fallback.
+    """Shift an array using GPU if available, else CPU fallback.
 
     Parameters
     ----------
@@ -120,8 +119,7 @@ def _shift_array(arr: Any, shift_vec: Any) -> Any:
 
 
 def _ssim(arr1: Any, arr2: Any, win_size: int) -> float:
-    """
-    Compute SSIM, routing to GPU kernel if available, else CPU skimage.
+    """Compute SSIM, routing to GPU kernel if available, else CPU skimage.
 
     Parameters
     ----------
@@ -163,8 +161,7 @@ def _accumulate_tile_block(
     y_off: int,
     x_off: int,
 ) -> None:
-    """
-    Accumulate a weighted sub-volume into fused and weight buffers (in-place).
+    """Accumulate a weighted sub-volume into fused and weight buffers (in-place).
 
     Parameters
     ----------
@@ -211,8 +208,7 @@ def _accumulate_tile_block(
 
 @njit(parallel=True)
 def _normalize_block(fused: np.ndarray, weight: np.ndarray) -> None:
-    """
-    Normalize fused by weight in-place.
+    """Normalize fused by weight in-place.
 
     Parameters
     ----------
@@ -355,6 +351,11 @@ class TileFusion:
             Absolute residual threshold for registration outliers.
         max_registration_shift_zyx
             Maximum accepted registration correction in ZYX voxels.
+
+        Returns
+        -------
+        None
+            No value is returned.
         """
         self.root = Path(root_path)
         base = self.root.parents[0]
@@ -453,8 +454,12 @@ class TileFusion:
 
     @property
     def debug(self) -> bool:
-        """
-        Get the debug flag.
+        """Get the debug flag.
+
+        Parameters
+        ----------
+        None
+            This callable has no parameters.
 
         Returns
         -------
@@ -465,8 +470,7 @@ class TileFusion:
 
     @debug.setter
     def debug(self, flag: bool) -> None:
-        """
-        Set the debug flag.
+        """Set the debug flag.
 
         Parameters
         ----------
@@ -480,8 +484,12 @@ class TileFusion:
         self._debug = bool(flag)
 
     def _update_profiles(self) -> None:
-        """
-        Recompute 1D feather profiles from blend_pixels and current data shape.
+        """Recompute 1D feather profiles from blend_pixels and current data shape.
+
+        Parameters
+        ----------
+        None
+            This callable has no parameters.
 
         Returns
         -------
@@ -495,8 +503,7 @@ class TileFusion:
 
     @staticmethod
     def _make_1d_profile(length: int, blend: int) -> np.ndarray:
-        """
-        Create a 1D feather profile with linear ramps at both ends.
+        """Create a 1D feather profile with linear ramps at both ends.
 
         Parameters
         ----------
@@ -552,8 +559,7 @@ class TileFusion:
         y_slice: slice,
         x_slice: slice,
     ) -> np.ndarray:
-        """
-        Read a tile subvolume using a global flattened tile index.
+        """Read a tile subvolume using a global flattened tile index.
 
         For time series:
             tile_idx = t_idx * position_dim + pos_idx
@@ -625,8 +631,7 @@ class TileFusion:
     def register_and_score(
         g1: Any, g2: Any, win_size: int
     ) -> tuple[tuple[float, float, float], float]:
-        """
-        Register `g2` to `g1` and compute an SSIM score.
+        """Register `g2` to `g1` and compute an SSIM score.
 
         Steps:
         1) histogram-match g2 -> g1
@@ -697,8 +702,7 @@ class TileFusion:
         ch_idx: int = 0,
         threshold: float | None = None,
     ) -> None:
-        """
-        Register and score all overlapping tile pairs independently per timepoint.
+        """Register and score all overlapping tile pairs independently per timepoint.
 
         Parameters
         ----------
@@ -735,13 +739,39 @@ class TileFusion:
         n_pos = int(self.position_dim)
 
         def bounds_1d(off: int, length: int) -> tuple[int, int]:
-            """Clip a shifted interval to one array dimension."""
+            """Clip a shifted interval to one array dimension.
+
+            Parameters
+            ----------
+            off : int
+                Value supplied for ``off``.
+            length : int
+                Value supplied for ``length``.
+
+            Returns
+            -------
+            tuple[int, int]
+                Result produced by the callable.
+            """
             return max(0, off), min(length, off + length)
 
         def effective_df_for_patch(
             patch: Any, df_zyx: tuple[int, int, int]
         ) -> tuple[int, int, int]:
-            """Clamp downsampling factors to the available patch shape."""
+            """Clamp downsampling factors to the available patch shape.
+
+            Parameters
+            ----------
+            patch : Any
+                Value supplied for ``patch``.
+            df_zyx : tuple[int, int, int]
+                Value supplied for ``df zyx``.
+
+            Returns
+            -------
+            tuple[int, int, int]
+                Result produced by the callable.
+            """
             arr = np.asarray(patch)
             if arr.ndim == 4:
                 zyx = (arr.shape[1], arr.shape[2], arr.shape[3])
@@ -804,7 +834,20 @@ class TileFusion:
                         def read_patch(
                             gidx: int, bnds: list[tuple[int, int]]
                         ) -> np.ndarray:
-                            """Read one bounded tile patch for pairwise registration."""
+                            """Read one bounded tile patch for pairwise registration.
+
+                            Parameters
+                            ----------
+                            gidx : int
+                                Value supplied for ``gidx``.
+                            bnds : list[tuple[int, int]]
+                                Value supplied for ``bnds``.
+
+                            Returns
+                            -------
+                            np.ndarray
+                                Result produced by the callable.
+                            """
                             z0, z1 = bnds[0]
                             y0, y1 = bnds[1]
                             x0, x1 = bnds[2]
@@ -873,8 +916,7 @@ class TileFusion:
     def _solve_global(
         links: list[dict[str, Any]], n_tiles: int, fixed_indices: list[int]
     ) -> np.ndarray:
-        """
-        Solve dense least-squares shifts per-axis with fixed tile constraints.
+        """Solve dense least-squares shifts per-axis with fixed tile constraints.
 
         Parameters
         ----------
@@ -930,8 +972,7 @@ class TileFusion:
         abs_thresh: float,
         iterative: bool,
     ) -> np.ndarray:
-        """
-        Perform robust two-round (optionally iterative) optimization.
+        """Perform robust two-round (optionally iterative) optimization.
 
         Parameters
         ----------
@@ -956,7 +997,20 @@ class TileFusion:
         shifts = self._solve_global(links, n_tiles, fixed_indices)
 
         def residuals(ls: list[dict[str, Any]], sh: np.ndarray) -> np.ndarray:
-            """Calculate Euclidean residuals for registration links."""
+            """Calculate Euclidean residuals for registration links.
+
+            Parameters
+            ----------
+            ls : list[dict[str, Any]]
+                Value supplied for ``ls``.
+            sh : np.ndarray
+                Value supplied for ``sh``.
+
+            Returns
+            -------
+            np.ndarray
+                Result produced by the callable.
+            """
             return np.array(
                 [
                     np.linalg.norm(sh[link["j"]] - sh[link["i"]] - link["t"])
@@ -998,8 +1052,7 @@ class TileFusion:
         rel_thresh: float = 0.5,
         abs_thresh: float = 1.5,
     ) -> None:
-        """
-        Optimize global shifts independently per timepoint, anchoring tile 0.
+        """Optimize global shifts independently per timepoint, anchoring tile 0.
 
         Parameters
         ----------
@@ -1082,8 +1135,7 @@ class TileFusion:
             self.global_offsets[base:hi, :] = d_opt
 
     def save_pairwise_metrics(self, filepath: str | Path) -> None:
-        """
-        Save pairwise link metrics to JSON.
+        """Save pairwise link metrics to JSON.
 
         Parameters
         ----------
@@ -1100,8 +1152,7 @@ class TileFusion:
             json.dump(out, f)
 
     def load_pairwise_metrics(self, filepath: str | Path) -> None:
-        """
-        Load pairwise link metrics from JSON.
+        """Load pairwise link metrics from JSON.
 
         Parameters
         ----------
@@ -1126,8 +1177,12 @@ class TileFusion:
         }
 
     def _compute_fused_image_space(self) -> None:
-        """
-        Compute a global fused space spanning all timepoints.
+        """Compute a global fused space spanning all timepoints.
+
+        Parameters
+        ----------
+        None
+            This callable has no parameters.
 
         Returns
         -------
@@ -1153,8 +1208,12 @@ class TileFusion:
         self.offset_um = (float(min_z), float(min_y), float(min_x))
 
     def _pad_to_chunk_multiple(self) -> None:
-        """
-        Pad the fused shape to multiples of tile shape.
+        """Pad the fused shape to multiples of tile shape.
+
+        Parameters
+        ----------
+        None
+            This callable has no parameters.
 
         Returns
         -------
@@ -1176,7 +1235,20 @@ class TileFusion:
     def _prepare_fused_image(
         self, output_path: str | Path, z_slices_per_write: int = 4
     ) -> tuple[ts.TensorStore, list[int]]:
-        """Create the fused multiscale Image through yaozarrs."""
+        """Create the fused multiscale Image through yaozarrs.
+
+        Parameters
+        ----------
+        output_path : str | Path
+            Value supplied for ``output path``.
+        z_slices_per_write : int
+            Value supplied for ``z slices per write``.
+
+        Returns
+        -------
+        tuple[ts.TensorStore, list[int]]
+            Result produced by the callable.
+        """
         if self.padded_shape is None:
             raise RuntimeError("padded_shape not computed.")
         if self.offset_um is None:
@@ -1245,7 +1317,22 @@ class TileFusion:
         y_size: int,
         x_size: int,
     ) -> tuple[int, int]:
-        """Choose a host-RAM-bounded Y/X accumulator shape for one Z slab."""
+        """Choose a host-RAM-bounded Y/X accumulator shape for one Z slab.
+
+        Parameters
+        ----------
+        z_depth : int
+            Value supplied for ``z depth``.
+        y_size : int
+            Value supplied for ``y size``.
+        x_size : int
+            Value supplied for ``x size``.
+
+        Returns
+        -------
+        tuple[int, int]
+            Result produced by the callable.
+        """
         available = int(psutil.virtual_memory().available)
         budget = max(1, int(available * self.fusion_ram_fraction))
 
@@ -1267,8 +1354,12 @@ class TileFusion:
         return int(block_y), int(block_x)
 
     def _fuse_by_blocks(self) -> None:
-        """
-        Fuse all timepoints into the global fused store using bounded block writes.
+        """Fuse all timepoints into the global fused store using bounded block writes.
+
+        Parameters
+        ----------
+        None
+            This callable has no parameters.
 
         Returns
         -------
@@ -1397,7 +1488,18 @@ class TileFusion:
             pending_writes.popleft().result()
 
     def _write_multiscales(self) -> None:
-        """Downsample scale 0 into bounded spatial blocks."""
+        """Downsample scale 0 into bounded spatial blocks.
+
+        Parameters
+        ----------
+        None
+            This callable has no parameters.
+
+        Returns
+        -------
+        None
+            No value is returned.
+        """
         inp = self._multiscale_arrays["0"]
         for level, factor in enumerate(self.multiscale_factors, start=1):
             out = self._multiscale_arrays[str(level)]
@@ -1463,8 +1565,12 @@ class TileFusion:
                                 ).result()
 
     def run(self) -> None:
-        """
-        Execute the full registration + fusion pipeline.
+        """Execute the full registration + fusion pipeline.
+
+        Parameters
+        ----------
+        None
+            This callable has no parameters.
 
         Returns
         -------
