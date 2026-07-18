@@ -42,7 +42,7 @@ def test_process_runs_end_to_end_on_opm_v2_projection_zarr(
         stage_z_flipped=False,
     )
 
-    collection_path = fixture.path.parent / f"{fixture.path.stem}_projection.zarr"
+    collection_path = fixture.path.parent / f"{fixture.path.stem}_projection.ome.zarr"
     collection = open_position_collection(collection_path)
     assert collection.shape == (2, 1, 2, 1, 16, 18)
     assert collection.attributes["channels"] == list(fixture.channel_names)
@@ -59,7 +59,7 @@ def test_process_runs_end_to_end_on_opm_v2_projection_zarr(
     ).astype(np.uint16)
     np.testing.assert_array_equal(processed[:, :, 0], expected)
 
-    fused_path = fixture.path.parent / f"{fixture.path.stem}_stagefused.zarr"
+    fused_path = fixture.path.parent / f"{fixture.path.stem}_stagefused.ome.zarr"
     fused = open_image_array(fused_path).read().result()
     assert fused.shape == (2, 2, 1, 16, 24)
     np.testing.assert_array_equal(fused[..., :16, :18], processed)
@@ -93,7 +93,7 @@ def test_process_runs_normal_skewed_opm_v2_acquisition(opm_v2_skewed_zarr):
         pixel_size=fixture.pixel_size_um,
         crop_after_deskew=False,
     )
-    deskewed_path = fixture.path.parent / f"{fixture.path.stem}_deskewed.zarr"
+    deskewed_path = fixture.path.parent / f"{fixture.path.stem}_deskewed.ome.zarr"
     deskewed_collection = open_position_collection(deskewed_path)
     assert deskewed_collection.shape == (1, 1, 1, *expected_zyx)
     assert deskewed_collection.attributes["channels"] == list(
@@ -112,7 +112,7 @@ def test_process_runs_normal_skewed_opm_v2_acquisition(opm_v2_skewed_zarr):
     assert np.count_nonzero(deskewed) > 0
     assert deskewed.max() <= np.iinfo(np.uint16).max
 
-    max_path = fixture.path.parent / f"{fixture.path.stem}_max_z_deskewed.zarr"
+    max_path = fixture.path.parent / f"{fixture.path.stem}_max_z_deskewed.ome.zarr"
     max_collection = open_position_collection(max_path)
     max_projection = max_collection.arrays[0].read().result()
     assert max_collection.shape == (1, 1, 1, 1, expected_zyx[1], expected_zyx[2])

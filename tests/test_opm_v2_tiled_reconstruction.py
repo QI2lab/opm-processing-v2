@@ -114,9 +114,9 @@ def _assert_tiled_reconstruction(
         **processing_options,
     )
 
-    deskewed_path = fixture.path.parent / f"{fixture.path.stem}_deskewed.zarr"
+    deskewed_path = fixture.path.parent / f"{fixture.path.stem}_deskewed.ome.zarr"
     deconvolved_path = (
-        fixture.path.parent / f"{fixture.path.stem}_decon_deskewed.zarr"
+        fixture.path.parent / f"{fixture.path.stem}_decon_deskewed.ome.zarr"
     )
     deskewed_collection = open_position_collection(deskewed_path)
     deconvolved_collection = open_position_collection(deconvolved_path)
