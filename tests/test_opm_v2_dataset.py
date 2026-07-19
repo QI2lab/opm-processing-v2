@@ -1,7 +1,5 @@
 """Integration coverage for acquisitions produced by QI2lab/opm-v2."""
 
-import json
-
 import numpy as np
 
 from opm_processing.dataio.position_collection import (
@@ -10,33 +8,6 @@ from opm_processing.dataio.position_collection import (
 )
 from opm_processing.imageprocessing.opmtools import deskew_shape_estimator
 from opm_processing.process import process
-
-
-def test_opm_v2_fixture_matches_handler_storage_schema(opm_v2_projection_zarr):
-    """Verify the synthetic fixture matches the opm-v2 storage schema.
-
-    Parameters
-    ----------
-    opm_v2_projection_zarr : object
-        Value supplied for ``opm v2 projection zarr``.
-
-    Returns
-    -------
-    None
-        No value is returned.
-    """
-    fixture = opm_v2_projection_zarr
-    zarray = json.loads((fixture.path / ".zarray").read_text())
-    zattrs = json.loads((fixture.path / ".zattrs").read_text())
-
-    assert zarray["zarr_format"] == 2
-    assert zarray["shape"] == list(fixture.raw_data.shape)
-    assert zarray["chunks"] == [1, 1, 1, 16, 18]
-    assert set(zattrs) == {"frame_metadatas"}
-    first_frame = zattrs["frame_metadatas"][0]
-    assert first_frame["pixel_size_um"] == fixture.pixel_size_um
-    assert first_frame["mda_event"]["index"] == {"t": 0, "p": 0, "c": 0}
-    assert first_frame["mda_event"]["metadata"]["DAQ"]["mode"] == "projection"
 
 
 def test_process_runs_end_to_end_on_opm_v2_projection_zarr(

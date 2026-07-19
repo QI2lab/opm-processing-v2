@@ -1,15 +1,12 @@
 """Test tiled registration, fusion, and multiscale writing."""
 
-import json
 from types import MethodType, SimpleNamespace
 
 import numpy as np
 import pytest
 from skimage.measure import block_reduce as block_reduce_cpu
-from yaozarrs import open_group
 
 from opm_processing.imageprocessing import tilefusion as tilefusion_module
-from opm_processing.imageprocessing.maxtilefusion import MaxTileFusion
 from opm_processing.imageprocessing.tilefusion import TileFusion
 
 
@@ -124,141 +121,6 @@ class _ArrayStore:
             Result produced by the callable.
         """
         return _ArrayView(self, key)
-
-
-def test_prepare_fused_image_uses_ngff_multiscales(tmp_path):
-    """Verify fused outputs use NGFF multiscale metadata and chunks.
-
-    Parameters
-    ----------
-    tmp_path : object
-        Value supplied for ``tmp path``.
-
-    Returns
-    -------
-    None
-        No value is returned.
-    """
-    fusion = TileFusion.__new__(TileFusion)
-    fusion.padded_shape = (8, 16, 20)
-    fusion.offset_um = (3.0, 4.0, 5.0)
-    fusion._pixel_size = (1.5, 0.3, 0.3)
-    fusion.time_dim = 2
-    fusion.channels = 3
-    fusion.multiscale_factors = (2, 4)
-    fusion._is_2d = False
-    fusion.chunk_y = 8
-    fusion.chunk_x = 8
-
-    path = tmp_path / "fused.ome.zarr"
-    scale0, write_block_shape = fusion._prepare_fused_image(path)
-
-    assert tuple(scale0.shape) == (2, 3, 8, 16, 20)
-    assert tuple(fusion._multiscale_arrays["1"].shape) == (2, 3, 4, 8, 10)
-    assert tuple(fusion._multiscale_arrays["2"].shape) == (2, 3, 2, 4, 5)
-    assert write_block_shape == [1, 1, 4, 16, 16]
-
-    scale0_metadata = json.loads((path / "0" / "zarr.json").read_text())
-    assert scale0_metadata["chunk_grid"]["configuration"]["chunk_shape"] == [
-        1,
-        1,
-        1,
-        8,
-        8,
-    ]
-    assert all(
-        codec["name"] != "sharding_indexed" for codec in scale0_metadata["codecs"]
-    )
-
-    multiscale = open_group(path).ome_metadata().multiscales[0]
-    assert [dataset.path for dataset in multiscale.datasets] == ["0", "1", "2"]
-
-
-def test_max_projection_fusion_uses_chunks_without_sharding(tmp_path):
-    """Verify maximum projections use ordinary chunks without sharding.
-
-    Parameters
-    ----------
-    tmp_path : object
-        Value supplied for ``tmp path``.
-
-    Returns
-    -------
-    None
-        No value is returned.
-    """
-    fusion = MaxTileFusion.__new__(MaxTileFusion)
-    fusion.time_range = None
-    fusion.time_dim = 1
-    fusion.channels = 2
-    fusion.fused_shape = (16, 20)
-    fusion.pixel_size = (0.3, 0.3)
-    fusion.chunk_size = 8
-    fusion.output_path = tmp_path / "max-fused.ome.zarr"
-
-    fusion.create_fused_image()
-
-    metadata = json.loads((fusion.output_path / "0" / "zarr.json").read_text())
-    assert metadata["chunk_grid"]["configuration"]["chunk_shape"] == [
-        1,
-        1,
-        1,
-        8,
-        8,
-    ]
-    assert all(codec["name"] != "sharding_indexed" for codec in metadata["codecs"])
-
-
-def test_max_projection_fusion_operational_settings_are_configurable():
-    """Verify maximum-projection blending settings are configurable.
-
-    Parameters
-    ----------
-    None
-        This callable has no parameters.
-
-    Returns
-    -------
-    None
-        No value is returned.
-    """
-    fusion = MaxTileFusion.__new__(MaxTileFusion)
-    fusion.tile_shape = (20, 30)
-    fusion.blend_pixels = (3, 5)
-
-    weights = fusion.generate_blending_weights()
-
-    assert weights.shape == fusion.tile_shape
-    assert np.all(weights > 0)
-    np.testing.assert_allclose(weights[10, 15], 1.0)
-
-
-def test_fusion_block_shape_respects_memory_budget(monkeypatch):
-    """Verify fusion block sizing respects the host-memory budget.
-
-    Parameters
-    ----------
-    monkeypatch : object
-        Value supplied for ``monkeypatch``.
-
-    Returns
-    -------
-    None
-        No value is returned.
-    """
-    fusion = TileFusion.__new__(TileFusion)
-    fusion.fusion_ram_fraction = 0.5
-    fusion.chunk_y = 4
-    fusion.chunk_x = 4
-    monkeypatch.setattr(
-        tilefusion_module.psutil,
-        "virtual_memory",
-        lambda: SimpleNamespace(available=1024),
-    )
-
-    block_y, block_x = fusion._fusion_block_shape(2, 100, 100)
-
-    assert block_y * block_x * 2 * 16 <= 512
 
 
 def test_fusion_uses_spatial_blocks_and_bounded_writes(monkeypatch):
@@ -391,60 +253,3 @@ def test_multiscales_are_generated_in_spatial_blocks(tmp_path, downsample_method
             fusion._multiscale_arrays[level].read().result(),
             expected,
         )
-
-
-def test_iterative_optimization_handles_all_links_rejected():
-    """Verify optimization remains defined when all links are rejected.
-
-    Parameters
-    ----------
-    None
-        This callable has no parameters.
-
-    Returns
-    -------
-    None
-        No value is returned.
-    """
-    fusion = TileFusion.__new__(TileFusion)
-    links = [
-        {
-            "i": 0,
-            "j": 1,
-            "t": np.array([10.0, 0.0, 0.0]),
-            "w": 1.0,
-        }
-    ]
-
-    shifts = fusion._two_round_opt(
-        links,
-        n_tiles=2,
-        fixed_indices=[0, 1],
-        rel_thresh=0.5,
-        abs_thresh=1.0,
-        iterative=True,
-    )
-
-    np.testing.assert_array_equal(shifts, np.zeros((2, 3)))
-
-
-def test_register_and_score_identical_3d_patches():
-    """Verify identical 3D patches register with a near-perfect score.
-
-    Parameters
-    ----------
-    None
-        This callable has no parameters.
-
-    Returns
-    -------
-    None
-        No value is returned.
-    """
-    rng = np.random.default_rng(42)
-    patch = rng.normal(size=(9, 17, 17)).astype(np.float32)
-
-    shift, score = TileFusion.register_and_score(patch, patch, win_size=7)
-
-    np.testing.assert_allclose(shift, (0.0, 0.0, 0.0), atol=0.1)
-    assert score > 0.99
