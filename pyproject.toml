@@ -15,10 +15,10 @@ allow-direct-references = true
 # https://peps.python.org/pep-0621/
 [project]
 name = "opm-processing-v2"
-version = "0.6.0"
+version = "0.10.0"
 description = "qi2lab OPM post-processing package v2"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.13"
 license = { text = "BSD-3-Clause" }
 authors = [{ name = "Douglas Shepherd", email = "douglas.shepherd@asu.edu" }]
 # https://pypi.org/classifiers/
@@ -27,25 +27,71 @@ classifiers = [
     "License :: OSI Approved :: BSD License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
     "Typing :: Typed",
 ]
 # add your package dependencies here
 dependencies = [
-    "typer"
+    "basicpy @ git+https://github.com/QI2lab/BaSiCPy.git@main",
+    "cmap",
+    "napari[all]",
+    "napari-ome-zarr>=0.9.0",
+    "napari-plugin-engine",
+    "numba",
+    "numpy",
+    "ome-types[lxml]",
+    "psutil",
+    "psfmodels",
+    "pyyaml",
+    "rich",
+    "ryomen",
+    "scikit-image",
+    "scipy",
+    "tensorstore",
+    "tifffile",
+    "torch",
+    "torchvision",
+    "tqdm",
+    "typer",
+    "yaozarrs[io,write-tensorstore] @ git+https://github.com/dpshepherd/yaozarrs.git@fix-v3-extra-attributes-location",
+    "zarr>3.0.8",
 ]
 
-# https://peps.python.org/pep-0621/#dependencies-optional-dependencies
-# "extras" (e.g. for `pip install .[test]`)
 [project.optional-dependencies]
-# add dependencies used for testing here
-test = ["pytest", "pytest-cov"]
+gpu = [
+    "cucim-cu12==26.6.*; sys_platform == 'linux'",
+    "cupy-cuda12x[ctk]>=14.1.1",
+]
 
-# add anything else you like to have in your dev environment here
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu129", marker = "extra == 'gpu' and sys_platform == 'linux'" },
+]
+torchvision = [
+    { index = "pytorch-cu129", marker = "extra == 'gpu' and sys_platform == 'linux'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+explicit = true
+
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com"
+
+[tool.uv]
+default-groups = []
+
+[dependency-groups]
 dev = [
     "ipython",
     "pdbpp",  # https://github.com/pdbpp/pdbpp
+    "pytest",
+    "pytest-cov",
     "rich",  # https://github.com/Textualize/rich
+    "ruff",
 ]
 
 [project.urls]
@@ -56,8 +102,9 @@ repository = "https://github.com/qi2lab/opm-processing-v2"
 # https://peps.python.org/pep-0621/#entry-points
 # same as console_scripts entry point
 [project.scripts]
-setup-cuda = "opm_processing.setup_cuda:main"
 process = "opm_processing.process:main"
+inspect-opm = "opm_processing.dataio.acquisition:main"
+convert-timelapse = "opm_processing.dataio.convert_timelapse_data:app"
 display = "opm_processing.display:main"
 fuse = "opm_processing.fuse:main"
 
@@ -65,14 +112,28 @@ fuse = "opm_processing.fuse:main"
 # tomatoes = "opm_processing:main_tomatoes"
 
 [tool.ruff]
+
+[tool.ruff.lint]
+extend-select = ["D"]
 ignore = ["E402"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
 
 
 # https://docs.pytest.org/
 [tool.pytest.ini_options]
 minversion = "7.0"
 testpaths = ["tests"]
-filterwarnings = ["error"]
+addopts = "-p no:zarr"
+markers = [
+    "gpu: correctness tests that execute CUDA code on a real NVIDIA GPU",
+]
+filterwarnings = [
+    "error",
+    "ignore:CUDA path could not be detected.*:UserWarning:cupy._environment",
+    "ignore::pydantic.warnings.PydanticDeprecatedSince20",
+]
 
 # https://coverage.readthedocs.io/
 [tool.coverage.report]

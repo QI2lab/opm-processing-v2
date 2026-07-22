@@ -12,7 +12,7 @@ Pipeline summary
    (two-round iterative outlier rejection) with tile 0 anchored to zero offset.
 3) Build a *global* fused coordinate space spanning all timepoints.
 4) Fuse each timepoint into the shared global space using weighted accumulation.
-5) Build NGFF multiscales and write OME-NGFF v0.5 JSON for Zarr v3 stores.
+5) Build and stream NGFF multiscales through yaozarrs.
 
 Notes
 -----
@@ -23,21 +23,34 @@ Notes
 
 import gc
 import json
+import math
+from collections import deque
 from collections.abc import Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+import psutil
 import tensorstore as ts
-from numba import njit, prange
-from tqdm import trange, tqdm
+from numba import njit
+from tqdm import tqdm, trange
+from yaozarrs import v05
+from yaozarrs.write.v05 import prepare_image
+
+from opm_processing.cuda import preload_cuda_libraries
+from opm_processing.dataio.acquisition import (
+    acquisition_stem,
+    resolve_acquisition_path,
+)
+from opm_processing.dataio.position_collection import open_position_collection
 
 
 # -----------------------------------------------------------------------------
 # Optional GPU stack (safe globals)
 # -----------------------------------------------------------------------------
 USING_GPU = False
+GPU_IMPORT_ERROR: Exception | None = None
 
 cp: Any | None = None
 cp_shift: Any | None = None
@@ -51,6 +64,10 @@ _shift_cpu: Any | None = None
 _ssim_cpu: Any | None = None
 
 xp: Any = np
+
+DEFAULT_FUSION_WORKERS = 8
+
+preload_cuda_libraries()
 
 try:
     import cupy as _cp  # type: ignore
@@ -70,8 +87,9 @@ try:
     cp_shift = _cp_shift
     ssim_cuda = _ssim_cuda
     USING_GPU = True
-except Exception as exc:  # noqa: BLE001
+except Exception as error:  # noqa: BLE001
     # GPU stack unavailable; fall back to CPU.
+    GPU_IMPORT_ERROR = error
     from scipy.ndimage import shift as _cpu_shift  # type: ignore
     from skimage.exposure import match_histograms as _mh  # type: ignore
     from skimage.measure import block_reduce as _br  # type: ignore
@@ -85,9 +103,34 @@ except Exception as exc:  # noqa: BLE001
     _ssim_cpu = _cpu_ssim
     USING_GPU = False
 
+
+def fusion_backend_status() -> dict[str, str | bool | int | None]:
+    """Return observable registration and fusion backend information."""
+    return {
+        "gpu_registration": USING_GPU,
+        "registration_backend": "cupy/cucim" if USING_GPU else "numpy/scikit-image",
+        "fusion_backend": "threaded-blocks/numba-cpu",
+        "fusion_workers": DEFAULT_FUSION_WORKERS,
+        "gpu_error": None if GPU_IMPORT_ERROR is None else repr(GPU_IMPORT_ERROR),
+    }
+
+
+def require_gpu_backend() -> None:
+    """Raise with the captured initialization error when CUDA is unavailable."""
+    if USING_GPU:
+        return
+    detail = "unknown initialization error"
+    if GPU_IMPORT_ERROR is not None:
+        detail = f"{type(GPU_IMPORT_ERROR).__name__}: {GPU_IMPORT_ERROR}"
+    raise RuntimeError(
+        "GPU registration was requested, but the CuPy/cuCIM backend could not "
+        f"initialize ({detail}). Install/run the project's gpu extra; on Windows, "
+        "also install the local pure-Python cuCIM package described in README.md."
+    )
+
+
 def _shift_array(arr: Any, shift_vec: Any) -> Any:
-    """
-    Shift an array using GPU if available, else CPU fallback.
+    """Shift an array using GPU if available, else CPU fallback.
 
     Parameters
     ----------
@@ -110,8 +153,7 @@ def _shift_array(arr: Any, shift_vec: Any) -> Any:
 
 
 def _ssim(arr1: Any, arr2: Any, win_size: int) -> float:
-    """
-    Compute SSIM, routing to GPU kernel if available, else CPU skimage.
+    """Compute SSIM, routing to GPU kernel if available, else CPU skimage.
 
     Parameters
     ----------
@@ -143,8 +185,8 @@ def _ssim(arr1: Any, arr2: Any, win_size: int) -> float:
     return float(_ssim_cpu(arr1_np, arr2_np, win_size=win_size, data_range=data_range))
 
 
-@njit(parallel=True)
-def _accumulate_tile_shard(
+@njit(nogil=True)
+def _accumulate_tile_block(
     fused: np.ndarray,
     weight: np.ndarray,
     sub: np.ndarray,
@@ -153,13 +195,12 @@ def _accumulate_tile_shard(
     y_off: int,
     x_off: int,
 ) -> None:
-    """
-    Accumulate a weighted sub-volume into fused and weight buffers (in-place).
+    """Accumulate a weighted sub-volume into fused and weight buffers (in-place).
 
     Parameters
     ----------
     fused : numpy.ndarray
-        Float32 accumulation buffer of shape (C, dz, Y, X) for the current shard.
+        Float32 accumulation buffer of shape (C, dz, Y, X) for the current block.
     weight : numpy.ndarray
         Float32 weight accumulation buffer of shape (C, dz, Y, X).
     sub : numpy.ndarray
@@ -167,7 +208,7 @@ def _accumulate_tile_shard(
     w3d : numpy.ndarray
         Float32 per-voxel weights of shape (sub_dz, Y_tile, X_tile).
     z_off : int
-        Offset of `sub` z=0 within `fused` shard coordinates.
+        Offset of `sub` z=0 within `fused` block coordinates.
     y_off : int
         Offset of `sub` y=0 within fused global Y coordinates.
     x_off : int
@@ -182,7 +223,7 @@ def _accumulate_tile_shard(
     _, sub_dz, y_sub, x_sub = sub.shape
     total = sub_dz * y_sub
 
-    for idx in prange(total):
+    for idx in range(total):
         dz_i = idx // y_sub
         y_i = idx % y_sub
         gz = z_off + dz_i
@@ -199,10 +240,9 @@ def _accumulate_tile_shard(
                 base_w[gx] += w_val
 
 
-@njit(parallel=True)
-def _normalize_shard(fused: np.ndarray, weight: np.ndarray) -> None:
-    """
-    Normalize fused by weight in-place.
+@njit(nogil=True)
+def _normalize_block(fused: np.ndarray, weight: np.ndarray) -> None:
+    """Normalize fused by weight in-place.
 
     Parameters
     ----------
@@ -219,7 +259,7 @@ def _normalize_shard(fused: np.ndarray, weight: np.ndarray) -> None:
     c_dim, dz, y_dim, x_dim = fused.shape
     total = c_dim * dz * y_dim
 
-    for idx in prange(total):
+    for idx in range(total):
         c = idx // (dz * y_dim)
         rem = idx % (dz * y_dim)
         z_i = rem // y_dim
@@ -229,6 +269,73 @@ def _normalize_shard(fused: np.ndarray, weight: np.ndarray) -> None:
         for x_i in range(x_dim):
             w_val = base_w[x_i]
             base_f[x_i] = base_f[x_i] / w_val if w_val > 0 else 0.0
+
+
+def _partition_fusion_block(
+    bounds: tuple[int, int, int, int, int, int],
+    contributors: Sequence[tuple[int, tuple[int, int, int]]],
+    tile_shape: tuple[int, int, int],
+) -> list[
+    tuple[
+        tuple[int, int, int, int, int, int],
+        list[tuple[int, tuple[int, int, int]]],
+    ]
+]:
+    """Partition a block wherever its set of contributing tiles changes.
+
+    This preserves the block-oriented memory bound while exposing exclusive tile
+    interiors for direct copying. Adjacent X regions with identical contributors
+    are merged to avoid unnecessary TensorStore reads and writes.
+    """
+    z0, z1, y0, y1, x0, x1 = bounds
+    tile_z, tile_y, tile_x = tile_shape
+    cuts = [{z0, z1}, {y0, y1}, {x0, x1}]
+    for _, (oz, oy, ox) in contributors:
+        for axis_cuts, lo, hi, tile_lo, tile_length in (
+            (cuts[0], z0, z1, oz, tile_z),
+            (cuts[1], y0, y1, oy, tile_y),
+            (cuts[2], x0, x1, ox, tile_x),
+        ):
+            axis_cuts.add(max(lo, tile_lo))
+            axis_cuts.add(min(hi, tile_lo + tile_length))
+
+    z_cuts, y_cuts, x_cuts = (sorted(axis) for axis in cuts)
+    regions: list[
+        tuple[
+            tuple[int, int, int, int, int, int],
+            list[tuple[int, tuple[int, int, int]]],
+        ]
+    ] = []
+    for rz0, rz1 in zip(z_cuts, z_cuts[1:]):
+        for ry0, ry1 in zip(y_cuts, y_cuts[1:]):
+            for rx0, rx1 in zip(x_cuts, x_cuts[1:]):
+                region_contributors = [
+                    (p, offset)
+                    for p, offset in contributors
+                    if offset[0] <= rz0
+                    and offset[0] + tile_z >= rz1
+                    and offset[1] <= ry0
+                    and offset[1] + tile_y >= ry1
+                    and offset[2] <= rx0
+                    and offset[2] + tile_x >= rx1
+                ]
+                if not region_contributors:
+                    continue
+                region = (rz0, rz1, ry0, ry1, rx0, rx1)
+                if (
+                    regions
+                    and regions[-1][1] == region_contributors
+                    and regions[-1][0][:4] == region[:4]
+                    and regions[-1][0][5] == region[4]
+                ):
+                    previous, previous_contributors = regions[-1]
+                    regions[-1] = (
+                        (*previous[:5], region[5]),
+                        previous_contributors,
+                    )
+                else:
+                    regions.append((region, region_contributors))
+    return regions
 
 
 class TileFusion:
@@ -246,8 +353,9 @@ class TileFusion:
     ----------
     root_path : str or pathlib.Path
         Path used to infer the processed datastore location. The code searches for:
-        `{stem}_decon_deskewed.zarr`, `{stem}_deskewed.zarr`,
-        `{stem}_decon_projection.zarr`, `{stem}_projection.zarr`.
+        `{stem}_decon_deskewed.ome.zarr`, `{stem}_deskewed.ome.zarr`,
+        `{stem}_decon_projection.ome.zarr`, `{stem}_projection.ome.zarr`,
+        followed by their legacy `.zarr` names.
     blend_pixels : tuple[int, int, int], default=(20, 600, 400)
         Feather ramp widths (bz, by, bx) used to build 1D weight profiles.
     downsample_factors : tuple[int, int, int], default=(3, 5, 5)
@@ -261,7 +369,7 @@ class TileFusion:
     resolution_multiples : sequence[int | sequence[int]], default=((1,1,1), ..., (32,32,32))
         Spatial scale multipliers recorded into NGFF metadata for each pyramid level.
     max_workers : int, default=8
-        TensorStore I/O concurrency limit.
+        Maximum number of fusion blocks rendered concurrently.
     debug : bool, default=False
         If True, emits debug logs.
     metrics_filename : str, default="stitching_metrics.json"
@@ -270,6 +378,10 @@ class TileFusion:
         Channel index used for registration.
     multiscale_downsample : {"stride", "block_mean"}, default="stride"
         Method for multiscale downsampling.
+    fusion_ram_fraction : float, default=0.25
+        Fraction of currently available host RAM available to fusion buffers.
+    max_in_flight_writes : int, default=2
+        Maximum number of TensorStore writes retained before applying backpressure.
     """
 
     def __init__(
@@ -288,55 +400,109 @@ class TileFusion:
             (16, 16, 16),
             (32, 32, 32),
         ),
-        max_workers: int = 8,
+        max_workers: int = DEFAULT_FUSION_WORKERS,
         debug: bool = False,
         metrics_filename: str = "stitching_metrics.json",
         channel_to_use: int = 0,
         multiscale_downsample: str = "stride",
+        fusion_ram_fraction: float = 0.25,
+        max_in_flight_writes: int = 2,
+        chunk_shape_yx: tuple[int, int] = (1024, 1024),
+        optimization_rel_threshold: float = 0.5,
+        optimization_abs_threshold: float = 1.5,
+        max_registration_shift_zyx: tuple[int, int, int] = (20, 50, 100),
     ) -> None:
-        self.root = Path(root_path)
-        base = self.root.parents[0]
-        stem = self.root.stem
+        """Initialize registration and fusion for a processed acquisition.
 
-        data_path = base / f"{stem}_decon_deskewed.zarr"
-        if not data_path.exists():
-            data_path = base / f"{stem}_deskewed.zarr"
-            if not data_path.exists():
-                data_path = base / f"{stem}_decon_projection.zarr"
-                if not data_path.exists():
-                    data_path = base / f"{stem}_projection.zarr"
-                    if not data_path.exists():
-                        raise FileNotFoundError("Processed data store not found.")
+        Parameters
+        ----------
+        root_path
+            Original acquisition path used to discover processed collections.
+        blend_pixels
+            Feathering width in ZYX voxels.
+        downsample_factors
+            Registration downsampling factors in ZYX order.
+        ssim_window
+            Structural-similarity window width.
+        threshold
+            Minimum accepted pairwise registration score.
+        multiscale_factors
+            Downsampling factors for pyramid levels.
+        resolution_multiples
+            NGFF spatial scale multiples for pyramid levels.
+        max_workers
+            Maximum number of fusion blocks rendered concurrently.
+        debug
+            Whether to emit diagnostic messages.
+        metrics_filename
+            Pairwise-registration metrics filename.
+        channel_to_use
+            Channel index used for registration.
+        multiscale_downsample
+            Pyramid downsampling method.
+        fusion_ram_fraction
+            Fraction of available host RAM allocated to fusion buffers.
+        max_in_flight_writes
+            Maximum number of pending TensorStore writes.
+        chunk_shape_yx
+            Spatial output chunk shape.
+        optimization_rel_threshold
+            Relative residual threshold for registration outliers.
+        optimization_abs_threshold
+            Absolute residual threshold for registration outliers.
+        max_registration_shift_zyx
+            Maximum accepted registration correction in ZYX voxels.
+
+        Returns
+        -------
+        None
+            No value is returned.
+        """
+        self.root = resolve_acquisition_path(root_path)
+        base = self.root.parents[0]
+        stem = acquisition_stem(self.root)
+
+        candidates = (
+            base / f"{stem}_decon_deskewed.ome.zarr",
+            base / f"{stem}_deskewed.ome.zarr",
+            base / f"{stem}_decon_projection.ome.zarr",
+            base / f"{stem}_projection.ome.zarr",
+            base / f"{stem}_decon_deskewed.zarr",
+            base / f"{stem}_deskewed.zarr",
+            base / f"{stem}_decon_projection.zarr",
+            base / f"{stem}_projection.zarr",
+        )
+        data_path = next((path for path in candidates if path.exists()), None)
+        if data_path is None:
+            checked = ", ".join(str(path) for path in candidates)
+            raise FileNotFoundError(
+                f"Processed data store not found. Checked: {checked}"
+            )
         self.data = data_path
 
-        with open(self.data / "zarr.json", "r") as f:
-            meta = json.load(f)
-
-        ds = ts.open(
-            {"driver": "zarr3", "kvstore": {"driver": "file", "path": str(self.data)}}
-        ).result()
-
-        self._tile_positions: list[tuple[float, float, float]] = [
-            tuple(
-                meta["attributes"]["per_index_metadata"][str(t)][str(p)]["0"][
-                    "stage_position"
-                ]
-            )
-            for t in range(int(ds.shape[0]))
-            for p in range(int(ds.shape[1]))
+        collection = open_position_collection(self.data)
+        self.position_arrays = collection.arrays
+        self._tile_positions = [
+            tuple(position)
+            for _ in range(collection.shape[0])
+            for position in collection.attributes["stage_positions"]
         ]
         self._pixel_size: tuple[float, float, float] = tuple(
-            float(x) for x in meta["attributes"]["deskewed_voxel_size_um"]
+            float(x) for x in collection.attributes["deskewed_voxel_size_um"]
         )
 
         self.downsample_factors = tuple(int(x) for x in downsample_factors)
         self.ssim_window = int(ssim_window)
         self.threshold = float(threshold)
         self.multiscale_factors = tuple(int(x) for x in multiscale_factors)
+        if any(value < 1 for value in self.multiscale_factors):
+            raise ValueError("multiscale_factors must contain positive integers")
         self.resolution_multiples: list[tuple[int, int, int]] = [
             tuple(r) if hasattr(r, "__len__") else (int(r), int(r), int(r))
             for r in resolution_multiples
         ]
+        if max_workers < 1:
+            raise ValueError("max_workers must be at least 1")
         self._max_workers = int(max_workers)
         self._debug = bool(debug)
         self.metrics_filename = str(metrics_filename)
@@ -346,39 +512,40 @@ class TileFusion:
         if multiscale_downsample not in ("stride", "block_mean"):
             raise ValueError('multiscale_downsample must be "stride" or "block_mean".')
         self.multiscale_downsample = multiscale_downsample
+        if not 0.0 < fusion_ram_fraction <= 1.0:
+            raise ValueError("fusion_ram_fraction must satisfy 0 < value <= 1")
+        if max_in_flight_writes < 1:
+            raise ValueError("max_in_flight_writes must be at least 1")
+        self.fusion_ram_fraction = float(fusion_ram_fraction)
+        self.max_in_flight_writes = int(max_in_flight_writes)
+        if len(chunk_shape_yx) != 2 or any(value < 1 for value in chunk_shape_yx):
+            raise ValueError("chunk_shape_yx must contain two positive values")
+        if optimization_rel_threshold < 0 or optimization_abs_threshold < 0:
+            raise ValueError("optimization thresholds must be nonnegative")
+        self.chunk_y, self.chunk_x = (int(value) for value in chunk_shape_yx)
+        self.optimization_rel_threshold = float(optimization_rel_threshold)
+        self.optimization_abs_threshold = float(optimization_abs_threshold)
+        if len(max_registration_shift_zyx) != 3 or any(
+            value < 0 for value in max_registration_shift_zyx
+        ):
+            raise ValueError(
+                "max_registration_shift_zyx must contain three nonnegative values"
+            )
+        self.max_registration_shift_zyx = tuple(
+            int(value) for value in max_registration_shift_zyx
+        )
 
-        spec = {
-            "context": {
-                "file_io_concurrency": {"limit": self._max_workers},
-                "data_copy_concurrency": {"limit": self._max_workers},
-            },
-            "driver": "zarr3",
-            "kvstore": {"driver": "file", "path": str(self.data)},
-        }
-        self.ts = ts.open(spec, create=False, open=True).result()
-
-        shape = self.ts.shape
-        if len(shape) == 6:
-            (
-                self.time_dim,
-                self.position_dim,
-                self.channels,
-                self.z_dim,
-                self.y_dim,
-                self.x_dim,
-            ) = shape
-            self._is_2d = False
-        elif len(shape) == 5:
-            self.time_dim, self.position_dim, self.channels, self.y_dim, self.x_dim = shape
-            self.z_dim = 1
-            self._is_2d = True
-        else:
-            raise ValueError(f"Unsupported data rank {len(shape)}; expected 5 or 6.")
+        (
+            self.time_dim,
+            self.position_dim,
+            self.channels,
+            self.z_dim,
+            self.y_dim,
+            self.x_dim,
+        ) = collection.shape
+        self._is_2d = self.z_dim == 1
 
         self._update_profiles()
-
-        self.chunk_y = 1024
-        self.chunk_x = 1024
 
         self.pairwise_metrics: dict[tuple[int, int], tuple[int, int, int, float]] = {}
         self.global_offsets: np.ndarray | None = None
@@ -388,12 +555,16 @@ class TileFusion:
         self.padded_shape: tuple[int, int, int] | None = None
 
         self.fused_ts: ts.TensorStore | None = None
-        self.shard_chunk: list[int] | None = None
+        self.write_block_shape: list[int] | None = None
 
     @property
     def debug(self) -> bool:
-        """
-        Get the debug flag.
+        """Get the debug flag.
+
+        Parameters
+        ----------
+        None
+            This callable has no parameters.
 
         Returns
         -------
@@ -404,8 +575,7 @@ class TileFusion:
 
     @debug.setter
     def debug(self, flag: bool) -> None:
-        """
-        Set the debug flag.
+        """Set the debug flag.
 
         Parameters
         ----------
@@ -419,8 +589,12 @@ class TileFusion:
         self._debug = bool(flag)
 
     def _update_profiles(self) -> None:
-        """
-        Recompute 1D feather profiles from blend_pixels and current data shape.
+        """Recompute 1D feather profiles from blend_pixels and current data shape.
+
+        Parameters
+        ----------
+        None
+            This callable has no parameters.
 
         Returns
         -------
@@ -434,8 +608,7 @@ class TileFusion:
 
     @staticmethod
     def _make_1d_profile(length: int, blend: int) -> np.ndarray:
-        """
-        Create a 1D feather profile with linear ramps at both ends.
+        """Create a 1D feather profile with linear ramps at both ends.
 
         Parameters
         ----------
@@ -490,9 +663,9 @@ class TileFusion:
         z_slice: slice,
         y_slice: slice,
         x_slice: slice,
+        dtype: Any = np.float32,
     ) -> np.ndarray:
-        """
-        Read a tile subvolume using a global flattened tile index.
+        """Read a tile subvolume using a global flattened tile index.
 
         For time series:
             tile_idx = t_idx * position_dim + pos_idx
@@ -510,6 +683,8 @@ class TileFusion:
             Y slice.
         x_slice : slice
             X slice.
+        dtype : numpy dtype or None, default=numpy.float32
+            Requested output dtype. ``None`` preserves the stored dtype.
 
         Returns
         -------
@@ -538,22 +713,33 @@ class TileFusion:
             )
 
         if self._is_2d:
-            arr = self.ts[t_idx, pos_idx, ch_sel, y_slice, x_slice].read().result()
+            arr = (
+                self.position_arrays[pos_idx][t_idx, ch_sel, 0, y_slice, x_slice]
+                .read()
+                .result()
+            )
             if arr.ndim == 2:
                 arr = arr[None, None, :, :]
             elif arr.ndim == 3:
                 arr = arr[:, None, :, :]
             else:
-                raise ValueError(f"Unexpected 2D tile ndim={arr.ndim}, shape={arr.shape}")
-            return arr.astype(np.float32, copy=False)
+                raise ValueError(
+                    f"Unexpected 2D tile ndim={arr.ndim}, shape={arr.shape}"
+                )
+            return arr if dtype is None else arr.astype(dtype, copy=False)
 
-        arr = self.ts[t_idx, pos_idx, ch_sel, z_slice, y_slice, x_slice].read().result()
-        return arr.astype(np.float32, copy=False)
+        arr = (
+            self.position_arrays[pos_idx][t_idx, ch_sel, z_slice, y_slice, x_slice]
+            .read()
+            .result()
+        )
+        return arr if dtype is None else arr.astype(dtype, copy=False)
 
     @staticmethod
-    def register_and_score(g1: Any, g2: Any, win_size: int) -> tuple[tuple[float, float, float], float]:
-        """
-        Register `g2` to `g1` and compute an SSIM score.
+    def register_and_score(
+        g1: Any, g2: Any, win_size: int
+    ) -> tuple[tuple[float, float, float], float]:
+        """Register `g2` to `g1` and compute an SSIM score.
 
         Steps:
         1) histogram-match g2 -> g1
@@ -624,8 +810,7 @@ class TileFusion:
         ch_idx: int = 0,
         threshold: float | None = None,
     ) -> None:
-        """
-        Register and score all overlapping tile pairs independently per timepoint.
+        """Register and score all overlapping tile pairs independently per timepoint.
 
         Parameters
         ----------
@@ -650,7 +835,11 @@ class TileFusion:
         - Links never cross timepoints; i and j always belong to the same t.
         - For 2D data, dz is forced to 0 and overlap gating ignores z.
         """
-        df_in = self.downsample_factors if downsample_factors is None else downsample_factors
+        df_in = (
+            self.downsample_factors
+            if downsample_factors is None
+            else downsample_factors
+        )
         sw = self.ssim_window if ssim_window is None else int(ssim_window)
         th = self.threshold if threshold is None else float(threshold)
 
@@ -658,9 +847,39 @@ class TileFusion:
         n_pos = int(self.position_dim)
 
         def bounds_1d(off: int, length: int) -> tuple[int, int]:
+            """Clip a shifted interval to one array dimension.
+
+            Parameters
+            ----------
+            off : int
+                Value supplied for ``off``.
+            length : int
+                Value supplied for ``length``.
+
+            Returns
+            -------
+            tuple[int, int]
+                Result produced by the callable.
+            """
             return max(0, off), min(length, off + length)
 
-        def effective_df_for_patch(patch: Any, df_zyx: tuple[int, int, int]) -> tuple[int, int, int]:
+        def effective_df_for_patch(
+            patch: Any, df_zyx: tuple[int, int, int]
+        ) -> tuple[int, int, int]:
+            """Clamp downsampling factors to the available patch shape.
+
+            Parameters
+            ----------
+            patch : Any
+                Value supplied for ``patch``.
+            df_zyx : tuple[int, int, int]
+                Value supplied for ``df zyx``.
+
+            Returns
+            -------
+            tuple[int, int, int]
+                Result produced by the callable.
+            """
             arr = np.asarray(patch)
             if arr.ndim == 4:
                 zyx = (arr.shape[1], arr.shape[2], arr.shape[3])
@@ -678,7 +897,7 @@ class TileFusion:
         if int(self.z_dim) == 1:
             df_zyx_base = (1, df_zyx_base[1], df_zyx_base[2])
 
-        with ThreadPoolExecutor(max_workers=2) as executor:
+        with ThreadPoolExecutor(max_workers=min(2, self._max_workers)) as executor:
             for t in range(int(self.time_dim)):
                 base = t * n_pos
 
@@ -692,8 +911,12 @@ class TileFusion:
                     for j_pos in range(i_pos + 1, n_pos):
                         j = base + j_pos
 
-                        phys = np.array(self._tile_positions[j]) - np.array(self._tile_positions[i])
-                        vox_off = np.round(phys / np.array(self._pixel_size)).astype(int)
+                        phys = np.array(self._tile_positions[j]) - np.array(
+                            self._tile_positions[i]
+                        )
+                        vox_off = np.round(phys / np.array(self._pixel_size)).astype(
+                            int
+                        )
 
                         dz = int(vox_off[0])
                         dy = int(vox_off[1])
@@ -716,7 +939,23 @@ class TileFusion:
                         if any(hi <= lo for (lo, hi) in bounds_i):
                             continue
 
-                        def read_patch(gidx: int, bnds: list[tuple[int, int]]) -> np.ndarray:
+                        def read_patch(
+                            gidx: int, bnds: list[tuple[int, int]]
+                        ) -> np.ndarray:
+                            """Read one bounded tile patch for pairwise registration.
+
+                            Parameters
+                            ----------
+                            gidx : int
+                                Value supplied for ``gidx``.
+                            bnds : list[tuple[int, int]]
+                                Value supplied for ``bnds``.
+
+                            Returns
+                            -------
+                            np.ndarray
+                                Result produced by the callable.
+                            """
                             z0, z1 = bnds[0]
                             y0, y1 = bnds[1]
                             x0, x1 = bnds[2]
@@ -728,8 +967,10 @@ class TileFusion:
                                 slice(x0, x1),
                             )
 
-                        patch_i = executor.submit(read_patch, i, bounds_i).result()
-                        patch_j = executor.submit(read_patch, j, bounds_j).result()
+                        future_i = executor.submit(read_patch, i, bounds_i)
+                        future_j = executor.submit(read_patch, j, bounds_j)
+                        patch_i = future_i.result()
+                        patch_j = future_j.result()
 
                         df_zyx_eff = effective_df_for_patch(patch_i, df_zyx_base)
 
@@ -741,7 +982,9 @@ class TileFusion:
                         elif arr_i.ndim == 3:
                             reduce_block = df_zyx_eff
                         else:
-                            raise ValueError(f"Unexpected patch ndim={arr_i.ndim}, shape={arr_i.shape}")
+                            raise ValueError(
+                                f"Unexpected patch ndim={arr_i.ndim}, shape={arr_i.shape}"
+                            )
 
                         g1 = block_reduce(arr_i, block_size=reduce_block, func=xp.mean)
                         g2 = block_reduce(arr_j, block_size=reduce_block, func=xp.mean)
@@ -756,7 +999,7 @@ class TileFusion:
                         dy_s = int(np.round(shift_ds[1] * df_zyx_eff[1]))
                         dx_s = int(np.round(shift_ds[2] * df_zyx_eff[2]))
 
-                        max_shift = (20, 50, 100)
+                        max_shift = self.max_registration_shift_zyx
                         if (
                             abs(dz_s) > max_shift[0]
                             or abs(dy_s) > max_shift[1]
@@ -772,12 +1015,18 @@ class TileFusion:
                                 )
                             continue
 
-                        self.pairwise_metrics[(i, j)] = (dz_s, dy_s, dx_s, round(score, 3))
+                        self.pairwise_metrics[(i, j)] = (
+                            dz_s,
+                            dy_s,
+                            dx_s,
+                            round(score, 3),
+                        )
 
     @staticmethod
-    def _solve_global(links: list[dict[str, Any]], n_tiles: int, fixed_indices: list[int]) -> np.ndarray:
-        """
-        Solve dense least-squares shifts per-axis with fixed tile constraints.
+    def _solve_global(
+        links: list[dict[str, Any]], n_tiles: int, fixed_indices: list[int]
+    ) -> np.ndarray:
+        """Solve dense least-squares shifts per-axis with fixed tile constraints.
 
         Parameters
         ----------
@@ -833,8 +1082,7 @@ class TileFusion:
         abs_thresh: float,
         iterative: bool,
     ) -> np.ndarray:
-        """
-        Perform robust two-round (optionally iterative) optimization.
+        """Perform robust two-round (optionally iterative) optimization.
 
         Parameters
         ----------
@@ -859,13 +1107,32 @@ class TileFusion:
         shifts = self._solve_global(links, n_tiles, fixed_indices)
 
         def residuals(ls: list[dict[str, Any]], sh: np.ndarray) -> np.ndarray:
+            """Calculate Euclidean residuals for registration links.
+
+            Parameters
+            ----------
+            ls : list[dict[str, Any]]
+                Value supplied for ``ls``.
+            sh : np.ndarray
+                Value supplied for ``sh``.
+
+            Returns
+            -------
+            np.ndarray
+                Result produced by the callable.
+            """
             return np.array(
-                [np.linalg.norm(sh[l["j"]] - sh[l["i"]] - l["t"]) for l in ls],
+                [
+                    np.linalg.norm(sh[link["j"]] - sh[link["i"]] - link["t"])
+                    for link in ls
+                ],
                 dtype=np.float64,
             )
 
         work = links.copy()
         res = residuals(work, shifts)
+        if len(res) == 0:
+            return shifts
         cutoff = max(abs_thresh, rel_thresh * float(np.median(res)))
         outliers = set(np.where(res > cutoff)[0])
 
@@ -873,8 +1140,13 @@ class TileFusion:
             while outliers:
                 for k in sorted(outliers, reverse=True):
                     work.pop(k)
+                if not work:
+                    shifts = self._solve_global(work, n_tiles, fixed_indices)
+                    break
                 shifts = self._solve_global(work, n_tiles, fixed_indices)
                 res = residuals(work, shifts)
+                if len(res) == 0:
+                    break
                 cutoff = max(abs_thresh, rel_thresh * float(np.median(res)))
                 outliers = set(np.where(res > cutoff)[0])
         else:
@@ -890,8 +1162,7 @@ class TileFusion:
         rel_thresh: float = 0.5,
         abs_thresh: float = 1.5,
     ) -> None:
-        """
-        Optimize global shifts independently per timepoint, anchoring tile 0.
+        """Optimize global shifts independently per timepoint, anchoring tile 0.
 
         Parameters
         ----------
@@ -974,8 +1245,7 @@ class TileFusion:
             self.global_offsets[base:hi, :] = d_opt
 
     def save_pairwise_metrics(self, filepath: str | Path) -> None:
-        """
-        Save pairwise link metrics to JSON.
+        """Save pairwise link metrics to JSON.
 
         Parameters
         ----------
@@ -992,8 +1262,7 @@ class TileFusion:
             json.dump(out, f)
 
     def load_pairwise_metrics(self, filepath: str | Path) -> None:
-        """
-        Load pairwise link metrics from JSON.
+        """Load pairwise link metrics from JSON.
 
         Parameters
         ----------
@@ -1018,8 +1287,12 @@ class TileFusion:
         }
 
     def _compute_fused_image_space(self) -> None:
-        """
-        Compute a global fused space spanning all timepoints.
+        """Compute a global fused space spanning all timepoints.
+
+        Parameters
+        ----------
+        None
+            This callable has no parameters.
 
         Returns
         -------
@@ -1044,9 +1317,13 @@ class TileFusion:
         self.unpadded_shape = (sz, sy, sx)
         self.offset_um = (float(min_z), float(min_y), float(min_x))
 
-    def _pad_to_chunk_multiple(self) -> None:
-        """
-        Pad the fused shape to multiples of tile shape.
+    def _pad_to_multiscale_multiple(self) -> None:
+        """Minimally pad the fused shape for integer multiscale levels.
+
+        Parameters
+        ----------
+        None
+            This callable has no parameters.
 
         Returns
         -------
@@ -1056,102 +1333,276 @@ class TileFusion:
         if self.unpadded_shape is None:
             raise RuntimeError("unpadded_shape not computed.")
 
-        tz, ty, tx = int(self.z_dim), int(self.y_dim), int(self.x_dim)
         sz, sy, sx = self.unpadded_shape
+        alignment = math.lcm(1, *(int(value) for value in self.multiscale_factors))
+        z_alignment = 1 if self._is_2d else alignment
 
-        pz = (-sz) % tz
-        py = (-sy) % ty
-        px = (-sx) % tx
+        pz = (-sz) % z_alignment
+        py = (-sy) % alignment
+        px = (-sx) % alignment
 
         self.padded_shape = (sz + pz, sy + py, sx + px)
 
-    def _create_fused_tensorstore(
-        self,
-        output_path: str | Path,
-        z_slices_per_shard: int = 4,
+    def _prepare_fused_image(
+        self, output_path: str | Path, z_slices_per_write: int = 4
     ) -> tuple[ts.TensorStore, list[int]]:
-        """
-        Create the output Zarr v3 store for fused data.
+        """Create the fused multiscale Image through yaozarrs.
 
         Parameters
         ----------
-        output_path : str or pathlib.Path
-            Output dataset path (the `.../scale0/image` node).
-        z_slices_per_shard : int, default=4
-            Number of z slices per sharding chunk.
+        output_path : str | Path
+            Value supplied for ``output path``.
+        z_slices_per_write : int
+            Value supplied for ``z slices per write``.
 
         Returns
         -------
-        handle : tensorstore.TensorStore
-            Open TensorStore handle to the created dataset.
-        shard_chunk : list[int]
-            Chunk shape used for the regular chunk grid (t, c, z, y, x).
-
-        Raises
-        ------
-        RuntimeError
-            If `self.padded_shape` is not computed.
+        tuple[ts.TensorStore, list[int]]
+            Result produced by the callable.
         """
         if self.padded_shape is None:
             raise RuntimeError("padded_shape not computed.")
+        if self.offset_um is None:
+            raise RuntimeError("offset_um not computed.")
 
-        out = Path(output_path)
-        out.mkdir(parents=True, exist_ok=True)
+        factors = (1, *self.multiscale_factors)
+        dz, dy, dx = self._pixel_size
+        axes = [
+            {"name": "t", "type": "time"},
+            {"name": "c", "type": "channel"},
+            {"name": "z", "type": "space", "unit": "micrometer"},
+            {"name": "y", "type": "space", "unit": "micrometer"},
+            {"name": "x", "type": "space", "unit": "micrometer"},
+        ]
+        datasets = []
+        specs = []
+        z0, y0, x0 = (int(value) for value in self.padded_shape)
+        for level, factor in enumerate(factors):
+            z_factor = 1 if self._is_2d else int(factor)
+            datasets.append(
+                {
+                    "path": str(level),
+                    "coordinateTransformations": [
+                        {"scale": [1, 1, dz * z_factor, dy * factor, dx * factor]},
+                        {"translation": [0, 0, *self.offset_um]},
+                    ],
+                }
+            )
+            specs.append(
+                (
+                    (
+                        int(self.time_dim),
+                        int(self.channels),
+                        max(1, (z0 + z_factor - 1) // z_factor),
+                        max(1, (y0 + factor - 1) // factor),
+                        max(1, (x0 + factor - 1) // factor),
+                    ),
+                    np.uint16,
+                )
+            )
 
-        t_dim = int(self.time_dim)
-        c_dim = int(self.channels)
-        z_dim, y_dim, x_dim = (
-            int(self.padded_shape[0]),
-            int(self.padded_shape[1]),
-            int(self.padded_shape[2]),
+        image = v05.Image(
+            multiscales=[v05.Multiscale(name="fused", axes=axes, datasets=datasets)]
         )
-        full_shape = [t_dim, c_dim, z_dim, y_dim, x_dim]
+        codec_chunks = (1, 1, 1, int(self.chunk_y), int(self.chunk_x))
+        _, self._multiscale_arrays = prepare_image(
+            output_path,
+            image,
+            specs,
+            chunks=codec_chunks,
+            writer="tensorstore",
+            overwrite=True,
+        )
+        write_block_shape = [
+            1,
+            1,
+            min(int(z_slices_per_write), z0),
+            int(self.chunk_y) * 2,
+            int(self.chunk_x) * 2,
+        ]
+        return self._multiscale_arrays["0"], write_block_shape
 
-        shard_chunk = [1, 1, int(z_slices_per_shard), int(self.chunk_y) * 2, int(self.chunk_x) * 2]
-        codec_chunk = [1, 1, 1, int(self.chunk_y), int(self.chunk_x)]
+    def _fusion_block_shape(
+        self,
+        z_depth: int,
+        y_size: int,
+        x_size: int,
+    ) -> tuple[int, int]:
+        """Choose a host-RAM-bounded Y/X accumulator shape for one Z slab.
 
-        config = {
-            "context": {
-                "file_io_concurrency": {"limit": int(self._max_workers)},
-                "data_copy_concurrency": {"limit": int(self._max_workers)},
-            },
-            "driver": "zarr3",
-            "kvstore": {"driver": "file", "path": str(out)},
-            "metadata": {
-                "shape": full_shape,
-                "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": shard_chunk}},
-                "chunk_key_encoding": {"name": "default"},
-                "codecs": [
-                    {
-                        "name": "sharding_indexed",
-                        "configuration": {
-                            "chunk_shape": codec_chunk,
-                            "codecs": [
-                                {"name": "bytes", "configuration": {"endian": "little"}},
-                                {
-                                    "name": "blosc",
-                                    "configuration": {"cname": "zstd", "clevel": 5, "shuffle": "bitshuffle"},
-                                },
-                            ],
-                            "index_codecs": [
-                                {"name": "bytes", "configuration": {"endian": "little"}},
-                                {"name": "crc32c"},
-                            ],
-                            "index_location": "end",
-                        },
-                    }
-                ],
-                "data_type": "uint16",
-                "dimension_names": ["t", "c", "z", "y", "x"],
-            },
-        }
+        Parameters
+        ----------
+        z_depth : int
+            Value supplied for ``z depth``.
+        y_size : int
+            Value supplied for ``y size``.
+        x_size : int
+            Value supplied for ``x size``.
 
-        handle = ts.open(config, create=True, open=True).result()
-        return handle, shard_chunk
-
-    def _fuse_by_shard(self) -> None:
+        Returns
+        -------
+        tuple[int, int]
+            Result produced by the callable.
         """
-        Fuse all timepoints into the global fused store using shard-centric writes.
+        available = int(psutil.virtual_memory().available)
+        budget = max(1, int(available * self.fusion_ram_fraction))
+        concurrent_buffers = max(
+            1, int(self._max_workers) + int(self.max_in_flight_writes)
+        )
+        per_block_budget = max(1, budget // concurrent_buffers)
+
+        # A mixed block holds uint16 source/output arrays plus float32 overlap
+        # accumulators. Budget per concurrently rendered block, including channels.
+        bytes_per_voxel = max(16, 12 * int(self.channels) + 4)
+        max_xy_pixels = max(
+            1,
+            per_block_budget // (max(1, z_depth) * bytes_per_voxel),
+        )
+        aspect = float(y_size) / float(max(1, x_size))
+        block_y = max(1, int(np.sqrt(max_xy_pixels * aspect)))
+        block_y = min(y_size, block_y, int(self.chunk_y) * 8)
+        block_x = min(
+            x_size,
+            max(1, max_xy_pixels // block_y),
+            int(self.chunk_x) * 8,
+        )
+
+        if block_y >= self.chunk_y:
+            block_y = max(self.chunk_y, (block_y // self.chunk_y) * self.chunk_y)
+        if block_x >= self.chunk_x:
+            block_x = max(self.chunk_x, (block_x // self.chunk_x) * self.chunk_x)
+        return int(block_y), int(block_x)
+
+    def _render_fusion_block(
+        self,
+        t: int,
+        base: int,
+        bounds: tuple[int, int, int, int, int, int],
+        contributors: Sequence[tuple[int, tuple[int, int, int]]],
+    ) -> tuple[Any, np.ndarray, int, int]:
+        """Render one independent output block without writing it.
+
+        Each contributing tile is read at most once. Exclusive regions are copied
+        into the integer output, while only regions with multiple contributors use
+        float32 feather accumulation.
+        """
+        z0, z1, y0, y1, x0, x1 = bounds
+        tile_shape = (int(self.z_dim), int(self.y_dim), int(self.x_dim))
+        regions = _partition_fusion_block(bounds, contributors, tile_shape)
+
+        if len(regions) == 1 and len(regions[0][1]) == 1:
+            region, region_contributors = regions[0]
+            rz0, rz1, ry0, ry1, rx0, rx1 = region
+            p, (oz, oy, ox) = region_contributors[0]
+            direct = self._read_tile_volume(
+                base + p,
+                slice(None),
+                slice(rz0 - oz, rz1 - oz),
+                slice(ry0 - oy, ry1 - oy),
+                slice(rx0 - ox, rx1 - ox),
+                dtype=np.uint16,
+            )
+            selection = (
+                t,
+                slice(None),
+                slice(rz0, rz1),
+                slice(ry0, ry1),
+                slice(rx0, rx1),
+            )
+            return selection, direct, 1, 0
+
+        source_blocks: dict[int, tuple[tuple[int, int, int], np.ndarray]] = {}
+        for p, (oz, oy, ox) in contributors:
+            tz0, tz1 = max(z0, oz), min(z1, oz + tile_shape[0])
+            ty0, ty1 = max(y0, oy), min(y1, oy + tile_shape[1])
+            tx0, tx1 = max(x0, ox), min(x1, ox + tile_shape[2])
+            source = self._read_tile_volume(
+                base + p,
+                slice(None),
+                slice(tz0 - oz, tz1 - oz),
+                slice(ty0 - oy, ty1 - oy),
+                slice(tx0 - ox, tx1 - ox),
+                dtype=None,
+            )
+            source_blocks[p] = ((tz0, ty0, tx0), source)
+
+        output = np.zeros(
+            (int(self.channels), z1 - z0, y1 - y0, x1 - x0),
+            dtype=np.uint16,
+        )
+        direct_regions = 0
+        blended_regions = 0
+        for region, region_contributors in regions:
+            rz0, rz1, ry0, ry1, rx0, rx1 = region
+            output_selection = (
+                slice(None),
+                slice(rz0 - z0, rz1 - z0),
+                slice(ry0 - y0, ry1 - y0),
+                slice(rx0 - x0, rx1 - x0),
+            )
+            if len(region_contributors) == 1:
+                p, _ = region_contributors[0]
+                (sz0, sy0, sx0), source = source_blocks[p]
+                output[output_selection] = source[
+                    :,
+                    rz0 - sz0 : rz1 - sz0,
+                    ry0 - sy0 : ry1 - sy0,
+                    rx0 - sx0 : rx1 - sx0,
+                ]
+                direct_regions += 1
+                continue
+
+            fused = np.zeros(
+                (
+                    int(self.channels),
+                    rz1 - rz0,
+                    ry1 - ry0,
+                    rx1 - rx0,
+                ),
+                dtype=np.float32,
+            )
+            weight = np.zeros_like(fused)
+            for p, (oz, oy, ox) in region_contributors:
+                (sz0, sy0, sx0), source = source_blocks[p]
+                sub = np.ascontiguousarray(
+                    source[
+                        :,
+                        rz0 - sz0 : rz1 - sz0,
+                        ry0 - sy0 : ry1 - sy0,
+                        rx0 - sx0 : rx1 - sx0,
+                    ],
+                    dtype=np.float32,
+                )
+                local_z = slice(rz0 - oz, rz1 - oz)
+                local_y = slice(ry0 - oy, ry1 - oy)
+                local_x = slice(rx0 - ox, rx1 - ox)
+                weights = (
+                    self.z_profile[local_z, None, None]
+                    * self.y_profile[None, local_y, None]
+                    * self.x_profile[None, None, local_x]
+                ).astype(np.float32, copy=False)
+                _accumulate_tile_block(fused, weight, sub, weights, 0, 0, 0)
+
+            _normalize_block(fused, weight)
+            output[output_selection] = fused.astype(np.uint16)
+            blended_regions += 1
+
+        selection = (
+            t,
+            slice(None),
+            slice(z0, z1),
+            slice(y0, y1),
+            slice(x0, x1),
+        )
+        return selection, output, direct_regions, blended_regions
+
+    def _fuse_by_blocks(self) -> None:
+        """Fuse all timepoints into the global fused store using bounded block writes.
+
+        Parameters
+        ----------
+        None
+            This callable has no parameters.
 
         Returns
         -------
@@ -1163,350 +1614,264 @@ class TileFusion:
         RuntimeError
             If fusion prerequisites are not initialized.
         """
-        if self.fused_ts is None or self.shard_chunk is None or self.offset_um is None or self.padded_shape is None:
-            raise RuntimeError("Fusion not initialized: compute fused space and create output store first.")
+        if (
+            self.fused_ts is None
+            or self.write_block_shape is None
+            or self.offset_um is None
+            or self.padded_shape is None
+        ):
+            raise RuntimeError(
+                "Fusion not initialized: compute fused space and create output store first."
+            )
 
         n_pos = int(self.position_dim)
         n_t = int(self.time_dim)
 
-        z_step = int(self.shard_chunk[2])
-        pad_z, pad_y, pad_x = (int(self.padded_shape[0]), int(self.padded_shape[1]), int(self.padded_shape[2]))
-        nz = (pad_z + z_step - 1) // z_step
+        z_step = int(self.write_block_shape[2])
+        pad_z, pad_y, pad_x = (
+            int(self.padded_shape[0]),
+            int(self.padded_shape[1]),
+            int(self.padded_shape[2]),
+        )
 
         dz_um, dy_um, dx_um = self._pixel_size
         off_z_um, off_y_um, off_x_um = self.offset_um
 
-        futures: list[Any] = []
+        pending_writes: deque[Any] = deque()
+        direct_regions = 0
+        blended_regions = 0
+        empty_blocks = 0
 
-        for t in trange(n_t, desc=f"scale0", leave=True):
-            base = t * n_pos
+        def queue_write(selection: Any, value: np.ndarray) -> None:
+            """Issue one bounded asynchronous output write."""
+            pending_writes.append(self.fused_ts[selection].write(value))
+            if len(pending_writes) >= self.max_in_flight_writes:
+                pending_writes.popleft().result()
 
-            offsets_t: list[tuple[int, int, int]] = []
-            for p in range(n_pos):
-                z_um, y_um, x_um = self._tile_positions[base + p]
-                oz = int(np.round((z_um - off_z_um) / dz_um))
-                oy = int(np.round((y_um - off_y_um) / dy_um))
-                ox = int(np.round((x_um - off_x_um) / dx_um))
-                offsets_t.append((oz, oy, ox))
-
-            for shard_idx in range(nz):
-                z0 = shard_idx * z_step
-                z1 = min(z0 + z_step, pad_z)
-                dz = z1 - z0
-
-                for c in range(int(self.channels)):
-                    fused_block = np.zeros((1, dz, pad_y, pad_x), dtype=np.float32)
-                    weight_sum = np.zeros_like(fused_block)
-
-                    for p, (oz, oy, ox) in enumerate(offsets_t):
-                        tz0 = max(z0, oz)
-                        tz1 = min(z1, oz + int(self.z_dim))
-                        if tz1 <= tz0:
-                            continue
-
-                        local_z0 = tz0 - oz
-                        local_z1 = tz1 - oz
-                        tile_gidx = base + p
-
-                        sub = self._read_tile_volume(
-                            tile_gidx,
-                            slice(c, c + 1),
-                            slice(local_z0, local_z1),
-                            slice(0, int(self.y_dim)),
-                            slice(0, int(self.x_dim)),
-                        )
-
-                        wz = self.z_profile[local_z0:local_z1]
-                        wy = self.y_profile
-                        wx = self.x_profile
-                        w3d = wz[:, None, None] * wy[None, :, None] * wx[None, None, :]
-
-                        z_off = tz0 - z0
-                        _accumulate_tile_shard(
-                            fused_block,
-                            weight_sum,
-                            sub,
-                            w3d.astype(np.float32, copy=False),
-                            int(z_off),
-                            int(oy),
-                            int(ox),
-                        )
-
-                    _normalize_shard(fused_block, weight_sum)
-
-                    fut = self.fused_ts[
-                        t,
-                        slice(c, c + 1),
-                        slice(z0, z1),
-                        slice(0, pad_y),
-                        slice(0, pad_x),
-                    ].write(fused_block.astype(np.uint16))
-                    futures.append(fut)
-
-                    del fused_block, weight_sum
-                    gc.collect()
-                    if USING_GPU and cp is not None:
-                        cp.get_default_memory_pool().free_all_blocks()
-                        cp.get_default_pinned_memory_pool().free_all_blocks()
-
-        for fut in futures:
-            fut.result()
-
-    def _create_multiscales(
-        self,
-        omezarr_path: Path,
-        factors: Sequence[int] = (2, 4, 8),
-        z_slices_per_shard: int = 4,
-    ) -> None:
-        """
-        Build NGFF multiscales by downsampling Z/Y/X iteratively.
-
-        Parameters
-        ----------
-        omezarr_path : pathlib.Path
-            Root NGFF group path.
-        factors : sequence[int], default=(2, 4, 8)
-            Pyramid factors. Each level is downsampled relative to scale0.
-        z_slices_per_shard : int, default=4
-            Z slices per sharding chunk for each scale.
-
-        Returns
-        -------
-        None
-            Writes additional scales under `omezarr_path/scale{n}/image`.
-
-        Notes
-        -----
-        - Preserves (t, c) axes unchanged.
-        - Does not modify the scale0 TensorStore handle.
-        - Progress display:
-            * Outer bar (scales) persists.
-            * Inner bar (timepoints) is per-scale and disappears when that scale finishes.
-        """
-        pad0 = self.padded_shape
-        cy0, cx0 = int(self.chunk_y), int(self.chunk_x)
-        shard0 = self.shard_chunk
-        fused0 = self.fused_ts
-
-        inp: ts.TensorStore | None = None
-        try:
-            # Outer bar: scales (stays)
-            for idx, factor in enumerate(factors):
-                out_path = omezarr_path / f"scale{idx + 1}" / "image"
-                out_path.parent.mkdir(parents=True, exist_ok=True)
-
-                prev = omezarr_path / f"scale{idx}" / "image"
-                inp = ts.open(
-                    {"driver": "zarr3", "kvstore": {"driver": "file", "path": str(prev)}}
-                ).result()
-
-                factor_to_use = (
-                    int(factor) if idx == 0 else int(factor) // int(factors[idx - 1])
-                )
-                if factor_to_use < 1:
-                    raise ValueError(f"Invalid pyramid factors: {factors}")
-
-                z_factor = factor_to_use if not self._is_2d else 1
-
-                t_dim = int(inp.shape[0])
-                c_dim = int(inp.shape[1])
-                z_in = int(inp.shape[2])
-                y_in = int(inp.shape[3])
-                x_in = int(inp.shape[4])
-
-                new_z = max(1, (z_in + z_factor - 1) // z_factor)
-                new_y = max(1, (y_in + factor_to_use - 1) // factor_to_use)
-                new_x = max(1, (x_in + factor_to_use - 1) // factor_to_use)
-                shard_z = min(int(z_slices_per_shard), int(new_z))
-
-                chunk_y = 1024 if new_y >= 2048 else max(1, new_y // 4)
-                chunk_x = 1024 if new_x >= 2048 else max(1, new_x // 4)
-
-                # Scale-local geometry (only for writing this scale)
-                self.padded_shape = (int(new_z), int(new_y), int(new_x))
-                self.chunk_y, self.chunk_x = int(chunk_y), int(chunk_x)
-
-                out_ts, _ = self._create_fused_tensorstore(
-                    output_path=out_path, z_slices_per_shard=shard_z
-                )
-
-                # Inner bar: timepoints (disappears)
-                # Writes timepoints one-by-one so t_idx can be arbitrarily large.
-                c_block = min(4, c_dim)
-                for t in trange(t_dim,desc=f"scale{idx+1}", leave=True):
-                    t0 = int(t)
-                    t1 = t0 + 1
-
-                    for c0 in range(0, c_dim, c_block):
-                        c1 = min(c_dim, c0 + c_block)
-
-                        for z0 in range(0, new_z, shard_z):
-                            bz = min(shard_z, new_z - z0)
-                            in_z0 = z0 * z_factor
-                            in_z1 = min(z_in, (z0 + bz) * z_factor)
-
-                            for y0 in range(0, new_y, chunk_y):
-                                by = min(chunk_y, new_y - y0)
-                                in_y0 = y0 * factor_to_use
-                                in_y1 = min(y_in, (y0 + by) * factor_to_use)
-
-                                for x0 in range(0, new_x, chunk_x):
-                                    bx = min(chunk_x, new_x - x0)
-                                    in_x0 = x0 * factor_to_use
-                                    in_x1 = min(x_in, (x0 + bx) * factor_to_use)
-
-                                    slab = inp[
-                                        t0:t1,
-                                        c0:c1,
-                                        in_z0:in_z1,
-                                        in_y0:in_y1,
-                                        in_x0:in_x1,
-                                    ].read().result()
-
-                                    if self.multiscale_downsample == "stride":
-                                        down = slab[
-                                            ...,
-                                            ::z_factor,
-                                            ::factor_to_use,
-                                            ::factor_to_use,
-                                        ]
-                                    else:
-                                        arr = xp.asarray(slab)
-                                        block = (1, 1, z_factor, factor_to_use, factor_to_use)
-                                        down_arr = block_reduce(arr, block_size=block, func=xp.mean)
-                                        down = (
-                                            cp.asnumpy(down_arr)
-                                            if USING_GPU and cp is not None
-                                            else np.asarray(down_arr)
-                                        )
-
-                                    down = down.astype(slab.dtype, copy=False)
-
-                                    out_ts[
-                                        t0:t1,
-                                        c0:c1,
-                                        z0 : z0 + bz,
-                                        y0 : y0 + by,
-                                        x0 : x0 + bx,
-                                    ].write(down).result()
-
-                # zarr.json for this scale group
-                ngff = {
-                    "attributes": {"_ARRAY_DIMENSIONS": ["t", "c", "z", "y", "x"]},
-                    "zarr_format": 3,
-                    "consolidated_metadata": "null",
-                    "node_type": "group",
-                }
-                with open(omezarr_path / f"scale{idx + 1}" / "zarr.json", "w") as f:
-                    json.dump(ngff, f, indent=2)
-
-        finally:
-            # Restore scale0 state
-            self.padded_shape = pad0
-            self.chunk_y, self.chunk_x = cy0, cx0
-            self.shard_chunk = shard0
-            self.fused_ts = fused0
-
-    def _generate_ngff_zarr3_json(
-        self,
-        omezarr_path: Path,
-        resolution_multiples: Sequence[int | Sequence[int]],
-        dataset_name: str = "image",
-        version: str = "0.5",
-    ) -> None:
-        """
-        Write OME-NGFF v0.5 metadata (zarr.json) for a Zarr v3 multiscale group.
-
-        Parameters
-        ----------
-        omezarr_path : pathlib.Path
-            Root NGFF group path.
-        resolution_multiples : sequence[int | sequence[int]]
-            Spatial resolution multipliers per pyramid level.
-        dataset_name : str, default="image"
-            Dataset node name within each scale group.
-        version : str, default="0.5"
-            NGFF version string.
-
-        Returns
-        -------
-        None
-            Writes `omezarr_path/zarr.json`.
-
-        Raises
-        ------
-        RuntimeError
-            If `offset_um` is not computed.
-        """
-        if self.offset_um is None:
-            raise RuntimeError("offset_um not computed.")
-
-        axes = [
-            {"name": "t", "type": "time"},
-            {"name": "c", "type": "channel"},
-            {"name": "z", "type": "space"},
-            {"name": "y", "type": "space"},
-            {"name": "x", "type": "space"},
-        ]
-
-        norm_res: list[tuple[int, int, int]] = [
-            tuple(r) if hasattr(r, "__len__") else (int(r), int(r), int(r))
-            for r in resolution_multiples
-        ]
-
-        base_scale = [1.0, 1.0] + [float(s) for s in self._pixel_size]
-        off_z, off_y, off_x = self.offset_um
-        trans0 = [0.0, 0.0, float(off_z), float(off_y), float(off_x)]
-
-        datasets: list[dict[str, Any]] = []
-        prev_sp = base_scale[2:]
-
-        for lvl, factors in enumerate(norm_res):
-            spatial = [base_scale[i + 2] * float(factors[i]) for i in range(3)]
-            scale = [1.0, 1.0] + spatial
-
-            if lvl == 0:
-                translation = trans0
-            else:
-                prev_translation = datasets[-1]["coordinateTransformations"][1]["translation"]
-                translation = [
-                    0.0,
-                    0.0,
-                    float(prev_translation[2]) + 0.5 * float(prev_sp[0]),
-                    float(prev_translation[3]) + 0.5 * float(prev_sp[1]),
-                    float(prev_translation[4]) + 0.5 * float(prev_sp[2]),
-                ]
-
-            datasets.append(
-                {
-                    "path": f"scale{lvl}/{dataset_name}",
-                    "coordinateTransformations": [
-                        {"type": "scale", "scale": scale},
-                        {"type": "translation", "translation": translation},
-                    ],
-                }
+        block_layout: list[tuple[int, int, int, int]] = []
+        spatial_blocks = 0
+        for z0 in range(0, pad_z, z_step):
+            z1 = min(z0 + z_step, pad_z)
+            block_y, block_x = self._fusion_block_shape(z1 - z0, pad_y, pad_x)
+            block_layout.append((z0, z1, block_y, block_x))
+            spatial_blocks += math.ceil(pad_y / block_y) * math.ceil(
+                pad_x / block_x
             )
-            prev_sp = spatial
+        chunk_total = n_t * int(self.channels) * spatial_blocks
 
-        mult = {"axes": axes, "datasets": datasets, "name": dataset_name, "@type": "ngff:Image"}
-        metadata = {
-            "attributes": {"ome": {"version": version, "multiscales": [mult]}},
-            "zarr_format": 3,
-            "node_type": "group",
+        scale_bar = tqdm(
+            total=n_t,
+            desc="scale0",
+            leave=True,
+            unit="timepoint",
+        )
+        chunk_bar = tqdm(
+            total=chunk_total,
+            desc="scale0 chunks",
+            leave=False,
+            unit="chunk",
+        )
+        render_workers = max(1, int(self._max_workers))
+        pending_renders: set[Future[Any]] = set()
+
+        def collect_rendered(done: set[Future[Any]]) -> None:
+            """Queue completed block writes and update observable statistics."""
+            nonlocal direct_regions, blended_regions
+            for future in done:
+                selection, value, direct_count, blended_count = future.result()
+                queue_write(selection, value)
+                direct_regions += int(direct_count)
+                blended_regions += int(blended_count)
+                chunk_bar.update(int(self.channels))
+
+        with ThreadPoolExecutor(max_workers=render_workers) as render_executor:
+            for t in range(n_t):
+                base = t * n_pos
+
+                offsets_t: list[tuple[int, int, int]] = []
+                for p in range(n_pos):
+                    z_um, y_um, x_um = self._tile_positions[base + p]
+                    oz = int(np.round((z_um - off_z_um) / dz_um))
+                    oy = int(np.round((y_um - off_y_um) / dy_um))
+                    ox = int(np.round((x_um - off_x_um) / dx_um))
+                    offsets_t.append((oz, oy, ox))
+
+                for z0, z1, block_y, block_x in block_layout:
+                    for y0 in range(0, pad_y, block_y):
+                        y1 = min(y0 + block_y, pad_y)
+                        for x0 in range(0, pad_x, block_x):
+                            x1 = min(x0 + block_x, pad_x)
+                            overlapping = [
+                                (p, offset)
+                                for p, offset in enumerate(offsets_t)
+                                if offset[0] + int(self.z_dim) > z0
+                                and offset[0] < z1
+                                and offset[1] + int(self.y_dim) > y0
+                                and offset[1] < y1
+                                and offset[2] + int(self.x_dim) > x0
+                                and offset[2] < x1
+                            ]
+                            if not overlapping:
+                                empty_blocks += 1
+                                chunk_bar.update(int(self.channels))
+                                continue
+                            pending_renders.add(
+                                render_executor.submit(
+                                    self._render_fusion_block,
+                                    t,
+                                    base,
+                                    (z0, z1, y0, y1, x0, x1),
+                                    overlapping,
+                                )
+                            )
+                            if len(pending_renders) >= render_workers:
+                                done, pending_renders = wait(
+                                    pending_renders,
+                                    return_when=FIRST_COMPLETED,
+                                )
+                                collect_rendered(done)
+
+                while pending_renders:
+                    done, pending_renders = wait(
+                        pending_renders,
+                        return_when=FIRST_COMPLETED,
+                    )
+                    collect_rendered(done)
+                while pending_writes:
+                    pending_writes.popleft().result()
+                scale_bar.update()
+
+        while pending_writes:
+            pending_writes.popleft().result()
+
+        chunk_bar.close()
+        scale_bar.close()
+        self._fusion_stats = {
+            "direct_regions": direct_regions,
+            "blended_regions": blended_regions,
+            "empty_blocks": empty_blocks,
         }
+        if self._debug:
+            print(
+                "[fusion] regions: "
+                f"direct={direct_regions}, blended={blended_regions}, "
+                f"empty={empty_blocks}, render_workers={render_workers}"
+            )
 
-        with open(omezarr_path / "zarr.json", "w") as f:
-            json.dump(metadata, f, indent=2)
+    def _write_multiscales(self) -> None:
+        """Downsample scale 0 into bounded spatial blocks.
+
+        Parameters
+        ----------
+        None
+            This callable has no parameters.
+
+        Returns
+        -------
+        None
+            No value is returned.
+        """
+        inp = self._multiscale_arrays["0"]
+        for level, factor in enumerate(self.multiscale_factors, start=1):
+            out = self._multiscale_arrays[str(level)]
+            z_factor = 1 if self._is_2d else int(factor)
+            out_z, out_y, out_x = (int(value) for value in out.shape[-3:])
+            block_z = max(1, int(self.write_block_shape[2]) // z_factor)
+            block_y = max(1, int(self.chunk_y) // int(factor))
+            block_x = max(1, int(self.chunk_x) // int(factor))
+
+            chunk_total = (
+                int(self.time_dim)
+                * int(self.channels)
+                * math.ceil(out_z / block_z)
+                * math.ceil(out_y / block_y)
+                * math.ceil(out_x / block_x)
+            )
+            scale_bar = tqdm(
+                total=int(self.time_dim),
+                desc=f"scale{level}",
+                leave=True,
+                unit="timepoint",
+            )
+            chunk_bar = tqdm(
+                total=chunk_total,
+                desc=f"scale{level} chunks",
+                leave=False,
+                unit="chunk",
+            )
+            for t in range(int(self.time_dim)):
+                for c in range(int(self.channels)):
+                    for z0 in range(0, out_z, block_z):
+                        z1 = min(z0 + block_z, out_z)
+                        for y0 in range(0, out_y, block_y):
+                            y1 = min(y0 + block_y, out_y)
+                            for x0 in range(0, out_x, block_x):
+                                x1 = min(x0 + block_x, out_x)
+                                slab = (
+                                    inp[
+                                        t,
+                                        c,
+                                        slice(
+                                            z0 * z_factor,
+                                            min(int(inp.shape[2]), z1 * z_factor),
+                                        ),
+                                        slice(
+                                            y0 * factor,
+                                            min(int(inp.shape[3]), y1 * factor),
+                                        ),
+                                        slice(
+                                            x0 * factor,
+                                            min(int(inp.shape[4]), x1 * factor),
+                                        ),
+                                    ]
+                                    .read()
+                                    .result()
+                                )
+                                if self.multiscale_downsample == "stride":
+                                    down = slab[::z_factor, ::factor, ::factor]
+                                else:
+                                    arr = xp.asarray(slab)
+                                    down_arr = block_reduce(
+                                        arr,
+                                        block_size=(z_factor, int(factor), int(factor)),
+                                        func=xp.mean,
+                                    )
+                                    down = (
+                                        cp.asnumpy(down_arr)
+                                        if USING_GPU and cp is not None
+                                        else np.asarray(down_arr)
+                                    )
+                                out[
+                                    t,
+                                    c,
+                                    slice(z0, z1),
+                                    slice(y0, y1),
+                                    slice(x0, x1),
+                                ].write(
+                                    down[: z1 - z0, : y1 - y0, : x1 - x0].astype(
+                                        np.uint16,
+                                        copy=False,
+                                    )
+                                ).result()
+                                chunk_bar.update()
+                scale_bar.update()
+
+            chunk_bar.close()
+            scale_bar.close()
 
     def run(self) -> None:
-        """
-        Execute the full registration + fusion pipeline.
+        """Execute the full registration + fusion pipeline.
+
+        Parameters
+        ----------
+        None
+            This callable has no parameters.
 
         Returns
         -------
         None
             Writes the fused NGFF store to:
-            `{base}/{stem}_fused_deskewed.ome.zarr`
+            `{base}/{stem}_fused.ome.zarr`
 
         Raises
         ------
@@ -1526,7 +1891,11 @@ class TileFusion:
             )
             self.save_pairwise_metrics(metrics_path)
 
-        self.optimize_shifts(method="TWO_ROUND_ITERATIVE", rel_thresh=0.5, abs_thresh=1.5)
+        self.optimize_shifts(
+            method="TWO_ROUND_ITERATIVE",
+            rel_thresh=self.optimization_rel_threshold,
+            abs_thresh=self.optimization_abs_threshold,
+        )
 
         gc.collect()
         if USING_GPU and cp is not None:
@@ -1542,28 +1911,9 @@ class TileFusion:
         ]
 
         self._compute_fused_image_space()
-        self._pad_to_chunk_multiple()
+        self._pad_to_multiscale_multiple()
 
-        omezarr = base / f"{self.root.stem}_fused.ome.zarr"
-        scale0 = omezarr / "scale0" / "image"
-
-        self.fused_ts, self.shard_chunk = self._create_fused_tensorstore(output_path=scale0)
-        self._fuse_by_shard()
-
-        (omezarr / "scale0").mkdir(parents=True, exist_ok=True)
-        ngff = {
-            "attributes": {"_ARRAY_DIMENSIONS": ["t", "c", "z", "y", "x"]},
-            "zarr_format": 3,
-            "consolidated_metadata": "null",
-            "node_type": "group",
-        }
-        with open(omezarr / "scale0" / "zarr.json", "w") as f:
-            json.dump(ngff, f, indent=2)
-
-        self._create_multiscales(omezarr, factors=self.multiscale_factors)
-        self._generate_ngff_zarr3_json(omezarr, resolution_multiples=self.resolution_multiples)
-
-
-if __name__ == "__main__":
-    fusion = TileFusion("/mnt/data2/qi2lab/20250513_human_OB/whole_OB_slice_polya.zarr")
-    fusion.run()
+        omezarr = base / f"{acquisition_stem(self.root)}_fused.ome.zarr"
+        self.fused_ts, self.write_block_shape = self._prepare_fused_image(omezarr)
+        self._fuse_by_blocks()
+        self._write_multiscales()

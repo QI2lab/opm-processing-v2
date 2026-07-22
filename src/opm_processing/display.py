@@ -1,192 +1,186 @@
-"""
-Display qi2lab OPM data
+"""Display processed OPM data through napari-ome-zarr."""
 
-This file displays deskewed qi2lab OPM data.
-"""
+from __future__ import annotations
 
-import multiprocessing as mp
-import sys
-
-if sys.platform.startswith("linux"):
-    mp.set_start_method("forkserver", force=True)
-elif sys.platform.startswith("win"):
-    mp.set_start_method("spawn", force=True)
-    
-import warnings
-
-warnings.filterwarnings("ignore", category=UserWarning)
-warnings.simplefilter("ignore", category=FutureWarning)
-
-
-import json
 from pathlib import Path
+from typing import Any
 
 import napari
-import numpy as np
-import tensorstore as ts
 import typer
-from cmap import Colormap
 from napari.experimental import link_layers
-from tqdm import tqdm
+from yaozarrs import open_group
 
-from opm_processing.dataio.metadata import extract_stage_positions, find_key
+from opm_processing.dataio.acquisition import acquisition_stem
 
-app = typer.Typer()
-app.pretty_exceptions_enable = False
+app = typer.Typer(pretty_exceptions_enable=False)
+
+
+def _resolve_data_path(root_path: Path, to_display: str) -> Path:
+    """Resolve a display mode to the first existing processed dataset.
+
+    Parameters
+    ----------
+    root_path
+        Original acquisition path used to derive output names.
+    to_display
+        Requested processed-data display mode.
+
+    Returns
+    -------
+    pathlib.Path
+        Existing processed dataset path.
+
+    Raises
+    ------
+    ValueError
+        If the display mode is unsupported.
+    FileNotFoundError
+        If no output exists for the requested mode.
+    """
+    base = root_path.parent
+    stem = acquisition_stem(root_path)
+    candidates = {
+        "max-z": (
+            base / f"{stem}_max_z_decon_deskewed.ome.zarr",
+            base / f"{stem}_max_z_deskewed.ome.zarr",
+            base / f"{stem}_max_z_decon_deskewed.zarr",
+            base / f"{stem}_max_z_deskewed.zarr",
+        ),
+        "full": (
+            base / f"{stem}_decon_deskewed.ome.zarr",
+            base / f"{stem}_deskewed.ome.zarr",
+            base / f"{stem}_decon_deskewed.zarr",
+            base / f"{stem}_deskewed.zarr",
+        ),
+        "fused-max-z": (
+            base / f"{stem}_max_z_fused.ome.zarr",
+            base / f"{stem}_max_z_fused.zarr",
+        ),
+        "fused-full": (base / f"{stem}_fused.ome.zarr",),
+    }
+    if to_display not in candidates:
+        choices = ", ".join(candidates)
+        raise ValueError(f"to_display must be one of: {choices}")
+    for candidate in candidates[to_display]:
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(
+        f"No {to_display} output found. Checked: "
+        + ", ".join(str(path) for path in candidates[to_display])
+    )
+
+
+def _configure_collection_layers(
+    data_path: Path,
+    layers: list[Any],
+    pos_range: tuple[int, int] | None,
+    time_range: tuple[int, int] | None,
+) -> None:
+    """Apply collection selections to plugin-created lazy layers.
+
+    Parameters
+    ----------
+    data_path : Path
+        Value supplied for ``data path``.
+    layers : list[Any]
+        Value supplied for ``layers``.
+    pos_range : tuple[int, int] | None
+        Value supplied for ``pos range``.
+    time_range : tuple[int, int] | None
+        Value supplied for ``time range``.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
+    if time_range is not None:
+        time_start, time_stop = time_range
+        if time_start < 0 or time_start >= time_stop:
+            raise ValueError("time_range must satisfy 0 <= start < stop")
+        for layer in layers:
+            if layer.multiscale:
+                layer.data = [level[time_start:time_stop] for level in layer.data]
+            else:
+                layer.data = layer.data[time_start:time_stop]
+
+    root = open_group(data_path)
+    if "bioformats2raw.layout" not in root.attrs.get("ome", {}):
+        return
+
+    positions = len(root["OME"].attrs["ome"]["series"])
+    channels = len(root.attrs.get("channels", ())) or max(1, len(layers) // positions)
+    start, stop = pos_range or (0, positions)
+    if start < 0 or stop > positions or start >= stop:
+        raise ValueError(f"pos_range must satisfy 0 <= start < stop <= {positions}")
+
+    stage_positions = root.attrs.get("stage_positions")
+    for position in range(positions):
+        position_layers = layers[position * channels : (position + 1) * channels]
+        for layer in position_layers:
+            layer.visible = start <= position < stop
+            if stage_positions is not None:
+                z, y, x = (float(value) for value in stage_positions[position])
+                layer.translate = (0.0, z, y, x)
+
 
 @app.command()
 def display(
-    root_path: Path, 
+    root_path: Path,
     to_display: str = "max-z",
-    time_range: tuple[int,int] = None,
-    pos_range: tuple[int,int] = None
-):
-    """Display deskewed OPM data.
-    
-    This code assumes data is already deskewed and on disk.
-    
-    Usage: `display "/path/to/qi2lab_acquisition.zarr" --to-display DISPLAY_OPTION` \
-    --time-range TSTART TEND --pos-range PSTART PEND
-    
-    `OPTION` is one of `{max-z, fused-max-z, full}`. 
-        - `max-z` loads each maximum Z projection and places in the recorded \
-            stage position in napari.
-        - `full` loads each deskewed tile and place in the recorded stage \
-            position in napari.
-        - `fused-max-z` loads the maximum z projections fused using recorded \
-            stage positions in napari.
-        - `fused-full` loads the full registered and fused deskewed data if \
-            available.
-    `TSTART` and `TEND` are the start (inclusive) and stop (exclusive) time \
-        indices to load and display
-    `PSTART` and `PEND` are the start (inclusive) and stop (exclusive) position \
-        indices to load and display
-    
-    
+    time_range: tuple[int, int] | None = None,
+    pos_range: tuple[int, int] | None = None,
+) -> None:
+    """Display processed OPM data using the napari-ome-zarr reader.
+
     Parameters
     ----------
-    root_path: Path
-        Path to OPM pymmcoregui zarr file.
-    to_display: str, default = "max-z"
-        Data type to display. Options are "max-z" for maximum z projection,
-        "fused-max-z" for fused maximum z projction, or "full" for 3D data.
-    time_range: list[int,int], default = None
-        Range of timepoints to reconstruct
-    pos_range: list[int,int], default = None
-        Range of stage positions to reconstruct   
+    root_path : Path
+        Value supplied for ``root path``.
+    to_display : str
+        Value supplied for ``to display``.
+    time_range : tuple[int, int] | None
+        Value supplied for ``time range``.
+    pos_range : tuple[int, int] | None
+        Value supplied for ``pos range``.
+
+    Returns
+    -------
+    None
+        No value is returned.
     """
-    
-    # account for flip between camera and stage in y direction
-    stage_y_flipped = True
-    stage_z_flipped = True
-    
-    # Read metadata
-    zattrs_path = root_path / Path(".zattrs")
-    with open(zattrs_path, "r") as f:
-        zattrs = json.load(f)
+    data_path = _resolve_data_path(root_path, to_display)
 
-    pixel_size_um = float(find_key(zattrs,"pixel_size_um"))
-    stage_positions = extract_stage_positions(zattrs)
-    
-    if stage_y_flipped:
-        stage_y_max = np.max(stage_positions[:,1])
-        for pos_idx, _ in enumerate(stage_positions):
-            stage_positions[pos_idx,1] = stage_y_max - stage_positions[pos_idx,1]
-
-    if stage_z_flipped:
-        stage_z_max = np.max(stage_positions[:,0])
-        for pos_idx, _ in enumerate(stage_positions):
-            stage_positions[pos_idx,0] = stage_z_max - stage_positions[pos_idx,0]
-    
-    # Search data paths for deconvolution, include in filename if found
-    all_zarr_paths = [p for p in root_path.parents[0].glob("*.zarr")]
-    is_decon = any([str(p).find("decon")>=0 for p in all_zarr_paths]) 
-    if is_decon:
-        decon_str = "_decon"
-    else:
-        decon_str = ""
-
-    if to_display == "max-z":
-        data_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_z"+decon_str+"_deskewed.zarr")
-        scale_to_use = [pixel_size_um,pixel_size_um]
-    if to_display == "fused-max-z":
-        data_path = root_path.parents[0] / Path(str(root_path.stem)+"_max_z_fused.zarr")
-        scale_to_use = [pixel_size_um,pixel_size_um]
-    elif to_display == "full":
-        data_path = root_path.parents[0] / Path(str(root_path.stem)+decon_str+"_deskewed.zarr")
-        scale_to_use = [pixel_size_um*2,pixel_size_um,pixel_size_um]
-        
-    # open datastore on disk
-    spec = {
-        "driver" : "zarr3",
-        "kvstore" : {
-            "driver" : "file",
-            "path" : str(data_path)
-        }
-    }
-    datastore = ts.open(spec).result()
-        
-    channel_layers = {ch: [] for ch in range(datastore.shape[2])}
-    colormaps = [
-        Colormap("chrisluts:bop_purple").to_napari(),
-        Colormap("chrisluts:bop_blue").to_napari(),
-        Colormap("chrisluts:bop_orange").to_napari(),
-    ]
     viewer = napari.Viewer()
-        
-    if time_range is not None:
-        time_iterator = tqdm(range(time_range[0],time_range[1]),desc="t")
-    else:
-        time_iterator = tqdm(range(datastore.shape[0]),desc="t")
+    layers = list(viewer.open(str(data_path), plugin="napari-ome-zarr"))
+    _configure_collection_layers(data_path, layers, pos_range, time_range)
 
-    if not(to_display == "fused-max-z"):
-        if pos_range is not None:
-            pos_iterator = tqdm(range(pos_range[0],pos_range[1]),desc="p",leave=False)
-        else:
-            pos_iterator = tqdm(range(datastore.shape[1]),desc="p",leave=False)
-    else:
-        pos_iterator = tqdm(range(datastore.shape[1]),desc="p",leave=False)
-        
-    for time_idx in time_iterator:
-        for pos_idx in pos_iterator:
-            for chan_idx in range(datastore.shape[2]):
-                if to_display == "full":
-                    translate_to_use = [
-                        stage_positions[pos_idx,0],
-                        stage_positions[pos_idx,1],
-                        stage_positions[pos_idx,2]
-                    ]
-                elif to_display == "max-z":
-                    translate_to_use = [
-                        stage_positions[pos_idx,1],
-                        stage_positions[pos_idx,2]
-                    ]
-                elif to_display == "fused-max-z":
-                    translate_to_use = [
-                        (np.max(stage_positions[:,1]) - np.min(stage_positions[:,1]))/2,
-                        (np.max(stage_positions[:,2]) - np.min(stage_positions[:,2]))/2
-                    ]
-                layer = viewer.add_image(
-                    datastore[time_idx,pos_idx,chan_idx,:],
-                    scale=scale_to_use,
-                    translate=translate_to_use,
-                    name = "p"+str(pos_idx).zfill(3)+"_c"+str(chan_idx),
-                    blending="additive",
-                    colormap=colormaps[chan_idx],
-                    # contrast_limits = [10,500] # SJS: Commented out to automatically set contrast limits
-                )
-                
-                channel_layers[chan_idx].append(layer)
-    
-    if not(to_display == "fused-max-z"):
-        for chan_idx in range(datastore.shape[2]):
-            link_layers(channel_layers[chan_idx],("contrast_limits","gamma"))
-            
+    root = open_group(data_path)
+    if "bioformats2raw.layout" in root.attrs.get("ome", {}):
+        channels = len(root.attrs.get("channels", ()))
+        if channels:
+            for channel in range(channels):
+                channel_layers = layers[channel::channels]
+                if len(channel_layers) > 1:
+                    link_layers(channel_layers, ("contrast_limits", "gamma"))
     napari.run()
-    
-# entry for point for CLI        
-def main():
+
+
+def main() -> None:
+    """Run the display command-line application.
+
+    Parameters
+    ----------
+    None
+        This callable has no parameters.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
     app()
+
 
 if __name__ == "__main__":
     main()

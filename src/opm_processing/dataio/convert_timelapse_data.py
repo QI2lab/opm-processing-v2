@@ -1,295 +1,477 @@
+"""Convert an acquisition timelapse without embedding experiment paths.
+
+All acquisition selection and camera calibration values are supplied by the
+caller or read from acquisition metadata. Importing this module performs no I/O.
+"""
+
+from __future__ import annotations
+
 import json
 from pathlib import Path
 
 import numpy as np
 import tensorstore as ts
+import typer
 import yaml
 from tifffile import TiffWriter
 
+from opm_processing.dataio.acquisition import (
+    inspect_acquisition,
+    open_acquisition_datastore,
+)
 from opm_processing.dataio.metadata import find_key
 
 
-def save_raw_with_yaml(data_array, output_path):
-    print("Saving Yaml")
-    if output_path.suffix != '.raw':
-        print('Output path is not a .raw, creating one now...')
-        output_path = output_path.parent / (output_path.stem + '.raw')
-    yml_path = output_path.parent / (output_path.stem + '.yaml')
-    print(data_array.shape)
-    data_array.tofile(output_path)
+app = typer.Typer()
 
+
+def _with_suffix(path: Path, suffix: str) -> Path:
+    """Return a path with the requested suffix.
+
+    Parameters
+    ----------
+    path : Path
+        Value supplied for ``path``.
+    suffix : str
+        Value supplied for ``suffix``.
+
+    Returns
+    -------
+    Path
+        Result produced by the callable.
+    """
+    return path if path.suffix == suffix else path.with_suffix(suffix)
+
+
+def save_raw_with_yaml(data_array: np.ndarray, output_path: Path) -> None:
+    """Write a uint16 RAW array and its shape/byte-order sidecar.
+
+    Parameters
+    ----------
+    data_array : np.ndarray
+        Value supplied for ``data array``.
+    output_path : Path
+        Value supplied for ``output path``.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
+    output_path = _with_suffix(Path(output_path), ".raw")
+    yml_path = output_path.with_suffix(".yaml")
+    np.asarray(data_array, dtype=np.uint16).tofile(output_path)
     meta = {
         "Frames": data_array.shape[0],
-        "Data Type": str(np.dtype('uint16')),
-        "Height": data_array.shape[1],
-        "Width": data_array.shape[2],
-        "Byte Order": "<"
+        "Data Type": str(np.dtype("uint16")),
+        "Height": data_array.shape[-2],
+        "Width": data_array.shape[-1],
+        "Byte Order": "<",
     }
-    with open(yml_path, "w") as yf:
-        yaml.safe_dump(meta, yf, sort_keys=False)
+    with yml_path.open("w") as stream:
+        yaml.safe_dump(meta, stream, sort_keys=False)
 
 
-def save_time_projection(data_array, pixel_size_um, output_path):
-    # time_projection = np.max(data_array, axis=0)
-    # Convert to photon counts
-    data_array = (data_array.astype(np.float32) - 100) * 0.24
-    data_array = np.clip(data_array, 0, 2**16 -1)
-    time_projection = np.mean(data_array, axis=0)
-    time_projection = time_projection.astype(np.uint16)
+def _camera_correct(
+    data_array: np.ndarray,
+    *,
+    camera_offset: float,
+    camera_conversion: float,
+) -> np.ndarray:
+    """Apply offset and gain correction while clipping to uint16 limits.
 
-    # save time projection as tiff
-    if output_path.suffix != '.tiff':
-        print('Output path is not a .tiff, creating one now...')
-        output_path = output_path.parent / (output_path.stem + '.tiff')
+    Parameters
+    ----------
+    data_array : np.ndarray
+        Value supplied for ``data array``.
+    camera_offset : float
+        Value supplied for ``camera offset``.
+    camera_conversion : float
+        Value supplied for ``camera conversion``.
 
-    axes = 'YX'
+    Returns
+    -------
+    np.ndarray
+        Result produced by the callable.
+    """
+    corrected = (data_array.astype(np.float32) - camera_offset) * camera_conversion
+    return np.clip(corrected, 0, np.iinfo(np.uint16).max)
+
+
+def _tiff_metadata(axes: str, pixel_size_um: float) -> dict[str, object]:
+    """Build physical-size metadata for an OME-TIFF image.
+
+    Parameters
+    ----------
+    axes : str
+        Value supplied for ``axes``.
+    pixel_size_um : float
+        Value supplied for ``pixel size um``.
+
+    Returns
+    -------
+    dict[str, object]
+        Result produced by the callable.
+    """
+    return {
+        "axes": axes,
+        "SignificantBits": np.iinfo(np.uint16).bits,
+        "PhysicalSizeX": pixel_size_um,
+        "PhysicalSizeXUnit": "µm",
+        "PhysicalSizeY": pixel_size_um,
+        "PhysicalSizeYUnit": "µm",
+    }
+
+
+def save_time_projection(
+    data_array: np.ndarray,
+    pixel_size_um: float,
+    output_path: Path,
+    *,
+    camera_offset: float,
+    camera_conversion: float,
+) -> None:
+    """Save a mean time projection after explicit camera calibration.
+
+    Parameters
+    ----------
+    data_array : np.ndarray
+        Value supplied for ``data array``.
+    pixel_size_um : float
+        Value supplied for ``pixel size um``.
+    output_path : Path
+        Value supplied for ``output path``.
+    camera_offset : float
+        Value supplied for ``camera offset``.
+    camera_conversion : float
+        Value supplied for ``camera conversion``.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
+    output_path = _with_suffix(Path(output_path), ".tiff")
+    projection = _camera_correct(
+        data_array,
+        camera_offset=camera_offset,
+        camera_conversion=camera_conversion,
+    ).mean(axis=0, dtype=np.float32)
+    _write_tiff(projection.astype(np.uint16), "YX", pixel_size_um, output_path)
+
+
+def _write_tiff(
+    data_array: np.ndarray,
+    axes: str,
+    pixel_size_um: float,
+    output_path: Path,
+) -> None:
+    """Write an array as a compressed OME-TIFF image.
+
+    Parameters
+    ----------
+    data_array : np.ndarray
+        Value supplied for ``data array``.
+    axes : str
+        Value supplied for ``axes``.
+    pixel_size_um : float
+        Value supplied for ``pixel size um``.
+    output_path : Path
+        Value supplied for ``output path``.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
+    output_path = _with_suffix(Path(output_path), ".tiff")
+    resolution = 1e4 / pixel_size_um
     with TiffWriter(output_path, bigtiff=True) as tif:
-            metadata={
-                'axes': axes,
-                'SignificantBits': 16,
-                'PhysicalSizeX': pixel_size_um,
-                'PhysicalSizeXUnit': 'µm',
-                'PhysicalSizeY': pixel_size_um,
-                'PhysicalSizeYUnit': 'µm'
-            }
-            options = dict(
-                compression='zlib',
-                compressionargs={'level': 8},
-                predictor=True,
-                photometric='minisblack',
-                resolutionunit='CENTIMETER',
-            )
-            tif.write(
-                time_projection,
-                resolution=(
-                    1e4 / pixel_size_um,
-                    1e4 / pixel_size_um
-                ),
-                **options,
-                metadata=metadata
-            )
-    
-
-def save_as_tiff(data_array, pixel_size_um, output_path):
-    
-    # save time projection as tiff
-    if output_path.suffix != '.tiff':
-        print('Output path is not a .tiff, creating one now...')
-        output_path = output_path.parent / (output_path.stem + '.tiff')
-
-    axes = 'TYX'
-    with TiffWriter(output_path, bigtiff=True) as tif:
-        metadata={
-            'axes': axes,
-            'SignificantBits': 16,
-            'PhysicalSizeX': pixel_size_um,
-            'PhysicalSizeXUnit': 'µm',
-            'PhysicalSizeY': pixel_size_um,
-            'PhysicalSizeYUnit': 'µm',
-            'PhysicalSizeZ': 1.0,
-            'PhysicalSizeZUnit': 'µm',
-        }
-        options = dict(
-            compression='zlib',
-            compressionargs={'level': 8},
-            predictor=True,
-            photometric='minisblack',
-            resolutionunit='CENTIMETER',
-        )
         tif.write(
             data_array,
-            resolution=(
-                1e4 / pixel_size_um,
-                1e4 / pixel_size_um
-            ),
-            **options,
-            metadata=metadata
+            resolution=(resolution, resolution),
+            compression="zlib",
+            predictor=True,
+            photometric="minisblack",
+            resolutionunit="CENTIMETER",
+            metadata=_tiff_metadata(axes, pixel_size_um),
         )
 
-data_dirs = [
-    Path(r"E:\20251106_DNApaint\20251106_204843_50pM_timelapse_restarted"), 
-    Path(r"E:\20251106_DNApaint\20251107_112433_80pM_timelapse") 
-]
 
-zarr_dir = Path(r'e:\20251218_beads_glyc\20251218_091258_testrun\testrun.zarr')
-big_tiff_path = zarr_dir.parent / 'timelapse.tiff'
-batch_processing = False
+def save_as_tiff(
+    data_array: np.ndarray,
+    pixel_size_um: float,
+    output_path: Path,
+    *,
+    axes: str = "TYX",
+) -> None:
+    """Save selected timelapse data as OME-TIFF.
 
-# zarr_dir = None
-mirror_pos_range = None
-stage_pos_range = None 
-fov_range = [300, 1000]
-time_range = None
-create_raw = False
-create_time_projection = False
-create_tiff = True
+    Parameters
+    ----------
+    data_array : np.ndarray
+        Value supplied for ``data array``.
+    pixel_size_um : float
+        Value supplied for ``pixel size um``.
+    output_path : Path
+        Value supplied for ``output path``.
+    axes : str
+        Value supplied for ``axes``.
 
-try:
-    ds_spec = {
-        "driver" : "zarr3",
-        "kvstore" : {
-            "driver" : "file",
-            "path" : str(zarr_dir)
-        }
-    }
-    datastore = ts.open(ds_spec).result()
-except ValueError:
-    try:
-        ds_spec = {
-            "driver" : "zarr",
-            "kvstore" : {
-                "driver" : "file",
-                "path" : str(zarr_dir)
-            }
-        }
-        datastore = ts.open(ds_spec).result()  
-    except Exception as e:
-        print(f"Error opening datastore: {e}")
-        raise
-
-# Read metadata
-zattrs_path = zarr_dir / Path(".zattrs")
-with open(zattrs_path, "r") as f:
-    zattrs = json.load(f)
-
-pixel_size_um = float(find_key(zattrs,"pixel_size_um"))
-
-data_array = np.squeeze(
-    datastore[:, :, :, :, :, fov_range[0]:fov_range[1]].read().result()
-).astype(np.uint16)
-
-if create_tiff:
-    print("Saving timelapse as TIFF")
-    save_as_tiff(data_array, pixel_size_um, big_tiff_path)
+    Returns
+    -------
+    None
+        No value is returned.
+    """
+    _write_tiff(data_array, axes, pixel_size_um, output_path)
 
 
-if batch_processing and data_dirs:
-    zarr_dirs = []
-    # Batch processing over all directories
-    if data_dirs:
-        for data_dir in data_dirs:
-            # Directory parsing for batch applications
-            for dir in data_dir.iterdir():
-                if dir.is_dir():
-                    if dir.is_dir() and dir.name.endswith("zarr"):
-                        zarr_dirs.append(dir)
-    # Process single directory
-    elif zarr_dir is not None:
-        zarr_dirs.append(zarr_dir)
+def _open_datastore(zarr_dir: Path) -> ts.TensorStore:
+    """Open a Zarr v2 or v3 acquisition as a TensorStore.
+
+    Parameters
+    ----------
+    zarr_dir : Path
+        Value supplied for ``zarr dir``.
+
+    Returns
+    -------
+    ts.TensorStore
+        Result produced by the callable.
+    """
+    last_error: Exception | None = None
+    for driver in ("zarr3", "zarr"):
+        try:
+            return ts.open(
+                {
+                    "driver": driver,
+                    "kvstore": {"driver": "file", "path": str(zarr_dir)},
+                }
+            ).result()
+        except Exception as error:  # TensorStore uses different errors by driver.
+            last_error = error
+    raise ValueError(f"Unable to open datastore {zarr_dir}") from last_error
+
+
+def _selection_bounds(
+    requested: tuple[int, int] | None,
+    length: int,
+    name: str,
+) -> tuple[int, int]:
+    """Validate and normalize a half-open selection range.
+
+    Parameters
+    ----------
+    requested : tuple[int, int] | None
+        Value supplied for ``requested``.
+    length : int
+        Value supplied for ``length``.
+    name : str
+        Value supplied for ``name``.
+
+    Returns
+    -------
+    tuple[int, int]
+        Result produced by the callable.
+    """
+    if requested is None:
+        return 0, length
+    start, stop = requested
+    if not 0 <= start < stop <= length:
+        raise ValueError(f"{name} must satisfy 0 <= start < stop <= {length}")
+    return int(start), int(stop)
+
+
+def convert_timelapse(
+    zarr_dir: Path,
+    *,
+    output_dir: Path | None = None,
+    time_range: tuple[int, int] | None = None,
+    stage_range: tuple[int, int] | None = None,
+    scan_range: tuple[int, int] | None = None,
+    fov_x_range: tuple[int, int] | None = None,
+    create_raw: bool = False,
+    create_time_projection: bool = False,
+    create_tiff: bool = True,
+    camera_offset: float | None = None,
+    camera_conversion: float | None = None,
+) -> list[Path]:
+    """Convert selected TPCZYX positions from one acquisition datastore.
+
+    Parameters
+    ----------
+    zarr_dir : Path
+        Value supplied for ``zarr dir``.
+    output_dir : Path | None
+        Value supplied for ``output dir``.
+    time_range : tuple[int, int] | None
+        Value supplied for ``time range``.
+    stage_range : tuple[int, int] | None
+        Value supplied for ``stage range``.
+    scan_range : tuple[int, int] | None
+        Value supplied for ``scan range``.
+    fov_x_range : tuple[int, int] | None
+        Value supplied for ``fov x range``.
+    create_raw : bool
+        Value supplied for ``create raw``.
+    create_time_projection : bool
+        Value supplied for ``create time projection``.
+    create_tiff : bool
+        Value supplied for ``create tiff``.
+    camera_offset : float | None
+        Value supplied for ``camera offset``.
+    camera_conversion : float | None
+        Value supplied for ``camera conversion``.
+
+    Returns
+    -------
+    list[Path]
+        Result produced by the callable.
+    """
+    zarr_dir = Path(zarr_dir)
+    acquisition = None
+    if (zarr_dir / ".zattrs").is_file():
+        # Compatibility for legacy root-array acquisitions.
+        datastore = _open_datastore(zarr_dir)
     else:
-        raise ValueError("No data directories or zarr directory specified.")
+        acquisition = inspect_acquisition(zarr_dir)
+        zarr_dir = acquisition.path
+        datastore = open_acquisition_datastore(acquisition)
+    if datastore.rank != 6:
+        raise ValueError(f"Expected TPCZYX rank 6, got shape {datastore.shape}")
 
-    for zarr_dir in zarr_dirs:
-        print(f"Processing {zarr_dir}...")
-        
-        # Read metadata
-        zattrs_path = zarr_dir / Path(".zattrs")
-        with open(zattrs_path, "r") as f:
-            zattrs = json.load(f)
+    if acquisition is not None:
+        if acquisition.pixel_size_um is None:
+            raise ValueError("Acquisition metadata lacks pixel size")
+        pixel_size_um = acquisition.pixel_size_um
+        if camera_offset is None:
+            camera_offset = acquisition.camera_offset
+        if camera_conversion is None:
+            camera_conversion = acquisition.camera_conversion
+    else:
+        attrs_path = zarr_dir / ".zattrs"
+        with attrs_path.open() as stream:
+            attributes = json.load(stream)
+        pixel_size_um = float(find_key(attributes, "pixel_size_um"))
+        if camera_offset is None:
+            value = find_key(attributes, "offset")
+            camera_offset = None if value is None else float(value)
+        if camera_conversion is None:
+            value = find_key(attributes, "e_to_ADU")
+            camera_conversion = None if value is None else float(value)
 
-        pixel_size_um = float(find_key(zattrs,"pixel_size_um"))
-        try:
-            output_dir_path = zarr_dir.parent / Path("converted_files")
-        except Exception:
-            print("Error creating tiff directory path.")
+    t0, t1 = _selection_bounds(time_range, datastore.shape[0], "time_range")
+    p0, p1 = _selection_bounds(stage_range, datastore.shape[1], "stage_range")
+    z0, z1 = _selection_bounds(scan_range, datastore.shape[3], "scan_range")
+    x0, x1 = _selection_bounds(fov_x_range, datastore.shape[5], "fov_x_range")
+    destination = (
+        Path(output_dir) if output_dir else zarr_dir.parent / "converted_files"
+    )
+    destination.mkdir(parents=True, exist_ok=True)
 
-        output_dir_path.mkdir(exist_ok=True)
+    if create_time_projection and (camera_offset is None or camera_conversion is None):
+        raise ValueError(
+            "Time projection requires camera offset and conversion in metadata "
+            "or as explicit arguments."
+        )
 
-        # Create new file paths 
-        raw_file_fname = 'timelapse.raw'
-        time_proj_fname = 'time_mean_projection.tiff'
-        big_tiff_fname = 'timeplapse.tiff'
+    written: list[Path] = []
+    for position in range(p0, p1):
+        for scan in range(z0, z1):
+            selected = np.asarray(
+                datastore[t0:t1, position, :, scan, :, x0:x1].read().result(),
+                dtype=np.uint16,
+            )
+            channel_count = selected.shape[1]
+            axes = "TYX" if channel_count == 1 else "TCYX"
+            stem = f"pos_{position}_scan_{scan}"
+            if create_raw:
+                path = destination / f"{stem}.raw"
+                save_raw_with_yaml(selected, path)
+                written.extend((path, path.with_suffix(".yaml")))
+            if create_time_projection:
+                for channel in range(channel_count):
+                    path = destination / f"{stem}_c{channel}_time_mean.tiff"
+                    save_time_projection(
+                        selected[:, channel],
+                        pixel_size_um,
+                        path,
+                        camera_offset=float(camera_offset),
+                        camera_conversion=float(camera_conversion),
+                    )
+                    written.append(path)
+            if create_tiff:
+                path = destination / f"{stem}.tiff"
+                save_as_tiff(
+                    np.squeeze(selected, axis=1) if channel_count == 1 else selected,
+                    pixel_size_um,
+                    path,
+                    axes=axes,
+                )
+                written.append(path)
+    return written
 
-        # Try opening datastore
-        try:
-            ds_spec = {
-                "driver" : "zarr3",
-                "kvstore" : {
-                    "driver" : "file",
-                    "path" : str(zarr_dir)
-                }
-            }
-            datastore = ts.open(ds_spec).result()
-        except ValueError:
-            try:
-                ds_spec = {
-                    "driver" : "zarr",
-                    "kvstore" : {
-                        "driver" : "file",
-                        "path" : str(zarr_dir)
-                    }
-                }
-                datastore = ts.open(ds_spec).result()  
-            except Exception as e:
-                print(f"Error opening datastore: {e}")
-                raise
-        
-        # Define the axis order based on datastore shape
-        num_scan_position = datastore.shape[3]
-        num_channels = datastore.shape[2]
-        num_timepoints = datastore.shape[0]
-        num_stage_positions = datastore.shape[1]
-        print(
-            f"Number of scan positions: {num_scan_position}\n"
-            f"Number of channels: {num_channels}\n"
-            f"Number of timepoints: {num_timepoints}\n"
-            f"Number of stage positions: {num_stage_positions}\n"
-            f"FOV size in pixels: {datastore.shape[-2]}, {datastore.shape[-1]}\n"
-        )   
 
-        if num_scan_position > 1:
-            if num_channels == 1:
-                axes = "TZYX"
-            else:
-                axes = "TCZYX"
-        elif num_scan_position == 1:
-            if num_channels == 1:
-                axes = "TYX"
-            else:
-                axes = "TCYX"
+@app.command()
+def main(
+    zarr_dir: Path,
+    output_dir: Path | None = None,
+    time_range: tuple[int, int] | None = None,
+    stage_range: tuple[int, int] | None = None,
+    scan_range: tuple[int, int] | None = None,
+    fov_x_range: tuple[int, int] | None = None,
+    create_raw: bool = False,
+    create_time_projection: bool = False,
+    create_tiff: bool = True,
+    camera_offset: float | None = None,
+    camera_conversion: float | None = None,
+) -> None:
+    """Convert a selected acquisition; no paths or calibration are implicit.
 
-        # Save each position as a separate file
-        if mirror_pos_range is not None:
-            pos_iterator = range(mirror_pos_range[0], mirror_pos_range[1])
-        else:
-            pos_iterator = range(num_scan_position)
+    Parameters
+    ----------
+    zarr_dir : Path
+        Value supplied for ``zarr dir``.
+    output_dir : Path | None
+        Value supplied for ``output dir``.
+    time_range : tuple[int, int] | None
+        Value supplied for ``time range``.
+    stage_range : tuple[int, int] | None
+        Value supplied for ``stage range``.
+    scan_range : tuple[int, int] | None
+        Value supplied for ``scan range``.
+    fov_x_range : tuple[int, int] | None
+        Value supplied for ``fov x range``.
+    create_raw : bool
+        Value supplied for ``create raw``.
+    create_time_projection : bool
+        Value supplied for ``create time projection``.
+    create_tiff : bool
+        Value supplied for ``create tiff``.
+    camera_offset : float | None
+        Value supplied for ``camera offset``.
+    camera_conversion : float | None
+        Value supplied for ``camera conversion``.
 
-        if stage_pos_range is not None:
-            stage_pos_iterator = range(stage_pos_range[0], stage_pos_range[1])
-        else:
-            stage_pos_iterator = range(num_stage_positions)
-        
-        for pos_idx in stage_pos_iterator:
-            for scan_idx in pos_iterator:
-                print(f"Processing position {pos_idx}, scan {scan_idx}...")
-                # create unique file path
-                raw_file_path = output_dir_path / ('pos_' + str(pos_idx) + 'scan_' + str(scan_idx) + '_' + raw_file_fname)
-                time_proj_path = output_dir_path / ('pos_' + str(pos_idx) + 'scan_' + str(scan_idx) +  '_' + time_proj_fname)
-                big_tiff_path = output_dir_path / ('pos_' + str(pos_idx) + 'scan_' + str(scan_idx) +  '_' + big_tiff_fname)
+    Returns
+    -------
+    None
+        No value is returned.
+    """
+    convert_timelapse(
+        zarr_dir,
+        output_dir=output_dir,
+        time_range=time_range,
+        stage_range=stage_range,
+        scan_range=scan_range,
+        fov_x_range=fov_x_range,
+        create_raw=create_raw,
+        create_time_projection=create_time_projection,
+        create_tiff=create_tiff,
+        camera_offset=camera_offset,
+        camera_conversion=camera_conversion,
+    )
 
-                # load current position as an array
-                if time_range is None:
-                    time_range = [0, num_timepoints]
-                if fov_range is None:
-                    fov_range = [0, datastore.shape[-1]]
 
-                current_pos_arr = np.squeeze(
-                    datastore[time_range[0]:time_range[1], pos_idx, :, scan_idx, :, fov_range[0]:fov_range[1]].read().result()
-                ).astype(np.uint16)
-
-                # Save raw file
-                if create_raw:
-                    print("Creating RAW")
-                    save_raw_with_yaml(current_pos_arr, raw_file_path)
-
-                # Save time proejection
-                if create_time_projection:
-                    print("Creating time-projection")
-                    save_time_projection(current_pos_arr, pixel_size_um, time_proj_path)
-
-                # Save timelapse as tiff
-                if create_tiff:
-                    print("Saving timelapse as TIFF")
-                    save_as_tiff(current_pos_arr, pixel_size_um, big_tiff_path)
-else:
-    print("Single directory processing...")
+if __name__ == "__main__":
+    app()

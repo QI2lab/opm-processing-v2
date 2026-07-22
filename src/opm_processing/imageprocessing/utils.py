@@ -16,6 +16,11 @@ import numpy as np
 import gc
 from numpy.typing import NDArray
 
+from opm_processing.cuda import preload_cuda_libraries
+
+
+preload_cuda_libraries()
+
 # GPU
 CUPY_AVIALABLE = True
 try:
@@ -30,9 +35,7 @@ else:
 
 
 def replace_hot_pixels(
-    noise_map: NDArray, 
-    data: NDArray, 
-    threshold: float = 375.0
+    noise_map: NDArray, data: NDArray, threshold: float = 375.0
 ) -> NDArray:
     """Replace hot pixels with median values surrounding them.
 
@@ -43,12 +46,14 @@ def replace_hot_pixels(
     data: NDArray
         ND data [broadcast_dim,z,y,x]
 
+    threshold : float
+        Value supplied for ``threshold``.
+
     Returns
     -------
     data: NDArray
         hotpixel corrected data
     """
-
     data = xp.asarray(data, dtype=xp.float32)
     noise_map = xp.asarray(noise_map, dtype=xp.float32)
 
@@ -76,6 +81,7 @@ def replace_hot_pixels(
 
     return data
 
+
 def downsample_image_yx(image: NDArray, level: int = 2) -> NDArray:
     """2D plane downsampling.
 
@@ -91,13 +97,10 @@ def downsample_image_yx(image: NDArray, level: int = 2) -> NDArray:
     downsampled_image: NDArray
         downsampled 3D image
     """
-
-    downsampled_image = downsample_axis(
-        downsample_axis(image, level, 1),
-        level, 2
-    )
+    downsampled_image = downsample_axis(downsample_axis(image, level, 1), level, 2)
 
     return downsampled_image
+
 
 def downsample_image_isotropic(image: NDArray, level: int = 2) -> NDArray:
     """3D isotropic downsampling.
@@ -114,19 +117,16 @@ def downsample_image_isotropic(image: NDArray, level: int = 2) -> NDArray:
     downsampled_image: NDArray
         downsampled 3D image
     """
-
     downsampled_image = downsample_axis(
-        downsample_axis(
-            downsample_axis(image, level, 0), 
-            level, 1), 
-        level, 2
+        downsample_axis(downsample_axis(image, level, 0), level, 1), level, 2
     )
 
     return downsampled_image
 
+
 def downsample_axis(image: NDArray, level: int = 2, axis: int = 0) -> NDArray:
     """Downsampling along a specified axis.
-    
+
     Parameters
     ----------
     image: NDArray
@@ -135,13 +135,12 @@ def downsample_axis(image: NDArray, level: int = 2, axis: int = 0) -> NDArray:
         integer amount to downsample.
     axis: int
         axis to apply to.
-    
+
     Returns
     -------
     downsampled_image: NDArray
-        downsampled image.    
+        downsampled image.
     """
-    
     # Compute new shape
     original_shape = image.shape
     new_size = original_shape[axis] // level
@@ -150,7 +149,9 @@ def downsample_axis(image: NDArray, level: int = 2, axis: int = 0) -> NDArray:
 
     # Trim excess values to ensure reshape works properly
     trim_size = new_size * level
-    slicing = [slice(0, trim_size) if i == axis else slice(None) for i in range(image.ndim)]
+    slicing = [
+        slice(0, trim_size) if i == axis else slice(None) for i in range(image.ndim)
+    ]
     image_trimmed = image[tuple(slicing)]
 
     # Reshape and compute mean along the downsampled axis
