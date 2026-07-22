@@ -103,6 +103,8 @@ repository = "https://github.com/qi2lab/opm-processing-v2"
 # same as console_scripts entry point
 [project.scripts]
 process = "opm_processing.process:main"
+inspect-opm = "opm_processing.dataio.acquisition:main"
+convert-timelapse = "opm_processing.dataio.convert_timelapse_data:app"
 display = "opm_processing.display:main"
 fuse = "opm_processing.fuse:main"
 
@@ -123,11 +125,13 @@ convention = "numpy"
 [tool.pytest.ini_options]
 minversion = "7.0"
 testpaths = ["tests"]
+addopts = "-p no:zarr"
 markers = [
     "gpu: correctness tests that execute CUDA code on a real NVIDIA GPU",
 ]
 filterwarnings = [
     "error",
+    "ignore:CUDA path could not be detected.*:UserWarning:cupy._environment",
     "ignore::pydantic.warnings.PydanticDeprecatedSince20",
 ]
 

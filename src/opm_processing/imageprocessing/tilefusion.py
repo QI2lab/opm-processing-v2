@@ -23,21 +23,26 @@ Notes
 
 import gc
 import json
+import math
 from collections import deque
 from collections.abc import Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import psutil
 import tensorstore as ts
-from numba import njit, prange
-from tqdm import trange
+from numba import njit
+from tqdm import tqdm, trange
 from yaozarrs import v05
 from yaozarrs.write.v05 import prepare_image
 
 from opm_processing.cuda import preload_cuda_libraries
+from opm_processing.dataio.acquisition import (
+    acquisition_stem,
+    resolve_acquisition_path,
+)
 from opm_processing.dataio.position_collection import open_position_collection
 
 
@@ -45,6 +50,7 @@ from opm_processing.dataio.position_collection import open_position_collection
 # Optional GPU stack (safe globals)
 # -----------------------------------------------------------------------------
 USING_GPU = False
+GPU_IMPORT_ERROR: Exception | None = None
 
 cp: Any | None = None
 cp_shift: Any | None = None
@@ -58,6 +64,8 @@ _shift_cpu: Any | None = None
 _ssim_cpu: Any | None = None
 
 xp: Any = np
+
+DEFAULT_FUSION_WORKERS = 8
 
 preload_cuda_libraries()
 
@@ -79,8 +87,9 @@ try:
     cp_shift = _cp_shift
     ssim_cuda = _ssim_cuda
     USING_GPU = True
-except Exception:  # noqa: BLE001
+except Exception as error:  # noqa: BLE001
     # GPU stack unavailable; fall back to CPU.
+    GPU_IMPORT_ERROR = error
     from scipy.ndimage import shift as _cpu_shift  # type: ignore
     from skimage.exposure import match_histograms as _mh  # type: ignore
     from skimage.measure import block_reduce as _br  # type: ignore
@@ -93,6 +102,31 @@ except Exception:  # noqa: BLE001
     _shift_cpu = _cpu_shift
     _ssim_cpu = _cpu_ssim
     USING_GPU = False
+
+
+def fusion_backend_status() -> dict[str, str | bool | int | None]:
+    """Return observable registration and fusion backend information."""
+    return {
+        "gpu_registration": USING_GPU,
+        "registration_backend": "cupy/cucim" if USING_GPU else "numpy/scikit-image",
+        "fusion_backend": "threaded-blocks/numba-cpu",
+        "fusion_workers": DEFAULT_FUSION_WORKERS,
+        "gpu_error": None if GPU_IMPORT_ERROR is None else repr(GPU_IMPORT_ERROR),
+    }
+
+
+def require_gpu_backend() -> None:
+    """Raise with the captured initialization error when CUDA is unavailable."""
+    if USING_GPU:
+        return
+    detail = "unknown initialization error"
+    if GPU_IMPORT_ERROR is not None:
+        detail = f"{type(GPU_IMPORT_ERROR).__name__}: {GPU_IMPORT_ERROR}"
+    raise RuntimeError(
+        "GPU registration was requested, but the CuPy/cuCIM backend could not "
+        f"initialize ({detail}). Install/run the project's gpu extra; on Windows, "
+        "also install the local pure-Python cuCIM package described in README.md."
+    )
 
 
 def _shift_array(arr: Any, shift_vec: Any) -> Any:
@@ -151,7 +185,7 @@ def _ssim(arr1: Any, arr2: Any, win_size: int) -> float:
     return float(_ssim_cpu(arr1_np, arr2_np, win_size=win_size, data_range=data_range))
 
 
-@njit(parallel=True)
+@njit(nogil=True)
 def _accumulate_tile_block(
     fused: np.ndarray,
     weight: np.ndarray,
@@ -189,7 +223,7 @@ def _accumulate_tile_block(
     _, sub_dz, y_sub, x_sub = sub.shape
     total = sub_dz * y_sub
 
-    for idx in prange(total):
+    for idx in range(total):
         dz_i = idx // y_sub
         y_i = idx % y_sub
         gz = z_off + dz_i
@@ -206,7 +240,7 @@ def _accumulate_tile_block(
                 base_w[gx] += w_val
 
 
-@njit(parallel=True)
+@njit(nogil=True)
 def _normalize_block(fused: np.ndarray, weight: np.ndarray) -> None:
     """Normalize fused by weight in-place.
 
@@ -225,7 +259,7 @@ def _normalize_block(fused: np.ndarray, weight: np.ndarray) -> None:
     c_dim, dz, y_dim, x_dim = fused.shape
     total = c_dim * dz * y_dim
 
-    for idx in prange(total):
+    for idx in range(total):
         c = idx // (dz * y_dim)
         rem = idx % (dz * y_dim)
         z_i = rem // y_dim
@@ -235,6 +269,73 @@ def _normalize_block(fused: np.ndarray, weight: np.ndarray) -> None:
         for x_i in range(x_dim):
             w_val = base_w[x_i]
             base_f[x_i] = base_f[x_i] / w_val if w_val > 0 else 0.0
+
+
+def _partition_fusion_block(
+    bounds: tuple[int, int, int, int, int, int],
+    contributors: Sequence[tuple[int, tuple[int, int, int]]],
+    tile_shape: tuple[int, int, int],
+) -> list[
+    tuple[
+        tuple[int, int, int, int, int, int],
+        list[tuple[int, tuple[int, int, int]]],
+    ]
+]:
+    """Partition a block wherever its set of contributing tiles changes.
+
+    This preserves the block-oriented memory bound while exposing exclusive tile
+    interiors for direct copying. Adjacent X regions with identical contributors
+    are merged to avoid unnecessary TensorStore reads and writes.
+    """
+    z0, z1, y0, y1, x0, x1 = bounds
+    tile_z, tile_y, tile_x = tile_shape
+    cuts = [{z0, z1}, {y0, y1}, {x0, x1}]
+    for _, (oz, oy, ox) in contributors:
+        for axis_cuts, lo, hi, tile_lo, tile_length in (
+            (cuts[0], z0, z1, oz, tile_z),
+            (cuts[1], y0, y1, oy, tile_y),
+            (cuts[2], x0, x1, ox, tile_x),
+        ):
+            axis_cuts.add(max(lo, tile_lo))
+            axis_cuts.add(min(hi, tile_lo + tile_length))
+
+    z_cuts, y_cuts, x_cuts = (sorted(axis) for axis in cuts)
+    regions: list[
+        tuple[
+            tuple[int, int, int, int, int, int],
+            list[tuple[int, tuple[int, int, int]]],
+        ]
+    ] = []
+    for rz0, rz1 in zip(z_cuts, z_cuts[1:]):
+        for ry0, ry1 in zip(y_cuts, y_cuts[1:]):
+            for rx0, rx1 in zip(x_cuts, x_cuts[1:]):
+                region_contributors = [
+                    (p, offset)
+                    for p, offset in contributors
+                    if offset[0] <= rz0
+                    and offset[0] + tile_z >= rz1
+                    and offset[1] <= ry0
+                    and offset[1] + tile_y >= ry1
+                    and offset[2] <= rx0
+                    and offset[2] + tile_x >= rx1
+                ]
+                if not region_contributors:
+                    continue
+                region = (rz0, rz1, ry0, ry1, rx0, rx1)
+                if (
+                    regions
+                    and regions[-1][1] == region_contributors
+                    and regions[-1][0][:4] == region[:4]
+                    and regions[-1][0][5] == region[4]
+                ):
+                    previous, previous_contributors = regions[-1]
+                    regions[-1] = (
+                        (*previous[:5], region[5]),
+                        previous_contributors,
+                    )
+                else:
+                    regions.append((region, region_contributors))
+    return regions
 
 
 class TileFusion:
@@ -268,7 +369,7 @@ class TileFusion:
     resolution_multiples : sequence[int | sequence[int]], default=((1,1,1), ..., (32,32,32))
         Spatial scale multipliers recorded into NGFF metadata for each pyramid level.
     max_workers : int, default=8
-        TensorStore I/O concurrency limit.
+        Maximum number of fusion blocks rendered concurrently.
     debug : bool, default=False
         If True, emits debug logs.
     metrics_filename : str, default="stitching_metrics.json"
@@ -299,7 +400,7 @@ class TileFusion:
             (16, 16, 16),
             (32, 32, 32),
         ),
-        max_workers: int = 8,
+        max_workers: int = DEFAULT_FUSION_WORKERS,
         debug: bool = False,
         metrics_filename: str = "stitching_metrics.json",
         channel_to_use: int = 0,
@@ -330,7 +431,7 @@ class TileFusion:
         resolution_multiples
             NGFF spatial scale multiples for pyramid levels.
         max_workers
-            Maximum TensorStore I/O worker count.
+            Maximum number of fusion blocks rendered concurrently.
         debug
             Whether to emit diagnostic messages.
         metrics_filename
@@ -357,9 +458,9 @@ class TileFusion:
         None
             No value is returned.
         """
-        self.root = Path(root_path)
+        self.root = resolve_acquisition_path(root_path)
         base = self.root.parents[0]
-        stem = self.root.stem
+        stem = acquisition_stem(self.root)
 
         candidates = (
             base / f"{stem}_decon_deskewed.ome.zarr",
@@ -394,10 +495,14 @@ class TileFusion:
         self.ssim_window = int(ssim_window)
         self.threshold = float(threshold)
         self.multiscale_factors = tuple(int(x) for x in multiscale_factors)
+        if any(value < 1 for value in self.multiscale_factors):
+            raise ValueError("multiscale_factors must contain positive integers")
         self.resolution_multiples: list[tuple[int, int, int]] = [
             tuple(r) if hasattr(r, "__len__") else (int(r), int(r), int(r))
             for r in resolution_multiples
         ]
+        if max_workers < 1:
+            raise ValueError("max_workers must be at least 1")
         self._max_workers = int(max_workers)
         self._debug = bool(debug)
         self.metrics_filename = str(metrics_filename)
@@ -558,6 +663,7 @@ class TileFusion:
         z_slice: slice,
         y_slice: slice,
         x_slice: slice,
+        dtype: Any = np.float32,
     ) -> np.ndarray:
         """Read a tile subvolume using a global flattened tile index.
 
@@ -577,6 +683,8 @@ class TileFusion:
             Y slice.
         x_slice : slice
             X slice.
+        dtype : numpy dtype or None, default=numpy.float32
+            Requested output dtype. ``None`` preserves the stored dtype.
 
         Returns
         -------
@@ -618,14 +726,14 @@ class TileFusion:
                 raise ValueError(
                     f"Unexpected 2D tile ndim={arr.ndim}, shape={arr.shape}"
                 )
-            return arr.astype(np.float32, copy=False)
+            return arr if dtype is None else arr.astype(dtype, copy=False)
 
         arr = (
             self.position_arrays[pos_idx][t_idx, ch_sel, z_slice, y_slice, x_slice]
             .read()
             .result()
         )
-        return arr.astype(np.float32, copy=False)
+        return arr if dtype is None else arr.astype(dtype, copy=False)
 
     @staticmethod
     def register_and_score(
@@ -789,7 +897,7 @@ class TileFusion:
         if int(self.z_dim) == 1:
             df_zyx_base = (1, df_zyx_base[1], df_zyx_base[2])
 
-        with ThreadPoolExecutor(max_workers=2) as executor:
+        with ThreadPoolExecutor(max_workers=min(2, self._max_workers)) as executor:
             for t in range(int(self.time_dim)):
                 base = t * n_pos
 
@@ -859,8 +967,10 @@ class TileFusion:
                                 slice(x0, x1),
                             )
 
-                        patch_i = executor.submit(read_patch, i, bounds_i).result()
-                        patch_j = executor.submit(read_patch, j, bounds_j).result()
+                        future_i = executor.submit(read_patch, i, bounds_i)
+                        future_j = executor.submit(read_patch, j, bounds_j)
+                        patch_i = future_i.result()
+                        patch_j = future_j.result()
 
                         df_zyx_eff = effective_df_for_patch(patch_i, df_zyx_base)
 
@@ -1207,8 +1317,8 @@ class TileFusion:
         self.unpadded_shape = (sz, sy, sx)
         self.offset_um = (float(min_z), float(min_y), float(min_x))
 
-    def _pad_to_chunk_multiple(self) -> None:
-        """Pad the fused shape to multiples of tile shape.
+    def _pad_to_multiscale_multiple(self) -> None:
+        """Minimally pad the fused shape for integer multiscale levels.
 
         Parameters
         ----------
@@ -1223,12 +1333,13 @@ class TileFusion:
         if self.unpadded_shape is None:
             raise RuntimeError("unpadded_shape not computed.")
 
-        tz, ty, tx = int(self.z_dim), int(self.y_dim), int(self.x_dim)
         sz, sy, sx = self.unpadded_shape
+        alignment = math.lcm(1, *(int(value) for value in self.multiscale_factors))
+        z_alignment = 1 if self._is_2d else alignment
 
-        pz = (-sz) % tz
-        py = (-sy) % ty
-        px = (-sx) % tx
+        pz = (-sz) % z_alignment
+        py = (-sy) % alignment
+        px = (-sx) % alignment
 
         self.padded_shape = (sz + pz, sy + py, sx + px)
 
@@ -1335,9 +1446,18 @@ class TileFusion:
         """
         available = int(psutil.virtual_memory().available)
         budget = max(1, int(available * self.fusion_ram_fraction))
+        concurrent_buffers = max(
+            1, int(self._max_workers) + int(self.max_in_flight_writes)
+        )
+        per_block_budget = max(1, budget // concurrent_buffers)
 
-        # Fused, weight, current tile, and feather arrays are all float32.
-        max_xy_pixels = max(1, budget // (max(1, z_depth) * 16))
+        # A mixed block holds uint16 source/output arrays plus float32 overlap
+        # accumulators. Budget per concurrently rendered block, including channels.
+        bytes_per_voxel = max(16, 12 * int(self.channels) + 4)
+        max_xy_pixels = max(
+            1,
+            per_block_budget // (max(1, z_depth) * bytes_per_voxel),
+        )
         aspect = float(y_size) / float(max(1, x_size))
         block_y = max(1, int(np.sqrt(max_xy_pixels * aspect)))
         block_y = min(y_size, block_y, int(self.chunk_y) * 8)
@@ -1352,6 +1472,129 @@ class TileFusion:
         if block_x >= self.chunk_x:
             block_x = max(self.chunk_x, (block_x // self.chunk_x) * self.chunk_x)
         return int(block_y), int(block_x)
+
+    def _render_fusion_block(
+        self,
+        t: int,
+        base: int,
+        bounds: tuple[int, int, int, int, int, int],
+        contributors: Sequence[tuple[int, tuple[int, int, int]]],
+    ) -> tuple[Any, np.ndarray, int, int]:
+        """Render one independent output block without writing it.
+
+        Each contributing tile is read at most once. Exclusive regions are copied
+        into the integer output, while only regions with multiple contributors use
+        float32 feather accumulation.
+        """
+        z0, z1, y0, y1, x0, x1 = bounds
+        tile_shape = (int(self.z_dim), int(self.y_dim), int(self.x_dim))
+        regions = _partition_fusion_block(bounds, contributors, tile_shape)
+
+        if len(regions) == 1 and len(regions[0][1]) == 1:
+            region, region_contributors = regions[0]
+            rz0, rz1, ry0, ry1, rx0, rx1 = region
+            p, (oz, oy, ox) = region_contributors[0]
+            direct = self._read_tile_volume(
+                base + p,
+                slice(None),
+                slice(rz0 - oz, rz1 - oz),
+                slice(ry0 - oy, ry1 - oy),
+                slice(rx0 - ox, rx1 - ox),
+                dtype=np.uint16,
+            )
+            selection = (
+                t,
+                slice(None),
+                slice(rz0, rz1),
+                slice(ry0, ry1),
+                slice(rx0, rx1),
+            )
+            return selection, direct, 1, 0
+
+        source_blocks: dict[int, tuple[tuple[int, int, int], np.ndarray]] = {}
+        for p, (oz, oy, ox) in contributors:
+            tz0, tz1 = max(z0, oz), min(z1, oz + tile_shape[0])
+            ty0, ty1 = max(y0, oy), min(y1, oy + tile_shape[1])
+            tx0, tx1 = max(x0, ox), min(x1, ox + tile_shape[2])
+            source = self._read_tile_volume(
+                base + p,
+                slice(None),
+                slice(tz0 - oz, tz1 - oz),
+                slice(ty0 - oy, ty1 - oy),
+                slice(tx0 - ox, tx1 - ox),
+                dtype=None,
+            )
+            source_blocks[p] = ((tz0, ty0, tx0), source)
+
+        output = np.zeros(
+            (int(self.channels), z1 - z0, y1 - y0, x1 - x0),
+            dtype=np.uint16,
+        )
+        direct_regions = 0
+        blended_regions = 0
+        for region, region_contributors in regions:
+            rz0, rz1, ry0, ry1, rx0, rx1 = region
+            output_selection = (
+                slice(None),
+                slice(rz0 - z0, rz1 - z0),
+                slice(ry0 - y0, ry1 - y0),
+                slice(rx0 - x0, rx1 - x0),
+            )
+            if len(region_contributors) == 1:
+                p, _ = region_contributors[0]
+                (sz0, sy0, sx0), source = source_blocks[p]
+                output[output_selection] = source[
+                    :,
+                    rz0 - sz0 : rz1 - sz0,
+                    ry0 - sy0 : ry1 - sy0,
+                    rx0 - sx0 : rx1 - sx0,
+                ]
+                direct_regions += 1
+                continue
+
+            fused = np.zeros(
+                (
+                    int(self.channels),
+                    rz1 - rz0,
+                    ry1 - ry0,
+                    rx1 - rx0,
+                ),
+                dtype=np.float32,
+            )
+            weight = np.zeros_like(fused)
+            for p, (oz, oy, ox) in region_contributors:
+                (sz0, sy0, sx0), source = source_blocks[p]
+                sub = np.ascontiguousarray(
+                    source[
+                        :,
+                        rz0 - sz0 : rz1 - sz0,
+                        ry0 - sy0 : ry1 - sy0,
+                        rx0 - sx0 : rx1 - sx0,
+                    ],
+                    dtype=np.float32,
+                )
+                local_z = slice(rz0 - oz, rz1 - oz)
+                local_y = slice(ry0 - oy, ry1 - oy)
+                local_x = slice(rx0 - ox, rx1 - ox)
+                weights = (
+                    self.z_profile[local_z, None, None]
+                    * self.y_profile[None, local_y, None]
+                    * self.x_profile[None, None, local_x]
+                ).astype(np.float32, copy=False)
+                _accumulate_tile_block(fused, weight, sub, weights, 0, 0, 0)
+
+            _normalize_block(fused, weight)
+            output[output_selection] = fused.astype(np.uint16)
+            blended_regions += 1
+
+        selection = (
+            t,
+            slice(None),
+            slice(z0, z1),
+            slice(y0, y1),
+            slice(x0, x1),
+        )
+        return selection, output, direct_regions, blended_regions
 
     def _fuse_by_blocks(self) -> None:
         """Fuse all timepoints into the global fused store using bounded block writes.
@@ -1395,97 +1638,125 @@ class TileFusion:
         off_z_um, off_y_um, off_x_um = self.offset_um
 
         pending_writes: deque[Any] = deque()
+        direct_regions = 0
+        blended_regions = 0
+        empty_blocks = 0
 
-        for t in trange(n_t, desc="scale0", leave=True):
-            base = t * n_pos
+        def queue_write(selection: Any, value: np.ndarray) -> None:
+            """Issue one bounded asynchronous output write."""
+            pending_writes.append(self.fused_ts[selection].write(value))
+            if len(pending_writes) >= self.max_in_flight_writes:
+                pending_writes.popleft().result()
 
-            offsets_t: list[tuple[int, int, int]] = []
-            for p in range(n_pos):
-                z_um, y_um, x_um = self._tile_positions[base + p]
-                oz = int(np.round((z_um - off_z_um) / dz_um))
-                oy = int(np.round((y_um - off_y_um) / dy_um))
-                ox = int(np.round((x_um - off_x_um) / dx_um))
-                offsets_t.append((oz, oy, ox))
+        block_layout: list[tuple[int, int, int, int]] = []
+        spatial_blocks = 0
+        for z0 in range(0, pad_z, z_step):
+            z1 = min(z0 + z_step, pad_z)
+            block_y, block_x = self._fusion_block_shape(z1 - z0, pad_y, pad_x)
+            block_layout.append((z0, z1, block_y, block_x))
+            spatial_blocks += math.ceil(pad_y / block_y) * math.ceil(
+                pad_x / block_x
+            )
+        chunk_total = n_t * int(self.channels) * spatial_blocks
 
-            for z0 in range(0, pad_z, z_step):
-                z1 = min(z0 + z_step, pad_z)
-                block_y, block_x = self._fusion_block_shape(z1 - z0, pad_y, pad_x)
+        scale_bar = tqdm(
+            total=n_t,
+            desc="scale0",
+            leave=True,
+            unit="timepoint",
+        )
+        chunk_bar = tqdm(
+            total=chunk_total,
+            desc="scale0 chunks",
+            leave=False,
+            unit="chunk",
+        )
+        render_workers = max(1, int(self._max_workers))
+        pending_renders: set[Future[Any]] = set()
 
-                for y0 in range(0, pad_y, block_y):
-                    y1 = min(y0 + block_y, pad_y)
-                    for x0 in range(0, pad_x, block_x):
-                        x1 = min(x0 + block_x, pad_x)
-                        overlapping = [
-                            (p, offset)
-                            for p, offset in enumerate(offsets_t)
-                            if offset[0] + int(self.z_dim) > z0
-                            and offset[0] < z1
-                            and offset[1] + int(self.y_dim) > y0
-                            and offset[1] < y1
-                            and offset[2] + int(self.x_dim) > x0
-                            and offset[2] < x1
-                        ]
-                        if not overlapping:
-                            continue
+        def collect_rendered(done: set[Future[Any]]) -> None:
+            """Queue completed block writes and update observable statistics."""
+            nonlocal direct_regions, blended_regions
+            for future in done:
+                selection, value, direct_count, blended_count = future.result()
+                queue_write(selection, value)
+                direct_regions += int(direct_count)
+                blended_regions += int(blended_count)
+                chunk_bar.update(int(self.channels))
 
-                        for c in range(int(self.channels)):
-                            fused_block = np.zeros(
-                                (1, z1 - z0, y1 - y0, x1 - x0),
-                                dtype=np.float32,
+        with ThreadPoolExecutor(max_workers=render_workers) as render_executor:
+            for t in range(n_t):
+                base = t * n_pos
+
+                offsets_t: list[tuple[int, int, int]] = []
+                for p in range(n_pos):
+                    z_um, y_um, x_um = self._tile_positions[base + p]
+                    oz = int(np.round((z_um - off_z_um) / dz_um))
+                    oy = int(np.round((y_um - off_y_um) / dy_um))
+                    ox = int(np.round((x_um - off_x_um) / dx_um))
+                    offsets_t.append((oz, oy, ox))
+
+                for z0, z1, block_y, block_x in block_layout:
+                    for y0 in range(0, pad_y, block_y):
+                        y1 = min(y0 + block_y, pad_y)
+                        for x0 in range(0, pad_x, block_x):
+                            x1 = min(x0 + block_x, pad_x)
+                            overlapping = [
+                                (p, offset)
+                                for p, offset in enumerate(offsets_t)
+                                if offset[0] + int(self.z_dim) > z0
+                                and offset[0] < z1
+                                and offset[1] + int(self.y_dim) > y0
+                                and offset[1] < y1
+                                and offset[2] + int(self.x_dim) > x0
+                                and offset[2] < x1
+                            ]
+                            if not overlapping:
+                                empty_blocks += 1
+                                chunk_bar.update(int(self.channels))
+                                continue
+                            pending_renders.add(
+                                render_executor.submit(
+                                    self._render_fusion_block,
+                                    t,
+                                    base,
+                                    (z0, z1, y0, y1, x0, x1),
+                                    overlapping,
+                                )
                             )
-                            weight_sum = np.zeros_like(fused_block)
-
-                            for p, (oz, oy, ox) in overlapping:
-                                tz0 = max(z0, oz)
-                                tz1 = min(z1, oz + int(self.z_dim))
-                                ty0 = max(y0, oy)
-                                ty1 = min(y1, oy + int(self.y_dim))
-                                tx0 = max(x0, ox)
-                                tx1 = min(x1, ox + int(self.x_dim))
-
-                                local_z0, local_z1 = tz0 - oz, tz1 - oz
-                                local_y0, local_y1 = ty0 - oy, ty1 - oy
-                                local_x0, local_x1 = tx0 - ox, tx1 - ox
-                                sub = self._read_tile_volume(
-                                    base + p,
-                                    slice(c, c + 1),
-                                    slice(local_z0, local_z1),
-                                    slice(local_y0, local_y1),
-                                    slice(local_x0, local_x1),
+                            if len(pending_renders) >= render_workers:
+                                done, pending_renders = wait(
+                                    pending_renders,
+                                    return_when=FIRST_COMPLETED,
                                 )
-                                w3d = (
-                                    self.z_profile[local_z0:local_z1, None, None]
-                                    * self.y_profile[None, local_y0:local_y1, None]
-                                    * self.x_profile[None, None, local_x0:local_x1]
-                                )
-                                _accumulate_tile_block(
-                                    fused_block,
-                                    weight_sum,
-                                    sub,
-                                    w3d.astype(np.float32, copy=False),
-                                    int(tz0 - z0),
-                                    int(ty0 - y0),
-                                    int(tx0 - x0),
-                                )
+                                collect_rendered(done)
 
-                            _normalize_block(fused_block, weight_sum)
-                            future = self.fused_ts[
-                                t,
-                                slice(c, c + 1),
-                                slice(z0, z1),
-                                slice(y0, y1),
-                                slice(x0, x1),
-                            ].write(fused_block.astype(np.uint16))
-                            pending_writes.append(future)
-                            if len(pending_writes) >= self.max_in_flight_writes:
-                                pending_writes.popleft().result()
-
-                            del fused_block, weight_sum
-
-                gc.collect()
+                while pending_renders:
+                    done, pending_renders = wait(
+                        pending_renders,
+                        return_when=FIRST_COMPLETED,
+                    )
+                    collect_rendered(done)
+                while pending_writes:
+                    pending_writes.popleft().result()
+                scale_bar.update()
 
         while pending_writes:
             pending_writes.popleft().result()
+
+        chunk_bar.close()
+        scale_bar.close()
+        self._fusion_stats = {
+            "direct_regions": direct_regions,
+            "blended_regions": blended_regions,
+            "empty_blocks": empty_blocks,
+        }
+        if self._debug:
+            print(
+                "[fusion] regions: "
+                f"direct={direct_regions}, blended={blended_regions}, "
+                f"empty={empty_blocks}, render_workers={render_workers}"
+            )
 
     def _write_multiscales(self) -> None:
         """Downsample scale 0 into bounded spatial blocks.
@@ -1509,7 +1780,26 @@ class TileFusion:
             block_y = max(1, int(self.chunk_y) // int(factor))
             block_x = max(1, int(self.chunk_x) // int(factor))
 
-            for t in trange(int(self.time_dim), desc=f"scale{level}", leave=True):
+            chunk_total = (
+                int(self.time_dim)
+                * int(self.channels)
+                * math.ceil(out_z / block_z)
+                * math.ceil(out_y / block_y)
+                * math.ceil(out_x / block_x)
+            )
+            scale_bar = tqdm(
+                total=int(self.time_dim),
+                desc=f"scale{level}",
+                leave=True,
+                unit="timepoint",
+            )
+            chunk_bar = tqdm(
+                total=chunk_total,
+                desc=f"scale{level} chunks",
+                leave=False,
+                unit="chunk",
+            )
+            for t in range(int(self.time_dim)):
                 for c in range(int(self.channels)):
                     for z0 in range(0, out_z, block_z):
                         z1 = min(z0 + block_z, out_z)
@@ -1563,6 +1853,11 @@ class TileFusion:
                                         copy=False,
                                     )
                                 ).result()
+                                chunk_bar.update()
+                scale_bar.update()
+
+            chunk_bar.close()
+            scale_bar.close()
 
     def run(self) -> None:
         """Execute the full registration + fusion pipeline.
@@ -1616,9 +1911,9 @@ class TileFusion:
         ]
 
         self._compute_fused_image_space()
-        self._pad_to_chunk_multiple()
+        self._pad_to_multiscale_multiple()
 
-        omezarr = base / f"{self.root.stem}_fused.ome.zarr"
+        omezarr = base / f"{acquisition_stem(self.root)}_fused.ome.zarr"
         self.fused_ts, self.write_block_shape = self._prepare_fused_image(omezarr)
         self._fuse_by_blocks()
         self._write_multiscales()

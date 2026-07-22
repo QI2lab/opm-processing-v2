@@ -36,13 +36,6 @@ def estimate_illuminations(
     datastore,
     camera_offset,
     camera_conversion,
-    *,
-    max_images: int = 5000,
-    image_batches: int = 25,
-    position_samples: int = 15,
-    position_margin: int = 5,
-    model_downsample: int = 4,
-    rng_seed: int | None = None,
 ):
     """Estimate per-channel illumination fields from sampled images.
 
@@ -54,29 +47,19 @@ def estimate_illuminations(
         Camera offset subtracted from each sampled image.
     camera_conversion
         Multiplicative conversion from camera units to intensity units.
-    max_images
-        Maximum number of scan images sampled per position.
-    image_batches
-        Number of batches averaged before illumination fitting.
-    position_samples
-        Maximum number of positions sampled.
-    position_margin
-        Additional central positions eligible for random sampling.
-    model_downsample
-        Spatial downsampling used to initialize the BaSiC model.
-    rng_seed
-        Optional random seed for reproducible sampling.
 
     Returns
     -------
     numpy.ndarray
         Per-channel illumination fields in CYX order.
     """
-    if min(max_images, image_batches, position_samples, model_downsample) < 1:
-        raise ValueError("flatfield sampling values must be positive")
-    if position_margin < 0:
-        raise ValueError("position_margin must be nonnegative")
-    rng = np.random.default_rng(rng_seed)
+    # These limits describe how acquisition images are sampled before fitting;
+    # the BaSiCPy model itself is constructed entirely from library defaults.
+    max_images = 5000
+    image_batches = 25
+    position_samples = 15
+    position_margin = 5
+    rng = np.random.default_rng()
     # flatfields shape: c, y, x
     flatfields = np.zeros(
         (datastore.shape[2], datastore.shape[-2], datastore.shape[-1]), dtype=np.float32
@@ -162,24 +145,7 @@ def estimate_illuminations(
         original_print = builtins.print
         builtins.print = no_op
         try:
-            basic = BaSiC(
-                get_darkfield=False,
-                darkfield=np.zeros(
-                    (
-                        temp_images.shape[-2] // model_downsample,
-                        temp_images.shape[-1] // model_downsample,
-                    ),
-                    dtype=np.float64,
-                ),
-                flatfield=np.zeros(
-                    (
-                        temp_images.shape[-2] // model_downsample,
-                        temp_images.shape[-1] // model_downsample,
-                    ),
-                    dtype=np.float64,
-                ),
-            )
-            basic.autotune(images)
+            basic = BaSiC()
             basic.fit(images)
         finally:
             builtins.print = original_print

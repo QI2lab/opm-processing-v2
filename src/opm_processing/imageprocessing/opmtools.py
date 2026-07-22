@@ -304,9 +304,9 @@ def chunk_indices(length: int, chunk_size: int) -> list[tuple[int, int]]:
 
 
 def _deconvolve_oblique_chunk(
-    image: np.ndarray, psf: np.ndarray, crop_y: int
+    image: np.ndarray, psf: np.ndarray, crop_scan: int
 ) -> np.ndarray:
-    """Run nested Y-only RLGC without importing CuPy for deskew-only use.
+    """Run scan-axis RLGC without importing CuPy for deskew-only use.
 
     Parameters
     ----------
@@ -314,8 +314,8 @@ def _deconvolve_oblique_chunk(
         Value supplied for ``image``.
     psf : np.ndarray
         Value supplied for ``psf``.
-    crop_y : int
-        Value supplied for ``crop y``.
+    crop_scan : int
+        Retained tile size along axis 0, the acquisition scan axis.
 
     Returns
     -------
@@ -324,14 +324,14 @@ def _deconvolve_oblique_chunk(
     """
     from opm_processing.imageprocessing.rlgc import chunked_rlgc
 
-    return chunked_rlgc(image=image, psf=psf, crop_y=crop_y)
+    return chunked_rlgc(image=image, psf=psf, crop_scan=crop_scan)
 
 
 def chunked_orthogonal_deskew(
     oblique_image: ArrayLike,
     psf_data: ArrayLike | None = None,
     deconvolve: bool = False,
-    decon_chunk_size: int = 2048,
+    decon_chunk_size: int = 128,
     chunk_size: int = 15000,
     overlap_size: int = 550,
     scan_crop: int = 700,
@@ -345,8 +345,8 @@ def chunked_orthogonal_deskew(
 ) -> ArrayLike:
     """Chunked orthogonal deskew of oblique data.
 
-    Optionally performs nested Y-chunked deconvolution on each outer deskew
-    chunk. Deconvolution always receives the chunk's full Z and X extents.
+    Optionally performs nested scan-axis deconvolution on each outer deskew
+    chunk. Deconvolution always receives the full camera Y and X extents.
 
     Parameters
     ----------
@@ -357,8 +357,8 @@ def chunked_orthogonal_deskew(
     deconvolve: bool
         Run RLGC before deskewing each outer chunk.
     decon_chunk_size: int
-        Retained Y size for nested RLGC chunks. This is independent of the
-        outer deskew ``chunk_size``.
+        Retained scan-axis size for nested RLGC chunks. This is independent of
+        the outer deskew ``chunk_size``.
     chunk_size: int
         size of chunks
     overlap_size: int
@@ -452,7 +452,7 @@ def chunked_orthogonal_deskew(
             raw_data = _deconvolve_oblique_chunk(
                 raw_data,
                 np.asarray(psf_data),
-                crop_y=decon_chunk_size,
+                crop_scan=decon_chunk_size,
             )
         temp_deskew = orthogonal_deskew(
             raw_data,

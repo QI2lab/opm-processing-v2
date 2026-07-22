@@ -20,6 +20,7 @@ from ome_types.model import (
 from yaozarrs import DimSpec, open_group, v05
 from yaozarrs.write.v05 import Bf2RawBuilder
 
+from opm_processing.dataio.acquisition import inspect_acquisition
 from opm_processing.dataio.metadata import convert_metadata
 
 
@@ -237,18 +238,35 @@ def open_position_collection(path: str | Path) -> PositionCollection:
         Result produced by the callable.
     """
     root = open_group(path)
-    if "bioformats2raw.layout" not in root.attrs.get("ome", {}):
+    if not isinstance(root.ome_metadata(), v05.Bf2Raw):
         raise ValueError(f"Not a Bio-Formats2Raw collection: {path}")
 
     ome_group = root["OME"]
-    series = ome_group.attrs["ome"]["series"]
-    arrays = tuple(root[name]["0"].to_tensorstore() for name in series)
+    series_metadata = ome_group.ome_metadata()
+    if not isinstance(series_metadata, v05.Series):
+        raise ValueError(f"Collection lacks typed OME series metadata: {path}")
+    arrays = []
+    for name in series_metadata.series:
+        image_group = root[name]
+        image_metadata = image_group.ome_metadata()
+        if not isinstance(image_metadata, v05.Image):
+            raise ValueError(f"Series {name} lacks typed OME image metadata")
+        dataset_path = image_metadata.multiscales[0].datasets[0].path
+        arrays.append(image_group[dataset_path].to_tensorstore())
+    arrays = tuple(arrays)
     if not arrays:
         raise ValueError(f"Bf2Raw collection has no image series: {path}")
     if any(tuple(array.shape) != tuple(arrays[0].shape) for array in arrays[1:]):
         raise ValueError("All position series must have the same TCZYX shape")
 
     attributes = {key: value for key, value in root.attrs.items() if key != "ome"}
+    if "opm_v2" in root.attrs:
+        acquisition = inspect_acquisition(path, root=root)
+        attributes.setdefault("acquisition", acquisition.to_dict())
+        attributes.setdefault(
+            "stage_positions", convert_metadata(acquisition.stage_positions_zxy)
+        )
+        attributes.setdefault("channels", list(acquisition.channel_names))
     return PositionCollection(Path(path), arrays, attributes)
 
 

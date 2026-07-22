@@ -774,7 +774,7 @@ def _chunked_rlgc_once(
     image: np.ndarray,
     psf: np.ndarray,
     gpu_id: int = 0,
-    crop_y: int = 2048,
+    crop_scan: int = 128,
     safe_mode: bool = True,
     limit: float = 0.01,
     max_delta: float = 0.001,
@@ -787,8 +787,8 @@ def _chunked_rlgc_once(
 ) -> np.ndarray:
     """Run one chunked RLGC attempt without GPU-memory fallback retries.
 
-    This function performs either full-frame RLGC or Y-only tiling for the
-    requested crop size. Every tile keeps the full Z and X extents.
+    This function performs either full-frame RLGC or scan-axis tiling for the
+    requested crop size. Every tile keeps the full camera Y and X extents.
 
     Parameters
     ----------
@@ -798,8 +798,8 @@ def _chunked_rlgc_once(
         2D or 3D point-spread function.
     gpu_id : int, default=0
         CUDA device ID to use.
-    crop_y : int, default=2048
-        Retained tile size along Y.
+    crop_scan : int, default=128
+        Retained tile size along the scan axis (axis 0 of normalized ZYX).
     safe_mode : bool, default=True
         If True, stop when either split KLD increases. If False, stop only when
         both split KLDs increase.
@@ -812,7 +812,7 @@ def _chunked_rlgc_once(
     normalize_psf : bool, default=True
         If True, normalize the padded PSF to unit sum before deconvolution.
     verbose : int, default=0
-        If at least 1, show a progress bar over Y tiles.
+        If at least 1, show a progress bar over scan-axis tiles.
     release_memory : bool, default=True
         If True, release CuPy memory pools and FFT caches before returning.
     logger : logging.Logger or None, default=None
@@ -826,8 +826,8 @@ def _chunked_rlgc_once(
         Deconvolved image as float32.
     """
     cp.cuda.Device(gpu_id).use()
-    if crop_y <= 0:
-        raise ValueError("crop_y must be greater than 0.")
+    if crop_scan <= 0:
+        raise ValueError("crop_scan must be greater than 0.")
 
     image_arr = np.asarray(image)
     original_ndim = image_arr.ndim
@@ -844,7 +844,7 @@ def _chunked_rlgc_once(
     psf_shape = psf_arr.shape if psf_arr.ndim == 3 else (1, *psf_arr.shape)
 
     # Full-frame path if tiling not needed
-    if crop_y >= image_work.shape[1]:
+    if crop_scan >= image_work.shape[0]:
         if logger is not None and logger.isEnabledFor(logging.INFO):
             logger.info(
                 "%spath=3d_fullframe image_shape=%s psf_shape=%s",
@@ -869,21 +869,25 @@ def _chunked_rlgc_once(
         if original_ndim == 2 and output.ndim == 3 and output.shape[0] == 1:
             output = np.squeeze(output, axis=0)
 
-    # Y-tiled deconvolution with discarded processing halos. The halo is wider
-    # than a single convolution radius because RLGC is iterative, so boundary
-    # influence can propagate farther than one PSF half-width.
+    # Scan-axis tiled deconvolution with discarded processing halos. The scan
+    # axis is axis 0 in the normalized ZYX volume; camera Y and X remain intact.
+    # The halo is wider than a single convolution radius because RLGC is
+    # iterative, so boundary influence can propagate farther than one PSF
+    # half-width.
     else:
         full_shape = image_work.shape
-        retained_y, tile_pad_y = _resolve_tiled_axis_geometry(
-            crop_y,
-            full_shape[1],
-            int(psf_shape[-2]),
-            "crop_y",
+        retained_scan, tile_pad_scan = _resolve_tiled_axis_geometry(
+            crop_scan,
+            full_shape[0],
+            int(psf_shape[-3]),
+            "crop_scan",
         )
         output = np.zeros_like(image_work, dtype=np.float32)
 
-        retained_bounds_y = _axis_retained_bounds(retained_y, full_shape[1])
-        num_tiles = len(retained_bounds_y)
+        retained_bounds_scan = _axis_retained_bounds(
+            retained_scan, full_shape[0]
+        )
+        num_tiles = len(retained_bounds_scan)
 
         if logger is not None and logger.isEnabledFor(logging.INFO):
             logger.info(
@@ -891,8 +895,8 @@ def _chunked_rlgc_once(
                 f"{log_prefix} " if log_prefix else "",
                 tuple(int(v) for v in image_work.shape),
                 tuple(int(v) for v in psf_shape),
-                (full_shape[0], retained_y, full_shape[2]),
-                (0, tile_pad_y, 0),
+                (retained_scan, full_shape[1], full_shape[2]),
+                (tile_pad_scan, 0, 0),
                 num_tiles,
             )
 
@@ -900,19 +904,19 @@ def _chunked_rlgc_once(
             from rich.progress import track
 
             iterator = track(
-                enumerate(retained_bounds_y),
+                enumerate(retained_bounds_scan),
                 description="Chunks",
                 total=num_tiles,
                 transient=True,
             )
         else:
-            iterator = enumerate(retained_bounds_y)
+            iterator = enumerate(retained_bounds_scan)
 
-        for tile_idx, (y_dest_start, y_dest_stop) in iterator:
-            y_crop_start = max(y_dest_start - tile_pad_y, 0)
-            y_crop_stop = min(y_dest_stop + tile_pad_y, full_shape[1])
+        for tile_idx, (scan_dest_start, scan_dest_stop) in iterator:
+            scan_crop_start = max(scan_dest_start - tile_pad_scan, 0)
+            scan_crop_stop = min(scan_dest_stop + tile_pad_scan, full_shape[0])
 
-            crop = image_work[:, y_crop_start:y_crop_stop, :]
+            crop = image_work[scan_crop_start:scan_crop_stop, :, :]
             crop_array = rlgc(
                 crop,
                 psf,
@@ -929,10 +933,12 @@ def _chunked_rlgc_once(
                 ),
             )
 
-            y_source_start = y_dest_start - y_crop_start
-            y_source_stop = y_source_start + (y_dest_stop - y_dest_start)
-            crop_sub = crop_array[:, y_source_start:y_source_stop, :]
-            output[:, y_dest_start:y_dest_stop, :] = crop_sub
+            scan_source_start = scan_dest_start - scan_crop_start
+            scan_source_stop = scan_source_start + (
+                scan_dest_stop - scan_dest_start
+            )
+            crop_sub = crop_array[scan_source_start:scan_source_stop, :, :]
+            output[scan_dest_start:scan_dest_stop, :, :] = crop_sub
 
         del crop_sub
         gc.collect()
@@ -950,7 +956,7 @@ def chunked_rlgc(
     image: np.ndarray,
     psf: np.ndarray,
     gpu_id: int = 0,
-    crop_y: int = 2048,
+    crop_scan: int = 128,
     safe_mode: bool = True,
     limit: float = 0.01,
     max_delta: float = 0.001,
@@ -960,15 +966,15 @@ def chunked_rlgc(
     release_memory: bool = True,
     logger: logging.Logger | None = None,
     log_prefix: str = "",
-    on_successful_crop_y: Callable[[int], None] | None = None,
-    fallback_step_y: int = 128,
+    on_successful_crop_scan: Callable[[int], None] | None = None,
+    fallback_step_scan: int = 128,
 ) -> np.ndarray:
-    """Y-chunked RLGC deconvolution with automatic chunk fallback.
+    """Scan-axis chunked RLGC deconvolution with automatic fallback.
 
-    The solver first attempts the requested ``crop_y``. If CUDA memory
-    allocation fails, it retries with Y chunks reduced by 128 pixels at a time.
-    Every solver call processes the full Z and X extents. If provided,
-    ``on_successful_crop_y`` is called with the crop size that completed
+    The solver first attempts the requested ``crop_scan``. If CUDA memory
+    allocation fails, it retries with smaller scan-axis chunks. Every solver
+    call retains the full camera Y and X extents. If provided,
+    ``on_successful_crop_scan`` is called with the crop size that completed
     successfully.
 
     Parameters
@@ -979,9 +985,9 @@ def chunked_rlgc(
         2D or 3D point-spread function.
     gpu_id : int, default=0
         CUDA device ID to use.
-    crop_y : int, default=2048
-        Requested retained Y tile size. Values at least as large as Y select
-        full-frame processing.
+    crop_scan : int, default=128
+        Requested retained scan-axis tile size. Values at least as large as
+        the scan-axis length select full-frame processing.
     safe_mode : bool, default=True
         If True, stop when either split KLD increases. If False, stop only when
         both split KLDs increase.
@@ -995,17 +1001,17 @@ def chunked_rlgc(
     normalize_psf : bool, default=True
         If True, normalize the padded PSF to unit sum before deconvolution.
     verbose : int, default=0
-        If at least 1, show a progress bar over Y tiles.
+        If at least 1, show a progress bar over scan-axis tiles.
     release_memory : bool, default=True
         If True, release CuPy memory pools and FFT caches before returning.
     logger : logging.Logger or None, default=None
         Optional logger for route, retry, and per-iteration diagnostics.
     log_prefix : str, default=""
         Structured prefix prepended to emitted log lines.
-    on_successful_crop_y : Callable[[int], None] or None, default=None
+    on_successful_crop_scan : Callable[[int], None] or None, default=None
         Optional callback receiving the crop size that completed successfully.
-    fallback_step_y : int, default=128
-        Number of retained Y pixels removed after each allocation failure.
+    fallback_step_scan : int, default=128
+        Number of retained scan planes removed after each allocation failure.
 
     Returns
     -------
@@ -1014,31 +1020,31 @@ def chunked_rlgc(
     """
     image_arr = np.asarray(image)
     if image_arr.ndim == 2:
-        image_y = image_arr.shape[0]
+        image_scan = 1
     elif image_arr.ndim == 3:
-        image_y = image_arr.shape[1]
+        image_scan = image_arr.shape[0]
     else:
         raise ValueError(f"Expected a 2D or 3D image, got shape {image_arr.shape}")
 
-    if fallback_step_y < 1:
-        raise ValueError("fallback_step_y must be at least 1")
-    min_crop_y = int(np.asarray(psf).shape[-2])
-    attempted_crop_y = min(int(crop_y), int(image_y))
+    if fallback_step_scan < 1:
+        raise ValueError("fallback_step_scan must be at least 1")
+    min_crop_scan = 1
+    attempted_crop_scan = min(int(crop_scan), int(image_scan))
 
     while True:
         try:
             if logger is not None and logger.isEnabledFor(logging.INFO):
                 logger.info(
-                    "%sattempt_rlgc_crop_y=%d requested_crop_y=%d",
+                    "%sattempt_rlgc_crop_scan=%d requested_crop_scan=%d",
                     f"{log_prefix} " if log_prefix else "",
-                    attempted_crop_y,
-                    crop_y,
+                    attempted_crop_scan,
+                    crop_scan,
                 )
             output = _chunked_rlgc_once(
                 image=image_arr,
                 psf=psf,
                 gpu_id=gpu_id,
-                crop_y=attempted_crop_y,
+                crop_scan=attempted_crop_scan,
                 safe_mode=safe_mode,
                 limit=limit,
                 max_delta=max_delta,
@@ -1049,14 +1055,14 @@ def chunked_rlgc(
                 logger=logger,
                 log_prefix=log_prefix,
             )
-            if on_successful_crop_y is not None:
-                on_successful_crop_y(attempted_crop_y)
+            if on_successful_crop_scan is not None:
+                on_successful_crop_scan(attempted_crop_scan)
             if logger is not None and logger.isEnabledFor(logging.INFO):
                 logger.info(
-                    "%ssuccessful_rlgc_crop_y=%d requested_crop_y=%d",
+                    "%ssuccessful_rlgc_crop_scan=%d requested_crop_scan=%d",
                     f"{log_prefix} " if log_prefix else "",
-                    attempted_crop_y,
-                    crop_y,
+                    attempted_crop_scan,
+                    crop_scan,
                 )
             return output
         except Exception as exc:
@@ -1064,18 +1070,20 @@ def chunked_rlgc(
                 raise
 
             clear_rlgc_caches(clear_memory_pool=True)
-            next_crop_y = attempted_crop_y - fallback_step_y
-            if next_crop_y < min_crop_y:
+            if attempted_crop_scan == min_crop_scan:
                 raise RuntimeError(
                     "RLGC failed due to GPU memory constraints even at the "
-                    f"minimum Y crop size {attempted_crop_y}."
+                    f"minimum scan-axis crop size {attempted_crop_scan}."
                 ) from exc
+            next_crop_scan = max(
+                min_crop_scan, attempted_crop_scan - fallback_step_scan
+            )
 
             if logger is not None and logger.isEnabledFor(logging.WARNING):
                 logger.warning(
-                    "%sretry_after_gpu_oom previous_crop_y=%d next_crop_y=%d",
+                    "%sretry_after_gpu_oom previous_crop_scan=%d next_crop_scan=%d",
                     f"{log_prefix} " if log_prefix else "",
-                    attempted_crop_y,
-                    next_crop_y,
+                    attempted_crop_scan,
+                    next_crop_scan,
                 )
-            attempted_crop_y = next_crop_y
+            attempted_crop_scan = next_crop_scan

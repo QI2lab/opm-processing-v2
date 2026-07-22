@@ -18,7 +18,7 @@ class ChunkedDeskewTestConfig:
     theta_deg: float = 30.0
     scan_axis_step_um: float = 0.4
     pixel_size_um: float = 0.115
-    decon_chunk_size: int = 12
+    decon_chunk_size: int = 5
     deskew_chunk_size: int = 22
     overlap_size: int = 24
     line_profile_half_window: int = 5
@@ -244,6 +244,7 @@ def test_chunked_deskew_with_gpu_deconvolution_improves_ground_truth(
     del cupy_gpu  # Shared fixture has already proved CUDA execution.
     sample = chunked_deskew_sample
     config = chunked_deskew_config
+    assert config.decon_chunk_size < sample.blurred_skewed.shape[0]
 
     without_deconvolution = _chunked_deskew(sample.blurred_skewed, config)
     with_deconvolution = _chunked_deskew(

@@ -32,9 +32,6 @@ def test_process_runs_end_to_end_on_opm_v2_projection_zarr(
         deconvolve=False,
         flatfield_correction=False,
         write_fused_max_projection_tiff=False,
-        stage_x_flipped=False,
-        stage_y_flipped=False,
-        stage_z_flipped=False,
     )
 
     collection_path = fixture.path.parent / f"{fixture.path.stem}_projection.ome.zarr"
@@ -83,9 +80,6 @@ def test_process_runs_normal_skewed_opm_v2_acquisition(opm_v2_skewed_zarr):
         create_fused_max_projection=False,
         z_downsample_level=1,
         write_fused_max_projection_tiff=False,
-        stage_x_flipped=False,
-        stage_y_flipped=False,
-        stage_z_flipped=False,
     )
 
     input_shape = (

@@ -15,6 +15,10 @@ import typer
 import yaml
 from tifffile import TiffWriter
 
+from opm_processing.dataio.acquisition import (
+    inspect_acquisition,
+    open_acquisition_datastore,
+)
 from opm_processing.dataio.metadata import find_key
 
 
@@ -325,20 +329,36 @@ def convert_timelapse(
         Result produced by the callable.
     """
     zarr_dir = Path(zarr_dir)
-    datastore = _open_datastore(zarr_dir)
+    acquisition = None
+    if (zarr_dir / ".zattrs").is_file():
+        # Compatibility for legacy root-array acquisitions.
+        datastore = _open_datastore(zarr_dir)
+    else:
+        acquisition = inspect_acquisition(zarr_dir)
+        zarr_dir = acquisition.path
+        datastore = open_acquisition_datastore(acquisition)
     if datastore.rank != 6:
         raise ValueError(f"Expected TPCZYX rank 6, got shape {datastore.shape}")
 
-    attrs_path = zarr_dir / ".zattrs"
-    with attrs_path.open() as stream:
-        attributes = json.load(stream)
-    pixel_size_um = float(find_key(attributes, "pixel_size_um"))
-    if camera_offset is None:
-        value = find_key(attributes, "offset")
-        camera_offset = None if value is None else float(value)
-    if camera_conversion is None:
-        value = find_key(attributes, "e_to_ADU")
-        camera_conversion = None if value is None else float(value)
+    if acquisition is not None:
+        if acquisition.pixel_size_um is None:
+            raise ValueError("Acquisition metadata lacks pixel size")
+        pixel_size_um = acquisition.pixel_size_um
+        if camera_offset is None:
+            camera_offset = acquisition.camera_offset
+        if camera_conversion is None:
+            camera_conversion = acquisition.camera_conversion
+    else:
+        attrs_path = zarr_dir / ".zattrs"
+        with attrs_path.open() as stream:
+            attributes = json.load(stream)
+        pixel_size_um = float(find_key(attributes, "pixel_size_um"))
+        if camera_offset is None:
+            value = find_key(attributes, "offset")
+            camera_offset = None if value is None else float(value)
+        if camera_conversion is None:
+            value = find_key(attributes, "e_to_ADU")
+            camera_conversion = None if value is None else float(value)
 
     t0, t1 = _selection_bounds(time_range, datastore.shape[0], "time_range")
     p0, p1 = _selection_bounds(stage_range, datastore.shape[1], "stage_range")

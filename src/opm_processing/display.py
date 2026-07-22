@@ -10,6 +10,8 @@ import typer
 from napari.experimental import link_layers
 from yaozarrs import open_group
 
+from opm_processing.dataio.acquisition import acquisition_stem
+
 app = typer.Typer(pretty_exceptions_enable=False)
 
 
@@ -36,7 +38,7 @@ def _resolve_data_path(root_path: Path, to_display: str) -> Path:
         If no output exists for the requested mode.
     """
     base = root_path.parent
-    stem = root_path.stem
+    stem = acquisition_stem(root_path)
     candidates = {
         "max-z": (
             base / f"{stem}_max_z_decon_deskewed.ome.zarr",

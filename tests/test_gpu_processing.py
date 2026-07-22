@@ -318,3 +318,86 @@ def test_rlgc_gpu_deconvolution_improves_synthetic_point_sample(cupy_gpu):
 
     assert scale_invariant_rmse(restored) < 0.85 * scale_invariant_rmse(observed)
     rlgc.clear_rlgc_caches(clear_memory_pool=True)
+
+
+def test_chunked_rlgc_tiles_scan_axis_and_preserves_camera_plane(
+    cupy_gpu, monkeypatch
+):
+    """Verify nested RLGC tiles axis 0 while retaining complete camera planes.
+
+    Parameters
+    ----------
+    cupy_gpu : object
+        Available CuPy CUDA backend.
+    monkeypatch : pytest.MonkeyPatch
+        Pytest patching fixture.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
+    del cupy_gpu
+    rlgc_module = importlib.import_module("opm_processing.imageprocessing.rlgc")
+    image = np.arange(13 * 7 * 9, dtype=np.float32).reshape(13, 7, 9)
+    psf = np.ones((3, 3, 3), dtype=np.float32)
+    processed_shapes = []
+
+    def identity_rlgc(crop, _psf, _gpu_id, **_kwargs):
+        processed_shapes.append(crop.shape)
+        return crop.astype(np.float32, copy=True)
+
+    monkeypatch.setattr(rlgc_module, "rlgc", identity_rlgc)
+    actual = rlgc_module._chunked_rlgc_once(
+        image=image,
+        psf=psf,
+        crop_scan=4,
+        release_memory=False,
+    )
+
+    np.testing.assert_array_equal(actual, image)
+    assert len(processed_shapes) > 1
+    assert all(shape[1:] == image.shape[1:] for shape in processed_shapes)
+    assert all(shape[0] < image.shape[0] for shape in processed_shapes)
+
+
+def test_chunked_rlgc_fallback_reaches_minimum_scan_crop(cupy_gpu, monkeypatch):
+    """Retry a 128-plane OOM at the minimum scan-axis crop instead of aborting.
+
+    Parameters
+    ----------
+    cupy_gpu : object
+        Available CuPy CUDA backend.
+    monkeypatch : pytest.MonkeyPatch
+        Pytest patching fixture.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
+    del cupy_gpu
+    rlgc_module = importlib.import_module("opm_processing.imageprocessing.rlgc")
+    image = np.ones((256, 3, 5), dtype=np.float32)
+    attempts = []
+    successful_crops = []
+
+    def fake_chunked_once(*, image, crop_scan, **_kwargs):
+        attempts.append(crop_scan)
+        if crop_scan == 128:
+            raise MemoryError("synthetic GPU OOM")
+        return image.copy()
+
+    monkeypatch.setattr(rlgc_module, "_chunked_rlgc_once", fake_chunked_once)
+    monkeypatch.setattr(rlgc_module, "clear_rlgc_caches", lambda **_kwargs: None)
+    actual = rlgc_module.chunked_rlgc(
+        image=image,
+        psf=np.ones((3, 3, 3), dtype=np.float32),
+        crop_scan=128,
+        fallback_step_scan=128,
+        on_successful_crop_scan=successful_crops.append,
+    )
+
+    np.testing.assert_array_equal(actual, image)
+    assert attempts == [128, 1]
+    assert successful_crops == [1]

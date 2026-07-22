@@ -1,8 +1,10 @@
 """CUDA runtime library loading for wheel-based Linux installations."""
 
 import ctypes
+import os
 import sys
 import sysconfig
+import warnings
 from pathlib import Path
 
 
@@ -20,6 +22,59 @@ _CUDA_LIBRARIES = (
 
 _CUDA_LIBRARY_HANDLES: list[ctypes.CDLL] = []
 _CUDA_PRELOAD_ATTEMPTED = False
+_CUPY_CUDA_PATH_WARNING_FILTER = (
+    "ignore:CUDA path could not be detected:UserWarning:cupy._environment"
+)
+
+
+def suppress_spurious_cupy_cuda_path_warning() -> None:
+    """Hide CuPy's expected warning for Windows CUDA 12 component wheels.
+
+    CuPy deliberately reports no single CUDA root for the CUDA 12 PyPI
+    component layout because the runtime and NVRTC packages use separate
+    directories. Its Windows initialization currently warns whenever that root
+    is absent even though ``cuda-pathfinder`` loads those component wheels.
+    Only suppress that exact warning when both required wheel layouts exist.
+
+    Parameters
+    ----------
+    None
+        This callable has no parameters.
+
+    Returns
+    -------
+    None
+        No value is returned.
+    """
+    if not sys.platform.startswith("win32"):
+        return
+
+    nvidia_root = Path(sysconfig.get_path("purelib")) / "nvidia"
+    component_bins = (
+        nvidia_root / "cuda_runtime" / "bin",
+        nvidia_root / "cuda_nvrtc" / "bin",
+    )
+    if not all(path.is_dir() for path in component_bins):
+        return
+
+    warnings.filterwarnings(
+        "ignore",
+        message=(
+            r"CUDA path could not be detected\. Set CUDA_PATH environment "
+            r"variable if CuPy fails to load\."
+        ),
+        category=UserWarning,
+        module=r"cupy\._environment",
+    )
+
+    # ``spawn`` starts a fresh interpreter before importing the target module,
+    # so the in-process warnings filter can be too late. Propagate the same
+    # narrow filter without altering the handling of any other warning.
+    python_warnings = os.environ.get("PYTHONWARNINGS", "")
+    filters = [value for value in python_warnings.split(",") if value]
+    if _CUPY_CUDA_PATH_WARNING_FILTER not in filters:
+        filters.append(_CUPY_CUDA_PATH_WARNING_FILTER)
+        os.environ["PYTHONWARNINGS"] = ",".join(filters)
 
 
 def _nvidia_library_roots() -> tuple[Path, ...]:

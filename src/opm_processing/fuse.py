@@ -19,7 +19,11 @@ warnings.simplefilter("ignore", category=FutureWarning)
 
 from pathlib import Path
 import typer
-from opm_processing.imageprocessing.tilefusion import TileFusion
+from opm_processing.imageprocessing.tilefusion import (
+    TileFusion,
+    fusion_backend_status,
+    require_gpu_backend,
+)
 
 
 app = typer.Typer()
@@ -40,6 +44,7 @@ def register_and_fuse(
     optimization_rel_threshold: float = 0.5,
     optimization_abs_threshold: float = 1.5,
     max_registration_shift_zyx: tuple[int, int, int] = (20, 50, 100),
+    require_gpu: bool = False,
 ):
     """Register and fuse processed OPM data.
 
@@ -54,7 +59,7 @@ def register_and_fuse(
     Parameters
     ----------
     root_path: Path
-        Path to OPM pymmcoregui zarr file.
+        Path to an OPM acquisition Zarr store or its containing directory.
     chan_idx: int, default = 0
         Channel index to use for registration and fusion.
         If there is only one channel, this should be 0.
@@ -81,13 +86,26 @@ def register_and_fuse(
         Value supplied for ``optimization abs threshold``.
     max_registration_shift_zyx : tuple[int, int, int]
         Value supplied for ``max registration shift zyx``.
+    require_gpu : bool
+        Fail instead of silently using CPU registration when CUDA is unavailable.
 
     Returns
     -------
     None
         No value is returned.
     """
-    # Open zarr using tensorstore
+    status = fusion_backend_status()
+    if require_gpu:
+        require_gpu_backend()
+    print(
+        "Fusion backends: "
+        f"registration={status['registration_backend']}; "
+        f"fusion={status['fusion_backend']} "
+        f"({status['fusion_workers']} block workers)"
+    )
+    if not status["gpu_registration"]:
+        print(f"GPU registration unavailable: {status['gpu_error']}")
+
     tile_fuser = TileFusion(
         root_path=root_path,
         channel_to_use=chan_idx,

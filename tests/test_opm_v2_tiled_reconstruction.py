@@ -33,6 +33,7 @@ class ReconstructionTestConfig:
     blend_pixels_zyx: tuple[int, int, int] = (1, 4, 4)
     registration_downsample_zyx: tuple[int, int, int] = (1, 1, 1)
     maximum_registration_shift_zyx: tuple[int, int, int] = (2, 2, 4)
+    decon_scan_chunk_size: int = 6
 
     def processing_options(self) -> dict[str, object]:
         """Options shared by deskew-only and deconvolved processing calls.
@@ -52,9 +53,6 @@ class ReconstructionTestConfig:
             "flatfield_correction": False,
             "create_fused_max_projection": False,
             "z_downsample_level": 1,
-            "stage_x_flipped": False,
-            "stage_y_flipped": False,
-            "stage_z_flipped": False,
         }
 
     def fusion_options(self) -> dict[str, object]:
@@ -185,12 +183,14 @@ def _assert_tiled_reconstruction(
     assert tilefusion_module.USING_GPU
     assert tilefusion_module.xp is cupy_gpu
     processing_options = config.processing_options()
+    processed_scan_length = fixture.raw_data.shape[-3] - int(fixture.mode == "stage")
+    assert config.decon_scan_chunk_size < processed_scan_length
 
     process(root_path=fixture.path, deconvolve=False, **processing_options)
     process(
         root_path=fixture.path,
         deconvolve=True,
-        decon_crop_y=fixture.raw_data.shape[-2],
+        decon_crop_scan=config.decon_scan_chunk_size,
         decon_gpu_id=0,
         decon_psf_paths=[fixture.psf_path],
         **processing_options,
