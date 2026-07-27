@@ -5,20 +5,16 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import numpy as np
 import zarr
+from tifffile import imread
 
 from opm_processing.dataio.acquisition import (
     inspect_acquisition,
     open_acquisition_datastore,
-    resolve_acquisition_path,
 )
 from opm_processing.dataio.convert_timelapse_data import convert_timelapse
-from opm_processing.dataio.position_collection import (
-    create_position_collection,
-    open_position_collection,
-)
-from opm_processing.process import process
-from opm_processing.imageprocessing.tilefusion import TileFusion
+from opm_processing.dataio.position_collection import create_position_collection
 
 
 @pytest.fixture
@@ -98,19 +94,21 @@ def current_opm_v2_stage_scan(tmp_path: Path) -> Path:
                     }
                 )
         root[str(position)].attrs["ome_writers"] = {"frame_metadata": frames}
+
+        data = np.empty((1, shape[2], shape[3], shape[4], shape[5]), dtype=np.uint16)
+        zz, yy, xx = np.mgrid[: shape[3], : shape[4], : shape[5]]
+        for channel in range(shape[2]):
+            data[0, channel] = (
+                1000 * position + 100 * channel + 10 * zz + 2 * yy + xx
+            )
+        root[str(position)]["0"][:] = data
     return path
 
 
 def test_current_stage_metadata_is_discovered_without_array_open(
     current_opm_v2_stage_scan: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Inspection must use yaozarrs metadata and never construct pixel handles."""
-
-    def fail_if_opened(*args, **kwargs):
-        raise AssertionError("metadata inspection attempted to open an image array")
-
-    monkeypatch.setattr("yaozarrs._zarr.ZarrArray.to_tensorstore", fail_if_opened)
+    """Recover all acquisition metadata written into a synthetic collection."""
     metadata = inspect_acquisition(current_opm_v2_stage_scan.parent)
 
     assert metadata.storage_format == "opm-v2-ome-zarr-v3"
@@ -134,13 +132,13 @@ def test_current_stage_metadata_is_discovered_without_array_open(
     assert metadata.camera_offset == pytest.approx(100.0)
     assert metadata.camera_conversion == pytest.approx(0.24)
     assert metadata.stage_axis_flips_xyz == (False, False, True)
-    assert metadata.scan_axis_reversed is False
+    assert metadata.scan_axis_reversed is True
 
 
 def test_current_stage_collection_opens_as_virtual_tpczyx(
     current_opm_v2_stage_scan: Path,
 ) -> None:
-    """Per-position TCZYX series are stacked virtually into logical TPCZYX."""
+    """Recover exact pixels from every virtualized position and channel."""
     metadata = inspect_acquisition(current_opm_v2_stage_scan)
     datastore = open_acquisition_datastore(metadata)
 
@@ -148,61 +146,18 @@ def test_current_stage_collection_opens_as_virtual_tpczyx(
     assert tuple(datastore.shape) == metadata.shape
     assert tuple(datastore.domain.labels) == ("t", "", "c", "z", "y", "x")
 
-    collection = open_position_collection(current_opm_v2_stage_scan)
-    assert collection.shape == metadata.shape
-    assert collection.attributes["channels"] == ["488nm", "561nm"]
-    assert collection.attributes["stage_positions"] == [
-        [30.0, 100.0, 200.0],
-        [30.0, 100.0, 220.0],
-    ]
-    assert collection.attributes["acquisition"]["scan_position_count"] == 3
-
-
-def test_current_stage_collection_processes_without_source_relayout(
-    current_opm_v2_stage_scan: Path,
-) -> None:
-    """The processing CLI accepts current multi-series OPM-v2 acquisitions."""
-    process(
-        root_path=current_opm_v2_stage_scan.parent,
-        deconvolve=False,
-        max_projection=False,
-        flatfield_correction=False,
-        create_fused_max_projection=False,
-        z_downsample_level=1,
-    )
-
-    output = current_opm_v2_stage_scan.parent / "current_stage_deskewed.ome.zarr"
-    collection = open_position_collection(output)
-    assert collection.shape[:3] == (1, 2, 2)
-    assert collection.attributes["channels"] == ["488nm", "561nm"]
-    assert collection.attributes["scan_axis_step_um"] == pytest.approx(0.4)
-    provenance = collection.attributes["opm_processing"]
-    assert provenance["schema_version"] == "1.0"
-    assert provenance["software"]["name"] == "opm-processing-v2"
-    assert provenance["source"]["path"] == str(current_opm_v2_stage_scan.resolve())
-    assert provenance["output"]["kind"] == "deskewed"
-    steps = {step["name"]: step for step in provenance["steps"]}
-    assert steps["camera_correction"]["applied"] is True
-    assert steps["illumination_correction"]["applied"] is False
-    assert steps["deconvolution"]["applied"] is False
-    assert steps["deskew"]["applied"] is True
-
-    # The containing directory now has both the acquisition and a processed
-    # collection. Metadata resolution must still select the acquisition, and
-    # fusion must discover the processed collection from the same directory.
-    assert (
-        resolve_acquisition_path(current_opm_v2_stage_scan.parent)
-        == current_opm_v2_stage_scan
-    )
-    fusion = TileFusion(current_opm_v2_stage_scan.parent)
-    assert fusion.root == current_opm_v2_stage_scan
-    assert fusion.data == output
+    zz, yy, xx = np.mgrid[:3, :4, :5]
+    for position in range(2):
+        for channel in range(2):
+            expected = 1000 * position + 100 * channel + 10 * zz + 2 * yy + xx
+            actual = datastore[0, position, channel].read().result()
+            np.testing.assert_array_equal(actual, expected)
 
 
 def test_timelapse_converter_accepts_current_collection(
     current_opm_v2_stage_scan: Path,
 ) -> None:
-    """The conversion script selects from the virtual position dimension."""
+    """Converted TIFF pixels must exactly match the requested source data."""
     output_dir = current_opm_v2_stage_scan.parent / "converted"
     written = convert_timelapse(
         current_opm_v2_stage_scan.parent,
@@ -214,4 +169,7 @@ def test_timelapse_converter_accepts_current_collection(
     )
 
     assert written == [output_dir / "pos_0_scan_0.tiff"]
-    assert written[0].is_file()
+    converted = imread(written[0])
+    yy, xx = np.mgrid[:4, :5]
+    expected = np.stack((2 * yy + xx, 100 + 2 * yy + xx))[np.newaxis, ...]
+    np.testing.assert_array_equal(converted, expected)

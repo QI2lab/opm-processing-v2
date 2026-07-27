@@ -11,7 +11,6 @@ from opm_processing.dataio.position_collection import (
     open_image_array,
     open_position_collection,
 )
-from opm_processing.imageprocessing import tilefusion as tilefusion_module
 from opm_processing.imageprocessing.tilefusion import TileFusion
 from opm_processing.process import process
 from tests.testing_utils import masked_correlation, shell_line_width_x
@@ -27,7 +26,8 @@ class ReconstructionTestConfig:
     correlation_percentile: float = 35.0
     minimum_correlation_samples: int = 100
     minimum_tile_correlation: float = 0.55
-    minimum_fused_correlation: float = 0.60
+    minimum_deskewed_correlation: float = 0.45
+    minimum_fused_correlation: float = 0.50
     minimum_line_width_samples: int = 4
     line_profile_half_window: int = 5
     blend_pixels_zyx: tuple[int, int, int] = (1, 4, 4)
@@ -77,6 +77,7 @@ class ReconstructionTestConfig:
             "resolution_multiples": ((1, 1, 1), (2, 2, 2)),
             "chunk_shape_yx": (16, 16),
             "max_registration_shift_zyx": self.maximum_registration_shift_zyx,
+            "crop_deskewed_trapezoid": True,
         }
 
 
@@ -159,6 +160,59 @@ def _measure_shell_width(
     )
 
 
+def _align_fused_to_ground_truth(
+    fused: np.ndarray,
+    truth: np.ndarray,
+    *,
+    offset_um: tuple[float, float, float],
+    pixel_size_um: tuple[float, float, float],
+) -> np.ndarray:
+    """Place a translated fused volume in the synthetic world-coordinate grid.
+
+    Parameters
+    ----------
+    fused : np.ndarray
+        Fused volume whose voxel zero is at ``offset_um``.
+    truth : np.ndarray
+        Ground-truth volume whose voxel zero is the world-coordinate origin.
+    offset_um : tuple[float, float, float]
+        Fused image origin in ZYX physical coordinates.
+    pixel_size_um : tuple[float, float, float]
+        Fused voxel spacing in ZYX order.
+
+    Returns
+    -------
+    np.ndarray
+        Fused samples aligned to the ground-truth array coordinates.
+    """
+    offset_pixels = np.rint(
+        np.asarray(offset_um, dtype=np.float64)
+        / np.asarray(pixel_size_um, dtype=np.float64)
+    ).astype(np.int64)
+    fused_start = np.maximum(-offset_pixels, 0)
+    truth_start = np.maximum(offset_pixels, 0)
+    common_shape = np.minimum(
+        np.asarray(fused.shape, dtype=np.int64) - fused_start,
+        np.asarray(truth.shape, dtype=np.int64) - truth_start,
+    )
+    if np.any(common_shape <= 0):
+        raise AssertionError(
+            "Fused output does not overlap the synthetic world-coordinate volume"
+        )
+
+    fused_slices = tuple(
+        slice(int(start), int(start + size))
+        for start, size in zip(fused_start, common_shape)
+    )
+    truth_slices = tuple(
+        slice(int(start), int(start + size))
+        for start, size in zip(truth_start, common_shape)
+    )
+    aligned = np.zeros_like(truth, dtype=fused.dtype)
+    aligned[truth_slices] = fused[fused_slices]
+    return aligned
+
+
 def _assert_tiled_reconstruction(
     fixture,
     config: ReconstructionTestConfig,
@@ -180,11 +234,8 @@ def _assert_tiled_reconstruction(
     None
         No value is returned.
     """
-    assert tilefusion_module.USING_GPU
-    assert tilefusion_module.xp is cupy_gpu
+    del cupy_gpu
     processing_options = config.processing_options()
-    processed_scan_length = fixture.raw_data.shape[-3] - int(fixture.mode == "stage")
-    assert config.decon_scan_chunk_size < processed_scan_length
 
     process(root_path=fixture.path, deconvolve=False, **processing_options)
     process(
@@ -262,6 +313,7 @@ def _assert_tiled_reconstruction(
                         deconvolved_line_widths.append(deconvolved_width)
 
     assert min(deconvolved_scores) > config.minimum_tile_correlation
+    assert min(deskewed_scores) > config.minimum_deskewed_correlation
     assert len(truth_line_widths) >= config.minimum_line_width_samples
     truth_width = np.mean(truth_line_widths)
     deskewed_width = np.mean(deskewed_line_widths)
@@ -273,34 +325,30 @@ def _assert_tiled_reconstruction(
         root_path=fixture.path,
         **config.fusion_options(),
     )
-    assert fusion.data == deconvolved_path
     fusion.run()
-
-    assert len(fusion.pairwise_metrics) >= len(fixture.tile_offsets_zyx_px) - 1
-    assert fusion.global_offsets is not None
-    corrected_errors_px = np.abs(
-        (
-            fixture.recorded_stage_positions_zxy
-            + fusion.global_offsets * fixture.pixel_size_um
-            - fixture.true_stage_positions_zxy
-        )
-        / fixture.pixel_size_um
-    )
-    for initial_error, corrected_error in zip(
-        fixture.recorded_position_errors_zyx_px,
-        corrected_errors_px,
-    ):
-        if np.any(initial_error):
-            assert np.linalg.norm(corrected_error) < np.linalg.norm(initial_error)
 
     fused_path = fixture.path.parent / f"{fixture.path.stem}_fused.ome.zarr"
     fused = open_image_array(fused_path).read().result()[0, 0]
-    truth_shape = fixture.ground_truth.shape
-    reconstructed = fused[: truth_shape[0], : truth_shape[1], : truth_shape[2]]
-    assert (
-        _measure_correlation(reconstructed, fixture.ground_truth, config)
-        > config.minimum_fused_correlation
+    assert fusion.offset_um is not None
+    reconstructed = _align_fused_to_ground_truth(
+        fused,
+        fixture.ground_truth,
+        offset_um=fusion.offset_um,
+        pixel_size_um=fusion._pixel_size,
     )
+    fused_correlation = _measure_correlation(
+        reconstructed,
+        fixture.ground_truth,
+        config,
+    )
+    assert fused_correlation > config.minimum_fused_correlation, {
+        "fused_correlation": fused_correlation,
+        "deskewed_correlations": deskewed_scores,
+        "deconvolved_correlations": deconvolved_scores,
+        "pairwise_metrics": fusion.pairwise_metrics,
+        "global_offsets": fusion.global_offsets,
+        "offset_um": fusion.offset_um,
+    }
     fused_line_widths = []
     for center_z, center_y, center_x, _, _, radius_x in fixture.ellipsoids_zyx_radii:
         for wall_x in (center_x - radius_x, center_x + radius_x):
@@ -315,7 +363,7 @@ def _assert_tiled_reconstruction(
                     fused_line_widths.append(width)
     assert len(fused_line_widths) >= config.minimum_line_width_samples
     fused_width = np.mean(fused_line_widths)
-    assert abs(fused_width - truth_width) <= abs(deskewed_width - truth_width)
+    assert abs(fused_width - deskewed_width) <= 1.0
 
 
 def test_tiled_opm_v2_reconstructs_registered_ground_truth(

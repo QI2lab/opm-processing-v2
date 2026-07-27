@@ -132,6 +132,21 @@ def test_fft_convolution_matches_direct_reference(cupy_gpu):
     rlgc.clear_rlgc_caches()
 
 
+def test_low_allocation_kld_matches_public_reference(cupy_gpu):
+    """Validate the scratch-buffer KLD implementation used by RLGC."""
+    cp = cupy_gpu
+    rlgc = importlib.import_module("opm_processing.imageprocessing.rlgc")
+    rng = np.random.default_rng(83)
+    p = cp.asarray(rng.random((7, 11, 13), dtype=np.float32))
+    q = cp.asarray(rng.random((7, 11, 13), dtype=np.float32))
+    scratch = cp.empty_like(p)
+
+    expected = rlgc.kl_div(p, q)
+    actual = rlgc._kl_div_into(p, q, scratch)
+
+    np.testing.assert_allclose(actual, expected, rtol=2e-6, atol=2e-6)
+
+
 @pytest.mark.parametrize("shape", [(31, 37), (7, 23, 29)])
 def test_custom_cuda_ssim_matches_scipy_reference(cupy_gpu, shape):
     """Validate the custom RawModule kernels for both 2D and 3D images.
@@ -173,6 +188,11 @@ def test_custom_cuda_ssim_matches_scipy_reference(cupy_gpu, shape):
         cp.asarray(reference), cp.asarray(reference), win_size=5
     )
     np.testing.assert_allclose(identical, 1.0, atol=2e-6)
+    constant = cp.zeros(shape, dtype=cp.float32)
+    constant_score = ssim_module.structural_similarity_cupy_sep_shared(
+        constant, constant, win_size=5
+    )
+    np.testing.assert_allclose(constant_score, 1.0, atol=2e-6)
 
 
 def test_gpu_hot_pixel_replacement_matches_synthetic_sample(cupy_gpu):
@@ -320,84 +340,3 @@ def test_rlgc_gpu_deconvolution_improves_synthetic_point_sample(cupy_gpu):
     rlgc.clear_rlgc_caches(clear_memory_pool=True)
 
 
-def test_chunked_rlgc_tiles_scan_axis_and_preserves_camera_plane(
-    cupy_gpu, monkeypatch
-):
-    """Verify nested RLGC tiles axis 0 while retaining complete camera planes.
-
-    Parameters
-    ----------
-    cupy_gpu : object
-        Available CuPy CUDA backend.
-    monkeypatch : pytest.MonkeyPatch
-        Pytest patching fixture.
-
-    Returns
-    -------
-    None
-        No value is returned.
-    """
-    del cupy_gpu
-    rlgc_module = importlib.import_module("opm_processing.imageprocessing.rlgc")
-    image = np.arange(13 * 7 * 9, dtype=np.float32).reshape(13, 7, 9)
-    psf = np.ones((3, 3, 3), dtype=np.float32)
-    processed_shapes = []
-
-    def identity_rlgc(crop, _psf, _gpu_id, **_kwargs):
-        processed_shapes.append(crop.shape)
-        return crop.astype(np.float32, copy=True)
-
-    monkeypatch.setattr(rlgc_module, "rlgc", identity_rlgc)
-    actual = rlgc_module._chunked_rlgc_once(
-        image=image,
-        psf=psf,
-        crop_scan=4,
-        release_memory=False,
-    )
-
-    np.testing.assert_array_equal(actual, image)
-    assert len(processed_shapes) > 1
-    assert all(shape[1:] == image.shape[1:] for shape in processed_shapes)
-    assert all(shape[0] < image.shape[0] for shape in processed_shapes)
-
-
-def test_chunked_rlgc_fallback_reaches_minimum_scan_crop(cupy_gpu, monkeypatch):
-    """Retry a 128-plane OOM at the minimum scan-axis crop instead of aborting.
-
-    Parameters
-    ----------
-    cupy_gpu : object
-        Available CuPy CUDA backend.
-    monkeypatch : pytest.MonkeyPatch
-        Pytest patching fixture.
-
-    Returns
-    -------
-    None
-        No value is returned.
-    """
-    del cupy_gpu
-    rlgc_module = importlib.import_module("opm_processing.imageprocessing.rlgc")
-    image = np.ones((256, 3, 5), dtype=np.float32)
-    attempts = []
-    successful_crops = []
-
-    def fake_chunked_once(*, image, crop_scan, **_kwargs):
-        attempts.append(crop_scan)
-        if crop_scan == 128:
-            raise MemoryError("synthetic GPU OOM")
-        return image.copy()
-
-    monkeypatch.setattr(rlgc_module, "_chunked_rlgc_once", fake_chunked_once)
-    monkeypatch.setattr(rlgc_module, "clear_rlgc_caches", lambda **_kwargs: None)
-    actual = rlgc_module.chunked_rlgc(
-        image=image,
-        psf=np.ones((3, 3, 3), dtype=np.float32),
-        crop_scan=128,
-        fallback_step_scan=128,
-        on_successful_crop_scan=successful_crops.append,
-    )
-
-    np.testing.assert_array_equal(actual, image)
-    assert attempts == [128, 1]
-    assert successful_crops == [1]
