@@ -13,6 +13,7 @@ elif sys.platform.startswith("win"):
     mp.set_start_method("spawn", force=True)
 
 import warnings
+from typing import Annotated
 
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.simplefilter("ignore", category=FutureWarning)
@@ -33,17 +34,36 @@ app.pretty_exceptions_enable = False
 @app.command()
 def register_and_fuse(
     root_path: Path,
-    chan_idx: int = 0,
+    registration_channel: Annotated[
+        int,
+        typer.Option(
+            "--registration-channel",
+            "--chan-idx",
+            min=0,
+            help="Zero-based channel index used to register tile positions.",
+        ),
+    ] = 0,
     blend_pixels: tuple[int, int, int] = (20, 600, 400),
     downsample_factors: tuple[int, int, int] = (3, 5, 5),
     ssim_window: int = 15,
     registration_threshold: float = 0.7,
     chunk_shape_yx: tuple[int, int] = (1024, 1024),
-    fusion_ram_fraction: float = 0.25,
+    fusion_ram_fraction: float = 0.4,
+    max_workers: int | None = None,
     max_in_flight_writes: int = 2,
     optimization_rel_threshold: float = 0.5,
     optimization_abs_threshold: float = 1.5,
     max_registration_shift_zyx: tuple[int, int, int] = (20, 50, 100),
+    crop_deskewed_trapezoid: Annotated[
+        bool,
+        typer.Option(
+            "--crop-ends",
+            help=(
+                "Crop the geometry-derived trapezoidal Y ends from every "
+                "deskewed tile before registration and fusion."
+            ),
+        ),
+    ] = False,
     require_gpu: bool = False,
 ):
     """Register and fuse processed OPM data.
@@ -60,8 +80,8 @@ def register_and_fuse(
     ----------
     root_path: Path
         Path to an OPM acquisition Zarr store or its containing directory.
-    chan_idx: int, default = 0
-        Channel index to use for registration and fusion.
+    registration_channel: int, default = 0
+        Zero-based channel index to use for registration.
         If there is only one channel, this should be 0.
         If there are multiple channels, this should be the index of the channel
         to use for registration.
@@ -78,6 +98,9 @@ def register_and_fuse(
         Value supplied for ``chunk shape yx``.
     fusion_ram_fraction : float
         Value supplied for ``fusion ram fraction``.
+    max_workers : int or None
+        Number of CPU fusion workers. By default, uses up to eight physical
+        cores so each concurrent block retains efficient Z depth.
     max_in_flight_writes : int
         Value supplied for ``max in flight writes``.
     optimization_rel_threshold : float
@@ -86,6 +109,8 @@ def register_and_fuse(
         Value supplied for ``optimization abs threshold``.
     max_registration_shift_zyx : tuple[int, int, int]
         Value supplied for ``max registration shift zyx``.
+    crop_deskewed_trapezoid : bool
+        Crop the tilted-acquisition Y ends using recorded acquisition geometry.
     require_gpu : bool
         Fail instead of silently using CPU registration when CUDA is unavailable.
 
@@ -94,7 +119,7 @@ def register_and_fuse(
     None
         No value is returned.
     """
-    status = fusion_backend_status()
+    status = fusion_backend_status(max_workers=max_workers)
     if require_gpu:
         require_gpu_backend()
     print(
@@ -108,18 +133,28 @@ def register_and_fuse(
 
     tile_fuser = TileFusion(
         root_path=root_path,
-        channel_to_use=chan_idx,
+        channel_to_use=registration_channel,
         blend_pixels=blend_pixels,
         downsample_factors=downsample_factors,
         ssim_window=ssim_window,
         threshold=registration_threshold,
         chunk_shape_yx=chunk_shape_yx,
         fusion_ram_fraction=fusion_ram_fraction,
+        max_workers=max_workers,
         max_in_flight_writes=max_in_flight_writes,
         optimization_rel_threshold=optimization_rel_threshold,
         optimization_abs_threshold=optimization_abs_threshold,
         max_registration_shift_zyx=max_registration_shift_zyx,
+        crop_deskewed_trapezoid=crop_deskewed_trapezoid,
     )
+    if crop_deskewed_trapezoid:
+        if tile_fuser.deskew_geometry_crop_y:
+            print(
+                "Deskew geometry crop: "
+                f"{tile_fuser.deskew_geometry_crop_y} Y pixels per side"
+            )
+        else:
+            print("Deskew geometry crop: already applied to the processed tiles")
     tile_fuser.run()
 
 

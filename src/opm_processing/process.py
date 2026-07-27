@@ -61,6 +61,84 @@ app = typer.Typer()
 app.pretty_exceptions_enable = False
 
 
+def _flatfield_software_tag() -> str:
+    """Return the estimator identifier stored with reusable flatfields."""
+    return "opm-processing/basicpy-autotuned-distributed-sampling-v5"
+
+
+def _read_current_flatfield(
+    path: Path,
+    expected_shape: tuple[int, int, int],
+) -> np.ndarray | None:
+    """Read a flatfield only when it was made by the current estimator."""
+    try:
+        with TiffFile(path) as tif:
+            tag = tif.pages[0].tags.get("Software")
+            if tag is None or tag.value != _flatfield_software_tag():
+                return None
+            flatfields = tif.asarray().astype(np.float32)
+    except (OSError, ValueError):
+        return None
+    if flatfields.shape != expected_shape:
+        return None
+    if not np.all(np.isfinite(flatfields)) or np.any(flatfields <= 0):
+        return None
+    return flatfields
+
+
+def _write_flatfield(
+    path: Path,
+    flatfields: np.ndarray,
+    pixel_size_um: float,
+) -> None:
+    """Write a reusable, versioned CYX flatfield OME-TIFF."""
+    with TiffWriter(path, bigtiff=True) as tif:
+        metadata = {
+            "axes": "CYX",
+            "SignificantBits": 32,
+            "PhysicalSizeX": pixel_size_um,
+            "PhysicalSizeXUnit": "µm",
+            "PhysicalSizeY": pixel_size_um,
+            "PhysicalSizeYUnit": "µm",
+        }
+        tif.write(
+            flatfields,
+            resolution=(1e4 / pixel_size_um, 1e4 / pixel_size_um),
+            photometric="minisblack",
+            resolutionunit="CENTIMETER",
+            software=_flatfield_software_tag(),
+            metadata=metadata,
+        )
+
+
+def _load_or_estimate_flatfield(
+    path: Path,
+    datastore,
+    camera_offset: float,
+    camera_conversion: float,
+    pixel_size_um: float,
+) -> np.ndarray:
+    """Reuse a current flatfield or replace an obsolete estimator artifact."""
+    expected_shape = (
+        datastore.shape[2],
+        datastore.shape[-2],
+        datastore.shape[-1],
+    )
+    if path.exists():
+        flatfields = _read_current_flatfield(path, expected_shape)
+        if flatfields is not None:
+            return flatfields
+        print("Existing flatfield uses an obsolete estimator; re-estimating it.")
+
+    flatfields = call_estimate_illuminations(
+        datastore,
+        camera_offset,
+        camera_conversion,
+    )
+    _write_flatfield(path, flatfields, pixel_size_um)
+    return flatfields
+
+
 def _distribution_version(distribution: str) -> str:
     """Return an installed distribution version for provenance."""
     try:
@@ -118,9 +196,7 @@ def _selection_step(
         "applied": time_range is not None or position_range is not None,
         "parameters": {
             "time_range": None if time_range is None else list(time_range),
-            "position_range": None
-            if position_range is None
-            else list(position_range),
+            "position_range": None if position_range is None else list(position_range),
         },
     }
 
@@ -167,10 +243,10 @@ def process(
     time_range: tuple[int, int] = None,
     pos_range: tuple[int, int] = None,
     eager_mode: bool = False,
-    decon_crop_scan: int = 128,
+    decon_crop_scan: int | None = None,
     decon_gpu_id: int = 0,
-    decon_verbose: int = 0,
-    decon_fallback_step_scan: int = 128,
+    decon_verbose: int = 1,
+    decon_fallback_step_scan: int | None = None,
     decon_psf_paths: list[Path] | None = None,
     asi_camera_conversion: float | None = None,
     write_fused_tiff: bool = False,
@@ -338,10 +414,10 @@ def process_skewed(
     pos_range: tuple[int, int] = None,
     excess_overide: int = None,
     flyback_crop: int = None,
-    decon_crop_scan: int = 128,
+    decon_crop_scan: int | None = None,
     decon_gpu_id: int = 0,
-    decon_verbose: int = 0,
-    decon_fallback_step_scan: int = 128,
+    decon_verbose: int = 1,
+    decon_fallback_step_scan: int | None = None,
     decon_psf_paths: list[Path] | None = None,
     stage_axis_flips: tuple[bool, bool, bool] = (False, True, True),
 ):
@@ -407,7 +483,12 @@ def process_skewed(
         No value is returned.
     """
     if deconvolve:
-        from opm_processing.imageprocessing.rlgc import chunked_rlgc
+        from opm_processing.imageprocessing.rlgc import (
+            RlgcChunkState,
+            chunked_rlgc,
+        )
+
+        decon_chunk_state = RlgcChunkState(decon_crop_scan)
 
     if acquisition is not None:
         datastore = open_acquisition_datastore(acquisition)
@@ -416,8 +497,7 @@ def process_skewed(
             raise ValueError("Acquisition metadata lacks a scan-axis step")
         scan_axis_step_um = acquisition.scan_axis_step_um
         excess_scan_positions = (
-            acquisition.excess_scan_start_positions
-            or acquisition.excess_scan_positions
+            acquisition.excess_scan_start_positions or acquisition.excess_scan_positions
         )
         flyback_crop = acquisition.excess_scan_end_positions or None
         scan_axis_reversed = acquisition.scan_axis_reversed
@@ -471,9 +551,7 @@ def process_skewed(
         ]
     else:
         psfs = None
-    stage_positions = _apply_stage_axis_flips(
-        stage_positions_raw, stage_axis_flips
-    )
+    stage_positions = _apply_stage_axis_flips(stage_positions_raw, stage_axis_flips)
     stage_x_flipped, stage_y_flipped, stage_z_flipped = stage_axis_flips
 
     # # estimate shape of one deskewed volume
@@ -547,7 +625,12 @@ def process_skewed(
             "parameters": {
                 "estimator": "BaSiCPy",
                 "estimator_version": _distribution_version("basicpy"),
-                "configuration": "library_defaults",
+                "configuration": "autotuned_library_defaults",
+                "sampling": "individual_planes_from_every_position",
+                "planes_per_position": 10,
+                "working_size": "half_resolution_preserving_aspect_ratio",
+                "darkfield_estimation": False,
+                "artifact_schema": _flatfield_software_tag(),
                 "artifact": str(flatfield_path.resolve()),
             },
         },
@@ -571,10 +654,16 @@ def process_skewed(
             "applied": deconvolve,
             "parameters": {
                 "method": "RLGC",
-                "crop_scan": int(decon_crop_scan),
+                "crop_scan": (
+                    "auto" if decon_crop_scan is None else int(decon_crop_scan)
+                ),
                 "gpu_id": int(decon_gpu_id),
                 "verbose": int(decon_verbose),
-                "fallback_step_scan": int(decon_fallback_step_scan),
+                "fallback_step_scan": (
+                    "adaptive"
+                    if decon_fallback_step_scan is None
+                    else int(decon_fallback_step_scan)
+                ),
                 "psf_source": "provided" if decon_psf_paths else "theoretical",
                 "psf_paths": None
                 if decon_psf_paths is None
@@ -693,33 +782,13 @@ def process_skewed(
         max_z_ts_store = max_z_collection.arrays
 
     if flatfield_correction:
-        if flatfield_path.exists():
-            flatfields = imread(flatfield_path).astype(np.float32)
-        else:
-            flatfields = call_estimate_illuminations(
-                datastore,
-                camera_offset,
-                camera_conversion,
-            )
-            with TiffWriter(flatfield_path, bigtiff=True) as tif:
-                metadata = {
-                    "axes": "CYX",
-                    "SignificantBits": 32,
-                    "PhysicalSizeX": pixel_size_um,
-                    "PhysicalSizeXUnit": "µm",
-                    "PhysicalSizeY": pixel_size_um,
-                    "PhysicalSizeYUnit": "µm",
-                }
-                options = dict(
-                    photometric="minisblack",
-                    resolutionunit="CENTIMETER",
-                )
-                tif.write(
-                    flatfields,
-                    resolution=(1e4 / pixel_size_um, 1e4 / pixel_size_um),
-                    **options,
-                    metadata=metadata,
-                )
+        flatfields = _load_or_estimate_flatfield(
+            flatfield_path,
+            datastore,
+            camera_offset,
+            camera_conversion,
+            pixel_size_um,
+        )
     else:
         flatfields = np.ones(
             (datastore.shape[2], datastore.shape[-2], datastore.shape[-1]),
@@ -782,25 +851,29 @@ def process_skewed(
                             psfs.append(psf)
 
                     if flyback_crop is not None:
-                        deconvolved_data = chunked_rlgc(
-                            camera_corrected_data[
-                                excess_scan_positions:-flyback_crop, :, :
-                            ],
-                            np.asarray(psfs[chan_idx]),
-                            crop_scan=decon_crop_scan,
-                            gpu_id=decon_gpu_id,
-                            verbose=decon_verbose,
-                            fallback_step_scan=decon_fallback_step_scan,
-                        )
+                        decon_input = camera_corrected_data[
+                            excess_scan_positions:-flyback_crop, :, :
+                        ]
                     else:
-                        deconvolved_data = chunked_rlgc(
-                            camera_corrected_data[excess_scan_positions:, :, :],
-                            np.asarray(psfs[chan_idx]),
-                            crop_scan=decon_crop_scan,
-                            gpu_id=decon_gpu_id,
-                            verbose=decon_verbose,
-                            fallback_step_scan=decon_fallback_step_scan,
-                        )
+                        decon_input = camera_corrected_data[
+                            excess_scan_positions:, :, :
+                        ]
+                    effective_crop_scan = decon_chunk_state.determine_once(
+                        tuple(int(size) for size in decon_input.shape),
+                        [tuple(int(size) for size in psf.shape) for psf in psfs],
+                        gpu_id=decon_gpu_id,
+                    )
+                    deconvolved_data = chunked_rlgc(
+                        decon_input,
+                        np.asarray(psfs[chan_idx]),
+                        crop_scan=effective_crop_scan,
+                        gpu_id=decon_gpu_id,
+                        verbose=decon_verbose,
+                        fallback_step_scan=decon_fallback_step_scan,
+                        on_successful_crop_scan=(
+                            decon_chunk_state.remember_successful_crop
+                        ),
+                    )
                     deskewed = orthogonal_deskew(
                         deconvolved_data,
                         theta=opm_tilt_deg,
@@ -936,10 +1009,10 @@ def process_projection(
     pos_range: tuple[int, int] = None,
     eager_deconvolution: bool = False,
     overwrite: bool = False,
-    decon_crop_scan: int = 128,
+    decon_crop_scan: int | None = None,
     decon_gpu_id: int = 0,
-    decon_verbose: int = 0,
-    decon_fallback_step_scan: int = 128,
+    decon_verbose: int = 1,
+    decon_fallback_step_scan: int | None = None,
     stage_axis_flips: tuple[bool, bool, bool] = (False, True, True),
 ):
     """Postprocess qi2lab OPM dataset.
@@ -994,7 +1067,12 @@ def process_projection(
         No value is returned.
     """
     if deconvolve:
-        from opm_processing.imageprocessing.rlgc import chunked_rlgc
+        from opm_processing.imageprocessing.rlgc import (
+            RlgcChunkState,
+            chunked_rlgc,
+        )
+
+        decon_chunk_state = RlgcChunkState(decon_crop_scan)
 
     if acquisition is not None:
         datastore = open_acquisition_datastore(acquisition)
@@ -1025,9 +1103,7 @@ def process_projection(
     opm_tilt_deg = float(opm_tilt_deg)
     camera_offset = float(camera_offset)
     camera_conversion = float(camera_conversion)
-    stage_positions = _apply_stage_axis_flips(
-        stage_positions_raw, stage_axis_flips
-    )
+    stage_positions = _apply_stage_axis_flips(stage_positions_raw, stage_axis_flips)
     stage_x_flipped, stage_y_flipped, stage_z_flipped = stage_axis_flips
 
     if time_range is not None:
@@ -1092,7 +1168,12 @@ def process_projection(
                         "parameters": {
                             "estimator": "BaSiCPy",
                             "estimator_version": _distribution_version("basicpy"),
-                            "configuration": "library_defaults",
+                            "configuration": "autotuned_library_defaults",
+                            "sampling": "individual_planes_from_every_position",
+                            "planes_per_position": 10,
+                            "working_size": "half_resolution_preserving_aspect_ratio",
+                            "darkfield_estimation": False,
+                            "artifact_schema": _flatfield_software_tag(),
                             "artifact": str(flatfield_path.resolve()),
                         },
                     },
@@ -1101,10 +1182,18 @@ def process_projection(
                         "applied": deconvolve,
                         "parameters": {
                             "method": "RLGC",
-                            "crop_scan": int(decon_crop_scan),
+                            "crop_scan": (
+                                "auto"
+                                if decon_crop_scan is None
+                                else int(decon_crop_scan)
+                            ),
                             "gpu_id": int(decon_gpu_id),
                             "verbose": int(decon_verbose),
-                            "fallback_step_scan": int(decon_fallback_step_scan),
+                            "fallback_step_scan": (
+                                "adaptive"
+                                if decon_fallback_step_scan is None
+                                else int(decon_fallback_step_scan)
+                            ),
                             "safe_mode": not eager_deconvolution,
                             "psf_source": "theoretical",
                         },
@@ -1129,33 +1218,13 @@ def process_projection(
         ts_store = output_collection.arrays
 
         if flatfield_correction:
-            if flatfield_path.exists():
-                flatfields = imread(flatfield_path).astype(np.float32)
-            else:
-                flatfields = call_estimate_illuminations(
-                    datastore,
-                    camera_offset,
-                    camera_conversion,
-                )
-                with TiffWriter(flatfield_path, bigtiff=True) as tif:
-                    metadata = {
-                        "axes": "CYX",
-                        "SignificantBits": 32,
-                        "PhysicalSizeX": pixel_size_um,
-                        "PhysicalSizeXUnit": "µm",
-                        "PhysicalSizeY": pixel_size_um,
-                        "PhysicalSizeYUnit": "µm",
-                    }
-                    options = dict(
-                        photometric="minisblack",
-                        resolutionunit="CENTIMETER",
-                    )
-                    tif.write(
-                        flatfields,
-                        resolution=(1e4 / pixel_size_um, 1e4 / pixel_size_um),
-                        **options,
-                        metadata=metadata,
-                    )
+            flatfields = _load_or_estimate_flatfield(
+                flatfield_path,
+                datastore,
+                camera_offset,
+                camera_conversion,
+                pixel_size_um,
+            )
         else:
             flatfields = np.ones(
                 (datastore.shape[2], datastore.shape[-2], datastore.shape[-1]),
@@ -1225,14 +1294,27 @@ def process_projection(
                             safe_stop = False
                         else:
                             safe_stop = True
+                        decon_shape = tuple(
+                            int(size) for size in camera_corrected_data.shape
+                        )
+                        if len(decon_shape) == 2:
+                            decon_shape = (1, *decon_shape)
+                        effective_crop_scan = decon_chunk_state.determine_once(
+                            decon_shape,
+                            [tuple(int(size) for size in psf.shape) for psf in psfs],
+                            gpu_id=decon_gpu_id,
+                        )
                         deconvolved_data = chunked_rlgc(
                             image=camera_corrected_data,
                             psf=np.asarray(psfs[chan_idx]),
-                            crop_scan=decon_crop_scan,
+                            crop_scan=effective_crop_scan,
                             gpu_id=decon_gpu_id,
                             verbose=decon_verbose,
                             fallback_step_scan=decon_fallback_step_scan,
                             safe_mode=safe_stop,
+                            on_successful_crop_scan=(
+                                decon_chunk_state.remember_successful_crop
+                            ),
                         )
                     else:
                         deconvolved_data = camera_corrected_data.copy()
@@ -1345,10 +1427,10 @@ def process_ASI_SCOPE(
     crop_after_deskew: bool = False,
     time_range: tuple[int, int] = None,
     pos_range: tuple[int, int] = None,
-    decon_crop_scan: int = 128,
+    decon_crop_scan: int | None = None,
     decon_gpu_id: int = 0,
-    decon_verbose: int = 0,
-    decon_fallback_step_scan: int = 128,
+    decon_verbose: int = 1,
+    decon_fallback_step_scan: int | None = None,
     camera_conversion_override: float | None = None,
     stage_axis_flips: tuple[bool, bool, bool] = (False, True, True),
 ):
@@ -1415,7 +1497,12 @@ def process_ASI_SCOPE(
         No value is returned.
     """
     if deconvolve:
-        from opm_processing.imageprocessing.rlgc import chunked_rlgc
+        from opm_processing.imageprocessing.rlgc import (
+            RlgcChunkState,
+            chunked_rlgc,
+        )
+
+        decon_chunk_state = RlgcChunkState(decon_crop_scan)
 
     import re
 
@@ -1568,7 +1655,12 @@ def process_ASI_SCOPE(
                 "parameters": {
                     "estimator": "BaSiCPy",
                     "estimator_version": _distribution_version("basicpy"),
-                    "configuration": "library_defaults",
+                    "configuration": "autotuned_library_defaults",
+                    "sampling": "individual_planes_from_every_position",
+                    "planes_per_position": 10,
+                    "working_size": "half_resolution_preserving_aspect_ratio",
+                    "darkfield_estimation": False,
+                    "artifact_schema": _flatfield_software_tag(),
                     "artifact": str(flatfield_path.resolve()),
                 },
             },
@@ -1577,10 +1669,16 @@ def process_ASI_SCOPE(
                 "applied": deconvolve,
                 "parameters": {
                     "method": "RLGC",
-                    "crop_scan": int(decon_crop_scan),
+                    "crop_scan": (
+                        "auto" if decon_crop_scan is None else int(decon_crop_scan)
+                    ),
                     "gpu_id": int(decon_gpu_id),
                     "verbose": int(decon_verbose),
-                    "fallback_step_scan": int(decon_fallback_step_scan),
+                    "fallback_step_scan": (
+                        "adaptive"
+                        if decon_fallback_step_scan is None
+                        else int(decon_fallback_step_scan)
+                    ),
                     "psf_source": "theoretical",
                 },
             },
@@ -1667,33 +1765,13 @@ def process_ASI_SCOPE(
         flatfield_dir = root_path.parents[0] / Path("flatfield")
         if not (flatfield_dir.exists()):
             flatfield_dir.mkdir()
-        if flatfield_path.exists():
-            flatfields = imread(flatfield_path).astype(np.float32)
-        else:
-            flatfields = call_estimate_illuminations(
-                datastore,
-                camera_offset,
-                camera_conversion,
-            )
-            with TiffWriter(flatfield_path, bigtiff=True) as tif:
-                metadata = {
-                    "axes": "CYX",
-                    "SignificantBits": 32,
-                    "PhysicalSizeX": pixel_size_um,
-                    "PhysicalSizeXUnit": "µm",
-                    "PhysicalSizeY": pixel_size_um,
-                    "PhysicalSizeYUnit": "µm",
-                }
-                options = dict(
-                    photometric="minisblack",
-                    resolutionunit="CENTIMETER",
-                )
-                tif.write(
-                    flatfields,
-                    resolution=(1e4 / pixel_size_um, 1e4 / pixel_size_um),
-                    **options,
-                    metadata=metadata,
-                )
+        flatfields = _load_or_estimate_flatfield(
+            flatfield_path,
+            datastore,
+            camera_offset,
+            camera_conversion,
+            pixel_size_um,
+        )
     else:
         flatfields = np.ones(
             (datastore.shape[2], datastore.shape[-2], datastore.shape[-1]),
@@ -1757,13 +1835,21 @@ def process_ASI_SCOPE(
                             )
                             psfs.append(psf)
 
+                    effective_crop_scan = decon_chunk_state.determine_once(
+                        tuple(int(size) for size in camera_corrected_data.shape),
+                        [tuple(int(size) for size in psf.shape) for psf in psfs],
+                        gpu_id=decon_gpu_id,
+                    )
                     deconvolved_data = chunked_rlgc(
                         camera_corrected_data,
                         np.asarray(psfs[chan_idx]),
-                        crop_scan=decon_crop_scan,
+                        crop_scan=effective_crop_scan,
                         gpu_id=decon_gpu_id,
                         verbose=decon_verbose,
                         fallback_step_scan=decon_fallback_step_scan,
+                        on_successful_crop_scan=(
+                            decon_chunk_state.remember_successful_crop
+                        ),
                     )
 
                     deskewed = orthogonal_deskew(

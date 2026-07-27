@@ -27,14 +27,15 @@ import math
 from collections import deque
 from collections.abc import Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from itertools import product
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import psutil
 import tensorstore as ts
-from numba import njit
-from tqdm import tqdm, trange
+from numba import njit, prange
+from tqdm import tqdm
 from yaozarrs import v05
 from yaozarrs.write.v05 import prepare_image
 
@@ -44,6 +45,9 @@ from opm_processing.dataio.acquisition import (
     resolve_acquisition_path,
 )
 from opm_processing.dataio.position_collection import open_position_collection
+from opm_processing.imageprocessing.coordinates import (
+    stage_positions_to_image_coordinates,
+)
 
 
 # -----------------------------------------------------------------------------
@@ -53,19 +57,15 @@ USING_GPU = False
 GPU_IMPORT_ERROR: Exception | None = None
 
 cp: Any | None = None
-cp_shift: Any | None = None
 ssim_cuda: Any | None = None
 
 match_histograms: Any
 block_reduce: Any
 phase_cross_correlation: Any
 
-_shift_cpu: Any | None = None
 _ssim_cpu: Any | None = None
 
 xp: Any = np
-
-DEFAULT_FUSION_WORKERS = 8
 
 preload_cuda_libraries()
 
@@ -74,7 +74,6 @@ try:
     from cucim.skimage.exposure import match_histograms as _mh  # type: ignore
     from cucim.skimage.measure import block_reduce as _br  # type: ignore
     from cucim.skimage.registration import phase_cross_correlation as _pcc  # type: ignore
-    from cupyx.scipy.ndimage import shift as _cp_shift  # type: ignore
     from opm_processing.imageprocessing.ssim_cuda import (  # type: ignore
         structural_similarity_cupy_sep_shared as _ssim_cuda,
     )
@@ -84,13 +83,11 @@ try:
     match_histograms = _mh
     block_reduce = _br
     phase_cross_correlation = _pcc
-    cp_shift = _cp_shift
     ssim_cuda = _ssim_cuda
     USING_GPU = True
 except Exception as error:  # noqa: BLE001
     # GPU stack unavailable; fall back to CPU.
     GPU_IMPORT_ERROR = error
-    from scipy.ndimage import shift as _cpu_shift  # type: ignore
     from skimage.exposure import match_histograms as _mh  # type: ignore
     from skimage.measure import block_reduce as _br  # type: ignore
     from skimage.metrics import structural_similarity as _cpu_ssim  # type: ignore
@@ -99,18 +96,29 @@ except Exception as error:  # noqa: BLE001
     match_histograms = _mh
     block_reduce = _br
     phase_cross_correlation = _pcc
-    _shift_cpu = _cpu_shift
     _ssim_cpu = _cpu_ssim
     USING_GPU = False
 
 
-def fusion_backend_status() -> dict[str, str | bool | int | None]:
+def _default_fusion_workers() -> int:
+    """Use up to eight physical cores to preserve deep, aligned I/O blocks."""
+    physical = psutil.cpu_count(logical=False)
+    if physical is not None:
+        return max(1, min(8, int(physical)))
+    logical = psutil.cpu_count(logical=True)
+    return max(1, min(8, int(logical or 2) // 2))
+
+
+def fusion_backend_status(
+    max_workers: int | None = None,
+) -> dict[str, str | bool | int | None]:
     """Return observable registration and fusion backend information."""
+    workers = _default_fusion_workers() if max_workers is None else int(max_workers)
     return {
         "gpu_registration": USING_GPU,
         "registration_backend": "cupy/cucim" if USING_GPU else "numpy/scikit-image",
         "fusion_backend": "threaded-blocks/numba-cpu",
-        "fusion_workers": DEFAULT_FUSION_WORKERS,
+        "fusion_workers": workers,
         "gpu_error": None if GPU_IMPORT_ERROR is None else repr(GPU_IMPORT_ERROR),
     }
 
@@ -127,29 +135,6 @@ def require_gpu_backend() -> None:
         f"initialize ({detail}). Install/run the project's gpu extra; on Windows, "
         "also install the local pure-Python cuCIM package described in README.md."
     )
-
-
-def _shift_array(arr: Any, shift_vec: Any) -> Any:
-    """Shift an array using GPU if available, else CPU fallback.
-
-    Parameters
-    ----------
-    arr : array-like
-        Input array (2D or 3D) in the same backend namespace as `shift_vec`.
-    shift_vec : array-like
-        Shift vector in pixels/voxels. For 2D arrays, shape is (2,); for 3D
-        arrays, shape is (3,). Uses (y, x) for 2D and (z, y, x) for 3D.
-
-    Returns
-    -------
-    shifted : array-like
-        Shifted array in the same backend namespace as the input.
-    """
-    if USING_GPU and cp_shift is not None:
-        return cp_shift(arr, shift=shift_vec, order=1, prefilter=False)
-    if _shift_cpu is None:
-        raise RuntimeError("CPU shift backend is unavailable.")
-    return _shift_cpu(arr, shift=shift_vec, order=1, prefilter=False)
 
 
 def _ssim(arr1: Any, arr2: Any, win_size: int) -> float:
@@ -185,12 +170,117 @@ def _ssim(arr1: Any, arr2: Any, win_size: int) -> float:
     return float(_ssim_cpu(arr1_np, arr2_np, win_size=win_size, data_range=data_range))
 
 
+def _aligned_registration_views(
+    fixed: Any,
+    moving: Any,
+    shift: Sequence[float],
+) -> tuple[Any, Any]:
+    """Return corresponding valid views after applying an integer moving shift.
+
+    Registration uses subpixel phase correlation, but SSIM is only an acceptance
+    score. Scoring the nearest integer-aligned overlap avoids resampling the
+    entire volume and excludes the artificial zero padding introduced by an
+    image-shift operation.
+    """
+    if fixed.shape != moving.shape:
+        raise ValueError("registration patches must have matching shapes")
+    if fixed.ndim != len(shift):
+        raise ValueError("registration shift rank must match the patch rank")
+
+    fixed_slices: list[slice] = []
+    moving_slices: list[slice] = []
+    for length, offset_float in zip(fixed.shape, shift):
+        offset = int(np.rint(float(offset_float)))
+        if abs(offset) >= int(length):
+            raise ValueError("registration shift leaves no overlapping samples")
+        if offset >= 0:
+            fixed_slices.append(slice(offset, int(length)))
+            moving_slices.append(slice(0, int(length) - offset))
+        else:
+            fixed_slices.append(slice(0, int(length) + offset))
+            moving_slices.append(slice(-offset, int(length)))
+
+    return fixed[tuple(fixed_slices)], moving[tuple(moving_slices)]
+
+
+def _bounded_disambiguate_shift(
+    fixed: np.ndarray,
+    moving: np.ndarray,
+    periodic_shift: Sequence[float],
+    max_shift: Sequence[float] | None,
+) -> np.ndarray:
+    """Resolve Fourier wraparound among physically permitted shift candidates.
+
+    Phase correlation reports each axis modulo its array length. When the
+    permitted correction reaches beyond half an array dimension, compare the
+    few equivalent candidates directly over their valid real-space overlaps.
+    This supplies the disambiguation needed by small overlaps without shifting
+    and rescoring every full-volume wraparound quadrant.
+    """
+    shift = np.asarray(periodic_shift, dtype=np.float32)
+    if shift.shape != (fixed.ndim,):
+        raise ValueError("periodic shift rank must match the patch rank")
+    if max_shift is None:
+        return shift
+
+    limits = np.asarray(max_shift, dtype=np.float32)
+    if limits.shape != shift.shape:
+        raise ValueError("maximum shift rank must match the patch rank")
+
+    axis_candidates: list[list[float]] = []
+    for value, length, limit in zip(shift, fixed.shape, limits):
+        candidates = {
+            float(value) + cycle * int(length)
+            for cycle in (-1, 0, 1)
+            if abs(float(value) + cycle * int(length)) <= float(limit) + 0.5
+        }
+        if not candidates:
+            candidates = {float(value)}
+        axis_candidates.append(sorted(candidates, key=lambda item: (abs(item), item)))
+
+    if math.prod(len(candidates) for candidates in axis_candidates) == 1:
+        return shift
+
+    best_shift = shift
+    best_score = -math.inf
+    for candidate_values in product(*axis_candidates):
+        try:
+            fixed_view, moving_view = _aligned_registration_views(
+                fixed,
+                moving,
+                candidate_values,
+            )
+        except ValueError:
+            continue
+
+        sample_count = int(math.prod(fixed_view.shape))
+        if sample_count < 2:
+            continue
+        fixed_sum = np.sum(fixed_view, dtype=np.float64)
+        moving_sum = np.sum(moving_view, dtype=np.float64)
+        cross_sum = np.sum(fixed_view * moving_view, dtype=np.float64)
+        fixed_sq_sum = np.sum(fixed_view * fixed_view, dtype=np.float64)
+        moving_sq_sum = np.sum(moving_view * moving_view, dtype=np.float64)
+        covariance = cross_sum - fixed_sum * moving_sum / sample_count
+        fixed_energy = fixed_sq_sum - fixed_sum * fixed_sum / sample_count
+        moving_energy = moving_sq_sum - moving_sum * moving_sum / sample_count
+        denominator = math.sqrt(max(fixed_energy * moving_energy, 0.0))
+        score = covariance / denominator if denominator > 0.0 else -math.inf
+        if score > best_score:
+            best_score = score
+            best_shift = np.asarray(candidate_values, dtype=np.float32)
+
+    return best_shift
+
+
 @njit(nogil=True)
 def _accumulate_tile_block(
     fused: np.ndarray,
     weight: np.ndarray,
     sub: np.ndarray,
-    w3d: np.ndarray,
+    z_weights: np.ndarray,
+    y_weights: np.ndarray,
+    x_weights: np.ndarray,
     z_off: int,
     y_off: int,
     x_off: int,
@@ -202,11 +292,11 @@ def _accumulate_tile_block(
     fused : numpy.ndarray
         Float32 accumulation buffer of shape (C, dz, Y, X) for the current block.
     weight : numpy.ndarray
-        Float32 weight accumulation buffer of shape (C, dz, Y, X).
+        Float32 weight accumulation buffer of shape (dz, Y, X).
     sub : numpy.ndarray
-        Float32 tile slab of shape (C, sub_dz, Y_tile, X_tile) to blend.
-    w3d : numpy.ndarray
-        Float32 per-voxel weights of shape (sub_dz, Y_tile, X_tile).
+        Tile slab of shape (C, sub_dz, Y_tile, X_tile) to blend.
+    z_weights, y_weights, x_weights : numpy.ndarray
+        Separable float32 feather profiles for the tile sub-volume.
     z_off : int
         Offset of `sub` z=0 within `fused` block coordinates.
     y_off : int
@@ -228,16 +318,19 @@ def _accumulate_tile_block(
         y_i = idx % y_sub
         gz = z_off + dz_i
         gy = y_off + y_i
-        w_line = w3d[dz_i, y_i]
+        base_w = weight[gz, gy]
+        zy_weight = z_weights[dz_i] * y_weights[y_i]
+        for x_i in range(x_sub):
+            gx = x_off + x_i
+            w_val = zy_weight * x_weights[x_i]
+            base_w[gx] += w_val
         for c in range(c_dim):
             sub_line = sub[c, dz_i, y_i]
             base_f = fused[c, gz, gy]
-            base_w = weight[c, gz, gy]
             for x_i in range(x_sub):
                 gx = x_off + x_i
-                w_val = w_line[x_i]
+                w_val = zy_weight * x_weights[x_i]
                 base_f[gx] += sub_line[x_i] * w_val
-                base_w[gx] += w_val
 
 
 @njit(nogil=True)
@@ -249,7 +342,7 @@ def _normalize_block(fused: np.ndarray, weight: np.ndarray) -> None:
     fused : numpy.ndarray
         Float32 accumulation buffer of shape (C, dz, Y, X).
     weight : numpy.ndarray
-        Float32 weight buffer of shape (C, dz, Y, X).
+        Float32 weight buffer of shape (dz, Y, X).
 
     Returns
     -------
@@ -257,18 +350,17 @@ def _normalize_block(fused: np.ndarray, weight: np.ndarray) -> None:
         Operates in-place on `fused`.
     """
     c_dim, dz, y_dim, x_dim = fused.shape
-    total = c_dim * dz * y_dim
+    total = dz * y_dim
 
     for idx in range(total):
-        c = idx // (dz * y_dim)
-        rem = idx % (dz * y_dim)
-        z_i = rem // y_dim
-        y_i = rem % y_dim
-        base_f = fused[c, z_i, y_i]
-        base_w = weight[c, z_i, y_i]
-        for x_i in range(x_dim):
-            w_val = base_w[x_i]
-            base_f[x_i] = base_f[x_i] / w_val if w_val > 0 else 0.0
+        z_i = idx // y_dim
+        y_i = idx % y_dim
+        base_w = weight[z_i, y_i]
+        for c in range(c_dim):
+            base_f = fused[c, z_i, y_i]
+            for x_i in range(x_dim):
+                w_val = base_w[x_i]
+                base_f[x_i] = base_f[x_i] / w_val if w_val > 0 else 0.0
 
 
 def _partition_fusion_block(
@@ -338,6 +430,293 @@ def _partition_fusion_block(
     return regions
 
 
+def _select_registration_pairs(
+    positions_zyx: Sequence[Sequence[float]],
+    tile_shape_zyx: Sequence[int],
+    pixel_size_zyx: Sequence[float],
+    *,
+    is_2d: bool = False,
+) -> list[tuple[int, int]]:
+    """Select a connected nearest-overlap graph for pairwise registration.
+
+    All geometric overlaps are found first. Within each connected component,
+    the distance cutoff is the shortest one that still connects that component.
+    Every overlap at or below that cutoff is retained, preserving useful cycles
+    between face-adjacent tiles while dropping diagonal and farther redundant
+    overlaps.
+
+    Parameters
+    ----------
+    positions_zyx
+        Image-placement tile positions in physical ZYX coordinates.
+    tile_shape_zyx
+        Per-tile ZYX shape in voxels.
+    pixel_size_zyx
+        ZYX voxel spacing in physical units.
+    is_2d
+        Ignore physical Z displacement for projection data.
+
+    Returns
+    -------
+    list[tuple[int, int]]
+        Local position-index pairs to register.
+    """
+    positions = np.asarray(positions_zyx, dtype=np.float64)
+    tile_shape = np.asarray(tile_shape_zyx, dtype=np.float64)
+    pixel_size = np.asarray(pixel_size_zyx, dtype=np.float64)
+    if positions.ndim != 2 or positions.shape[1] != 3:
+        raise ValueError("positions_zyx must have shape (positions, 3)")
+    if tile_shape.shape != (3,) or pixel_size.shape != (3,):
+        raise ValueError("tile_shape_zyx and pixel_size_zyx must have length 3")
+
+    physical_shape = tile_shape * pixel_size
+    edges: list[tuple[float, int, int]] = []
+    for i in range(len(positions)):
+        for j in range(i + 1, len(positions)):
+            delta = positions[j] - positions[i]
+            if is_2d:
+                delta = delta.copy()
+                delta[0] = 0.0
+            if np.all(np.abs(delta) < physical_shape):
+                distance = float(np.linalg.norm(delta / physical_shape))
+                edges.append((distance, i, j))
+
+    if not edges:
+        return []
+
+    parent = list(range(len(positions)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(left: int, right: int) -> bool:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root == right_root:
+            return False
+        parent[right_root] = left_root
+        return True
+
+    for _, i, j in edges:
+        union(i, j)
+    component_by_node = [find(index) for index in range(len(positions))]
+
+    edges_by_component: dict[int, list[tuple[float, int, int]]] = {}
+    nodes_by_component: dict[int, set[int]] = {}
+    for edge in edges:
+        _, i, j = edge
+        component = component_by_node[i]
+        edges_by_component.setdefault(component, []).append(edge)
+        nodes_by_component.setdefault(component, set()).update((i, j))
+
+    selected: list[tuple[int, int]] = []
+    for component, component_edges in edges_by_component.items():
+        component_edges.sort()
+        component_nodes = nodes_by_component[component]
+        local_parent = {node: node for node in component_nodes}
+
+        def local_find(index: int) -> int:
+            while local_parent[index] != index:
+                local_parent[index] = local_parent[local_parent[index]]
+                index = local_parent[index]
+            return index
+
+        merges_needed = len(component_nodes) - 1
+        merges = 0
+        cutoff = component_edges[-1][0]
+        for distance, i, j in component_edges:
+            i_root = local_find(i)
+            j_root = local_find(j)
+            if i_root != j_root:
+                local_parent[j_root] = i_root
+                merges += 1
+            if merges == merges_needed:
+                cutoff = distance
+                break
+
+        tolerance = max(1e-12, cutoff * 1e-6)
+        selected.extend(
+            (i, j)
+            for distance, i, j in component_edges
+            if distance <= cutoff + tolerance
+        )
+
+    selected.sort()
+    return selected
+
+
+def _crop_registration_overlap(
+    bounds_i: Sequence[tuple[int, int]],
+    bounds_j: Sequence[tuple[int, int]],
+    downsample_factors_zyx: Sequence[int],
+    max_downsampled_shape_zyx: Sequence[int],
+) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+    """Center-crop corresponding overlap bounds to a bounded registration ROI.
+
+    Both tiles are trimmed identically on every axis, preserving their physical
+    correspondence while avoiding full-face reads that are immediately reduced
+    for registration.
+
+    Parameters
+    ----------
+    bounds_i, bounds_j
+        Corresponding ZYX overlap bounds for the two tiles.
+    downsample_factors_zyx
+        Registration reduction factors in ZYX order.
+    max_downsampled_shape_zyx
+        Maximum reduced registration ROI shape in ZYX order.
+
+    Returns
+    -------
+    tuple[list[tuple[int, int]], list[tuple[int, int]]]
+        Cropped bounds for the two tiles.
+    """
+    if not (
+        len(bounds_i)
+        == len(bounds_j)
+        == len(downsample_factors_zyx)
+        == len(max_downsampled_shape_zyx)
+        == 3
+    ):
+        raise ValueError("registration overlap arguments must all have length 3")
+
+    cropped_i: list[tuple[int, int]] = []
+    cropped_j: list[tuple[int, int]] = []
+    for first, second, factor, target in zip(
+        bounds_i,
+        bounds_j,
+        downsample_factors_zyx,
+        max_downsampled_shape_zyx,
+    ):
+        first_length = int(first[1]) - int(first[0])
+        second_length = int(second[1]) - int(second[0])
+        if first_length != second_length or first_length <= 0:
+            raise ValueError("paired registration overlap bounds must match")
+
+        maximum_length = max(1, int(factor)) * max(1, int(target))
+        retained_length = min(first_length, maximum_length)
+        trim_before = (first_length - retained_length) // 2
+        trim_after = first_length - retained_length - trim_before
+        cropped_i.append((int(first[0]) + trim_before, int(first[1]) - trim_after))
+        cropped_j.append((int(second[0]) + trim_before, int(second[1]) - trim_after))
+
+    return cropped_i, cropped_j
+
+
+def _deskew_geometry_crop_y(
+    deskewed_z: int,
+    angle_deg: float,
+    voxel_size_zyx: Sequence[float],
+    stored_y: int,
+) -> int:
+    """Return the rectangular Y crop implied by the oblique camera geometry."""
+    if deskewed_z < 2 or stored_y < 1:
+        raise ValueError("deskewed Z and stored Y dimensions must be positive")
+    if len(voxel_size_zyx) != 3 or any(
+        float(value) <= 0.0 for value in voxel_size_zyx
+    ):
+        raise ValueError("deskewed voxel size must contain three positive values")
+    angle_rad = math.radians(float(angle_deg))
+    if not 0.0 < abs(angle_rad) < math.pi / 2:
+        raise ValueError("OPM angle must be strictly between 0 and 90 degrees")
+    z_extent_in_y_pixels = (
+        deskewed_z * float(voxel_size_zyx[0]) / float(voxel_size_zyx[1])
+    )
+    crop_y = int(math.ceil(z_extent_in_y_pixels / abs(math.tan(angle_rad))))
+    if 2 * crop_y >= stored_y:
+        raise ValueError(
+            "deskew geometry crop would remove the entire stored Y dimension: "
+            f"{crop_y} pixels per side from {stored_y}"
+        )
+    return crop_y
+
+
+def _processing_step_applied(
+    attributes: dict[str, Any],
+    step_name: str,
+) -> bool:
+    """Return whether a named recorded processing step was already applied."""
+    provenance = attributes.get("opm_processing")
+    if not isinstance(provenance, dict):
+        return False
+    steps = provenance.get("steps")
+    if not isinstance(steps, list):
+        return False
+    return any(
+        isinstance(step, dict)
+        and step.get("name") == step_name
+        and bool(step.get("applied"))
+        for step in steps
+    )
+
+
+@njit(parallel=True, nogil=True, cache=True)
+def _mean_downsample_3d_cpu(
+    source: np.ndarray,
+    z_factor: int,
+    y_factor: int,
+    x_factor: int,
+) -> np.ndarray:
+    """Mean-downsample one ZYX array with a parallel bounded reduction."""
+    z_size, y_size, x_size = source.shape
+    out_z = (z_size + z_factor - 1) // z_factor
+    out_y = (y_size + y_factor - 1) // y_factor
+    out_x = (x_size + x_factor - 1) // x_factor
+    output = np.empty((out_z, out_y, out_x), dtype=np.float32)
+    output_size = out_z * out_y * out_x
+
+    for output_index in prange(output_size):
+        out_z_index = output_index // (out_y * out_x)
+        remainder = output_index - out_z_index * out_y * out_x
+        out_y_index = remainder // out_x
+        out_x_index = remainder - out_y_index * out_x
+        z_start = out_z_index * z_factor
+        y_start = out_y_index * y_factor
+        x_start = out_x_index * x_factor
+
+        total = np.float32(0.0)
+        count = 0
+        for z in range(z_start, min(z_start + z_factor, z_size)):
+            for y in range(y_start, min(y_start + y_factor, y_size)):
+                for x in range(x_start, min(x_start + x_factor, x_size)):
+                    total += np.float32(source[z, y, x])
+                    count += 1
+        output[out_z_index, out_y_index, out_x_index] = total / count
+
+    return output
+
+
+def _mean_downsample_registration(
+    array: np.ndarray,
+    factors: Sequence[int],
+) -> np.ndarray:
+    """Mean-downsample a 2D/3D registration patch without generic block reduction."""
+    source_array = np.asarray(array)
+    if source_array.ndim not in (2, 3):
+        raise ValueError("registration patches must be 2D or 3D")
+    if len(factors) != source_array.ndim or any(int(value) < 1 for value in factors):
+        raise ValueError("downsampling factors must match the patch rank")
+
+    was_2d = source_array.ndim == 2
+    if was_2d:
+        source_array = source_array[None, ...]
+        factors_zyx = (1, int(factors[0]), int(factors[1]))
+    else:
+        factors_zyx = tuple(int(value) for value in factors)
+
+    z_factor, y_factor, x_factor = factors_zyx
+    reduced = _mean_downsample_3d_cpu(
+        source_array,
+        z_factor,
+        y_factor,
+        x_factor,
+    )
+    return reduced[0] if was_2d else reduced
+
+
 class TileFusion:
     """
     Register and fuse multi-tile OPM acquisitions into a global OME-NGFF Zarr v3 store.
@@ -353,9 +732,9 @@ class TileFusion:
     ----------
     root_path : str or pathlib.Path
         Path used to infer the processed datastore location. The code searches for:
-        `{stem}_decon_deskewed.ome.zarr`, `{stem}_deskewed.ome.zarr`,
-        `{stem}_decon_projection.ome.zarr`, `{stem}_projection.ome.zarr`,
-        followed by their legacy `.zarr` names.
+        `{stem}_deskewed.ome.zarr`, `{stem}_projection.ome.zarr`, followed by
+        their legacy `.zarr` names. Deconvolved products are used as fallbacks
+        only when no corresponding non-deconvolved product exists.
     blend_pixels : tuple[int, int, int], default=(20, 600, 400)
         Feather ramp widths (bz, by, bx) used to build 1D weight profiles.
     downsample_factors : tuple[int, int, int], default=(3, 5, 5)
@@ -368,17 +747,24 @@ class TileFusion:
         Downsampling factors for creating multiscale pyramid levels.
     resolution_multiples : sequence[int | sequence[int]], default=((1,1,1), ..., (32,32,32))
         Spatial scale multipliers recorded into NGFF metadata for each pyramid level.
-    max_workers : int, default=8
-        Maximum number of fusion blocks rendered concurrently.
+    max_workers : int or None, default=None
+        Maximum number of fusion blocks rendered concurrently. By default,
+        uses up to eight physical CPU cores so blocks can retain enough Z depth
+        for efficient source-chunk reads.
     debug : bool, default=False
         If True, emits debug logs.
     metrics_filename : str, default="stitching_metrics.json"
         File used to save/load pairwise registration links.
     channel_to_use : int, default=0
         Channel index used for registration.
+    reverse_stage_y : bool, default=True
+        Reverse stage-derived Y for tile placement without flipping tile pixels.
+    crop_deskewed_trapezoid : bool, default=False
+        Crop the geometry-derived trapezoidal Y ends from deskewed volumes before
+        registration and fusion.
     multiscale_downsample : {"stride", "block_mean"}, default="stride"
         Method for multiscale downsampling.
-    fusion_ram_fraction : float, default=0.25
+    fusion_ram_fraction : float, default=0.4
         Fraction of currently available host RAM available to fusion buffers.
     max_in_flight_writes : int, default=2
         Maximum number of TensorStore writes retained before applying backpressure.
@@ -400,17 +786,19 @@ class TileFusion:
             (16, 16, 16),
             (32, 32, 32),
         ),
-        max_workers: int = DEFAULT_FUSION_WORKERS,
+        max_workers: int | None = None,
         debug: bool = False,
         metrics_filename: str = "stitching_metrics.json",
         channel_to_use: int = 0,
         multiscale_downsample: str = "stride",
-        fusion_ram_fraction: float = 0.25,
+        fusion_ram_fraction: float = 0.4,
         max_in_flight_writes: int = 2,
         chunk_shape_yx: tuple[int, int] = (1024, 1024),
         optimization_rel_threshold: float = 0.5,
         optimization_abs_threshold: float = 1.5,
         max_registration_shift_zyx: tuple[int, int, int] = (20, 50, 100),
+        reverse_stage_y: bool = True,
+        crop_deskewed_trapezoid: bool = False,
     ) -> None:
         """Initialize registration and fusion for a processed acquisition.
 
@@ -452,6 +840,12 @@ class TileFusion:
             Absolute residual threshold for registration outliers.
         max_registration_shift_zyx
             Maximum accepted registration correction in ZYX voxels.
+        reverse_stage_y
+            Whether to reverse stage-derived image-Y placement. Tile pixel
+            arrays are not modified.
+        crop_deskewed_trapezoid
+            Whether to crop both Y ends using the OPM angle, deskewed Z extent,
+            and voxel sizes before registration and fusion.
 
         Returns
         -------
@@ -463,14 +857,14 @@ class TileFusion:
         stem = acquisition_stem(self.root)
 
         candidates = (
-            base / f"{stem}_decon_deskewed.ome.zarr",
             base / f"{stem}_deskewed.ome.zarr",
-            base / f"{stem}_decon_projection.ome.zarr",
             base / f"{stem}_projection.ome.zarr",
-            base / f"{stem}_decon_deskewed.zarr",
             base / f"{stem}_deskewed.zarr",
-            base / f"{stem}_decon_projection.zarr",
             base / f"{stem}_projection.zarr",
+            base / f"{stem}_decon_deskewed.ome.zarr",
+            base / f"{stem}_decon_projection.ome.zarr",
+            base / f"{stem}_decon_deskewed.zarr",
+            base / f"{stem}_decon_projection.zarr",
         )
         data_path = next((path for path in candidates if path.exists()), None)
         if data_path is None:
@@ -481,11 +875,25 @@ class TileFusion:
         self.data = data_path
 
         collection = open_position_collection(self.data)
+        self._input_attributes = dict(collection.attributes)
         self.position_arrays = collection.arrays
-        self._tile_positions = [
-            tuple(position)
+        try:
+            input_chunks = self.position_arrays[0].chunk_layout.read_chunk.shape
+            self._input_chunk_zyx = tuple(int(value) for value in input_chunks[-3:])
+        except (AttributeError, TypeError):
+            self._input_chunk_zyx = tuple(int(value) for value in collection.shape[-3:])
+        stage_positions = [
+            position
             for _ in range(collection.shape[0])
             for position in collection.attributes["stage_positions"]
+        ]
+        self.reverse_stage_y = bool(reverse_stage_y)
+        self._tile_positions = [
+            tuple(position)
+            for position in stage_positions_to_image_coordinates(
+                stage_positions,
+                reverse_y=self.reverse_stage_y,
+            )
         ]
         self._pixel_size: tuple[float, float, float] = tuple(
             float(x) for x in collection.attributes["deskewed_voxel_size_um"]
@@ -501,6 +909,8 @@ class TileFusion:
             tuple(r) if hasattr(r, "__len__") else (int(r), int(r), int(r))
             for r in resolution_multiples
         ]
+        if max_workers is None:
+            max_workers = _default_fusion_workers()
         if max_workers < 1:
             raise ValueError("max_workers must be at least 1")
         self._max_workers = int(max_workers)
@@ -534,6 +944,7 @@ class TileFusion:
         self.max_registration_shift_zyx = tuple(
             int(value) for value in max_registration_shift_zyx
         )
+        self.crop_deskewed_trapezoid = bool(crop_deskewed_trapezoid)
 
         (
             self.time_dim,
@@ -544,6 +955,16 @@ class TileFusion:
             self.x_dim,
         ) = collection.shape
         self._is_2d = self.z_dim == 1
+        self._source_y_dim = int(self.y_dim)
+        self._source_y_start = 0
+        self.deskew_geometry_crop_y = 0
+        if self.crop_deskewed_trapezoid:
+            self._configure_deskew_geometry_crop()
+        if not 0 <= self.channel_to_use < int(self.channels):
+            raise ValueError(
+                "channel_to_use must be between 0 and "
+                f"{int(self.channels) - 1}; got {self.channel_to_use}"
+            )
 
         self._update_profiles()
 
@@ -587,6 +1008,51 @@ class TileFusion:
         None
         """
         self._debug = bool(flag)
+
+    def _configure_deskew_geometry_crop(self) -> None:
+        """Convert stored tiles to their rectangular geometry-cropped Y extent."""
+        if _processing_step_applied(
+            self._input_attributes,
+            "crop_after_deskew",
+        ):
+            return
+
+        if self._is_2d:
+            raise ValueError(
+                "--crop-ends requires a volumetric deskewed input"
+            )
+        angle_deg = self._input_attributes.get("opm_tilt_deg")
+        if angle_deg is None:
+            raise ValueError(
+                "Cannot crop deskew geometry because acquisition metadata lacks "
+                "the OPM angle"
+            )
+
+        crop_y = _deskew_geometry_crop_y(
+            int(self.z_dim),
+            float(angle_deg),
+            self._pixel_size,
+            int(self._source_y_dim),
+        )
+        self._source_y_start = crop_y
+        self.deskew_geometry_crop_y = crop_y
+        self.y_dim = int(self._source_y_dim) - 2 * crop_y
+
+        leading_crop_um = crop_y * float(self._pixel_size[1])
+        self._tile_positions = [
+            (float(z), float(y) + leading_crop_um, float(x))
+            for z, y, x in self._tile_positions
+        ]
+
+    def _source_y_slice(self, cropped_slice: slice) -> slice:
+        """Map an effective cropped-tile Y slice to the stored source tile."""
+        start, stop, step = cropped_slice.indices(int(self.y_dim))
+        if step != 1:
+            raise ValueError("fusion Y slices must use a unit positive step")
+        return slice(
+            start + int(self._source_y_start),
+            stop + int(self._source_y_start),
+        )
 
     def _update_profiles(self) -> None:
         """Recompute 1D feather profiles from blend_pixels and current data shape.
@@ -712,6 +1178,7 @@ class TileFusion:
                 f"tile_idx={tile_idx} maps to t_idx={t_idx}, but time_dim={self.time_dim}"
             )
 
+        y_slice = self._source_y_slice(y_slice)
         if self._is_2d:
             arr = (
                 self.position_arrays[pos_idx][t_idx, ch_sel, 0, y_slice, x_slice]
@@ -737,15 +1204,18 @@ class TileFusion:
 
     @staticmethod
     def register_and_score(
-        g1: Any, g2: Any, win_size: int
+        g1: Any,
+        g2: Any,
+        win_size: int,
+        max_shift: Sequence[float] | None = None,
     ) -> tuple[tuple[float, float, float], float]:
         """Register `g2` to `g1` and compute an SSIM score.
 
         Steps:
         1) histogram-match g2 -> g1
         2) phase cross-correlation to estimate subpixel shift
-        3) shift g2 by that estimate
-        4) compute SSIM between g1 and shifted g2
+        3) extract corresponding valid views at the nearest integer shift
+        4) compute SSIM over that aligned overlap
 
         Parameters
         ----------
@@ -755,6 +1225,10 @@ class TileFusion:
             Moving patch (same shape as g1).
         win_size : int
             SSIM window size.
+        max_shift : sequence[float] or None
+            Maximum permitted shift in downsampled patch coordinates. When an
+            axis can wrap within this range, equivalent Fourier shifts are
+            disambiguated by direct overlap correlation.
 
         Returns
         -------
@@ -775,31 +1249,59 @@ class TileFusion:
             arr1 = arr1[0]
             arr2 = arr2[0]
 
+        data_range_1 = float(xp.max(arr1) - xp.min(arr1))
+        data_range_2 = float(xp.max(arr2) - xp.min(arr2))
+        if (
+            not math.isfinite(data_range_1)
+            or not math.isfinite(data_range_2)
+            or data_range_1 <= 0.0
+            or data_range_2 <= 0.0
+        ):
+            return (0.0, 0.0, 0.0), float("nan")
+
         arr2 = match_histograms(arr2, arr1)
 
         shift, _, _ = phase_cross_correlation(
             arr1,
             arr2,
-            disambiguate=True,
+            # Resolve only physically permitted wraparound candidates below.
+            # cuCIM's generic path shifts the full volume and correlates every
+            # wraparound quadrant, including candidates outside our bounds.
+            disambiguate=False,
             normalization="phase",
             upsample_factor=10,
             overlap_ratio=0.5,
         )
 
-        if arr1.ndim == 2 and len(shift) == 2:
-            shift_apply = xp.asarray(shift, dtype=xp.float32)
-            shift_ret = xp.asarray([0.0, shift[0], shift[1]], dtype=xp.float32)
-        else:
-            shift_apply = xp.asarray(shift, dtype=xp.float32)
-            shift_ret = shift_apply
-
-        g2s = _shift_array(arr2, shift_vec=shift_apply)
-        score = _ssim(arr1, g2s, win_size=win_size)
-
         if USING_GPU and cp is not None:
-            out_shift = cp.asnumpy(shift_ret)
+            shift_array = cp.asnumpy(cp.asarray(shift, dtype=cp.float32))
         else:
-            out_shift = np.asarray(shift_ret)
+            shift_array = np.asarray(shift, dtype=np.float32)
+        shift_array = _bounded_disambiguate_shift(
+            np.asarray(g1, dtype=np.float32),
+            np.asarray(g2, dtype=np.float32),
+            shift_array,
+            max_shift,
+        )
+
+        arr1_score, arr2_score = _aligned_registration_views(
+            arr1,
+            arr2,
+            shift_array,
+        )
+        # The custom CUDA SSIM kernels consume dense ZYX buffers. Cropped views
+        # generally retain parent strides, so materialize them before scoring.
+        arr1_score = xp.ascontiguousarray(arr1_score)
+        arr2_score = xp.ascontiguousarray(arr2_score)
+        score = _ssim(arr1_score, arr2_score, win_size=win_size)
+
+        if arr1.ndim == 2 and len(shift_array) == 2:
+            out_shift = np.asarray(
+                [0.0, shift_array[0], shift_array[1]],
+                dtype=np.float32,
+            )
+        else:
+            out_shift = shift_array
 
         return tuple(float(s) for s in out_shift), float(score)
 
@@ -845,6 +1347,12 @@ class TileFusion:
 
         self.pairwise_metrics.clear()
         n_pos = int(self.position_dim)
+        registration_pairs = _select_registration_pairs(
+            self._tile_positions[:n_pos],
+            (self.z_dim, self.y_dim, self.x_dim),
+            self._pixel_size,
+            is_2d=self._is_2d,
+        )
 
         def bounds_1d(off: int, length: int) -> tuple[int, int]:
             """Clip a shifted interval to one array dimension.
@@ -863,164 +1371,162 @@ class TileFusion:
             """
             return max(0, off), min(length, off + length)
 
-        def effective_df_for_patch(
-            patch: Any, df_zyx: tuple[int, int, int]
-        ) -> tuple[int, int, int]:
-            """Clamp downsampling factors to the available patch shape.
-
-            Parameters
-            ----------
-            patch : Any
-                Value supplied for ``patch``.
-            df_zyx : tuple[int, int, int]
-                Value supplied for ``df zyx``.
-
-            Returns
-            -------
-            tuple[int, int, int]
-                Result produced by the callable.
-            """
-            arr = np.asarray(patch)
-            if arr.ndim == 4:
-                zyx = (arr.shape[1], arr.shape[2], arr.shape[3])
-            elif arr.ndim == 3:
-                zyx = (arr.shape[0], arr.shape[1], arr.shape[2])
-            else:
-                raise ValueError(f"Unexpected patch ndim={arr.ndim}, shape={arr.shape}")
-
-            ez = max(1, min(int(df_zyx[0]), int(zyx[0])))
-            ey = max(1, min(int(df_zyx[1]), int(zyx[1])))
-            ex = max(1, min(int(df_zyx[2]), int(zyx[2])))
-            return (ez, ey, ex)
-
         df_zyx_base = (int(df_in[0]), int(df_in[1]), int(df_in[2]))
         if int(self.z_dim) == 1:
             df_zyx_base = (1, df_zyx_base[1], df_zyx_base[2])
+        max_downsampled_shape_zyx = (
+            min(64, int(self.z_dim)),
+            min(512, int(self.y_dim)),
+            min(512, int(self.x_dim)),
+        )
 
         with ThreadPoolExecutor(max_workers=min(2, self._max_workers)) as executor:
             for t in range(int(self.time_dim)):
                 base = t * n_pos
 
-                for i_pos in trange(
-                    n_pos,
-                    desc=f"register t={t + 1}/{int(self.time_dim)}",
+                for i_pos, j_pos in tqdm(
+                    registration_pairs,
+                    desc=f"register pairs t={t + 1}/{int(self.time_dim)}",
                     leave=False,
+                    unit="pair",
                 ):
                     i = base + i_pos
+                    j = base + j_pos
 
-                    for j_pos in range(i_pos + 1, n_pos):
-                        j = base + j_pos
+                    phys = np.array(self._tile_positions[j]) - np.array(
+                        self._tile_positions[i]
+                    )
+                    vox_off = np.round(phys / np.array(self._pixel_size)).astype(int)
 
-                        phys = np.array(self._tile_positions[j]) - np.array(
-                            self._tile_positions[i]
+                    dz = int(vox_off[0])
+                    dy = int(vox_off[1])
+                    dx = int(vox_off[2])
+
+                    if self._is_2d:
+                        dz = 0
+
+                    bounds_i = [
+                        bounds_1d(dz, int(self.z_dim)),
+                        bounds_1d(dy, int(self.y_dim)),
+                        bounds_1d(dx, int(self.x_dim)),
+                    ]
+                    bounds_j = [
+                        bounds_1d(-dz, int(self.z_dim)),
+                        bounds_1d(-dy, int(self.y_dim)),
+                        bounds_1d(-dx, int(self.x_dim)),
+                    ]
+                    bounds_i, bounds_j = _crop_registration_overlap(
+                        bounds_i,
+                        bounds_j,
+                        df_zyx_base,
+                        max_downsampled_shape_zyx,
+                    )
+                    overlap_shape = tuple(hi - lo for lo, hi in bounds_i)
+                    df_zyx_eff = tuple(
+                        max(1, min(factor, length))
+                        for factor, length in zip(df_zyx_base, overlap_shape)
+                    )
+
+                    def read_patch(
+                        gidx: int, bnds: list[tuple[int, int]]
+                    ) -> np.ndarray:
+                        """Read one bounded tile patch for pairwise registration.
+
+                        Parameters
+                        ----------
+                        gidx : int
+                            Value supplied for ``gidx``.
+                        bnds : list[tuple[int, int]]
+                            Value supplied for ``bnds``.
+
+                        Returns
+                        -------
+                        np.ndarray
+                            Result produced by the callable.
+                        """
+                        z0, z1 = bnds[0]
+                        y0, y1 = bnds[1]
+                        x0, x1 = bnds[2]
+                        return self._read_tile_volume(
+                            gidx,
+                            ch_idx,
+                            slice(z0, z1),
+                            slice(y0, y1),
+                            slice(x0, x1),
+                            dtype=None,
                         )
-                        vox_off = np.round(phys / np.array(self._pixel_size)).astype(
-                            int
+
+                    future_i = executor.submit(read_patch, i, bounds_i)
+                    future_j = executor.submit(read_patch, j, bounds_j)
+                    patch_i = future_i.result()
+                    patch_j = future_j.result()
+
+                    if self._is_2d:
+                        patch_i = np.asarray(patch_i)[0, 0]
+                        patch_j = np.asarray(patch_j)[0, 0]
+                        reduction_factors = df_zyx_eff[1:]
+                    else:
+                        reduction_factors = df_zyx_eff
+                    g1 = _mean_downsample_registration(
+                        patch_i,
+                        reduction_factors,
+                    )
+                    g2 = _mean_downsample_registration(
+                        patch_j,
+                        reduction_factors,
+                    )
+
+                    max_shift = self.max_registration_shift_zyx
+                    if self._is_2d:
+                        max_shift_ds = (
+                            max_shift[1] / df_zyx_eff[1],
+                            max_shift[2] / df_zyx_eff[2],
                         )
+                    else:
+                        max_shift_ds = tuple(
+                            limit / factor
+                            for limit, factor in zip(max_shift, df_zyx_eff)
+                        )
+                    shift_ds, score = self.register_and_score(
+                        g1,
+                        g2,
+                        win_size=sw,
+                        max_shift=max_shift_ds,
+                    )
+                    if not math.isfinite(score) or not all(
+                        math.isfinite(value) for value in shift_ds
+                    ):
+                        continue
+                    score = float(max(score, 1e-6))
 
-                        dz = int(vox_off[0])
-                        dy = int(vox_off[1])
-                        dx = int(vox_off[2])
+                    if th != 0.0 and score < th:
+                        continue
 
-                        if self._is_2d:
-                            dz = 0
+                    dz_s = int(np.round(shift_ds[0] * df_zyx_eff[0]))
+                    dy_s = int(np.round(shift_ds[1] * df_zyx_eff[1]))
+                    dx_s = int(np.round(shift_ds[2] * df_zyx_eff[2]))
 
-                        bounds_i = [
-                            bounds_1d(dz, int(self.z_dim)),
-                            bounds_1d(dy, int(self.y_dim)),
-                            bounds_1d(dx, int(self.x_dim)),
-                        ]
-                        bounds_j = [
-                            bounds_1d(-dz, int(self.z_dim)),
-                            bounds_1d(-dy, int(self.y_dim)),
-                            bounds_1d(-dx, int(self.x_dim)),
-                        ]
-
-                        if any(hi <= lo for (lo, hi) in bounds_i):
-                            continue
-
-                        def read_patch(
-                            gidx: int, bnds: list[tuple[int, int]]
-                        ) -> np.ndarray:
-                            """Read one bounded tile patch for pairwise registration.
-
-                            Parameters
-                            ----------
-                            gidx : int
-                                Value supplied for ``gidx``.
-                            bnds : list[tuple[int, int]]
-                                Value supplied for ``bnds``.
-
-                            Returns
-                            -------
-                            np.ndarray
-                                Result produced by the callable.
-                            """
-                            z0, z1 = bnds[0]
-                            y0, y1 = bnds[1]
-                            x0, x1 = bnds[2]
-                            return self._read_tile_volume(
-                                gidx,
-                                ch_idx,
-                                slice(z0, z1),
-                                slice(y0, y1),
-                                slice(x0, x1),
+                    if (
+                        abs(dz_s) > max_shift[0]
+                        or abs(dy_s) > max_shift[1]
+                        or abs(dx_s) > max_shift[2]
+                    ):
+                        if self._debug:
+                            print(
+                                "Dropping link (%d, %d) shift=%s exceeds max=%s",
+                                i,
+                                j,
+                                (dz_s, dy_s, dx_s),
+                                max_shift,
                             )
+                        continue
 
-                        future_i = executor.submit(read_patch, i, bounds_i)
-                        future_j = executor.submit(read_patch, j, bounds_j)
-                        patch_i = future_i.result()
-                        patch_j = future_j.result()
-
-                        df_zyx_eff = effective_df_for_patch(patch_i, df_zyx_base)
-
-                        arr_i = xp.asarray(patch_i)
-                        arr_j = xp.asarray(patch_j)
-
-                        if arr_i.ndim == 4:
-                            reduce_block = (1, *df_zyx_eff)
-                        elif arr_i.ndim == 3:
-                            reduce_block = df_zyx_eff
-                        else:
-                            raise ValueError(
-                                f"Unexpected patch ndim={arr_i.ndim}, shape={arr_i.shape}"
-                            )
-
-                        g1 = block_reduce(arr_i, block_size=reduce_block, func=xp.mean)
-                        g2 = block_reduce(arr_j, block_size=reduce_block, func=xp.mean)
-
-                        shift_ds, score = self.register_and_score(g1, g2, win_size=sw)
-                        score = float(max(score, 1e-6))
-
-                        if th != 0.0 and score < th:
-                            continue
-
-                        dz_s = int(np.round(shift_ds[0] * df_zyx_eff[0]))
-                        dy_s = int(np.round(shift_ds[1] * df_zyx_eff[1]))
-                        dx_s = int(np.round(shift_ds[2] * df_zyx_eff[2]))
-
-                        max_shift = self.max_registration_shift_zyx
-                        if (
-                            abs(dz_s) > max_shift[0]
-                            or abs(dy_s) > max_shift[1]
-                            or abs(dx_s) > max_shift[2]
-                        ):
-                            if self._debug:
-                                print(
-                                    "Dropping link (%d, %d) shift=%s exceeds max=%s",
-                                    i,
-                                    j,
-                                    (dz_s, dy_s, dx_s),
-                                    max_shift,
-                                )
-                            continue
-
-                        self.pairwise_metrics[(i, j)] = (
-                            dz_s,
-                            dy_s,
-                            dx_s,
-                            round(score, 3),
-                        )
+                    self.pairwise_metrics[(i, j)] = (
+                        dz_s,
+                        dy_s,
+                        dx_s,
+                        round(score, 3),
+                    )
 
     @staticmethod
     def _solve_global(
@@ -1257,7 +1763,26 @@ class TileFusion:
         None
         """
         path = Path(filepath)
-        out = {f"{i},{j}": list(v) for (i, j), v in self.pairwise_metrics.items()}
+        out = {
+            "schema_version": 10,
+            "registration": {
+                "channel_index": self.channel_to_use,
+                "stage_y_reversed": self.reverse_stage_y,
+                "pair_selection": "connected-nearest-overlap-v1",
+                "overlap_roi": "centered-64x512x512-v1",
+                "downsample": "bounded-numba-mean-v1",
+                "phase_disambiguation": "bounded-direct-overlap-v1",
+                "crop_deskewed_trapezoid": bool(
+                    getattr(self, "crop_deskewed_trapezoid", False)
+                ),
+                "deskew_geometry_crop_y": int(
+                    getattr(self, "deskew_geometry_crop_y", 0)
+                ),
+            },
+            "pairwise_metrics": {
+                f"{i},{j}": list(v) for (i, j), v in self.pairwise_metrics.items()
+            },
+        }
         with open(path, "w") as f:
             json.dump(out, f)
 
@@ -1282,9 +1807,94 @@ class TileFusion:
         path = Path(filepath)
         with open(path, "r") as f:
             data = json.load(f)
-        self.pairwise_metrics = {
-            tuple(map(int, k.split(","))): tuple(v) for k, v in data.items()
+
+        if not isinstance(data, dict):
+            raise ValueError(f"{path} does not contain a registration metrics object")
+
+        if "pairwise_metrics" not in data:
+            legacy_metrics = data
+            invalid_count = self._count_invalid_pairwise_metrics(legacy_metrics)
+            if invalid_count:
+                raise ValueError(
+                    f"{path} contains {invalid_count} invalid registration metrics"
+                )
+            raise ValueError(
+                f"{path} uses an unscoped legacy registration cache; "
+                "registration must be recomputed"
+            )
+
+        expected_registration = {
+            "channel_index": self.channel_to_use,
+            "stage_y_reversed": self.reverse_stage_y,
+            "pair_selection": "connected-nearest-overlap-v1",
+            "overlap_roi": "centered-64x512x512-v1",
+            "downsample": "bounded-numba-mean-v1",
+            "phase_disambiguation": "bounded-direct-overlap-v1",
+            "crop_deskewed_trapezoid": bool(
+                getattr(self, "crop_deskewed_trapezoid", False)
+            ),
+            "deskew_geometry_crop_y": int(
+                getattr(self, "deskew_geometry_crop_y", 0)
+            ),
         }
+        if data.get("schema_version") != 10:
+            raise ValueError(f"{path} has an unsupported registration cache schema")
+        if data.get("registration") != expected_registration:
+            raise ValueError(
+                f"{path} was created for different registration settings; "
+                "registration must be recomputed"
+            )
+
+        raw_metrics = data["pairwise_metrics"]
+        if not isinstance(raw_metrics, dict):
+            raise ValueError(f"{path} contains invalid registration metrics")
+
+        metrics = {}
+        invalid_count = self._count_invalid_pairwise_metrics(raw_metrics)
+        for key, value in raw_metrics.items():
+            try:
+                indices = tuple(map(int, key.split(",")))
+                values = tuple(value)
+                valid = (
+                    len(indices) == 2
+                    and len(values) == 4
+                    and all(math.isfinite(float(item)) for item in values)
+                    and float(values[3]) > 0.0
+                )
+            except (TypeError, ValueError):
+                valid = False
+
+            if valid:
+                metrics[indices] = values
+
+        if invalid_count:
+            raise ValueError(
+                f"{path} contains {invalid_count} invalid registration metrics"
+            )
+        self.pairwise_metrics = metrics
+
+    @staticmethod
+    def _count_invalid_pairwise_metrics(data: object) -> int:
+        """Count malformed or nonfinite pairwise registration records."""
+        if not isinstance(data, dict):
+            return 1
+
+        invalid_count = 0
+        for key, value in data.items():
+            try:
+                indices = tuple(map(int, key.split(",")))
+                values = tuple(value)
+                valid = (
+                    len(indices) == 2
+                    and len(values) == 4
+                    and all(math.isfinite(float(item)) for item in values)
+                    and float(values[3]) > 0.0
+                )
+            except (AttributeError, TypeError, ValueError):
+                valid = False
+            if not valid:
+                invalid_count += 1
+        return invalid_count
 
     def _compute_fused_image_space(self) -> None:
         """Compute a global fused space spanning all timepoints.
@@ -1344,7 +1954,9 @@ class TileFusion:
         self.padded_shape = (sz + pz, sy + py, sx + px)
 
     def _prepare_fused_image(
-        self, output_path: str | Path, z_slices_per_write: int = 4
+        self,
+        output_path: str | Path,
+        z_slices_per_write: int | None = None,
     ) -> tuple[ts.TensorStore, list[int]]:
         """Create the fused multiscale Image through yaozarrs.
 
@@ -1352,8 +1964,10 @@ class TileFusion:
         ----------
         output_path : str | Path
             Value supplied for ``output path``.
-        z_slices_per_write : int
-            Value supplied for ``z slices per write``.
+        z_slices_per_write : int or None
+            Z depth rendered per scale-0 block. By default, this matches the
+            input Zarr chunk depth so source chunks are not decompressed again
+            for successive shallow slabs.
 
         Returns
         -------
@@ -1379,12 +1993,19 @@ class TileFusion:
         z0, y0, x0 = (int(value) for value in self.padded_shape)
         for level, factor in enumerate(factors):
             z_factor = 1 if self._is_2d else int(factor)
+            translation = [
+                0,
+                0,
+                float(self.offset_um[0] + 0.5 * (z_factor - 1) * dz),
+                float(self.offset_um[1] + 0.5 * (factor - 1) * dy),
+                float(self.offset_um[2] + 0.5 * (factor - 1) * dx),
+            ]
             datasets.append(
                 {
                     "path": str(level),
                     "coordinateTransformations": [
                         {"scale": [1, 1, dz * z_factor, dy * factor, dx * factor]},
-                        {"translation": [0, 0, *self.offset_um]},
+                        {"translation": translation},
                     ],
                 }
             )
@@ -1404,15 +2025,40 @@ class TileFusion:
         image = v05.Image(
             multiscales=[v05.Multiscale(name="fused", axes=axes, datasets=datasets)]
         )
-        codec_chunks = (1, 1, 1, int(self.chunk_y), int(self.chunk_x))
+        # Keep storage chunks shallow enough for interactive plane viewing.
+        # Rendering uses a separate, much deeper RAM block chosen below.
+        output_chunk_z = 1 if self._is_2d else min(4, z0)
+        self._output_chunk_z = output_chunk_z
+        codec_chunks = (
+            1,
+            1,
+            output_chunk_z,
+            int(self.chunk_y),
+            int(self.chunk_x),
+        )
+        extra_attributes = None
+        if bool(getattr(self, "crop_deskewed_trapezoid", False)):
+            extra_attributes = {
+                "opm_fusion": {
+                    "deskew_geometry_crop": {
+                        "applied": bool(self.deskew_geometry_crop_y),
+                        "requested": True,
+                        "axis": "y",
+                        "pixels_per_side": int(self.deskew_geometry_crop_y),
+                    }
+                }
+            }
         _, self._multiscale_arrays = prepare_image(
             output_path,
             image,
             specs,
+            extra_attributes=extra_attributes,
             chunks=codec_chunks,
             writer="tensorstore",
             overwrite=True,
         )
+        if z_slices_per_write is None:
+            z_slices_per_write = self._fusion_z_step(z0)
         write_block_shape = [
             1,
             1,
@@ -1421,6 +2067,30 @@ class TileFusion:
             int(self.chunk_x) * 2,
         ]
         return self._multiscale_arrays["0"], write_block_shape
+
+    def _fusion_z_step(self, z_size: int) -> int:
+        """Choose an input-aware Z depth that still permits aligned Y/X blocks."""
+        output_chunk_z = max(1, int(self._output_chunk_z))
+        target_z = min(
+            int(z_size),
+            max(int(self._input_chunk_zyx[0]), output_chunk_z),
+        )
+        available = int(psutil.virtual_memory().available)
+        budget = max(1, int(available * self.fusion_ram_fraction))
+        concurrent_buffers = max(
+            1, int(self._max_workers) + int(self.max_in_flight_writes)
+        )
+        bytes_per_voxel = max(16, 12 * int(self.channels) + 4)
+        bytes_per_z_plane = int(self.chunk_y) * int(self.chunk_x) * bytes_per_voxel
+        max_z = max(
+            output_chunk_z,
+            budget // concurrent_buffers // max(1, bytes_per_z_plane),
+        )
+        aligned_z = max(
+            output_chunk_z,
+            (min(target_z, max_z) // output_chunk_z) * output_chunk_z,
+        )
+        return min(int(z_size), aligned_z)
 
     def _fusion_block_shape(
         self,
@@ -1467,6 +2137,8 @@ class TileFusion:
             int(self.chunk_x) * 8,
         )
 
+        block_y = max(min(y_size, int(self.chunk_y)), block_y)
+        block_x = max(min(x_size, int(self.chunk_x)), block_x)
         if block_y >= self.chunk_y:
             block_y = max(self.chunk_y, (block_y // self.chunk_y) * self.chunk_y)
         if block_x >= self.chunk_x:
@@ -1561,7 +2233,7 @@ class TileFusion:
                 ),
                 dtype=np.float32,
             )
-            weight = np.zeros_like(fused)
+            weight = np.zeros(fused.shape[1:], dtype=np.float32)
             for p, (oz, oy, ox) in region_contributors:
                 (sz0, sy0, sx0), source = source_blocks[p]
                 sub = np.ascontiguousarray(
@@ -1570,18 +2242,22 @@ class TileFusion:
                         rz0 - sz0 : rz1 - sz0,
                         ry0 - sy0 : ry1 - sy0,
                         rx0 - sx0 : rx1 - sx0,
-                    ],
-                    dtype=np.float32,
+                    ]
                 )
                 local_z = slice(rz0 - oz, rz1 - oz)
                 local_y = slice(ry0 - oy, ry1 - oy)
                 local_x = slice(rx0 - ox, rx1 - ox)
-                weights = (
-                    self.z_profile[local_z, None, None]
-                    * self.y_profile[None, local_y, None]
-                    * self.x_profile[None, None, local_x]
-                ).astype(np.float32, copy=False)
-                _accumulate_tile_block(fused, weight, sub, weights, 0, 0, 0)
+                _accumulate_tile_block(
+                    fused,
+                    weight,
+                    sub,
+                    self.z_profile[local_z],
+                    self.y_profile[local_y],
+                    self.x_profile[local_x],
+                    0,
+                    0,
+                    0,
+                )
 
             _normalize_block(fused, weight)
             output[output_selection] = fused.astype(np.uint16)
@@ -1654,9 +2330,7 @@ class TileFusion:
             z1 = min(z0 + z_step, pad_z)
             block_y, block_x = self._fusion_block_shape(z1 - z0, pad_y, pad_x)
             block_layout.append((z0, z1, block_y, block_x))
-            spatial_blocks += math.ceil(pad_y / block_y) * math.ceil(
-                pad_x / block_x
-            )
+            spatial_blocks += math.ceil(pad_y / block_y) * math.ceil(pad_x / block_x)
         chunk_total = n_t * int(self.channels) * spatial_blocks
 
         scale_bar = tqdm(
@@ -1759,7 +2433,7 @@ class TileFusion:
             )
 
     def _write_multiscales(self) -> None:
-        """Downsample scale 0 into bounded spatial blocks.
+        """Downsample successive scales in parallel, storage-aligned blocks.
 
         Parameters
         ----------
@@ -1771,14 +2445,22 @@ class TileFusion:
         None
             No value is returned.
         """
-        inp = self._multiscale_arrays["0"]
+        previous_factor = 1
         for level, factor in enumerate(self.multiscale_factors, start=1):
+            factor = int(factor)
+            if factor > previous_factor and factor % previous_factor == 0:
+                inp = self._multiscale_arrays[str(level - 1)]
+                relative_factor = factor // previous_factor
+            else:
+                inp = self._multiscale_arrays["0"]
+                relative_factor = factor
+
             out = self._multiscale_arrays[str(level)]
-            z_factor = 1 if self._is_2d else int(factor)
+            z_factor = 1 if self._is_2d else relative_factor
             out_z, out_y, out_x = (int(value) for value in out.shape[-3:])
-            block_z = max(1, int(self.write_block_shape[2]) // z_factor)
-            block_y = max(1, int(self.chunk_y) // int(factor))
-            block_x = max(1, int(self.chunk_x) // int(factor))
+            block_z = min(out_z, max(1, int(self.write_block_shape[2])))
+            block_y = min(out_y, max(1, int(self.chunk_y)))
+            block_x = min(out_x, max(1, int(self.chunk_x)))
 
             chunk_total = (
                 int(self.time_dim)
@@ -1799,65 +2481,121 @@ class TileFusion:
                 leave=False,
                 unit="chunk",
             )
-            for t in range(int(self.time_dim)):
-                for c in range(int(self.channels)):
-                    for z0 in range(0, out_z, block_z):
-                        z1 = min(z0 + block_z, out_z)
-                        for y0 in range(0, out_y, block_y):
-                            y1 = min(y0 + block_y, out_y)
-                            for x0 in range(0, out_x, block_x):
-                                x1 = min(x0 + block_x, out_x)
-                                slab = (
-                                    inp[
-                                        t,
-                                        c,
-                                        slice(
-                                            z0 * z_factor,
-                                            min(int(inp.shape[2]), z1 * z_factor),
-                                        ),
-                                        slice(
-                                            y0 * factor,
-                                            min(int(inp.shape[3]), y1 * factor),
-                                        ),
-                                        slice(
-                                            x0 * factor,
-                                            min(int(inp.shape[4]), x1 * factor),
-                                        ),
-                                    ]
-                                    .read()
-                                    .result()
-                                )
-                                if self.multiscale_downsample == "stride":
-                                    down = slab[::z_factor, ::factor, ::factor]
-                                else:
-                                    arr = xp.asarray(slab)
-                                    down_arr = block_reduce(
-                                        arr,
-                                        block_size=(z_factor, int(factor), int(factor)),
-                                        func=xp.mean,
+
+            def write_block(
+                t: int,
+                c: int,
+                z0: int,
+                z1: int,
+                y0: int,
+                y1: int,
+                x0: int,
+                x1: int,
+            ) -> None:
+                """Read, downsample, and write one output-aligned block."""
+                slab = (
+                    inp[
+                        t,
+                        c,
+                        slice(
+                            z0 * z_factor,
+                            min(int(inp.shape[2]), z1 * z_factor),
+                        ),
+                        slice(
+                            y0 * relative_factor,
+                            min(int(inp.shape[3]), y1 * relative_factor),
+                        ),
+                        slice(
+                            x0 * relative_factor,
+                            min(int(inp.shape[4]), x1 * relative_factor),
+                        ),
+                    ]
+                    .read()
+                    .result()
+                )
+                if self.multiscale_downsample == "stride":
+                    down = slab[
+                        ::z_factor,
+                        ::relative_factor,
+                        ::relative_factor,
+                    ]
+                else:
+                    arr = xp.asarray(slab)
+                    down_arr = block_reduce(
+                        arr,
+                        block_size=(
+                            z_factor,
+                            relative_factor,
+                            relative_factor,
+                        ),
+                        func=xp.mean,
+                    )
+                    down = (
+                        cp.asnumpy(down_arr)
+                        if USING_GPU and cp is not None
+                        else np.asarray(down_arr)
+                    )
+                out[
+                    t,
+                    c,
+                    slice(z0, z1),
+                    slice(y0, y1),
+                    slice(x0, x1),
+                ].write(
+                    down[: z1 - z0, : y1 - y0, : x1 - x0].astype(
+                        np.uint16,
+                        copy=False,
+                    )
+                ).result()
+
+            workers = max(1, int(self._max_workers))
+            pending: set[Future[Any]] = set()
+
+            def collect_completed(done: set[Future[Any]]) -> None:
+                """Propagate worker failures and advance the transient bar."""
+                for future in done:
+                    future.result()
+                    chunk_bar.update()
+
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                for t in range(int(self.time_dim)):
+                    for c in range(int(self.channels)):
+                        for z0 in range(0, out_z, block_z):
+                            z1 = min(z0 + block_z, out_z)
+                            for y0 in range(0, out_y, block_y):
+                                y1 = min(y0 + block_y, out_y)
+                                for x0 in range(0, out_x, block_x):
+                                    x1 = min(x0 + block_x, out_x)
+                                    pending.add(
+                                        executor.submit(
+                                            write_block,
+                                            t,
+                                            c,
+                                            z0,
+                                            z1,
+                                            y0,
+                                            y1,
+                                            x0,
+                                            x1,
+                                        )
                                     )
-                                    down = (
-                                        cp.asnumpy(down_arr)
-                                        if USING_GPU and cp is not None
-                                        else np.asarray(down_arr)
-                                    )
-                                out[
-                                    t,
-                                    c,
-                                    slice(z0, z1),
-                                    slice(y0, y1),
-                                    slice(x0, x1),
-                                ].write(
-                                    down[: z1 - z0, : y1 - y0, : x1 - x0].astype(
-                                        np.uint16,
-                                        copy=False,
-                                    )
-                                ).result()
-                                chunk_bar.update()
-                scale_bar.update()
+                                    if len(pending) >= workers:
+                                        done, pending = wait(
+                                            pending,
+                                            return_when=FIRST_COMPLETED,
+                                        )
+                                        collect_completed(done)
+                    while pending:
+                        done, pending = wait(
+                            pending,
+                            return_when=FIRST_COMPLETED,
+                        )
+                        collect_completed(done)
+                    scale_bar.update()
 
             chunk_bar.close()
             scale_bar.close()
+            previous_factor = factor
 
     def run(self) -> None:
         """Execute the full registration + fusion pipeline.
@@ -1883,7 +2621,7 @@ class TileFusion:
 
         try:
             self.load_pairwise_metrics(metrics_path)
-        except FileNotFoundError:
+        except (FileNotFoundError, ValueError):
             self.refine_tile_positions_with_cross_correlation(
                 downsample_factors=self.downsample_factors,
                 ch_idx=self.channel_to_use,

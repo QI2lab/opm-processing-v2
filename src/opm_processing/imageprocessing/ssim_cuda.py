@@ -211,6 +211,8 @@ def structural_similarity_cupy_sep_shared(
 
     if data_range is None:
         data_range = float(img1.max() - img1.min())
+    if data_range == 0.0:
+        data_range = 1.0
     C1 = (K1 * data_range) ** 2
     C2 = (K2 * data_range) ** 2
 

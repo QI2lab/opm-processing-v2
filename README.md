@@ -131,8 +131,10 @@ uv run process "/path/to/qi2lab_acquisition.zarr"
 ```
 
 Flatfield estimation is controlled only by `--flatfield-correction`. When it is
-enabled, the pipeline constructs `BaSiC()` with the installed BaSiCPy defaults;
-BaSiCPy automatically selects CUDA when PyTorch reports it as available.
+enabled, the pipeline fits a rectangular working field downsampled twofold on
+each camera axis. It otherwise uses the installed BaSiCPy defaults, disables
+darkfield estimation because camera offset is already subtracted, and
+automatically selects CUDA when PyTorch reports it as available.
 
 Current opm-v2 acquisitions are OME-Zarr v0.5 Bio-Formats2Raw collections:
 each tile is stored as a `TCZYX` image series. The processing and timelapse
@@ -205,6 +207,25 @@ uv run fuse "/path/to/qi2lab_acquisition.zarr"
 
 The path may be the acquisition `.ome.zarr` store itself or its containing
 directory, even when that directory already contains processed Zarr outputs.
+
+Registration uses channel index 0 by default. Select another zero-based channel
+index without changing which channels are written to the fused output:
+
+```bash
+uv run fuse "/path/to/qi2lab_acquisition.zarr" --registration-channel 1
+```
+
+To test blending after removing the trapezoidal Y ends introduced by the
+tilted acquisition geometry, enable the automatic rectangular crop:
+
+```bash
+uv run fuse "/path/to/qi2lab_acquisition.zarr" --crop-ends
+```
+
+The crop width is derived from the stored deskewed Z extent, physical voxel
+sizes, and OPM angle. The leading crop is included in tile placement, and the
+cropped extent is used for registration, feather profiles, direct-copy regions,
+and blended regions.
 
 Fusion always reports its selected registration and scale-0 fusion backends.
 To require CUDA registration and fail on an incomplete GPU environment on

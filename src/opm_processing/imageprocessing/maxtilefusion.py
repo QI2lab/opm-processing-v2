@@ -9,6 +9,10 @@ from tqdm import tqdm
 from yaozarrs import DimSpec, v05
 from yaozarrs.write.v05 import prepare_image
 
+from opm_processing.imageprocessing.coordinates import (
+    stage_positions_to_image_coordinates,
+)
+
 
 class MaxTileFusion:
     """
@@ -24,6 +28,9 @@ class MaxTileFusion:
         Path to the output TensorStore dataset.
     pixel_size : tuple of float
         Pixel size (y, x) in physical units.
+    reverse_stage_y : bool, default=True
+        Reverse the stage-derived Y placement coordinate without flipping tile
+        pixels. OPM stage motion is opposite image Y.
     pad_yx : list of int, default  = [0, 0].
         Padding in y and x dimensions already applied to the dataset
     time_range: list of int, default = None
@@ -40,6 +47,7 @@ class MaxTileFusion:
         blend_pixels: tuple[int, int] = (380, 380),
         chunk_size: int = 512,
         padding_multiple: int = 8,
+        reverse_stage_y: bool = True,
     ):
         """Initialize a maximum-projection tile fusion operation.
 
@@ -63,6 +71,9 @@ class MaxTileFusion:
             Spatial output chunk size.
         padding_multiple
             Multiple to which the fused shape is padded.
+        reverse_stage_y
+            Whether to reverse the stage-derived image-Y placement coordinate.
+            Tile pixel arrays are not modified.
 
         Returns
         -------
@@ -74,7 +85,11 @@ class MaxTileFusion:
 
         self.ts_dataset = tuple(ts_dataset)
 
-        self.tile_positions = np.array(tile_positions)
+        self.reverse_stage_y = bool(reverse_stage_y)
+        self.tile_positions = stage_positions_to_image_coordinates(
+            tile_positions,
+            reverse_y=self.reverse_stage_y,
+        )
         self.output_path = Path(output_path)
         self.pixel_size = pixel_size
 

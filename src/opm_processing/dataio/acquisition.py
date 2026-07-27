@@ -88,9 +88,7 @@ class AcquisitionMetadata:
     @property
     def stage_axis_flips_xyz(self) -> tuple[bool, bool, bool]:
         """Derive stage-coordinate flips from recorded camera orientation."""
-        orientations = {
-            key: value.strip().lower() for key, value in self.orientations
-        }
+        orientations = {key: value.strip().lower() for key, value in self.orientations}
 
         def is_flipped(key: str) -> bool:
             return orientations.get(key, "normal") in {
@@ -109,7 +107,14 @@ class AcquisitionMetadata:
 
     @property
     def scan_axis_reversed(self) -> bool:
-        """Return whether stored scan samples run toward decreasing stage values."""
+        """Return whether stored scan samples must be reversed before deskew."""
+        # During a stage scan the sample moves opposite the stage trajectory in
+        # the stationary OPM imaging plane. The deskew convention follows sample
+        # coordinates, so stage-scan samples must always be reversed regardless
+        # of whether the recorded stage positions increase or decrease.
+        if "stage" in self.mode.lower():
+            return True
+
         if (
             self.scan_axis is not None
             and self.scan_axis in "xyz"
@@ -447,13 +452,17 @@ def _inspect_ome_zarr(path: Path, root: ZarrGroup) -> AcquisitionMetadata:
                 _integer(index.get("c"), 0),
                 str(metadata.get("DAQ", {}).get("current_channel", "")),
             )
-        channel_names = [found.get(index) or f"channel-{index}" for index in range(shape[2])]
+        channel_names = [
+            found.get(index) or f"channel-{index}" for index in range(shape[2])
+        ]
     channel_states = list(daq_config.get("channel_states", []))
 
     def enabled_values(key: str) -> list[Any]:
         values = list(daq_config.get(key, []))
         if len(channel_states) == len(values):
-            values = [value for value, enabled in zip(values, channel_states) if enabled]
+            values = [
+                value for value, enabled in zip(values, channel_states) if enabled
+            ]
         return values
 
     configured_powers = enabled_values("channel_powers")
@@ -461,7 +470,9 @@ def _inspect_ome_zarr(path: Path, root: ZarrGroup) -> AcquisitionMetadata:
     channels = _channel_metadata(
         channel_names, frames, configured_powers, configured_exposures
     )
-    positions, starts, ends, scan_axis, measured_step = _positions_from_frame_sets(frame_sets)
+    positions, starts, ends, scan_axis, measured_step = _positions_from_frame_sets(
+        frame_sets
+    )
     configured_step = _number(daq.get("scan_axis_step_um"))
     if configured_step is None:
         configured_step = _number(daq_config.get("scan_axis_step_um"))
@@ -504,7 +515,9 @@ def _inspect_ome_zarr(path: Path, root: ZarrGroup) -> AcquisitionMetadata:
         camera_offset=_number(camera.get("offset")),
         camera_conversion=_number(camera.get("e_to_ADU")),
         excess_scan_positions=_integer(opm_frame.get("excess_scan_positions")),
-        excess_scan_start_positions=_integer(opm_frame.get("excess_scan_start_positions")),
+        excess_scan_start_positions=_integer(
+            opm_frame.get("excess_scan_start_positions")
+        ),
         excess_scan_end_positions=_integer(opm_frame.get("excess_scan_end_positions")),
         orientations=orientations,
         sidecar_paths=_sidecars(path),

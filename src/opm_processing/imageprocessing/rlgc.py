@@ -12,8 +12,10 @@ import gc
 import logging
 import timeit
 from collections.abc import Callable
+from dataclasses import dataclass
 
 import numpy as np
+from tqdm import tqdm
 
 from opm_processing.cuda import preload_cuda_libraries
 
@@ -34,6 +36,18 @@ filter_update = ElementwiseKernel(
     out = skip ? recon : recon * HTratio
     """,
     "filter_update",
+)
+
+_kld_terms = ElementwiseKernel(
+    "float32 p, float32 q, float32 p_sum, float32 q_sum",
+    "float32 out",
+    """
+    const float eps = 1e-4f;
+    const float p_norm = (p + eps) / p_sum;
+    const float q_norm = (q + eps) / q_sum;
+    out = p_norm * (logf(p_norm) - logf(q_norm));
+    """,
+    "kld_terms",
 )
 
 # -----------------------------------------------------------------------------
@@ -75,7 +89,7 @@ def clear_rlgc_caches(clear_memory_pool: bool = False) -> None:
 
 
 def next_gpu_fft_size(x: int) -> int:
-    """Return the smallest FFT-friendly size >= ``x`` with prime factors in {2, 3}.
+    """Return the smallest cuFFT-friendly size at least as large as ``x``.
 
     Parameters
     ----------
@@ -85,17 +99,16 @@ def next_gpu_fft_size(x: int) -> int:
     Returns
     -------
     int
-        Next 2-3-smooth length >= ``x``.
+        Next length whose prime factors are in 2, 3, 5, and 7.
     """
     if x <= 1:
         return 1
     n = x
     while True:
         m = n
-        while (m % 2) == 0:
-            m //= 2
-        while (m % 3) == 0:
-            m //= 3
+        for factor in (2, 3, 5, 7):
+            while (m % factor) == 0:
+                m //= factor
         if m == 1:
             return n
         n += 1
@@ -134,6 +147,22 @@ def _axis_linear_fft_padding(
     return pad_before, pad_after
 
 
+def _linear_fft_pad_width(
+    image_shape: tuple[int, int, int],
+    psf_shape: tuple[int, int, int],
+    pad_yx: bool = True,
+) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int]]:
+    """Calculate per-axis linear FFT padding without allocating an image."""
+    pad_scan = _axis_linear_fft_padding(image_shape[0], psf_shape[0])
+    if pad_yx:
+        pad_y = _axis_linear_fft_padding(image_shape[1], psf_shape[1])
+        pad_x = _axis_linear_fft_padding(image_shape[2], psf_shape[2])
+    else:
+        pad_y = (0, 0)
+        pad_x = (0, 0)
+    return pad_scan, pad_y, pad_x
+
+
 def pad_for_linear_fft(
     image: np.ndarray,
     psf_shape: tuple[int, int, int],
@@ -162,15 +191,11 @@ def pad_for_linear_fft(
     if image.ndim != 3:
         raise ValueError(f"Expected 3D input, got shape {image.shape!r}")
 
-    pad_z = _axis_linear_fft_padding(image.shape[0], psf_shape[0])
-    if pad_yx:
-        pad_y = _axis_linear_fft_padding(image.shape[1], psf_shape[1])
-        pad_x = _axis_linear_fft_padding(image.shape[2], psf_shape[2])
-    else:
-        pad_y = (0, 0)
-        pad_x = (0, 0)
-
-    pad_width = (pad_z, pad_y, pad_x)
+    pad_width = _linear_fft_pad_width(
+        tuple(int(size) for size in image.shape),
+        psf_shape,
+        pad_yx=pad_yx,
+    )
     padded_image = np.pad(image, pad_width, mode="symmetric")
     return padded_image, pad_width
 
@@ -375,6 +400,31 @@ def _observed_region_mask(
     return mask
 
 
+def _observed_region_slices(
+    shape: tuple[int, int, int],
+    pad_width: tuple[tuple[int, int], tuple[int, int], tuple[int, int]],
+) -> tuple[slice, slice, slice]:
+    """Return slices selecting the unpadded observed image region.
+
+    Parameters
+    ----------
+    shape : tuple[int, int, int]
+        Full padded image shape.
+    pad_width : tuple[tuple[int, int], tuple[int, int], tuple[int, int]]
+        Per-axis padding widths.
+
+    Returns
+    -------
+    tuple[slice, slice, slice]
+        Slices selecting the original image inside the padded volume.
+    """
+    slices = []
+    for axis, (pad_before, pad_after) in enumerate(pad_width):
+        stop = shape[axis] - pad_after if pad_after > 0 else None
+        slices.append(slice(pad_before, stop))
+    return tuple(slices)
+
+
 def kl_div(p: cp.ndarray, q: cp.ndarray, mask: cp.ndarray | None = None) -> float:
     """Compute Kullback-Leibler divergence between two distributions.
 
@@ -405,6 +455,34 @@ def kl_div(p: cp.ndarray, q: cp.ndarray, mask: cp.ndarray | None = None) -> floa
     kldiv = p * (cp.log(p) - cp.log(q))
     kldiv[cp.isnan(kldiv)] = 0
     return float(cp.sum(kldiv))
+
+
+def _kl_div_into(
+    p: cp.ndarray,
+    q: cp.ndarray,
+    scratch: cp.ndarray,
+) -> float:
+    """Compute KLD using a caller-owned scratch array.
+
+    Parameters
+    ----------
+    p : cupy.ndarray
+        First nonnegative distribution.
+    q : cupy.ndarray
+        Second nonnegative distribution.
+    scratch : cupy.ndarray
+        Float32 workspace with the same shape as ``p`` and ``q``.
+
+    Returns
+    -------
+    float
+        Sum of the elementwise KLD terms.
+    """
+    eps_total = cp.float32(1e-4 * p.size)
+    p_sum = cp.sum(p, dtype=cp.float32) + eps_total
+    q_sum = cp.sum(q, dtype=cp.float32) + eps_total
+    _kld_terms(p, q, p_sum, q_sum, scratch)
+    return float(cp.sum(scratch, dtype=cp.float64))
 
 
 def _child_log_prefix(base_prefix: str, suffix: str) -> str:
@@ -460,6 +538,109 @@ def _resolve_tiled_axis_geometry(
     return retained_size, tile_pad
 
 
+def determine_rlgc_crop_scan(
+    image_shape: tuple[int, int, int],
+    psf_shapes: list[tuple[int, ...]] | tuple[tuple[int, ...], ...],
+    gpu_id: int = 0,
+    memory_fraction: float = 0.8,
+) -> int:
+    """Choose the largest scan crop estimated to fit available GPU memory.
+
+    The estimate includes scan processing halos, linear-convolution padding,
+    FFT workspaces, solver state, and iteration temporaries. All channel PSFs
+    are considered so the returned crop can be reused across channels.
+
+    Parameters
+    ----------
+    image_shape : tuple[int, int, int]
+        Unpadded input shape in scan, camera-Y, camera-X order.
+    psf_shapes : list[tuple[int, ...]] or tuple[tuple[int, ...], ...]
+        Shapes of every PSF that will be used during processing.
+    gpu_id : int, default=0
+        CUDA device used by RLGC.
+    memory_fraction : float, default=0.8
+        Fraction of currently free device memory available to the solver.
+
+    Returns
+    -------
+    int
+        Retained scan-axis crop size.
+    """
+    if len(image_shape) != 3 or any(int(size) < 1 for size in image_shape):
+        raise ValueError(f"Expected a positive scan-Y-X shape, got {image_shape}")
+    if not psf_shapes:
+        raise ValueError("At least one PSF shape is required")
+    if not 0 < memory_fraction < 1:
+        raise ValueError("memory_fraction must be between 0 and 1")
+
+    normalized_psf_shapes = [
+        (1, *shape) if len(shape) == 2 else tuple(int(size) for size in shape)
+        for shape in psf_shapes
+    ]
+    if any(len(shape) != 3 for shape in normalized_psf_shapes):
+        raise ValueError("PSF shapes must be two- or three-dimensional")
+    psf_shape = tuple(
+        max(shape[axis] for shape in normalized_psf_shapes) for axis in range(3)
+    )
+
+    cp.cuda.Device(gpu_id).use()
+    free_bytes, _ = cp.cuda.runtime.memGetInfo()
+    memory_budget = int(free_bytes * memory_fraction)
+
+    # The optimized solver peaks at approximately 18 float32-equivalent
+    # buffers per padded voxel: object-space state, three OTFs, the reusable
+    # FFT workspace, normalization, split data, ratios, consensus, and CuPy
+    # FFT/random work areas. Keeping this derivation local avoids a global
+    # hardware-specific crop setting.
+    estimated_bytes_per_voxel = 18 * np.dtype(np.float32).itemsize
+    scan_size, camera_y, camera_x = (int(size) for size in image_shape)
+    pad_y = _axis_linear_fft_padding(camera_y, psf_shape[1])
+    pad_x = _axis_linear_fft_padding(camera_x, psf_shape[2])
+    padded_y = camera_y + sum(pad_y)
+    padded_x = camera_x + sum(pad_x)
+
+    for retained_scan in range(scan_size, 0, -1):
+        if retained_scan == scan_size:
+            processing_scan = scan_size
+        else:
+            processing_scan = min(
+                scan_size,
+                retained_scan + 2 * psf_shape[0],
+            )
+        pad_scan = _axis_linear_fft_padding(processing_scan, psf_shape[0])
+        padded_scan = processing_scan + sum(pad_scan)
+        estimated_bytes = padded_scan * padded_y * padded_x * estimated_bytes_per_voxel
+        if estimated_bytes <= memory_budget:
+            return retained_scan
+    return 1
+
+
+@dataclass
+class RlgcChunkState:
+    """Store one process-local scan crop and reuse it across deconvolutions."""
+
+    crop_scan: int | None = None
+
+    def determine_once(
+        self,
+        image_shape: tuple[int, int, int],
+        psf_shapes: list[tuple[int, ...]] | tuple[tuple[int, ...], ...],
+        gpu_id: int = 0,
+    ) -> int:
+        """Determine the crop only when this state has no stored value."""
+        if self.crop_scan is None:
+            self.crop_scan = determine_rlgc_crop_scan(
+                image_shape,
+                psf_shapes,
+                gpu_id=gpu_id,
+            )
+        return self.crop_scan
+
+    def remember_successful_crop(self, crop_scan: int) -> None:
+        """Retain a successful fallback crop for all later solver calls."""
+        self.crop_scan = int(crop_scan)
+
+
 def _axis_retained_bounds(retained_size: int, image_size: int) -> list[tuple[int, int]]:
     """Build non-overlapping retained tile bounds that exactly cover one axis.
 
@@ -491,8 +672,8 @@ def rlgc(
     psf: np.ndarray,
     gpu_id: int = 0,
     safe_mode: bool = True,
-    limit: float = 0.01,
-    max_delta: float = 0.001,
+    limit: float = 0.1,
+    max_delta: float = 0.01,
     pad_yx: bool = True,
     rng_seed: int | None = 42,
     normalize_psf: bool = True,
@@ -518,9 +699,9 @@ def rlgc(
     safe_mode : bool, default=True
         If True, stop when either split KLD increases. If False, stop only when
         both split KLDs increase.
-    limit : float, default=0.01
+    limit : float, default=0.1
         Minimum fraction of pixels updated per iteration before early stopping.
-    max_delta : float, default=0.001
+    max_delta : float, default=0.01
         Stop when the largest relative update falls below this threshold.
     pad_yx : bool, default=True
         If True, pad Y/X by PSF support and expand to FFT-friendly sizes. Z is
@@ -559,15 +740,31 @@ def rlgc(
         if image.ndim == 2:
             image = np.expand_dims(image, axis=0)
 
-        image_gpu_np, pad_width = pad_for_linear_fft(
-            image=image,
-            psf_shape=tuple(int(v) for v in psf.shape),
+        image_shape = tuple(int(size) for size in image.shape)
+        psf_shape = tuple(int(size) for size in psf.shape)
+        pad_width = _linear_fft_pad_width(
+            image_shape,
+            psf_shape,
             pad_yx=pad_yx,
         )
-        image_gpu = cp.asarray(image_gpu_np, dtype=cp.float32)
-        del image_gpu_np
+        padded_shape = tuple(
+            size + sum(axis_pad) for size, axis_pad in zip(image_shape, pad_width)
+        )
+
+        target_cache_key = (int(cp.cuda.Device().id), *padded_shape)
+        stale_cache_keys = [key for key in _fft_cache_3d if key != target_cache_key]
+        if stale_cache_keys:
+            for key in stale_cache_keys:
+                del _fft_cache_3d[key]
+            cp.cuda.Stream.null.synchronize()
+            cp.get_default_memory_pool().free_all_blocks()
+
+        observed_slices = _observed_region_slices(padded_shape, pad_width)
+        observed_core = cp.asarray(image, dtype=cp.float32)
         psf_gpu = pad_psf(
-            cp.asarray(psf, dtype=cp.float32), image_gpu.shape, normalize=normalize_psf
+            cp.asarray(psf, dtype=cp.float32),
+            padded_shape,
+            normalize=normalize_psf,
         )
 
         otf = cp.fft.rfftn(psf_gpu)
@@ -575,30 +772,31 @@ def rlgc(
         otfotfT = otf * otfT
         del psf_gpu
 
-        observed_mask = _observed_region_mask(image_gpu.shape, pad_width)
-        observed_image = image_gpu * observed_mask
-        update_norm = fft_conv(observed_mask, otfT, image_gpu.shape)
-        update_norm = cp.maximum(update_norm, cp.float32(1e-6))
+        observed_support = cp.zeros(padded_shape, dtype=cp.float32)
+        observed_support[observed_slices] = 1
+        update_norm = fft_conv(observed_support, otfT, padded_shape)
+        cp.maximum(update_norm, cp.float32(1e-6), out=update_norm)
+        del observed_support
 
-        num_z = image_gpu.shape[0]
-        num_y = image_gpu.shape[1]
-        num_x = image_gpu.shape[2]
-        num_pixels = int(cp.sum(observed_mask))
+        num_pixels = int(observed_core.size)
         num_iters = 0
         prev_kld1 = np.inf
         prev_kld2 = np.inf
 
-        recon = cp.mean(observed_image[observed_mask > 0]) * cp.ones(
-            (num_z, num_y, num_x), dtype=cp.float32
+        recon = cp.full(
+            padded_shape,
+            cp.mean(observed_core),
+            dtype=cp.float32,
         )
-        previous_recon = recon
+        next_recon = cp.empty_like(recon)
+        kld_scratch = cp.empty_like(observed_core)
 
         if logging_enabled:
             logger.info(
                 "%ssolver_started image_shape=%s padded_shape=%s psf_shape=%s reference_core=non_accelerated safe_mode=%s pad_yx=%s",
                 log_tag,
                 tuple(int(v) for v in image.shape),
-                tuple(int(v) for v in image_gpu.shape),
+                padded_shape,
                 tuple(int(v) for v in psf.shape),
                 safe_mode,
                 pad_yx,
@@ -607,23 +805,31 @@ def rlgc(
         while True:
             iter_start_time = timeit.default_timer() if logging_enabled else None
 
-            split1 = rng.binomial(observed_image.astype("int64"), p=0.5).astype(
-                cp.float32
+            observed_counts = observed_core.astype(cp.int64)
+            split1_core = rng.binomial(observed_counts, p=0.5)
+            del observed_counts
+            split1 = cp.zeros(padded_shape, dtype=cp.float32)
+            split1[observed_slices] = split1_core
+            del split1_core
+            split2_core = observed_core - split1[observed_slices]
+
+            Hu = fft_conv(recon, otf, padded_shape)
+
+            predicted_core = Hu[observed_slices]
+            kldim = _kl_div_into(predicted_core, observed_core, kld_scratch)
+            kld1 = _kl_div_into(
+                predicted_core,
+                split1[observed_slices],
+                kld_scratch,
             )
-            split2 = observed_image - split1
-
-            Hu = fft_conv(recon, otf, image_gpu.shape)
-
-            kldim = kl_div(Hu, observed_image, observed_mask)
-            kld1 = kl_div(Hu, split1, observed_mask)
-            kld2 = kl_div(Hu, split2, observed_mask)
+            kld2 = _kl_div_into(predicted_core, split2_core, kld_scratch)
 
             if safe_mode:
                 should_restore = (kld1 > prev_kld1) or (kld2 > prev_kld2)
             else:
                 should_restore = (kld1 > prev_kld1) and (kld2 > prev_kld2)
             if should_restore:
-                recon[...] = previous_recon
+                recon = next_recon
                 if logging_enabled:
                     logger.info(
                         "%sstop=restore_previous_recon best_iteration=%d elapsed_s=%.2f safe_mode=%s kld_image=%.6f kld_split1=%.6f prev_kld_split1=%.6f kld_split2=%.6f prev_kld_split2=%.6f",
@@ -642,49 +848,44 @@ def rlgc(
             prev_kld1 = kld1
             prev_kld2 = kld2
 
-            HTratio1 = (
-                fft_conv(
-                    observed_mask
-                    * cp.divide(split1, 0.5 * (Hu + 1e-12), dtype=cp.float32),
-                    otfT,
-                    image_gpu.shape,
-                )
-                / update_norm
+            Hu *= cp.float32(0.5)
+            Hu += cp.float32(1e-12)
+            cp.divide(split1, Hu, out=split1)
+            HTratio1 = fft_conv(split1, otfT, padded_shape)
+            HTratio1 /= update_norm
+            split1.fill(0)
+            cp.divide(
+                split2_core,
+                Hu[observed_slices],
+                out=split1[observed_slices],
             )
-            del split1
-            HTratio2 = (
-                fft_conv(
-                    observed_mask
-                    * cp.divide(split2, 0.5 * (Hu + 1e-12), dtype=cp.float32),
-                    otfT,
-                    image_gpu.shape,
-                )
-                / update_norm
-            )
-            del split2
-            HTratio = HTratio1 + HTratio2
+            del split2_core
+            HTratio2 = fft_conv(split1, otfT, padded_shape)
+            HTratio2 /= update_norm
+
+            cp.subtract(HTratio1, cp.float32(1), out=split1)
+            cp.subtract(HTratio2, cp.float32(1), out=Hu)
+            cp.multiply(split1, Hu, out=split1)
             del Hu
+            consensus_map = fft_conv(split1, otfotfT, padded_shape)
+            del split1
 
-            consensus_map = fft_conv(
-                (HTratio1 - 1) * (HTratio2 - 1), otfotfT, recon.shape
-            )
+            cp.add(HTratio1, HTratio2, out=HTratio1)
+            del HTratio2
+            filter_update(recon, HTratio1, consensus_map, next_recon)
+            enforce_symmetric_boundary(next_recon, pad_width)
 
-            previous_recon = recon
-            recon = filter_update(recon, HTratio, consensus_map)
-            enforce_symmetric_boundary(recon, pad_width)
-
-            num_updated = cp.sum((consensus_map >= 0) * observed_mask)
-            observed_recon = recon * observed_mask
-            observed_previous = previous_recon * observed_mask
-            recon_max = cp.maximum(cp.max(observed_recon), cp.float32(1e-12))
+            next_core = next_recon[observed_slices]
+            recon_core = recon[observed_slices]
+            num_updated = cp.count_nonzero(consensus_map[observed_slices] >= 0)
+            recon_max = cp.maximum(cp.max(next_core), cp.float32(1e-12))
             updated_fraction = float(num_updated) / float(num_pixels)
-            min_HTratio = cp.min(HTratio)
-            max_HTratio = cp.max(HTratio)
+            min_HTratio = cp.min(HTratio1)
+            max_HTratio = cp.max(HTratio1)
             max_relative_delta = float(
-                cp.max(cp.abs(observed_recon - observed_previous) / recon_max)
+                cp.max(cp.abs(next_core - recon_core)) / recon_max
             )
-            del observed_recon, observed_previous
-            del HTratio
+            recon, next_recon = next_recon, recon
 
             num_iters += 1
             if logging_enabled:
@@ -702,7 +903,7 @@ def rlgc(
                     max_relative_delta,
                 )
 
-            del HTratio1, HTratio2, consensus_map
+            del HTratio1, consensus_map
 
             if updated_fraction < limit:
                 if logging_enabled:
@@ -776,11 +977,11 @@ def _chunked_rlgc_once(
     gpu_id: int = 0,
     crop_scan: int = 128,
     safe_mode: bool = True,
-    limit: float = 0.01,
-    max_delta: float = 0.001,
+    limit: float = 0.1,
+    max_delta: float = 0.01,
     rng_seed: int | None = 42,
     normalize_psf: bool = True,
-    verbose: int = 0,
+    verbose: int = 1,
     release_memory: bool = True,
     logger: logging.Logger | None = None,
     log_prefix: str = "",
@@ -803,15 +1004,15 @@ def _chunked_rlgc_once(
     safe_mode : bool, default=True
         If True, stop when either split KLD increases. If False, stop only when
         both split KLDs increase.
-    limit : float, default=0.01
+    limit : float, default=0.1
         Minimum fraction of pixels updated per iteration before early stopping.
-    max_delta : float, default=0.001
+    max_delta : float, default=0.01
         Stop when the largest relative update falls below this threshold.
     rng_seed : int or None, default=42
         Seed for the per-iteration 50:50 data split.
     normalize_psf : bool, default=True
         If True, normalize the padded PSF to unit sum before deconvolution.
-    verbose : int, default=0
+    verbose : int, default=1
         If at least 1, show a progress bar over scan-axis tiles.
     release_memory : bool, default=True
         If True, release CuPy memory pools and FFT caches before returning.
@@ -884,9 +1085,7 @@ def _chunked_rlgc_once(
         )
         output = np.zeros_like(image_work, dtype=np.float32)
 
-        retained_bounds_scan = _axis_retained_bounds(
-            retained_scan, full_shape[0]
-        )
+        retained_bounds_scan = _axis_retained_bounds(retained_scan, full_shape[0])
         num_tiles = len(retained_bounds_scan)
 
         if logger is not None and logger.isEnabledFor(logging.INFO):
@@ -900,14 +1099,13 @@ def _chunked_rlgc_once(
                 num_tiles,
             )
 
-        if verbose >= 1:
-            from rich.progress import track
-
-            iterator = track(
+        if verbose >= 1 and num_tiles > 1:
+            iterator = tqdm(
                 enumerate(retained_bounds_scan),
-                description="Chunks",
+                desc="Decon chunks",
                 total=num_tiles,
-                transient=True,
+                leave=False,
+                unit="chunk",
             )
         else:
             iterator = enumerate(retained_bounds_scan)
@@ -934,9 +1132,7 @@ def _chunked_rlgc_once(
             )
 
             scan_source_start = scan_dest_start - scan_crop_start
-            scan_source_stop = scan_source_start + (
-                scan_dest_stop - scan_dest_start
-            )
+            scan_source_stop = scan_source_start + (scan_dest_stop - scan_dest_start)
             crop_sub = crop_array[scan_source_start:scan_source_stop, :, :]
             output[scan_dest_start:scan_dest_stop, :, :] = crop_sub
 
@@ -956,18 +1152,18 @@ def chunked_rlgc(
     image: np.ndarray,
     psf: np.ndarray,
     gpu_id: int = 0,
-    crop_scan: int = 128,
+    crop_scan: int | None = None,
     safe_mode: bool = True,
-    limit: float = 0.01,
-    max_delta: float = 0.001,
+    limit: float = 0.1,
+    max_delta: float = 0.01,
     rng_seed: int | None = 42,
     normalize_psf: bool = True,
-    verbose: int = 0,
+    verbose: int = 1,
     release_memory: bool = True,
     logger: logging.Logger | None = None,
     log_prefix: str = "",
     on_successful_crop_scan: Callable[[int], None] | None = None,
-    fallback_step_scan: int = 128,
+    fallback_step_scan: int | None = None,
 ) -> np.ndarray:
     """Scan-axis chunked RLGC deconvolution with automatic fallback.
 
@@ -985,22 +1181,23 @@ def chunked_rlgc(
         2D or 3D point-spread function.
     gpu_id : int, default=0
         CUDA device ID to use.
-    crop_scan : int, default=128
-        Requested retained scan-axis tile size. Values at least as large as
-        the scan-axis length select full-frame processing.
+    crop_scan : int or None, default=None
+        Requested retained scan-axis tile size. If None, determine a crop from
+        current free GPU memory and this PSF. Values at least as large as the
+        scan-axis length select full-frame processing.
     safe_mode : bool, default=True
         If True, stop when either split KLD increases. If False, stop only when
         both split KLDs increase.
-    limit : float, default=0.01
+    limit : float, default=0.1
         Minimum fraction of pixels updated per iteration before early stopping.
-    max_delta : float, default=0.001
+    max_delta : float, default=0.01
         Stop when the largest relative update falls below this threshold.
     rng_seed : int or None, default=42
         Seed for the per-iteration 50:50 data split. Tiled calls offset this
         seed by tile index.
     normalize_psf : bool, default=True
         If True, normalize the padded PSF to unit sum before deconvolution.
-    verbose : int, default=0
+    verbose : int, default=1
         If at least 1, show a progress bar over scan-axis tiles.
     release_memory : bool, default=True
         If True, release CuPy memory pools and FFT caches before returning.
@@ -1010,8 +1207,9 @@ def chunked_rlgc(
         Structured prefix prepended to emitted log lines.
     on_successful_crop_scan : Callable[[int], None] or None, default=None
         Optional callback receiving the crop size that completed successfully.
-    fallback_step_scan : int, default=128
+    fallback_step_scan : int or None, default=None
         Number of retained scan planes removed after each allocation failure.
+        If None, reduce the current crop by one quarter.
 
     Returns
     -------
@@ -1026,7 +1224,16 @@ def chunked_rlgc(
     else:
         raise ValueError(f"Expected a 2D or 3D image, got shape {image_arr.shape}")
 
-    if fallback_step_scan < 1:
+    if crop_scan is None:
+        if image_arr.ndim == 2:
+            crop_scan = 1
+        else:
+            crop_scan = determine_rlgc_crop_scan(
+                tuple(int(size) for size in image_arr.shape),
+                [tuple(int(size) for size in np.asarray(psf).shape)],
+                gpu_id=gpu_id,
+            )
+    if fallback_step_scan is not None and fallback_step_scan < 1:
         raise ValueError("fallback_step_scan must be at least 1")
     min_crop_scan = 1
     attempted_crop_scan = min(int(crop_scan), int(image_scan))
@@ -1075,9 +1282,12 @@ def chunked_rlgc(
                     "RLGC failed due to GPU memory constraints even at the "
                     f"minimum scan-axis crop size {attempted_crop_scan}."
                 ) from exc
-            next_crop_scan = max(
-                min_crop_scan, attempted_crop_scan - fallback_step_scan
+            retry_step = (
+                max(1, attempted_crop_scan // 4)
+                if fallback_step_scan is None
+                else fallback_step_scan
             )
+            next_crop_scan = max(min_crop_scan, attempted_crop_scan - retry_step)
 
             if logger is not None and logger.isEnabledFor(logging.WARNING):
                 logger.warning(

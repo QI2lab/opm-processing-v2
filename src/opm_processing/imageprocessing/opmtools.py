@@ -304,7 +304,10 @@ def chunk_indices(length: int, chunk_size: int) -> list[tuple[int, int]]:
 
 
 def _deconvolve_oblique_chunk(
-    image: np.ndarray, psf: np.ndarray, crop_scan: int
+    image: np.ndarray,
+    psf: np.ndarray,
+    crop_scan: int,
+    on_successful_crop_scan=None,
 ) -> np.ndarray:
     """Run scan-axis RLGC without importing CuPy for deskew-only use.
 
@@ -316,6 +319,8 @@ def _deconvolve_oblique_chunk(
         Value supplied for ``psf``.
     crop_scan : int
         Retained tile size along axis 0, the acquisition scan axis.
+    on_successful_crop_scan : callable or None
+        Callback used to retain a successful fallback crop.
 
     Returns
     -------
@@ -324,14 +329,19 @@ def _deconvolve_oblique_chunk(
     """
     from opm_processing.imageprocessing.rlgc import chunked_rlgc
 
-    return chunked_rlgc(image=image, psf=psf, crop_scan=crop_scan)
+    return chunked_rlgc(
+        image=image,
+        psf=psf,
+        crop_scan=crop_scan,
+        on_successful_crop_scan=on_successful_crop_scan,
+    )
 
 
 def chunked_orthogonal_deskew(
     oblique_image: ArrayLike,
     psf_data: ArrayLike | None = None,
     deconvolve: bool = False,
-    decon_chunk_size: int = 128,
+    decon_chunk_size: int | None = None,
     chunk_size: int = 15000,
     overlap_size: int = 550,
     scan_crop: int = 700,
@@ -387,12 +397,16 @@ def chunked_orthogonal_deskew(
     """
     if deconvolve and psf_data is None:
         raise ValueError("psf_data is required when deconvolve=True")
-    if decon_chunk_size <= 0:
+    if decon_chunk_size is not None and decon_chunk_size <= 0:
         raise ValueError("decon_chunk_size must be greater than 0")
     if scan_axis_step_um <= 0 or pixel_size_um <= 0:
         raise ValueError("scan_axis_step_um and pixel_size_um must be positive")
     if camera_qe <= 0:
         raise ValueError("camera_qe must be positive")
+    if deconvolve:
+        from opm_processing.imageprocessing.rlgc import RlgcChunkState
+
+        decon_chunk_state = RlgcChunkState(decon_chunk_size)
 
     estimated_shape, _, _, _ = deskew_shape_estimator(
         oblique_image.shape,
@@ -449,10 +463,15 @@ def chunked_orthogonal_deskew(
         raw_data[raw_data < 0.0] = 0.0
         raw_data = ((raw_data * camera_cf) / camera_qe).astype(np.uint16)
         if deconvolve:
+            effective_crop_scan = decon_chunk_state.determine_once(
+                tuple(int(size) for size in raw_data.shape),
+                [tuple(int(size) for size in np.asarray(psf_data).shape)],
+            )
             raw_data = _deconvolve_oblique_chunk(
                 raw_data,
                 np.asarray(psf_data),
-                crop_scan=decon_chunk_size,
+                crop_scan=effective_crop_scan,
+                on_successful_crop_scan=(decon_chunk_state.remember_successful_crop),
             )
         temp_deskew = orthogonal_deskew(
             raw_data,

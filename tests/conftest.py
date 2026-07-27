@@ -162,7 +162,7 @@ def _tiled_acquisition_config(
             ((0, 0, 0), (0, 0, 2)),
         ),
         "yx_grid": (
-            ((0, 0, 0), (0, 0, 14), (0, 42, 0), (0, 42, 14)),
+            ((0, 0, 0), (0, 0, 14), (0, 8, 0), (0, 8, 14)),
             ((0, 0, 0), (0, 0, 2), (0, 2, 0), (0, 2, 2)),
         ),
         "z_staggered": (
@@ -170,8 +170,8 @@ def _tiled_acquisition_config(
             ((0, 0, 0), (1, 0, 0), (1, 0, 0)),
         ),
         "yx_grid_z_staggered": (
-            ((0, 0, 0), (2, 0, 14), (4, 42, 0), (6, 42, 14)),
-            ((0, 0, 0), (1, 0, 2), (1, 2, 0), (1, 2, 2)),
+            ((0, 0, 0), (2, 0, 14), (4, 8, 0), (6, 8, 14)),
+            ((0, 0, 0), (0, 0, 0), (0, 0, 0), (0, 0, 0)),
         ),
     }
     try:
@@ -646,6 +646,9 @@ def _create_opm_v2_tiled_ground_truth_zarr(
     )
     true_stage_positions_zxy = true_offsets * pixel_size_um
     recorded_stage_positions_zxy = (true_offsets + recorded_errors) * pixel_size_um
+    # OPM stage Y and image-placement Y point in opposite directions.
+    true_stage_positions_zxy[:, 1] *= -1
+    recorded_stage_positions_zxy[:, 1] *= -1
     frame_metadatas = []
     for position in range(shape[1]):
         for stored_scan in range(shape[3]):
