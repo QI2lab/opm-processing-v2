@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 
 import numpy as np
 import pytest
@@ -28,10 +29,11 @@ class ReconstructionTestConfig:
     minimum_tile_correlation: float = 0.55
     minimum_deskewed_correlation: float = 0.45
     minimum_fused_correlation: float = 0.50
+    minimum_overlap_correlation: float = 0.50
     minimum_line_width_samples: int = 4
     line_profile_half_window: int = 5
     blend_pixels_zyx: tuple[int, int, int] = (1, 4, 4)
-    registration_downsample_zyx: tuple[int, int, int] = (1, 1, 1)
+    registration_downsample_zyx: tuple[int, int, int] = (3, 1, 1)
     maximum_registration_shift_zyx: tuple[int, int, int] = (2, 2, 4)
     decon_scan_chunk_size: int = 6
 
@@ -77,7 +79,6 @@ class ReconstructionTestConfig:
             "resolution_multiples": ((1, 1, 1), (2, 2, 2)),
             "chunk_shape_yx": (16, 16),
             "max_registration_shift_zyx": self.maximum_registration_shift_zyx,
-            "crop_deskewed_trapezoid": True,
         }
 
 
@@ -213,6 +214,55 @@ def _align_fused_to_ground_truth(
     return aligned
 
 
+def _tile_overlap_mask(
+    world_shape: tuple[int, int, int],
+    tile_shape: tuple[int, int, int],
+    tile_offsets_zyx_px,
+) -> np.ndarray:
+    """Return voxels covered by at least two ground-truth tiles."""
+    coverage = np.zeros(world_shape, dtype=np.uint8)
+    for offset in tile_offsets_zyx_px:
+        slices = tuple(
+            slice(int(start), int(start) + int(length))
+            for start, length in zip(offset, tile_shape)
+        )
+        coverage[slices] += 1
+    return coverage > 1
+
+
+def _assert_fused_overlap_matches_ground_truth(
+    fixture,
+    config: ReconstructionTestConfig,
+    fusion: TileFusion,
+) -> tuple[np.ndarray, float]:
+    """Validate the registered fused pixels specifically inside tile overlaps."""
+    fused_path = fixture.path.parent / f"{fixture.path.stem}_fused.ome.zarr"
+    fused = open_image_array(fused_path).read().result()[0, 0]
+    assert fusion.offset_um is not None
+    reconstructed = _align_fused_to_ground_truth(
+        fused,
+        fixture.ground_truth,
+        offset_um=fusion.offset_um,
+        pixel_size_um=fusion._pixel_size,
+    )
+    overlap = _tile_overlap_mask(
+        fixture.ground_truth.shape,
+        tuple(int(value) for value in fusion.position_arrays[0].shape[-3:]),
+        fixture.tile_offsets_zyx_px,
+    )
+    overlap_correlation = _measure_correlation(
+        reconstructed[overlap],
+        fixture.ground_truth[overlap],
+        config,
+    )
+    assert overlap_correlation > config.minimum_overlap_correlation, {
+        "overlap_correlation": overlap_correlation,
+        "pairwise_metrics": fusion.pairwise_metrics,
+        "global_offsets": fusion.global_offsets,
+    }
+    return reconstructed, overlap_correlation
+
+
 def _assert_tiled_reconstruction(
     fixture,
     config: ReconstructionTestConfig,
@@ -296,8 +346,8 @@ def _assert_tiled_reconstruction(
                 local_center_x = center_x - x_offset
                 local_wall_x = wall_x - x_offset
                 if (
-                    0 <= local_center_z < truth_tile.shape[0]
-                    and 0 <= local_center_y < truth_tile.shape[1]
+                    0 <= round(local_center_z) < truth_tile.shape[0]
+                    and 0 <= round(local_center_y) < truth_tile.shape[1]
                     and 5 <= local_wall_x < truth_tile.shape[2] - 5
                 ):
                     center = (local_center_z, local_center_y, local_center_x)
@@ -326,15 +376,35 @@ def _assert_tiled_reconstruction(
         **config.fusion_options(),
     )
     fusion.run()
+    if fixture.configuration == "thin_z_staggered":
+        expected_x_corrections = -fixture.recorded_position_errors_zyx_px[:, 2]
+        np.testing.assert_allclose(
+            np.asarray(fusion.global_offsets)[:, 2],
+            expected_x_corrections,
+            atol=0.5,
+        )
+    adjacency = {
+        tile_index: set() for tile_index in range(len(fixture.tile_offsets_zyx_px))
+    }
+    for left, right in fusion.pairwise_metrics:
+        adjacency[left].add(right)
+        adjacency[right].add(left)
+    connected = {0}
+    frontier = [0]
+    while frontier:
+        current = frontier.pop()
+        unseen_neighbors = adjacency[current] - connected
+        connected.update(unseen_neighbors)
+        frontier.extend(unseen_neighbors)
+    assert connected == set(range(len(fixture.tile_offsets_zyx_px))), {
+        "connected_tiles": connected,
+        "pairwise_metrics": fusion.pairwise_metrics,
+    }
 
-    fused_path = fixture.path.parent / f"{fixture.path.stem}_fused.ome.zarr"
-    fused = open_image_array(fused_path).read().result()[0, 0]
-    assert fusion.offset_um is not None
-    reconstructed = _align_fused_to_ground_truth(
-        fused,
-        fixture.ground_truth,
-        offset_um=fusion.offset_um,
-        pixel_size_um=fusion._pixel_size,
+    reconstructed, overlap_correlation = _assert_fused_overlap_matches_ground_truth(
+        fixture,
+        config,
+        fusion,
     )
     fused_correlation = _measure_correlation(
         reconstructed,
@@ -348,6 +418,7 @@ def _assert_tiled_reconstruction(
         "pairwise_metrics": fusion.pairwise_metrics,
         "global_offsets": fusion.global_offsets,
         "offset_um": fusion.offset_um,
+        "overlap_correlation": overlap_correlation,
     }
     fused_line_widths = []
     for center_z, center_y, center_x, _, _, radius_x in fixture.ellipsoids_zyx_radii:
@@ -419,4 +490,49 @@ def test_spatial_tiling_reconstructs_registered_ground_truth(
         opm_v2_spatial_tiling_ground_truth_zarr,
         reconstruction_config,
         cupy_gpu,
+    )
+
+
+def test_reprocessing_recomputes_registration_before_fusing(
+    opm_v2_tiled_ground_truth_zarr,
+    reconstruction_config,
+    cupy_gpu,
+):
+    """Reprocess fake tiles, reject their old cache, and validate fused overlap."""
+    del cupy_gpu
+    fixture = opm_v2_tiled_ground_truth_zarr
+    options = reconstruction_config.processing_options()
+    metrics_path = fixture.path.parent / "stitching_metrics.json"
+
+    process(root_path=fixture.path, deconvolve=False, **options)
+    first_fusion = TileFusion(
+        root_path=fixture.path,
+        **reconstruction_config.fusion_options(),
+    )
+    first_fusion.run()
+    first_cache = json.loads(metrics_path.read_text(encoding="utf-8"))
+
+    process(root_path=fixture.path, deconvolve=False, **options)
+    second_fusion = TileFusion(
+        root_path=fixture.path,
+        **reconstruction_config.fusion_options(),
+    )
+    with pytest.raises(ValueError, match="different processed data"):
+        second_fusion.load_pairwise_metrics(metrics_path)
+
+    second_fusion.run()
+    second_cache = json.loads(metrics_path.read_text(encoding="utf-8"))
+    assert (
+        second_cache["source"]["processing_created_at"]
+        != first_cache["source"]["processing_created_at"]
+    )
+    processed_path = fixture.path.parent / f"{fixture.path.stem}_deskewed.ome.zarr"
+    current_created_at = open_position_collection(processed_path).attributes[
+        "opm_processing"
+    ]["created_at"]
+    assert second_cache["source"]["processing_created_at"] == current_created_at
+    _assert_fused_overlap_matches_ground_truth(
+        fixture,
+        reconstruction_config,
+        second_fusion,
     )

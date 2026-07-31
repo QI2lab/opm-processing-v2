@@ -134,7 +134,15 @@ Flatfield estimation is controlled only by `--flatfield-correction`. When it is
 enabled, the pipeline fits a rectangular working field downsampled twofold on
 each camera axis. It otherwise uses the installed BaSiCPy defaults, disables
 darkfield estimation because camera offset is already subtracted, and
-automatically selects CUDA when PyTorch reports it as available.
+automatically selects CUDA when PyTorch reports it as available. BaSiCPy
+uses intensity sorting for these independent, non-time-lapse planes.
+Ten distributed scan planes are sampled from every tile and reduced to one
+per-tile median for the BaSiCPy fit. Autotuning runs before
+`smoothness_flatfield` is set to `2.0`, retaining the narrow detector feature.
+A separate 75th-percentile tile summary measures the remaining detector-fixed
+gain after BaSiCPy correction. Smoothed separable Y and X residual profiles are
+then folded into the illumination field; this corrects broad tile-axis shading
+without fitting a specimen-shaped two-dimensional residual.
 
 Current opm-v2 acquisitions are OME-Zarr v0.5 Bio-Formats2Raw collections:
 each tile is stored as a `TCZYX` image series. The processing and timelapse
@@ -215,17 +223,9 @@ index without changing which channels are written to the fused output:
 uv run fuse "/path/to/qi2lab_acquisition.zarr" --registration-channel 1
 ```
 
-To test blending after removing the trapezoidal Y ends introduced by the
-tilted acquisition geometry, enable the automatic rectangular crop:
-
-```bash
-uv run fuse "/path/to/qi2lab_acquisition.zarr" --crop-ends
-```
-
-The crop width is derived from the stored deskewed Z extent, physical voxel
-sizes, and OPM angle. The leading crop is included in tile placement, and the
-cropped extent is used for registration, feather profiles, direct-copy regions,
-and blended regions.
+Fusion preserves each complete deskewed tile. Pixels that are zero in every
+channel are treated as invalid deskew padding, so the trapezoidal wedge
+contributes neither signal nor weight where tiles overlap.
 
 Fusion always reports its selected registration and scale-0 fusion backends.
 To require CUDA registration and fail on an incomplete GPU environment on
@@ -249,3 +249,11 @@ shapes are padded only to the smallest boundary that supports all configured
 multiscale factors, avoiding tile-sized padding.
 
 The command discovers the corresponding deskewed or projection collection and writes `/path/to/qi2lab_acquisition_fused.ome.zarr`. Registration is optimized per timepoint, and fusion writes a single chunked `TCZYX` image with an OME-Zarr multiscale pyramid. Open it with `--to-display fused-full`, or open the `.ome.zarr` directory directly in napari with the `napari-ome-zarr` reader.
+
+To overwrite the fused maximum-Z projection from scale 0 of an existing
+registered full-resolution fused image, without rerunning registration or
+full-volume fusion:
+
+```bash
+uv run fuse "/path/to/qi2lab_acquisition.zarr" --regenerate-max-z
+```

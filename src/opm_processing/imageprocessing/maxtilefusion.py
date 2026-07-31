@@ -1,17 +1,219 @@
 """Fuse maximum-projection image tiles using stage positions."""
 
-from pathlib import Path
+import math
 from collections.abc import Sequence
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from pathlib import Path
 
 import numpy as np
 from tqdm import tqdm
 
-from yaozarrs import DimSpec, v05
+from yaozarrs import DimSpec, open_group, v05
 from yaozarrs.write.v05 import prepare_image
 
 from opm_processing.imageprocessing.coordinates import (
     stage_positions_to_image_coordinates,
 )
+
+
+def regenerate_fused_max_projection(
+    fused_path: str | Path,
+    output_path: str | Path,
+    *,
+    max_workers: int | None = None,
+) -> Path:
+    """Stream a maximum-Z projection from registered full-resolution fused data.
+
+    Parameters
+    ----------
+    fused_path
+        Full-resolution fused OME-Zarr image.
+    output_path
+        OME-Zarr image to overwrite with the maximum-Z projection.
+    max_workers
+        Maximum number of spatial chunks projected concurrently.
+
+    Returns
+    -------
+    pathlib.Path
+        Path to the regenerated maximum-projection image.
+    """
+    fused_path = Path(fused_path).expanduser().resolve()
+    output_path = Path(output_path).expanduser().resolve()
+    if not fused_path.is_dir():
+        raise FileNotFoundError(
+            f"Full-resolution fused data store not found: {fused_path}"
+        )
+
+    source_root = open_group(fused_path)
+    source_metadata = source_root.ome_metadata()
+    if not isinstance(source_metadata, v05.Image):
+        raise ValueError(f"Not an OME-Zarr v0.5 Image: {fused_path}")
+    source_multiscale = source_metadata.multiscales[0]
+    source_dataset = source_multiscale.datasets[0]
+    source = source_root[source_dataset.path].to_tensorstore()
+    if source.rank != 5:
+        raise ValueError(
+            f"Expected full-resolution TCZYX fused data, received shape {source.shape}"
+        )
+
+    time_dim, channel_dim, z_dim, y_dim, x_dim = (int(value) for value in source.shape)
+    scale = np.asarray(source_dataset.scale_transform.scale, dtype=np.float64)
+    if scale.shape != (5,):
+        raise ValueError("Fused dataset scale transform must contain TCZYX values")
+    if source_dataset.translation_transform is None:
+        translation = np.zeros(5, dtype=np.float64)
+    else:
+        translation = np.asarray(
+            source_dataset.translation_transform.translation,
+            dtype=np.float64,
+        )
+    if translation.shape != (5,):
+        raise ValueError(
+            "Fused dataset translation transform must contain TCZYX values"
+        )
+    projection_translation = translation.copy()
+    projection_translation[2] += 0.5 * (z_dim - 1) * scale[2]
+
+    projection_image = v05.Image(
+        multiscales=[
+            v05.Multiscale(
+                name="registered-fused-max-z",
+                axes=source_multiscale.axes,
+                datasets=[
+                    v05.Dataset(
+                        path="0",
+                        coordinateTransformations=[
+                            v05.ScaleTransformation(scale=scale.tolist()),
+                            v05.TranslationTransformation(
+                                translation=projection_translation.tolist()
+                            ),
+                        ],
+                    )
+                ],
+            )
+        ]
+    )
+
+    source_chunks = tuple(int(value) for value in source.chunk_layout.read_chunk.shape)
+    chunk_y = min(y_dim, max(1, source_chunks[-2]))
+    chunk_x = min(x_dim, max(1, source_chunks[-1]))
+    source_dtype = np.dtype(source.dtype.numpy_dtype)
+    extra_attributes = {
+        key: value for key, value in source_root.attrs.items() if key != "ome"
+    }
+    fusion_attributes = dict(extra_attributes.get("opm_fusion", {}))
+    fusion_attributes["maximum_projection"] = {
+        "axis": "z",
+        "source": str(fused_path),
+        "source_dataset": source_dataset.path,
+        "full_resolution": True,
+        "registered": True,
+    }
+    extra_attributes["opm_fusion"] = fusion_attributes
+    _, arrays = prepare_image(
+        output_path,
+        projection_image,
+        ((time_dim, channel_dim, 1, y_dim, x_dim), source_dtype),
+        extra_attributes=extra_attributes,
+        chunks=(1, 1, 1, chunk_y, chunk_x),
+        writer="tensorstore",
+        overwrite=True,
+    )
+    output = arrays["0"]
+
+    z_step = min(z_dim, max(16, source_chunks[-3]))
+    chunk_total = (
+        time_dim * channel_dim * math.ceil(y_dim / chunk_y) * math.ceil(x_dim / chunk_x)
+    )
+    workers = max_workers
+    if workers is None:
+        workers = min(8, chunk_total)
+    workers = max(1, min(int(workers), chunk_total))
+
+    def project_chunk(
+        time_index: int,
+        channel_index: int,
+        y_start: int,
+        y_stop: int,
+        x_start: int,
+        x_stop: int,
+    ) -> None:
+        """Project one output-aligned YX chunk through every source Z plane."""
+        projection = None
+        for z_start in range(0, z_dim, z_step):
+            z_stop = min(z_start + z_step, z_dim)
+            slab = (
+                source[
+                    time_index,
+                    channel_index,
+                    z_start:z_stop,
+                    y_start:y_stop,
+                    x_start:x_stop,
+                ]
+                .read()
+                .result()
+            )
+            slab_max = np.max(slab, axis=0)
+            if projection is None:
+                projection = slab_max
+            else:
+                np.maximum(projection, slab_max, out=projection)
+        if projection is None:
+            raise RuntimeError("Cannot project an empty Z axis")
+        output[
+            time_index,
+            channel_index,
+            0,
+            y_start:y_stop,
+            x_start:x_stop,
+        ].write(projection).result()
+
+    progress = tqdm(
+        total=chunk_total,
+        desc="registered max-z",
+        leave=True,
+        unit="chunk",
+    )
+    pending: set[Future[None]] = set()
+
+    def collect(done: set[Future[None]]) -> None:
+        for future in done:
+            future.result()
+            progress.update()
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        for time_index in range(time_dim):
+            for channel_index in range(channel_dim):
+                for y_start in range(0, y_dim, chunk_y):
+                    y_stop = min(y_start + chunk_y, y_dim)
+                    for x_start in range(0, x_dim, chunk_x):
+                        x_stop = min(x_start + chunk_x, x_dim)
+                        pending.add(
+                            executor.submit(
+                                project_chunk,
+                                time_index,
+                                channel_index,
+                                y_start,
+                                y_stop,
+                                x_start,
+                                x_stop,
+                            )
+                        )
+                        if len(pending) >= 2 * workers:
+                            done, pending = wait(
+                                pending,
+                                return_when=FIRST_COMPLETED,
+                            )
+                            collect(done)
+        while pending:
+            done, pending = wait(
+                pending,
+                return_when=FIRST_COMPLETED,
+            )
+            collect(done)
+    progress.close()
+    return output_path
 
 
 class MaxTileFusion:
@@ -48,6 +250,7 @@ class MaxTileFusion:
         chunk_size: int = 512,
         padding_multiple: int = 8,
         reverse_stage_y: bool = True,
+        opm_angle_deg: float | None = None,
     ):
         """Initialize a maximum-projection tile fusion operation.
 
@@ -74,6 +277,9 @@ class MaxTileFusion:
         reverse_stage_y
             Whether to reverse the stage-derived image-Y placement coordinate.
             Tile pixel arrays are not modified.
+        opm_angle_deg
+            OPM angle used to map relative stage Z into deskewed image Y when
+            `tile_positions` contains ZYX coordinates.
 
         Returns
         -------
@@ -86,10 +292,12 @@ class MaxTileFusion:
         self.ts_dataset = tuple(ts_dataset)
 
         self.reverse_stage_y = bool(reverse_stage_y)
-        self.tile_positions = stage_positions_to_image_coordinates(
+        placement_coordinates = stage_positions_to_image_coordinates(
             tile_positions,
             reverse_y=self.reverse_stage_y,
+            opm_angle_deg=opm_angle_deg,
         )
+        self.tile_positions = placement_coordinates[:, -2:]
         self.output_path = Path(output_path)
         self.pixel_size = pixel_size
 

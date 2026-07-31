@@ -63,7 +63,7 @@ app.pretty_exceptions_enable = False
 
 def _flatfield_software_tag() -> str:
     """Return the estimator identifier stored with reusable flatfields."""
-    return "opm-processing/basicpy-autotuned-distributed-sampling-v5"
+    return "opm-processing/basicpy-autotuned-distributed-sampling-v7"
 
 
 def _read_current_flatfield(
@@ -268,7 +268,7 @@ def process(
         Deconvolve the data using RLGC.
     max_projection: bool, default = True
         Create a maximum projection datastore.
-    flatfield_correction: bool, default = True
+    flatfield_correction: bool, default = False
         Estimate and apply flatfield correction on raw data.
     create_fused_max_projection: bool, default = True
         Create stage position fused max Z projection.
@@ -554,14 +554,17 @@ def process_skewed(
     stage_positions = _apply_stage_axis_flips(stage_positions_raw, stage_axis_flips)
     stage_x_flipped, stage_y_flipped, stage_z_flipped = stage_axis_flips
 
-    # # estimate shape of one deskewed volume
+    # Estimate the shape of one deskewed volume.
+    deskew_input_shape = (
+        datastore.shape[-3]
+        - excess_scan_positions
+        - (flyback_crop if flyback_crop is not None else 0),
+        datastore.shape[-2],
+        datastore.shape[-1],
+    )
     if flyback_crop is not None:
         deskewed_shape, pad_y, pad_x, crop_y = deskew_shape_estimator(
-            (
-                datastore.shape[-3] - excess_scan_positions - flyback_crop,
-                datastore.shape[-2],
-                datastore.shape[-1],
-            ),
+            deskew_input_shape,
             theta=opm_tilt_deg,
             distance=scan_axis_step_um,
             pixel_size=pixel_size_um,
@@ -569,11 +572,7 @@ def process_skewed(
         )
     else:
         deskewed_shape, pad_y, pad_x, crop_y = deskew_shape_estimator(
-            (
-                datastore.shape[-3] - excess_scan_positions,
-                datastore.shape[-2],
-                datastore.shape[-1],
-            ),
+            deskew_input_shape,
             theta=opm_tilt_deg,
             distance=scan_axis_step_um,
             pixel_size=pixel_size_um,
@@ -625,9 +624,14 @@ def process_skewed(
             "parameters": {
                 "estimator": "BaSiCPy",
                 "estimator_version": _distribution_version("basicpy"),
-                "configuration": "autotuned_library_defaults",
-                "sampling": "individual_planes_from_every_position",
+                "configuration": "autotuned_then_smoothness_2_with_residual_calibration",
+                "sort_intensity": True,
+                "smoothness_flatfield": 2.0,
+                "sampling": "per_position_summaries_across_all_positions",
                 "planes_per_position": 10,
+                "fit_summary": "median",
+                "residual_summary": "75th_percentile",
+                "residual_calibration": "smoothed_separable_yx",
                 "working_size": "half_resolution_preserving_aspect_ratio",
                 "darkfield_estimation": False,
                 "artifact_schema": _flatfield_software_tag(),
@@ -703,6 +707,7 @@ def process_skewed(
             pixel_size_um,
             pixel_size_um,
         ],
+        "deskew_input_shape_zyx": [int(value) for value in deskew_input_shape],
         "stage_x_flipped": stage_x_flipped,
         "stage_y_flipped": stage_y_flipped,
         "stage_z_flipped": stage_z_flipped,
@@ -943,16 +948,17 @@ def process_skewed(
         )
 
         if pos_range is not None:
-            tile_positions = stage_positions[pos_range[0] : pos_range[1], 1:]
+            tile_positions = stage_positions[pos_range[0] : pos_range[1]]
 
         else:
-            tile_positions = stage_positions[:, 1:]
+            tile_positions = stage_positions
 
         tile_fusion = MaxTileFusion(
             ts_dataset=max_z_ts_store,
             tile_positions=tile_positions,
             output_path=fused_output_path,
             pixel_size=np.asarray((pixel_size_um, pixel_size_um), dtype=np.float32),
+            opm_angle_deg=opm_tilt_deg,
         )
         tile_fusion.run()
 
@@ -1168,9 +1174,14 @@ def process_projection(
                         "parameters": {
                             "estimator": "BaSiCPy",
                             "estimator_version": _distribution_version("basicpy"),
-                            "configuration": "autotuned_library_defaults",
-                            "sampling": "individual_planes_from_every_position",
+                            "configuration": "autotuned_then_smoothness_2_with_residual_calibration",
+                            "sort_intensity": True,
+                            "smoothness_flatfield": 2.0,
+                            "sampling": "per_position_summaries_across_all_positions",
                             "planes_per_position": 10,
+                            "fit_summary": "median",
+                            "residual_summary": "75th_percentile",
+                            "residual_calibration": "smoothed_separable_yx",
                             "working_size": "half_resolution_preserving_aspect_ratio",
                             "darkfield_estimation": False,
                             "artifact_schema": _flatfield_software_tag(),
@@ -1343,10 +1354,10 @@ def process_projection(
         )
 
         if pos_range is not None:
-            tile_positions = stage_positions[pos_range[0] : pos_range[1], 1:]
+            tile_positions = stage_positions[pos_range[0] : pos_range[1]]
 
         else:
-            tile_positions = stage_positions[:, 1:]
+            tile_positions = stage_positions
 
         tile_fusion = MaxTileFusion(
             ts_dataset=ts_store,
@@ -1354,6 +1365,7 @@ def process_projection(
             output_path=fused_output_path,
             pixel_size=np.asarray((pixel_size_um, pixel_size_um), dtype=np.float32),
             time_range=time_range,
+            opm_angle_deg=opm_tilt_deg,
         )
         tile_fusion.run()
         del deconvolved_data, ts_write, ts_store
@@ -1569,8 +1581,13 @@ def process_ASI_SCOPE(
     stage_x_flipped, stage_y_flipped, stage_z_flipped = stage_axis_flips
 
     # estimate shape of one deskewed volume
+    deskew_input_shape = (
+        int(datastore.shape[-3]),
+        int(datastore.shape[-2]),
+        int(datastore.shape[-1]),
+    )
     deskewed_shape, pad_y, pad_x, crop_y = deskew_shape_estimator(
-        [datastore.shape[-3], datastore.shape[-2], datastore.shape[-1]],
+        deskew_input_shape,
         theta=opm_tilt_deg,
         distance=scan_axis_step_um,
         pixel_size=pixel_size_um,
@@ -1613,6 +1630,7 @@ def process_ASI_SCOPE(
             pixel_size_um,
             pixel_size_um,
         ],
+        "deskew_input_shape_zyx": list(deskew_input_shape),
         "stage_x_flipped": stage_x_flipped,
         "stage_y_flipped": stage_y_flipped,
         "stage_z_flipped": stage_z_flipped,
@@ -1655,9 +1673,14 @@ def process_ASI_SCOPE(
                 "parameters": {
                     "estimator": "BaSiCPy",
                     "estimator_version": _distribution_version("basicpy"),
-                    "configuration": "autotuned_library_defaults",
-                    "sampling": "individual_planes_from_every_position",
+                    "configuration": "autotuned_then_smoothness_2_with_residual_calibration",
+                    "sort_intensity": True,
+                    "smoothness_flatfield": 2.0,
+                    "sampling": "per_position_summaries_across_all_positions",
                     "planes_per_position": 10,
+                    "fit_summary": "median",
+                    "residual_summary": "75th_percentile",
+                    "residual_calibration": "smoothed_separable_yx",
                     "working_size": "half_resolution_preserving_aspect_ratio",
                     "darkfield_estimation": False,
                     "artifact_schema": _flatfield_software_tag(),
@@ -1910,10 +1933,10 @@ def process_ASI_SCOPE(
         )
 
         if pos_range is not None:
-            tile_positions = stage_positions[pos_range[0] : pos_range[1], 1:]
+            tile_positions = stage_positions[pos_range[0] : pos_range[1]]
 
         else:
-            tile_positions = stage_positions[:, 1:]
+            tile_positions = stage_positions
 
         # apply max-tile-fusion
         tile_fusion = MaxTileFusion(
@@ -1921,6 +1944,7 @@ def process_ASI_SCOPE(
             tile_positions=tile_positions,
             output_path=fused_output_path,
             pixel_size=np.asarray((pixel_size_um, pixel_size_um), dtype=np.float32),
+            opm_angle_deg=opm_tilt_deg,
         )
         tile_fusion.run()
 

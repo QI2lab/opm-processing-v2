@@ -20,6 +20,13 @@ warnings.simplefilter("ignore", category=FutureWarning)
 
 from pathlib import Path
 import typer
+from opm_processing.dataio.acquisition import (
+    acquisition_stem,
+    resolve_acquisition_path,
+)
+from opm_processing.imageprocessing.maxtilefusion import (
+    regenerate_fused_max_projection,
+)
 from opm_processing.imageprocessing.tilefusion import (
     TileFusion,
     fusion_backend_status,
@@ -54,17 +61,17 @@ def register_and_fuse(
     optimization_rel_threshold: float = 0.5,
     optimization_abs_threshold: float = 1.5,
     max_registration_shift_zyx: tuple[int, int, int] = (20, 50, 100),
-    crop_deskewed_trapezoid: Annotated[
+    require_gpu: bool = False,
+    regenerate_max_z: Annotated[
         bool,
         typer.Option(
-            "--crop-ends",
+            "--regenerate-max-z",
             help=(
-                "Crop the geometry-derived trapezoidal Y ends from every "
-                "deskewed tile before registration and fusion."
+                "Only overwrite the fused maximum-Z projection using scale 0 "
+                "of the existing registered full-resolution fused image."
             ),
         ),
     ] = False,
-    require_gpu: bool = False,
 ):
     """Register and fuse processed OPM data.
 
@@ -109,16 +116,31 @@ def register_and_fuse(
         Value supplied for ``optimization abs threshold``.
     max_registration_shift_zyx : tuple[int, int, int]
         Value supplied for ``max registration shift zyx``.
-    crop_deskewed_trapezoid : bool
-        Crop the tilted-acquisition Y ends using recorded acquisition geometry.
     require_gpu : bool
         Fail instead of silently using CPU registration when CUDA is unavailable.
+    regenerate_max_z : bool
+        Regenerate only the fused maximum-Z projection from the existing
+        registered full-resolution fused image.
 
     Returns
     -------
     None
         No value is returned.
     """
+    if regenerate_max_z:
+        acquisition_path = resolve_acquisition_path(root_path)
+        base = acquisition_path.parent
+        stem = acquisition_stem(acquisition_path)
+        fused_path = base / f"{stem}_fused.ome.zarr"
+        output_path = base / f"{stem}_max_z_fused.ome.zarr"
+        regenerate_fused_max_projection(
+            fused_path,
+            output_path,
+            max_workers=max_workers,
+        )
+        print(f"Regenerated fused maximum-Z projection: {output_path}")
+        return
+
     status = fusion_backend_status(max_workers=max_workers)
     if require_gpu:
         require_gpu_backend()
@@ -145,16 +167,7 @@ def register_and_fuse(
         optimization_rel_threshold=optimization_rel_threshold,
         optimization_abs_threshold=optimization_abs_threshold,
         max_registration_shift_zyx=max_registration_shift_zyx,
-        crop_deskewed_trapezoid=crop_deskewed_trapezoid,
     )
-    if crop_deskewed_trapezoid:
-        if tile_fuser.deskew_geometry_crop_y:
-            print(
-                "Deskew geometry crop: "
-                f"{tile_fuser.deskew_geometry_crop_y} Y pixels per side"
-            )
-        else:
-            print("Deskew geometry crop: already applied to the processed tiles")
     tile_fuser.run()
 
 

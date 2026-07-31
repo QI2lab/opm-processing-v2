@@ -3,6 +3,7 @@
 import warnings
 
 import numpy as np
+import tensorstore as ts
 
 from opm_processing.imageprocessing.flatfield import (
     _flatfield_working_shape,
@@ -27,6 +28,14 @@ def test_flatfield_correction_recovers_multitile_multichannel_truth():
             1.0 - 0.22 * yy + 0.16 * xx - 0.06 * yy * xx,
         )
     )
+    detector_x = 78
+    detector_distance = (
+        np.arange(width, dtype=np.float32) - detector_x
+    ) / 3.0
+    detector_stripe = 1.0 - 0.12 * np.exp(
+        -0.5 * detector_distance**2
+    )
+    illuminations *= detector_stripe[np.newaxis, np.newaxis, :]
     illuminations /= illuminations.mean(axis=(1, 2), keepdims=True)
 
     specimen = rng.uniform(
@@ -39,7 +48,7 @@ def test_flatfield_correction_recovers_multitile_multichannel_truth():
         / camera_conversion
         + camera_offset
     ).astype(np.uint16)
-    datastore = raw[np.newaxis, ...]
+    datastore = ts.array(raw[np.newaxis, ...])
 
     with warnings.catch_warnings():
         warnings.filterwarnings(
@@ -76,4 +85,32 @@ def test_flatfield_correction_recovers_multitile_multichannel_truth():
                 illuminations[channel].ravel(),
             )[0, 1]
             > 0.95
+        )
+        before_gain = np.median(before / truth, axis=(0, 1, 2))
+        after_gain = np.median(after / truth, axis=(0, 1, 2))
+        before_stripe_error = abs(
+            before_gain[detector_x]
+            - np.median(
+                np.concatenate(
+                    (
+                        before_gain[detector_x - 12 : detector_x - 7],
+                        before_gain[detector_x + 8 : detector_x + 13],
+                    )
+                )
+            )
+        )
+        after_stripe_error = abs(
+            after_gain[detector_x]
+            - np.median(
+                np.concatenate(
+                    (
+                        after_gain[detector_x - 12 : detector_x - 7],
+                        after_gain[detector_x + 8 : detector_x + 13],
+                    )
+                )
+            )
+        )
+        assert after_stripe_error < 0.4 * before_stripe_error, (
+            f"channel {channel}: stripe error changed from "
+            f"{before_stripe_error:.6f} to {after_stripe_error:.6f}"
         )

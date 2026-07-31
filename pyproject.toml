@@ -50,8 +50,8 @@ dependencies = [
     "scipy",
     "tensorstore",
     "tifffile",
-    "torch",
-    "torchvision",
+    "torch==2.9.0; sys_platform == 'win32'",
+    "torch; sys_platform != 'win32'",
     "tqdm",
     "typer",
     "yaozarrs[io,write-tensorstore] @ git+https://github.com/dpshepherd/yaozarrs.git@fix-v3-extra-attributes-location",
@@ -66,12 +66,8 @@ gpu = [
 
 [tool.uv.sources]
 torch = [
-    { index = "pytorch-cu129", marker = "extra == 'gpu' and sys_platform == 'linux'" },
+    { index = "pytorch-cu129", marker = "extra == 'gpu' and (sys_platform == 'linux' or sys_platform == 'win32')" },
 ]
-torchvision = [
-    { index = "pytorch-cu129", marker = "extra == 'gpu' and sys_platform == 'linux'" },
-]
-
 [[tool.uv.index]]
 name = "pytorch-cu129"
 url = "https://download.pytorch.org/whl/cu129"

@@ -169,6 +169,10 @@ def _tiled_acquisition_config(
             ((0, 0, 0), (4, 0, 0), (8, 0, 0)),
             ((0, 0, 0), (1, 0, 0), (1, 0, 0)),
         ),
+        "thin_z_staggered": (
+            ((0, 0, 0), (11, 0, 0), (22, 0, 0)),
+            ((0, 0, 0), (0, 0, 2), (0, 0, 2)),
+        ),
         "yx_grid_z_staggered": (
             ((0, 0, 0), (2, 0, 14), (4, 8, 0), (6, 8, 14)),
             ((0, 0, 0), (0, 0, 0), (0, 0, 0), (0, 0, 0)),
@@ -540,6 +544,10 @@ def _create_opm_v2_tiled_ground_truth_zarr(
     scan_axis_step_um = config.scan_axis_step_um
     theta_deg = config.theta_deg
     camera_shape = config.camera_shape_zyx
+    true_stage_offsets = np.asarray(config.tile_offsets_zyx_px, dtype=np.float64)
+    true_image_offsets = true_stage_offsets.copy()
+    true_image_offsets[:, 1] += true_stage_offsets[:, 0] / np.tan(np.deg2rad(theta_deg))
+    true_image_offsets = np.rint(true_image_offsets).astype(np.int64)
     excess_scan_positions = 1 if mode == "stage" else 0
     stored_scan_count = camera_shape[0] + excess_scan_positions
     shape = (
@@ -557,7 +565,7 @@ def _create_opm_v2_tiled_ground_truth_zarr(
         pixel_size=pixel_size_um,
         crop_after_deskew=False,
     )
-    max_offsets = np.max(np.asarray(config.tile_offsets_zyx_px), axis=0)
+    max_offsets = np.max(true_image_offsets, axis=0)
     ground_truth_shape = tuple(
         int(tile_size + offset) for tile_size, offset in zip(tile_zyx, max_offsets)
     )
@@ -565,6 +573,7 @@ def _create_opm_v2_tiled_ground_truth_zarr(
     rng = np.random.default_rng(config.rng_seed)
     ground_truth = np.zeros(ground_truth_shape, dtype=np.float32)
     ellipsoids = []
+    ellipsoid_amplitudes = []
     for z_index, center_z in enumerate(
         np.arange(4.0, ground_truth_shape[0] - 2.0, 5.0)
     ):
@@ -577,30 +586,33 @@ def _create_opm_v2_tiled_ground_truth_zarr(
                 if (z_index + y_index + x_index) % 2 == 0:
                     ellipsoids.append(
                         (
-                            center_z,
-                            center_y,
-                            center_x,
-                            2.5 + 0.2 * (x_index % 2),
-                            5.5 + 0.5 * (z_index % 2),
-                            4.0 + 0.4 * (y_index % 2),
+                            center_z + rng.uniform(-0.6, 0.6),
+                            center_y + rng.uniform(-1.2, 1.2),
+                            center_x + rng.uniform(-1.0, 1.0),
+                            2.2 + rng.uniform(0.0, 0.8),
+                            4.8 + rng.uniform(0.0, 1.8),
+                            3.4 + rng.uniform(0.0, 1.4),
                         )
                     )
+                    ellipsoid_amplitudes.append(rng.uniform(4500.0, 8500.0))
     ellipsoids_zyx_radii = tuple(ellipsoids)
     zz, yy, xx = np.indices(ground_truth_shape, dtype=np.float32)
-    for (
+    for amplitude, (
         center_z,
         center_y,
         center_x,
         radius_z,
         radius_y,
         radius_x,
-    ) in ellipsoids_zyx_radii:
+    ) in zip(ellipsoid_amplitudes, ellipsoids_zyx_radii):
         elliptical_radius = np.sqrt(
             ((zz - center_z) / radius_z) ** 2
             + ((yy - center_y) / radius_y) ** 2
             + ((xx - center_x) / radius_x) ** 2
         )
-        ground_truth += 6500.0 * np.exp(-0.5 * ((elliptical_radius - 1.0) / 0.13) ** 2)
+        ground_truth += amplitude * np.exp(
+            -0.5 * ((elliptical_radius - 1.0) / 0.13) ** 2
+        )
     ground_truth = np.clip(ground_truth, 0.0, 40_000.0)
 
     scan, camera_y, camera_x = np.indices(camera_shape, dtype=np.float32)
@@ -617,7 +629,7 @@ def _create_opm_v2_tiled_ground_truth_zarr(
 
     raw_data = np.zeros(shape, dtype=np.uint16)
     for position, (tile_z_offset, tile_y_offset, tile_x_offset) in enumerate(
-        config.tile_offsets_zyx_px
+        true_image_offsets
     ):
         tile_sample_z = sample_z + tile_z_offset
         tile_sample_y = sample_y + tile_y_offset
@@ -640,12 +652,13 @@ def _create_opm_v2_tiled_ground_truth_zarr(
             blurred = post_flip[::-1]
         raw_data[0, position, 0] = blurred
 
-    true_offsets = np.asarray(config.tile_offsets_zyx_px, dtype=np.float64)
     recorded_errors = np.asarray(
         config.recorded_position_errors_zyx_px, dtype=np.float64
     )
-    true_stage_positions_zxy = true_offsets * pixel_size_um
-    recorded_stage_positions_zxy = (true_offsets + recorded_errors) * pixel_size_um
+    true_stage_positions_zxy = true_stage_offsets * pixel_size_um
+    recorded_stage_positions_zxy = (
+        true_stage_offsets + recorded_errors
+    ) * pixel_size_um
     # OPM stage Y and image-placement Y point in opposite directions.
     true_stage_positions_zxy[:, 1] *= -1
     recorded_stage_positions_zxy[:, 1] *= -1
@@ -729,7 +742,9 @@ def _create_opm_v2_tiled_ground_truth_zarr(
         raw_data=raw_data,
         true_stage_positions_zxy=true_stage_positions_zxy,
         recorded_stage_positions_zxy=recorded_stage_positions_zxy,
-        tile_offsets_zyx_px=config.tile_offsets_zyx_px,
+        tile_offsets_zyx_px=tuple(
+            tuple(int(value) for value in offset) for offset in true_image_offsets
+        ),
         recorded_position_errors_zyx_px=recorded_errors,
         ellipsoids_zyx_radii=ellipsoids_zyx_radii,
         pixel_size_um=pixel_size_um,
@@ -761,8 +776,18 @@ def opm_v2_tiled_ground_truth_zarr(request, tmp_path) -> OpmV2TiledGroundTruthFi
 
 
 @pytest.fixture(
-    params=("yx_grid", "z_staggered", "yx_grid_z_staggered"),
-    ids=("yx-grid", "z-staggered", "yx-grid-z-staggered"),
+    params=(
+        "yx_grid",
+        "z_staggered",
+        "thin_z_staggered",
+        "yx_grid_z_staggered",
+    ),
+    ids=(
+        "yx-grid",
+        "z-staggered",
+        "thin-z-staggered",
+        "yx-grid-z-staggered",
+    ),
 )
 def opm_v2_spatial_tiling_ground_truth_zarr(
     request,

@@ -27,14 +27,13 @@ import math
 from collections import deque
 from collections.abc import Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from itertools import product
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import psutil
 import tensorstore as ts
-from numba import njit, prange
+from numba import njit
 from tqdm import tqdm
 from yaozarrs import v05
 from yaozarrs.write.v05 import prepare_image
@@ -42,12 +41,14 @@ from yaozarrs.write.v05 import prepare_image
 from opm_processing.cuda import preload_cuda_libraries
 from opm_processing.dataio.acquisition import (
     acquisition_stem,
+    inspect_acquisition,
     resolve_acquisition_path,
 )
 from opm_processing.dataio.position_collection import open_position_collection
 from opm_processing.imageprocessing.coordinates import (
     stage_positions_to_image_coordinates,
 )
+from opm_processing.imageprocessing.opmtools import orthogonal_deskew
 
 
 # -----------------------------------------------------------------------------
@@ -62,6 +63,7 @@ ssim_cuda: Any | None = None
 match_histograms: Any
 block_reduce: Any
 phase_cross_correlation: Any
+sobel_filter: Any
 
 _ssim_cpu: Any | None = None
 
@@ -73,17 +75,17 @@ try:
     import cupy as _cp  # type: ignore
     from cucim.skimage.exposure import match_histograms as _mh  # type: ignore
     from cucim.skimage.measure import block_reduce as _br  # type: ignore
+    from cucim.skimage.metrics import structural_similarity as _ssim_gpu  # type: ignore
     from cucim.skimage.registration import phase_cross_correlation as _pcc  # type: ignore
-    from opm_processing.imageprocessing.ssim_cuda import (  # type: ignore
-        structural_similarity_cupy_sep_shared as _ssim_cuda,
-    )
+    from cupyx.scipy.ndimage import sobel as _sobel  # type: ignore
 
     cp = _cp
     xp = _cp
     match_histograms = _mh
     block_reduce = _br
     phase_cross_correlation = _pcc
-    ssim_cuda = _ssim_cuda
+    sobel_filter = _sobel
+    ssim_cuda = _ssim_gpu
     USING_GPU = True
 except Exception as error:  # noqa: BLE001
     # GPU stack unavailable; fall back to CPU.
@@ -92,10 +94,12 @@ except Exception as error:  # noqa: BLE001
     from skimage.measure import block_reduce as _br  # type: ignore
     from skimage.metrics import structural_similarity as _cpu_ssim  # type: ignore
     from skimage.registration import phase_cross_correlation as _pcc  # type: ignore
+    from scipy.ndimage import sobel as _sobel  # type: ignore
 
     match_histograms = _mh
     block_reduce = _br
     phase_cross_correlation = _pcc
+    sobel_filter = _sobel
     _ssim_cpu = _cpu_ssim
     USING_GPU = False
 
@@ -155,7 +159,17 @@ def _ssim(arr1: Any, arr2: Any, win_size: int) -> float:
         Structural similarity index in [-1, 1] (typically [0, 1] for images).
     """
     if USING_GPU and ssim_cuda is not None:
-        return float(ssim_cuda(arr1, arr2, win_size=win_size))
+        data_range = float(xp.ptp(arr1))
+        if data_range == 0.0:
+            data_range = 1.0
+        return float(
+            ssim_cuda(
+                arr1,
+                arr2,
+                win_size=win_size,
+                data_range=data_range,
+            )
+        )
 
     if _ssim_cpu is None:
         raise RuntimeError("CPU SSIM backend is unavailable.")
@@ -175,13 +189,7 @@ def _aligned_registration_views(
     moving: Any,
     shift: Sequence[float],
 ) -> tuple[Any, Any]:
-    """Return corresponding valid views after applying an integer moving shift.
-
-    Registration uses subpixel phase correlation, but SSIM is only an acceptance
-    score. Scoring the nearest integer-aligned overlap avoids resampling the
-    entire volume and excludes the artificial zero padding introduced by an
-    image-shift operation.
-    """
+    """Return corresponding valid views after an integer moving-image shift."""
     if fixed.shape != moving.shape:
         raise ValueError("registration patches must have matching shapes")
     if fixed.ndim != len(shift):
@@ -203,74 +211,74 @@ def _aligned_registration_views(
     return fixed[tuple(fixed_slices)], moving[tuple(moving_slices)]
 
 
-def _bounded_disambiguate_shift(
-    fixed: np.ndarray,
-    moving: np.ndarray,
-    periodic_shift: Sequence[float],
-    max_shift: Sequence[float] | None,
-) -> np.ndarray:
-    """Resolve Fourier wraparound among physically permitted shift candidates.
+def _bounded_phase_correlation_peak(
+    fixed: Any,
+    moving: Any,
+    max_shift: Sequence[float],
+) -> Any:
+    """Return the strongest phase-correlation peak inside physical shift limits."""
+    limits = xp.asarray(max_shift, dtype=xp.float32)
+    if limits.shape != (fixed.ndim,):
+        raise ValueError("maximum shift rank must match registration patch rank")
 
-    Phase correlation reports each axis modulo its array length. When the
-    permitted correction reaches beyond half an array dimension, compare the
-    few equivalent candidates directly over their valid real-space overlaps.
-    This supplies the disambiguation needed by small overlaps without shifting
-    and rescoring every full-volume wraparound quadrant.
-    """
-    shift = np.asarray(periodic_shift, dtype=np.float32)
-    if shift.shape != (fixed.ndim,):
-        raise ValueError("periodic shift rank must match the patch rank")
-    if max_shift is None:
-        return shift
+    frequency_product = xp.fft.fftn(fixed) * xp.fft.fftn(moving).conj()
+    magnitude = xp.abs(frequency_product)
+    epsilon = xp.finfo(magnitude.dtype).eps
+    frequency_product /= xp.maximum(magnitude, epsilon)
+    cross_correlation = xp.abs(xp.fft.ifftn(frequency_product))
 
-    limits = np.asarray(max_shift, dtype=np.float32)
-    if limits.shape != shift.shape:
-        raise ValueError("maximum shift rank must match the patch rank")
+    valid_peak = xp.ones(cross_correlation.shape, dtype=xp.bool_)
+    signed_coordinates: list[Any] = []
+    for axis, (length, limit) in enumerate(zip(cross_correlation.shape, limits)):
+        coordinates = xp.arange(length)
+        signed = xp.where(
+            coordinates > length // 2,
+            coordinates - length,
+            coordinates,
+        )
+        signed_coordinates.append(signed)
+        reshape = [1] * cross_correlation.ndim
+        reshape[axis] = length
+        valid_peak &= xp.abs(signed.reshape(reshape)) <= limit
 
-    axis_candidates: list[list[float]] = []
-    for value, length, limit in zip(shift, fixed.shape, limits):
-        candidates = {
-            float(value) + cycle * int(length)
-            for cycle in (-1, 0, 1)
-            if abs(float(value) + cycle * int(length)) <= float(limit) + 0.5
-        }
-        if not candidates:
-            candidates = {float(value)}
-        axis_candidates.append(sorted(candidates, key=lambda item: (abs(item), item)))
+    peak_index = xp.unravel_index(
+        xp.argmax(xp.where(valid_peak, cross_correlation, -xp.inf)),
+        cross_correlation.shape,
+    )
+    return xp.asarray(
+        [signed_coordinates[axis][index] for axis, index in enumerate(peak_index)],
+        dtype=xp.float32,
+    )
 
-    if math.prod(len(candidates) for candidates in axis_candidates) == 1:
-        return shift
 
-    best_shift = shift
-    best_score = -math.inf
-    for candidate_values in product(*axis_candidates):
-        try:
-            fixed_view, moving_view = _aligned_registration_views(
-                fixed,
-                moving,
-                candidate_values,
-            )
-        except ValueError:
-            continue
+class _RegistrationDeviceBuffers:
+    """Grow-only reusable CuPy staging buffers for a registration pair."""
 
-        sample_count = int(math.prod(fixed_view.shape))
-        if sample_count < 2:
-            continue
-        fixed_sum = np.sum(fixed_view, dtype=np.float64)
-        moving_sum = np.sum(moving_view, dtype=np.float64)
-        cross_sum = np.sum(fixed_view * moving_view, dtype=np.float64)
-        fixed_sq_sum = np.sum(fixed_view * fixed_view, dtype=np.float64)
-        moving_sq_sum = np.sum(moving_view * moving_view, dtype=np.float64)
-        covariance = cross_sum - fixed_sum * moving_sum / sample_count
-        fixed_energy = fixed_sq_sum - fixed_sum * fixed_sum / sample_count
-        moving_energy = moving_sq_sum - moving_sum * moving_sum / sample_count
-        denominator = math.sqrt(max(fixed_energy * moving_energy, 0.0))
-        score = covariance / denominator if denominator > 0.0 else -math.inf
-        if score > best_score:
-            best_score = score
-            best_shift = np.asarray(candidate_values, dtype=np.float32)
+    def __init__(self, cupy_module: Any) -> None:
+        self._cupy = cupy_module
+        self._buffers: list[Any | None] = [None, None]
+        self._dtypes: list[np.dtype[Any] | None] = [None, None]
 
-    return best_shift
+    def _stage_one(self, index: int, host: np.ndarray) -> Any:
+        contiguous = np.ascontiguousarray(host)
+        dtype = contiguous.dtype
+        required = int(contiguous.size)
+        buffer = self._buffers[index]
+        if (
+            buffer is None
+            or self._dtypes[index] != dtype
+            or int(buffer.size) < required
+        ):
+            buffer = self._cupy.empty(required, dtype=dtype)
+            self._buffers[index] = buffer
+            self._dtypes[index] = dtype
+        view = buffer[:required].reshape(contiguous.shape)
+        view.set(contiguous)
+        return view
+
+    def stage(self, fixed: np.ndarray, moving: np.ndarray) -> tuple[Any, Any]:
+        """Copy a host pair into reusable device allocations."""
+        return self._stage_one(0, fixed), self._stage_one(1, moving)
 
 
 @njit(nogil=True)
@@ -278,6 +286,7 @@ def _accumulate_tile_block(
     fused: np.ndarray,
     weight: np.ndarray,
     sub: np.ndarray,
+    valid_zy: np.ndarray,
     z_weights: np.ndarray,
     y_weights: np.ndarray,
     x_weights: np.ndarray,
@@ -295,6 +304,10 @@ def _accumulate_tile_block(
         Float32 weight accumulation buffer of shape (dz, Y, X).
     sub : numpy.ndarray
         Tile slab of shape (C, sub_dz, Y_tile, X_tile) to blend.
+    valid_zy : numpy.ndarray
+        Metadata-derived deskew support for the slab, with shape
+        (sub_dz, Y_tile). Unsupported rows contribute neither signal nor weight;
+        pixel intensity is never used to infer support.
     z_weights, y_weights, x_weights : numpy.ndarray
         Separable float32 feather profiles for the tile sub-volume.
     z_off : int
@@ -318,19 +331,16 @@ def _accumulate_tile_block(
         y_i = idx % y_sub
         gz = z_off + dz_i
         gy = y_off + y_i
+        if not valid_zy[dz_i, y_i]:
+            continue
         base_w = weight[gz, gy]
         zy_weight = z_weights[dz_i] * y_weights[y_i]
         for x_i in range(x_sub):
             gx = x_off + x_i
             w_val = zy_weight * x_weights[x_i]
             base_w[gx] += w_val
-        for c in range(c_dim):
-            sub_line = sub[c, dz_i, y_i]
-            base_f = fused[c, gz, gy]
-            for x_i in range(x_sub):
-                gx = x_off + x_i
-                w_val = zy_weight * x_weights[x_i]
-                base_f[gx] += sub_line[x_i] * w_val
+            for c in range(c_dim):
+                fused[c, gz, gy, gx] += sub[c, dz_i, y_i, x_i] * w_val
 
 
 @njit(nogil=True)
@@ -430,7 +440,7 @@ def _partition_fusion_block(
     return regions
 
 
-def _select_registration_pairs(
+def _select_nearest_registration_pairs(
     positions_zyx: Sequence[Sequence[float]],
     tile_shape_zyx: Sequence[int],
     pixel_size_zyx: Sequence[float],
@@ -548,173 +558,33 @@ def _select_registration_pairs(
     return selected
 
 
-def _crop_registration_overlap(
-    bounds_i: Sequence[tuple[int, int]],
-    bounds_j: Sequence[tuple[int, int]],
-    downsample_factors_zyx: Sequence[int],
-    max_downsampled_shape_zyx: Sequence[int],
-) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
-    """Center-crop corresponding overlap bounds to a bounded registration ROI.
+def _select_registration_pairs(
+    positions_zyx: Sequence[Sequence[float]],
+    tile_shape_zyx: Sequence[int],
+    pixel_size_zyx: Sequence[float],
+    *,
+    is_2d: bool = False,
+) -> list[tuple[int, int]]:
+    """Return every pair whose physical tile bounding boxes overlap."""
+    positions = np.asarray(positions_zyx, dtype=np.float64)
+    tile_shape = np.asarray(tile_shape_zyx, dtype=np.float64)
+    pixel_size = np.asarray(pixel_size_zyx, dtype=np.float64)
+    if positions.ndim != 2 or positions.shape[1] != 3:
+        raise ValueError("positions_zyx must have shape (positions, 3)")
+    if tile_shape.shape != (3,) or pixel_size.shape != (3,):
+        raise ValueError("tile_shape_zyx and pixel_size_zyx must have length 3")
 
-    Both tiles are trimmed identically on every axis, preserving their physical
-    correspondence while avoiding full-face reads that are immediately reduced
-    for registration.
-
-    Parameters
-    ----------
-    bounds_i, bounds_j
-        Corresponding ZYX overlap bounds for the two tiles.
-    downsample_factors_zyx
-        Registration reduction factors in ZYX order.
-    max_downsampled_shape_zyx
-        Maximum reduced registration ROI shape in ZYX order.
-
-    Returns
-    -------
-    tuple[list[tuple[int, int]], list[tuple[int, int]]]
-        Cropped bounds for the two tiles.
-    """
-    if not (
-        len(bounds_i)
-        == len(bounds_j)
-        == len(downsample_factors_zyx)
-        == len(max_downsampled_shape_zyx)
-        == 3
-    ):
-        raise ValueError("registration overlap arguments must all have length 3")
-
-    cropped_i: list[tuple[int, int]] = []
-    cropped_j: list[tuple[int, int]] = []
-    for first, second, factor, target in zip(
-        bounds_i,
-        bounds_j,
-        downsample_factors_zyx,
-        max_downsampled_shape_zyx,
-    ):
-        first_length = int(first[1]) - int(first[0])
-        second_length = int(second[1]) - int(second[0])
-        if first_length != second_length or first_length <= 0:
-            raise ValueError("paired registration overlap bounds must match")
-
-        maximum_length = max(1, int(factor)) * max(1, int(target))
-        retained_length = min(first_length, maximum_length)
-        trim_before = (first_length - retained_length) // 2
-        trim_after = first_length - retained_length - trim_before
-        cropped_i.append((int(first[0]) + trim_before, int(first[1]) - trim_after))
-        cropped_j.append((int(second[0]) + trim_before, int(second[1]) - trim_after))
-
-    return cropped_i, cropped_j
-
-
-def _deskew_geometry_crop_y(
-    deskewed_z: int,
-    angle_deg: float,
-    voxel_size_zyx: Sequence[float],
-    stored_y: int,
-) -> int:
-    """Return the rectangular Y crop implied by the oblique camera geometry."""
-    if deskewed_z < 2 or stored_y < 1:
-        raise ValueError("deskewed Z and stored Y dimensions must be positive")
-    if len(voxel_size_zyx) != 3 or any(
-        float(value) <= 0.0 for value in voxel_size_zyx
-    ):
-        raise ValueError("deskewed voxel size must contain three positive values")
-    angle_rad = math.radians(float(angle_deg))
-    if not 0.0 < abs(angle_rad) < math.pi / 2:
-        raise ValueError("OPM angle must be strictly between 0 and 90 degrees")
-    z_extent_in_y_pixels = (
-        deskewed_z * float(voxel_size_zyx[0]) / float(voxel_size_zyx[1])
-    )
-    crop_y = int(math.ceil(z_extent_in_y_pixels / abs(math.tan(angle_rad))))
-    if 2 * crop_y >= stored_y:
-        raise ValueError(
-            "deskew geometry crop would remove the entire stored Y dimension: "
-            f"{crop_y} pixels per side from {stored_y}"
-        )
-    return crop_y
-
-
-def _processing_step_applied(
-    attributes: dict[str, Any],
-    step_name: str,
-) -> bool:
-    """Return whether a named recorded processing step was already applied."""
-    provenance = attributes.get("opm_processing")
-    if not isinstance(provenance, dict):
-        return False
-    steps = provenance.get("steps")
-    if not isinstance(steps, list):
-        return False
-    return any(
-        isinstance(step, dict)
-        and step.get("name") == step_name
-        and bool(step.get("applied"))
-        for step in steps
-    )
-
-
-@njit(parallel=True, nogil=True, cache=True)
-def _mean_downsample_3d_cpu(
-    source: np.ndarray,
-    z_factor: int,
-    y_factor: int,
-    x_factor: int,
-) -> np.ndarray:
-    """Mean-downsample one ZYX array with a parallel bounded reduction."""
-    z_size, y_size, x_size = source.shape
-    out_z = (z_size + z_factor - 1) // z_factor
-    out_y = (y_size + y_factor - 1) // y_factor
-    out_x = (x_size + x_factor - 1) // x_factor
-    output = np.empty((out_z, out_y, out_x), dtype=np.float32)
-    output_size = out_z * out_y * out_x
-
-    for output_index in prange(output_size):
-        out_z_index = output_index // (out_y * out_x)
-        remainder = output_index - out_z_index * out_y * out_x
-        out_y_index = remainder // out_x
-        out_x_index = remainder - out_y_index * out_x
-        z_start = out_z_index * z_factor
-        y_start = out_y_index * y_factor
-        x_start = out_x_index * x_factor
-
-        total = np.float32(0.0)
-        count = 0
-        for z in range(z_start, min(z_start + z_factor, z_size)):
-            for y in range(y_start, min(y_start + y_factor, y_size)):
-                for x in range(x_start, min(x_start + x_factor, x_size)):
-                    total += np.float32(source[z, y, x])
-                    count += 1
-        output[out_z_index, out_y_index, out_x_index] = total / count
-
-    return output
-
-
-def _mean_downsample_registration(
-    array: np.ndarray,
-    factors: Sequence[int],
-) -> np.ndarray:
-    """Mean-downsample a 2D/3D registration patch without generic block reduction."""
-    source_array = np.asarray(array)
-    if source_array.ndim not in (2, 3):
-        raise ValueError("registration patches must be 2D or 3D")
-    if len(factors) != source_array.ndim or any(int(value) < 1 for value in factors):
-        raise ValueError("downsampling factors must match the patch rank")
-
-    was_2d = source_array.ndim == 2
-    if was_2d:
-        source_array = source_array[None, ...]
-        factors_zyx = (1, int(factors[0]), int(factors[1]))
-    else:
-        factors_zyx = tuple(int(value) for value in factors)
-
-    z_factor, y_factor, x_factor = factors_zyx
-    reduced = _mean_downsample_3d_cpu(
-        source_array,
-        z_factor,
-        y_factor,
-        x_factor,
-    )
-    return reduced[0] if was_2d else reduced
+    physical_shape = tile_shape * pixel_size
+    selected = []
+    for left in range(len(positions)):
+        for right in range(left + 1, len(positions)):
+            delta = positions[right] - positions[left]
+            if is_2d:
+                delta = delta.copy()
+                delta[0] = 0.0
+            if np.all(np.abs(delta) < physical_shape):
+                selected.append((left, right))
+    return selected
 
 
 class TileFusion:
@@ -759,9 +629,6 @@ class TileFusion:
         Channel index used for registration.
     reverse_stage_y : bool, default=True
         Reverse stage-derived Y for tile placement without flipping tile pixels.
-    crop_deskewed_trapezoid : bool, default=False
-        Crop the geometry-derived trapezoidal Y ends from deskewed volumes before
-        registration and fusion.
     multiscale_downsample : {"stride", "block_mean"}, default="stride"
         Method for multiscale downsampling.
     fusion_ram_fraction : float, default=0.4
@@ -798,7 +665,6 @@ class TileFusion:
         optimization_abs_threshold: float = 1.5,
         max_registration_shift_zyx: tuple[int, int, int] = (20, 50, 100),
         reverse_stage_y: bool = True,
-        crop_deskewed_trapezoid: bool = False,
     ) -> None:
         """Initialize registration and fusion for a processed acquisition.
 
@@ -843,9 +709,6 @@ class TileFusion:
         reverse_stage_y
             Whether to reverse stage-derived image-Y placement. Tile pixel
             arrays are not modified.
-        crop_deskewed_trapezoid
-            Whether to crop both Y ends using the OPM angle, deskewed Z extent,
-            and voxel sizes before registration and fusion.
 
         Returns
         -------
@@ -874,9 +737,38 @@ class TileFusion:
             )
         self.data = data_path
 
+        if max_workers is None:
+            max_workers = _default_fusion_workers()
+        if max_workers < 1:
+            raise ValueError("max_workers must be at least 1")
+        self._max_workers = int(max_workers)
+        self._source_cache_bytes = min(
+            4 * 1024**3,
+            max(1, int(psutil.virtual_memory().available * 0.1)),
+        )
+        self._source_context = ts.Context(
+            {
+                "cache_pool": {
+                    "total_bytes_limit": self._source_cache_bytes,
+                },
+                "data_copy_concurrency": {
+                    "limit": min(8, self._max_workers),
+                },
+            }
+        )
         collection = open_position_collection(self.data)
         self._input_attributes = dict(collection.attributes)
-        self.position_arrays = collection.arrays
+        source_open_futures = [
+            ts.open(
+                array.spec(retain_context=False),
+                context=self._source_context,
+                recheck_cached_data=False,
+            )
+            for array in collection.arrays
+        ]
+        self.position_arrays = tuple(
+            future.result() for future in source_open_futures
+        )
         try:
             input_chunks = self.position_arrays[0].chunk_layout.read_chunk.shape
             self._input_chunk_zyx = tuple(int(value) for value in input_chunks[-3:])
@@ -893,6 +785,7 @@ class TileFusion:
             for position in stage_positions_to_image_coordinates(
                 stage_positions,
                 reverse_y=self.reverse_stage_y,
+                opm_angle_deg=float(self._input_attributes["opm_tilt_deg"]),
             )
         ]
         self._pixel_size: tuple[float, float, float] = tuple(
@@ -909,11 +802,6 @@ class TileFusion:
             tuple(r) if hasattr(r, "__len__") else (int(r), int(r), int(r))
             for r in resolution_multiples
         ]
-        if max_workers is None:
-            max_workers = _default_fusion_workers()
-        if max_workers < 1:
-            raise ValueError("max_workers must be at least 1")
-        self._max_workers = int(max_workers)
         self._debug = bool(debug)
         self.metrics_filename = str(metrics_filename)
         self._blend_pixels = tuple(int(x) for x in blend_pixels)
@@ -944,8 +832,6 @@ class TileFusion:
         self.max_registration_shift_zyx = tuple(
             int(value) for value in max_registration_shift_zyx
         )
-        self.crop_deskewed_trapezoid = bool(crop_deskewed_trapezoid)
-
         (
             self.time_dim,
             self.position_dim,
@@ -955,11 +841,7 @@ class TileFusion:
             self.x_dim,
         ) = collection.shape
         self._is_2d = self.z_dim == 1
-        self._source_y_dim = int(self.y_dim)
-        self._source_y_start = 0
-        self.deskew_geometry_crop_y = 0
-        if self.crop_deskewed_trapezoid:
-            self._configure_deskew_geometry_crop()
+        self._deskew_support_zy = self._build_deskew_support_mask()
         if not 0 <= self.channel_to_use < int(self.channels):
             raise ValueError(
                 "channel_to_use must be between 0 and "
@@ -1009,50 +891,81 @@ class TileFusion:
         """
         self._debug = bool(flag)
 
-    def _configure_deskew_geometry_crop(self) -> None:
-        """Convert stored tiles to their rectangular geometry-cropped Y extent."""
-        if _processing_step_applied(
-            self._input_attributes,
-            "crop_after_deskew",
+    def _build_deskew_support_mask(self) -> np.ndarray:
+        """Generate exact deskew support from metadata without reading pixels."""
+        stored_input_shape = self._input_attributes.get("deskew_input_shape_zyx")
+        if (
+            isinstance(stored_input_shape, (list, tuple))
+            and len(stored_input_shape) == 3
         ):
-            return
+            scan_count = int(stored_input_shape[0])
+            raw_camera_y = int(stored_input_shape[1])
+        else:
+            acquisition = inspect_acquisition(self.root)
+            raw_sizes = acquisition.index_sizes
+            try:
+                raw_scan_count = int(raw_sizes["z"])
+                raw_camera_y = int(raw_sizes["y"])
+            except KeyError as error:
+                raise ValueError(
+                    "Acquisition metadata must contain raw Z and Y dimensions"
+                ) from error
+            scan_count = (
+                raw_scan_count
+                - int(
+                    acquisition.excess_scan_start_positions
+                    or acquisition.excess_scan_positions
+                )
+                - int(acquisition.excess_scan_end_positions)
+            )
+        if scan_count < 2 or raw_camera_y < 2:
+            raise ValueError("Acquisition geometry cannot produce a deskew mask")
 
+        try:
+            angle_deg = float(self._input_attributes["opm_tilt_deg"])
+            scan_step_um = float(self._input_attributes["scan_axis_step_um"])
+            raw_pixel_size_um = float(self._input_attributes["raw_pixel_size_um"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(
+                "Processed metadata lacks the deskew geometry parameters"
+            ) from error
+        z_downsample = int(round(float(self._pixel_size[0]) / raw_pixel_size_um))
+        if z_downsample < 1:
+            raise ValueError("Deskew Z downsampling must be positive")
+
+        support = (
+            orthogonal_deskew(
+                np.full(
+                    (scan_count, raw_camera_y, 1),
+                    1024.0,
+                    dtype=np.float32,
+                ),
+                theta=angle_deg,
+                distance=scan_step_um,
+                pixel_size=raw_pixel_size_um,
+                divisible_by=1,
+                downsample_factor=z_downsample,
+            )[..., 0]
+            != 0
+        )
         if self._is_2d:
+            support = np.any(support, axis=0, keepdims=True)
+        if int(support.shape[0]) != int(self.z_dim):
             raise ValueError(
-                "--crop-ends requires a volumetric deskewed input"
+                "Metadata-derived deskew support Z does not match processed data: "
+                f"{support.shape[0]} != {self.z_dim}"
             )
-        angle_deg = self._input_attributes.get("opm_tilt_deg")
-        if angle_deg is None:
+        if int(support.shape[1]) > int(self.y_dim):
             raise ValueError(
-                "Cannot crop deskew geometry because acquisition metadata lacks "
-                "the OPM angle"
+                "Metadata-derived deskew support Y exceeds processed data: "
+                f"{support.shape[1]} > {self.y_dim}"
             )
-
-        crop_y = _deskew_geometry_crop_y(
-            int(self.z_dim),
-            float(angle_deg),
-            self._pixel_size,
-            int(self._source_y_dim),
+        padded_support = np.zeros(
+            (int(self.z_dim), int(self.y_dim)),
+            dtype=bool,
         )
-        self._source_y_start = crop_y
-        self.deskew_geometry_crop_y = crop_y
-        self.y_dim = int(self._source_y_dim) - 2 * crop_y
-
-        leading_crop_um = crop_y * float(self._pixel_size[1])
-        self._tile_positions = [
-            (float(z), float(y) + leading_crop_um, float(x))
-            for z, y, x in self._tile_positions
-        ]
-
-    def _source_y_slice(self, cropped_slice: slice) -> slice:
-        """Map an effective cropped-tile Y slice to the stored source tile."""
-        start, stop, step = cropped_slice.indices(int(self.y_dim))
-        if step != 1:
-            raise ValueError("fusion Y slices must use a unit positive step")
-        return slice(
-            start + int(self._source_y_start),
-            stop + int(self._source_y_start),
-        )
+        padded_support[:, : support.shape[1]] = support
+        return padded_support
 
     def _update_profiles(self) -> None:
         """Recompute 1D feather profiles from blend_pixels and current data shape.
@@ -1086,8 +999,9 @@ class TileFusion:
         Returns
         -------
         prof : numpy.ndarray
-            Float32 array of shape (length,). Values are in [0, 1] with ramped
-            edges; for very small `length` (<= 2) or `blend` <= 0, returns ones.
+            Float32 array of shape (length,). Values are in (0, 1] with
+            pixel-centered ramped edges; for very small `length` (<= 2) or
+            `blend` <= 0, returns ones.
 
         Raises
         ------
@@ -1107,19 +1021,14 @@ class TileFusion:
         prof = np.ones(length, dtype=np.float32)
 
         if blend >= length:
-            x = np.linspace(0.0, 1.0, length, dtype=np.float32)
-            tent = 1.0 - np.abs(2.0 * x - 1.0)
-            tent[0] = 0.0
-            tent[-1] = 0.0
-            tent[1:-1] = np.maximum(tent[1:-1], np.float32(1e-6))
+            indices = np.arange(length, dtype=np.float32)
+            tent = np.minimum(indices + 1.0, length - indices)
+            tent /= tent.max()
             return tent.astype(np.float32, copy=False)
 
-        ramp = np.linspace(0.0, 1.0, blend, endpoint=False, dtype=np.float32)
+        ramp = np.arange(1, blend + 1, dtype=np.float32) / np.float32(blend)
         prof[:blend] = ramp
         prof[-blend:] = ramp[::-1]
-
-        if float(prof.max()) <= 0.0:
-            prof[:] = 1.0
         return prof
 
     def _read_tile_volume(
@@ -1178,7 +1087,6 @@ class TileFusion:
                 f"tile_idx={tile_idx} maps to t_idx={t_idx}, but time_dim={self.time_dim}"
             )
 
-        y_slice = self._source_y_slice(y_slice)
         if self._is_2d:
             arr = (
                 self.position_arrays[pos_idx][t_idx, ch_sel, 0, y_slice, x_slice]
@@ -1202,20 +1110,38 @@ class TileFusion:
         )
         return arr if dtype is None else arr.astype(dtype, copy=False)
 
+    def _read_registration_patch(
+        self,
+        tile_idx: int,
+        channel_index: int,
+        bounds_zyx: tuple[tuple[int, int], tuple[int, int], tuple[int, int]],
+    ) -> np.ndarray:
+        """Read one overlap through TensorStore's shared native chunk cache."""
+        return self._read_tile_volume(
+            tile_idx,
+            channel_index,
+            slice(*bounds_zyx[0]),
+            slice(*bounds_zyx[1]),
+            slice(*bounds_zyx[2]),
+            dtype=None,
+        )
+
     @staticmethod
     def register_and_score(
         g1: Any,
         g2: Any,
         win_size: int,
         max_shift: Sequence[float] | None = None,
+        allow_bounded_peak: bool = True,
+        registration_axis: int | None = None,
     ) -> tuple[tuple[float, float, float], float]:
         """Register `g2` to `g1` and compute an SSIM score.
 
         Steps:
         1) histogram-match g2 -> g1
         2) phase cross-correlation to estimate subpixel shift
-        3) extract corresponding valid views at the nearest integer shift
-        4) compute SSIM over that aligned overlap
+        3) shift g2 by that estimate
+        4) compute SSIM between g1 and shifted g2
 
         Parameters
         ----------
@@ -1226,9 +1152,17 @@ class TileFusion:
         win_size : int
             SSIM window size.
         max_shift : sequence[float] or None
-            Maximum permitted shift in downsampled patch coordinates. When an
-            axis can wrap within this range, equivalent Fourier shifts are
-            disambiguated by direct overlap correlation.
+            Maximum permitted shift in downsampled patch coordinates. The
+            upstream fully disambiguated result is used when it lies inside
+            these limits; otherwise the strongest bounded phase peak is used.
+        allow_bounded_peak : bool, default=True
+            Whether an out-of-range upstream result may be replaced by the
+            strongest in-range periodic peak. Thin-Z overlaps disable this
+            because their bounded alternatives are underdetermined.
+        registration_axis : int or None, default=None
+            Axis normal to the physical tile boundary. When provided, an
+            edge-based phase-correlation candidate is scored alongside the
+            intensity candidate to suppress periodic crop-boundary bias.
 
         Returns
         -------
@@ -1249,59 +1183,108 @@ class TileFusion:
             arr1 = arr1[0]
             arr2 = arr2[0]
 
-        data_range_1 = float(xp.max(arr1) - xp.min(arr1))
-        data_range_2 = float(xp.max(arr2) - xp.min(arr2))
-        if (
-            not math.isfinite(data_range_1)
-            or not math.isfinite(data_range_2)
-            or data_range_1 <= 0.0
-            or data_range_2 <= 0.0
-        ):
-            return (0.0, 0.0, 0.0), float("nan")
-
         arr2 = match_histograms(arr2, arr1)
+        disambiguate = True
+        if max_shift is not None:
+            limits = xp.asarray(max_shift, dtype=xp.float32)
+            if limits.shape != (arr1.ndim,):
+                raise ValueError(
+                    "maximum shift rank must match registration patch rank"
+                )
+            disambiguate = not all(
+                2.0 * float(limit) < float(length)
+                for limit, length in zip(max_shift, arr1.shape)
+            )
 
-        shift, _, _ = phase_cross_correlation(
-            arr1,
-            arr2,
-            # Resolve only physically permitted wraparound candidates below.
-            # cuCIM's generic path shifts the full volume and correlates every
-            # wraparound quadrant, including candidates outside our bounds.
-            disambiguate=False,
-            normalization="phase",
-            upsample_factor=10,
-            overlap_ratio=0.5,
-        )
+        def correlate(fixed: Any, moving: Any) -> Any:
+            shift, _, _ = phase_cross_correlation(
+                fixed,
+                moving,
+                disambiguate=disambiguate,
+                normalization="phase",
+                upsample_factor=10,
+                overlap_ratio=0.5,
+            )
+            result = xp.asarray(shift, dtype=xp.float32)
+            if (
+                not disambiguate
+                and max_shift is not None
+                and bool(xp.any(xp.abs(result) >= limits * 0.5))
+            ):
+                shift, _, _ = phase_cross_correlation(
+                    fixed,
+                    moving,
+                    disambiguate=True,
+                    normalization="phase",
+                    upsample_factor=10,
+                    overlap_ratio=0.5,
+                )
+                result = xp.asarray(shift, dtype=xp.float32)
+            return result
 
-        if USING_GPU and cp is not None:
-            shift_array = cp.asnumpy(cp.asarray(shift, dtype=cp.float32))
-        else:
-            shift_array = np.asarray(shift, dtype=np.float32)
-        shift_array = _bounded_disambiguate_shift(
-            np.asarray(g1, dtype=np.float32),
-            np.asarray(g2, dtype=np.float32),
-            shift_array,
-            max_shift,
-        )
+        def score_shift(candidate: Any) -> float:
+            try:
+                fixed_view, moving_view = _aligned_registration_views(
+                    arr1,
+                    arr2,
+                    candidate,
+                )
+                if min(fixed_view.shape) < win_size:
+                    return -math.inf
+                return _ssim(fixed_view, moving_view, win_size=win_size)
+            except ValueError:
+                return -math.inf
 
-        arr1_score, arr2_score = _aligned_registration_views(
-            arr1,
-            arr2,
-            shift_array,
-        )
-        # The custom CUDA SSIM kernels consume dense ZYX buffers. Cropped views
-        # generally retain parent strides, so materialize them before scoring.
-        arr1_score = xp.ascontiguousarray(arr1_score)
-        arr2_score = xp.ascontiguousarray(arr2_score)
-        score = _ssim(arr1_score, arr2_score, win_size=win_size)
+        shift_apply = correlate(arr1, arr2)
+        if max_shift is not None and limits.shape != shift_apply.shape:
+            raise ValueError(
+                "maximum shift rank must match registration patch rank"
+            )
+        if (
+            max_shift is not None
+            and allow_bounded_peak
+            and bool(xp.any(xp.abs(shift_apply) > limits))
+        ):
+            shift_apply = _bounded_phase_correlation_peak(
+                arr1,
+                arr2,
+                max_shift,
+            )
 
-        if arr1.ndim == 2 and len(shift_array) == 2:
-            out_shift = np.asarray(
-                [0.0, shift_array[0], shift_array[1]],
-                dtype=np.float32,
+        score = score_shift(shift_apply)
+        if registration_axis is not None:
+            axis = int(registration_axis)
+            if not 0 <= axis < arr1.ndim:
+                raise ValueError("registration_axis is outside the patch rank")
+            edge_shift = correlate(
+                sobel_filter(arr1, axis=axis),
+                sobel_filter(arr2, axis=axis),
+            )
+            edge_is_allowed = max_shift is None or not bool(
+                xp.any(xp.abs(edge_shift) > limits)
+            )
+            if edge_is_allowed and not bool(
+                xp.all(xp.rint(edge_shift) == xp.rint(shift_apply))
+            ):
+                edge_score = score_shift(edge_shift)
+                if edge_score > score:
+                    shift_apply = edge_shift
+                    score = edge_score
+
+        if arr1.ndim == 2 and len(shift_apply) == 2:
+            shift_ret = xp.concatenate(
+                (
+                    xp.zeros(1, dtype=xp.float32),
+                    shift_apply.astype(xp.float32, copy=False),
+                )
             )
         else:
-            out_shift = shift_array
+            shift_ret = shift_apply
+
+        if USING_GPU and cp is not None:
+            out_shift = cp.asnumpy(shift_ret)
+        else:
+            out_shift = np.asarray(shift_ret)
 
         return tuple(float(s) for s in out_shift), float(score)
 
@@ -1347,6 +1330,14 @@ class TileFusion:
 
         self.pairwise_metrics.clear()
         n_pos = int(self.position_dim)
+        nearest_registration_pairs = set(
+            _select_nearest_registration_pairs(
+                self._tile_positions[:n_pos],
+                (self.z_dim, self.y_dim, self.x_dim),
+                self._pixel_size,
+                is_2d=self._is_2d,
+            )
+        )
         registration_pairs = _select_registration_pairs(
             self._tile_positions[:n_pos],
             (self.z_dim, self.y_dim, self.x_dim),
@@ -1374,22 +1365,27 @@ class TileFusion:
         df_zyx_base = (int(df_in[0]), int(df_in[1]), int(df_in[2]))
         if int(self.z_dim) == 1:
             df_zyx_base = (1, df_zyx_base[1], df_zyx_base[2])
-        max_downsampled_shape_zyx = (
-            min(64, int(self.z_dim)),
-            min(512, int(self.y_dim)),
-            min(512, int(self.x_dim)),
+        available_host_bytes = int(psutil.virtual_memory().available)
+        read_workers = min(4, max(1, self._max_workers))
+        device_buffers = (
+            _RegistrationDeviceBuffers(cp)
+            if USING_GPU and cp is not None
+            else None
         )
 
-        with ThreadPoolExecutor(max_workers=min(2, self._max_workers)) as executor:
+        with ThreadPoolExecutor(max_workers=read_workers) as executor:
             for t in range(int(self.time_dim)):
                 base = t * n_pos
-
-                for i_pos, j_pos in tqdm(
-                    registration_pairs,
-                    desc=f"register pairs t={t + 1}/{int(self.time_dim)}",
-                    leave=False,
-                    unit="pair",
-                ):
+                candidates: dict[
+                    tuple[int, int],
+                    tuple[int, int, int, float],
+                ] = {}
+                candidate_scores: dict[tuple[int, int], float] = {}
+                pair_specs = []
+                input_itemsize = int(
+                    np.dtype(self.position_arrays[0].dtype.numpy_dtype).itemsize
+                )
+                for i_pos, j_pos in registration_pairs:
                     i = base + i_pos
                     j = base + j_pos
 
@@ -1415,65 +1411,169 @@ class TileFusion:
                         bounds_1d(-dy, int(self.y_dim)),
                         bounds_1d(-dx, int(self.x_dim)),
                     ]
-                    bounds_i, bounds_j = _crop_registration_overlap(
-                        bounds_i,
-                        bounds_j,
-                        df_zyx_base,
-                        max_downsampled_shape_zyx,
-                    )
+                    if any(hi <= lo for lo, hi in bounds_i):
+                        continue
                     overlap_shape = tuple(hi - lo for lo, hi in bounds_i)
-                    df_zyx_eff = tuple(
+                    df_zyx_eff = [
                         max(1, min(factor, length))
                         for factor, length in zip(df_zyx_base, overlap_shape)
+                    ]
+                    thin_z_overlap = (
+                        not self._is_2d
+                        and overlap_shape[0] // df_zyx_base[0] < sw
+                    )
+                    if (
+                        thin_z_overlap
+                        and (i_pos, j_pos) not in nearest_registration_pairs
+                    ):
+                        continue
+                    if thin_z_overlap and sw > 1:
+                        maximum_z_factor = max(
+                            1,
+                            overlap_shape[0] // sw,
+                        )
+                        df_zyx_eff[0] = min(
+                            df_zyx_eff[0],
+                            maximum_z_factor,
+                        )
+                    separation = np.abs(vox_off).astype(np.float64) / np.asarray(
+                        (self.z_dim, self.y_dim, self.x_dim),
+                        dtype=np.float64,
+                    )
+                    if self._is_2d:
+                        separation[0] = -math.inf
+                    boundary_axis = int(np.argmax(separation))
+                    registration_axis = (
+                        None
+                        if thin_z_overlap
+                        else boundary_axis - 1
+                        if self._is_2d
+                        else boundary_axis
+                    )
+                    df_zyx_eff_tuple = tuple(df_zyx_eff)
+                    pair_specs.append(
+                        (
+                            i_pos,
+                            j_pos,
+                            i,
+                            j,
+                            tuple(bounds_i),
+                            tuple(bounds_j),
+                            df_zyx_eff_tuple,
+                            thin_z_overlap,
+                            registration_axis,
+                            (
+                                2
+                                * math.prod(overlap_shape)
+                                * input_itemsize
+                            ),
+                        )
                     )
 
-                    def read_patch(
-                        gidx: int, bnds: list[tuple[int, int]]
-                    ) -> np.ndarray:
-                        """Read one bounded tile patch for pairwise registration.
+                read_ahead_budget = min(
+                    4 * 1024**3,
+                    max(1, int(available_host_bytes * 0.1)),
+                )
+                read_ahead_pairs = 2 if read_workers > 1 else 1
+                pending_reads: deque[
+                    tuple[
+                        tuple[Any, ...],
+                        Future[np.ndarray],
+                        Future[np.ndarray],
+                    ]
+                ] = deque()
+                spec_iterator = iter(pair_specs)
+                deferred_spec: tuple[Any, ...] | None = None
+                pending_read_bytes = 0
 
-                        Parameters
-                        ----------
-                        gidx : int
-                            Value supplied for ``gidx``.
-                        bnds : list[tuple[int, int]]
-                            Value supplied for ``bnds``.
-
-                        Returns
-                        -------
-                        np.ndarray
-                            Result produced by the callable.
-                        """
-                        z0, z1 = bnds[0]
-                        y0, y1 = bnds[1]
-                        x0, x1 = bnds[2]
-                        return self._read_tile_volume(
-                            gidx,
-                            ch_idx,
-                            slice(z0, z1),
-                            slice(y0, y1),
-                            slice(x0, x1),
-                            dtype=None,
+                def fill_read_ahead() -> None:
+                    nonlocal deferred_spec, pending_read_bytes
+                    while len(pending_reads) < read_ahead_pairs:
+                        if deferred_spec is not None:
+                            spec = deferred_spec
+                            deferred_spec = None
+                        else:
+                            try:
+                                spec = next(spec_iterator)
+                            except StopIteration:
+                                return
+                        _, _, i, j, bounds_i, bounds_j, _, _, _, pair_bytes = spec
+                        if (
+                            pending_reads
+                            and pending_read_bytes + pair_bytes > read_ahead_budget
+                        ):
+                            deferred_spec = spec
+                            return
+                        pending_reads.append(
+                            (
+                                spec,
+                                executor.submit(
+                                    self._read_registration_patch,
+                                    i,
+                                    ch_idx,
+                                    bounds_i,
+                                ),
+                                executor.submit(
+                                    self._read_registration_patch,
+                                    j,
+                                    ch_idx,
+                                    bounds_j,
+                                ),
+                            )
                         )
+                        pending_read_bytes += int(pair_bytes)
 
-                    future_i = executor.submit(read_patch, i, bounds_i)
-                    future_j = executor.submit(read_patch, j, bounds_j)
+                fill_read_ahead()
+                progress = tqdm(
+                    total=len(pair_specs),
+                    desc=f"register pairs t={t + 1}/{int(self.time_dim)}",
+                    leave=False,
+                    unit="pair",
+                )
+                while pending_reads:
+                    (
+                        spec,
+                        future_i,
+                        future_j,
+                    ) = pending_reads.popleft()
+                    (
+                        i_pos,
+                        j_pos,
+                        i,
+                        j,
+                        _,
+                        _,
+                        df_zyx_eff,
+                        thin_z_overlap,
+                        registration_axis,
+                        pair_bytes,
+                    ) = spec
                     patch_i = future_i.result()
                     patch_j = future_j.result()
 
                     if self._is_2d:
                         patch_i = np.asarray(patch_i)[0, 0]
                         patch_j = np.asarray(patch_j)[0, 0]
-                        reduction_factors = df_zyx_eff[1:]
+                        reduce_block = df_zyx_eff[1:]
                     else:
-                        reduction_factors = df_zyx_eff
-                    g1 = _mean_downsample_registration(
-                        patch_i,
-                        reduction_factors,
+                        reduce_block = df_zyx_eff
+                    if device_buffers is not None:
+                        staged_i, staged_j = device_buffers.stage(
+                            np.asarray(patch_i),
+                            np.asarray(patch_j),
+                        )
+                    else:
+                        staged_i = xp.asarray(patch_i)
+                        staged_j = xp.asarray(patch_j)
+                    g1 = block_reduce(
+                        staged_i,
+                        block_size=reduce_block,
+                        func=xp.mean,
                     )
-                    g2 = _mean_downsample_registration(
-                        patch_j,
-                        reduction_factors,
+                    g2 = block_reduce(
+                        staged_j,
+                        block_size=reduce_block,
+                        func=xp.mean,
                     )
 
                     max_shift = self.max_registration_shift_zyx
@@ -1492,19 +1592,23 @@ class TileFusion:
                         g2,
                         win_size=sw,
                         max_shift=max_shift_ds,
+                        allow_bounded_peak=not thin_z_overlap,
+                        registration_axis=registration_axis,
                     )
-                    if not math.isfinite(score) or not all(
-                        math.isfinite(value) for value in shift_ds
+                    progress.update()
+                    shift_ds_array = np.asarray(shift_ds, dtype=np.float64)
+                    if not math.isfinite(score) or not np.all(
+                        np.isfinite(shift_ds_array)
                     ):
+                        pending_read_bytes -= int(pair_bytes)
+                        fill_read_ahead()
                         continue
+                    coarse_shift = np.rint(
+                        shift_ds_array * np.asarray(df_zyx_eff, dtype=np.float64)
+                    ).astype(np.int64)
+
                     score = float(max(score, 1e-6))
-
-                    if th != 0.0 and score < th:
-                        continue
-
-                    dz_s = int(np.round(shift_ds[0] * df_zyx_eff[0]))
-                    dy_s = int(np.round(shift_ds[1] * df_zyx_eff[1]))
-                    dx_s = int(np.round(shift_ds[2] * df_zyx_eff[2]))
+                    dz_s, dy_s, dx_s = (int(value) for value in coarse_shift)
 
                     if (
                         abs(dz_s) > max_shift[0]
@@ -1519,18 +1623,44 @@ class TileFusion:
                                 (dz_s, dy_s, dx_s),
                                 max_shift,
                             )
+                        pending_read_bytes -= int(pair_bytes)
+                        fill_read_ahead()
                         continue
 
-                    self.pairwise_metrics[(i, j)] = (
+                    candidates[(i_pos, j_pos)] = (
                         dz_s,
                         dy_s,
                         dx_s,
                         round(score, 3),
                     )
+                    candidate_scores[(i_pos, j_pos)] = score
+                    pending_read_bytes -= int(pair_bytes)
+                    fill_read_ahead()
+                progress.close()
+                if self._debug:
+                    print(
+                        "Registration source cache: TensorStore native LRU, "
+                        f"{self._source_cache_bytes / 1024**3:.2f} GiB limit"
+                    )
+
+                selected = {
+                    pair
+                    for pair in candidates
+                    if th == 0.0 or candidate_scores[pair] >= th
+                }
+
+                self.pairwise_metrics.update(
+                    {
+                        (base + left, base + right): candidates[(left, right)]
+                        for left, right in sorted(selected)
+                    }
+                )
 
     @staticmethod
     def _solve_global(
-        links: list[dict[str, Any]], n_tiles: int, fixed_indices: list[int]
+        links: list[dict[str, Any]],
+        n_tiles: int,
+        fixed_indices: list[int],
     ) -> np.ndarray:
         """Solve dense least-squares shifts per-axis with fixed tile constraints.
 
@@ -1644,11 +1774,8 @@ class TileFusion:
 
         if iterative:
             while outliers:
-                for k in sorted(outliers, reverse=True):
-                    work.pop(k)
-                if not work:
-                    shifts = self._solve_global(work, n_tiles, fixed_indices)
-                    break
+                for index in sorted(outliers, reverse=True):
+                    work.pop(index)
                 shifts = self._solve_global(work, n_tiles, fixed_indices)
                 res = residuals(work, shifts)
                 if len(res) == 0:
@@ -1656,8 +1783,8 @@ class TileFusion:
                 cutoff = max(abs_thresh, rel_thresh * float(np.median(res)))
                 outliers = set(np.where(res > cutoff)[0])
         else:
-            for k in sorted(outliers, reverse=True):
-                work.pop(k)
+            for index in sorted(outliers, reverse=True):
+                work.pop(index)
             shifts = self._solve_global(work, n_tiles, fixed_indices)
 
         return shifts
@@ -1668,7 +1795,7 @@ class TileFusion:
         rel_thresh: float = 0.5,
         abs_thresh: float = 1.5,
     ) -> None:
-        """Optimize global shifts independently per timepoint, anchoring tile 0.
+        """Optimize shifts per connected image-link component and timepoint.
 
         Parameters
         ----------
@@ -1689,8 +1816,9 @@ class TileFusion:
 
         Notes
         -----
-        - If `self.pairwise_metrics` is empty, global_offsets is set to all zeros.
-        - Tile index 0 is anchored at each timepoint (local index 0).
+        - Every tile must have at least one accepted image-registration link.
+        - Each connected component is anchored at one zero correction, preserving
+          the stage-derived placement between components.
         """
         n_pos = int(self.position_dim)
         n_t = int(self.time_dim)
@@ -1735,7 +1863,25 @@ class TileFusion:
             if not local_links:
                 continue
 
-            fixed = [0]
+            adjacency = [set() for _ in range(n_pos)]
+            for link in local_links:
+                left = int(link["i"])
+                right = int(link["j"])
+                adjacency[left].add(right)
+                adjacency[right].add(left)
+            fixed = []
+            visited: set[int] = set()
+            for start in range(n_pos):
+                if start in visited:
+                    continue
+                fixed.append(start)
+                visited.add(start)
+                frontier = [start]
+                while frontier:
+                    current = frontier.pop()
+                    unseen = adjacency[current] - visited
+                    visited.update(unseen)
+                    frontier.extend(unseen)
             if mode == "ONE_ROUND":
                 d_opt = self._solve_global(local_links, n_pos, fixed)
             else:
@@ -1764,21 +1910,9 @@ class TileFusion:
         """
         path = Path(filepath)
         out = {
-            "schema_version": 10,
-            "registration": {
-                "channel_index": self.channel_to_use,
-                "stage_y_reversed": self.reverse_stage_y,
-                "pair_selection": "connected-nearest-overlap-v1",
-                "overlap_roi": "centered-64x512x512-v1",
-                "downsample": "bounded-numba-mean-v1",
-                "phase_disambiguation": "bounded-direct-overlap-v1",
-                "crop_deskewed_trapezoid": bool(
-                    getattr(self, "crop_deskewed_trapezoid", False)
-                ),
-                "deskew_geometry_crop_y": int(
-                    getattr(self, "deskew_geometry_crop_y", 0)
-                ),
-            },
+            "schema_version": 23,
+            "source": self._registration_cache_source(),
+            "registration": self._registration_cache_settings(),
             "pairwise_metrics": {
                 f"{i},{j}": list(v) for (i, j), v in self.pairwise_metrics.items()
             },
@@ -1823,22 +1957,20 @@ class TileFusion:
                 "registration must be recomputed"
             )
 
-        expected_registration = {
-            "channel_index": self.channel_to_use,
-            "stage_y_reversed": self.reverse_stage_y,
-            "pair_selection": "connected-nearest-overlap-v1",
-            "overlap_roi": "centered-64x512x512-v1",
-            "downsample": "bounded-numba-mean-v1",
-            "phase_disambiguation": "bounded-direct-overlap-v1",
-            "crop_deskewed_trapezoid": bool(
-                getattr(self, "crop_deskewed_trapezoid", False)
-            ),
-            "deskew_geometry_crop_y": int(
-                getattr(self, "deskew_geometry_crop_y", 0)
-            ),
-        }
-        if data.get("schema_version") != 10:
+        expected_source = self._registration_cache_source()
+        if expected_source["processing_created_at"] is None:
+            raise ValueError(
+                "Processed data has no unique generation timestamp; "
+                "registration must be recomputed"
+            )
+        if data.get("schema_version") != 23:
             raise ValueError(f"{path} has an unsupported registration cache schema")
+        if data.get("source") != expected_source:
+            raise ValueError(
+                f"{path} was created for different processed data; "
+                "registration must be recomputed"
+            )
+        expected_registration = self._registration_cache_settings()
         if data.get("registration") != expected_registration:
             raise ValueError(
                 f"{path} was created for different registration settings; "
@@ -1872,6 +2004,56 @@ class TileFusion:
                 f"{path} contains {invalid_count} invalid registration metrics"
             )
         self.pairwise_metrics = metrics
+
+    def _registration_cache_source(self) -> dict[str, Any]:
+        """Describe the exact processed collection used for registration."""
+        provenance = self._input_attributes.get("opm_processing")
+        created_at = None
+        output_kind = None
+        if isinstance(provenance, dict):
+            value = provenance.get("created_at")
+            if isinstance(value, str) and value:
+                created_at = value
+            output = provenance.get("output")
+            if isinstance(output, dict):
+                output_kind = output.get("kind")
+        return {
+            "processed_path": str(self.data.resolve()),
+            "processing_created_at": created_at,
+            "output_kind": output_kind,
+            "shape_tpczyx": [
+                int(self.time_dim),
+                int(self.position_dim),
+                int(self.channels),
+                int(self.z_dim),
+                int(self.y_dim),
+                int(self.x_dim),
+            ],
+        }
+
+    def _registration_cache_settings(self) -> dict[str, Any]:
+        """Return every setting that can change pairwise registration."""
+        return {
+            "channel_index": self.channel_to_use,
+            "stage_y_reversed": self.reverse_stage_y,
+            "stage_z_to_image_y": "relative-cotangent-opm-angle-v1",
+            "pair_selection": "all-thick-overlaps-nearest-thin-z-overlaps-v2",
+            "acceptance": "threshold-only-no-forced-bridges-v2",
+            "overlap_roi": "full-physical-overlap-main-v1",
+            "downsample": (
+                "upstream-block-reduce-with-adaptive-z-ssim-support-v1"
+            ),
+            "phase_registration": (
+                "thin-z-full-reject-out-of-range-thick-bounded-peak-v7"
+            ),
+            "score": (
+                "upstream-cucim-ssim-valid-aligned-overlap-boundary-edge-v3"
+            ),
+            "downsample_factors_zyx": list(self.downsample_factors),
+            "ssim_window": self.ssim_window,
+            "max_registration_shift_zyx": list(self.max_registration_shift_zyx),
+            "threshold": self.threshold,
+        }
 
     @staticmethod
     def _count_invalid_pairwise_metrics(data: object) -> int:
@@ -2036,18 +2218,30 @@ class TileFusion:
             int(self.chunk_y),
             int(self.chunk_x),
         )
-        extra_attributes = None
-        if bool(getattr(self, "crop_deskewed_trapezoid", False)):
-            extra_attributes = {
-                "opm_fusion": {
-                    "deskew_geometry_crop": {
-                        "applied": bool(self.deskew_geometry_crop_y),
-                        "requested": True,
-                        "axis": "y",
-                        "pixels_per_side": int(self.deskew_geometry_crop_y),
-                    }
-                }
+        if hasattr(self, "pairwise_metrics"):
+            registration_metadata = {
+                "applied": True,
+                "method": "phase-cross-correlation-ssim-global-two-round-iterative",
+                "optimization_rel_threshold": self.optimization_rel_threshold,
+                "optimization_abs_threshold": self.optimization_abs_threshold,
+                **self._registration_cache_settings(),
             }
+        else:
+            registration_metadata = {
+                "applied": False,
+                "reason": "registration state unavailable",
+            }
+        extra_attributes = {
+            "opm_fusion": {
+                "deskew_support_mask": {
+                    "applied": True,
+                    "source": "acquisition_geometry",
+                    "axes": ["z", "y"],
+                    "scope": "scale0_fusion",
+                },
+                "registration": registration_metadata,
+            }
+        }
         _, self._multiscale_arrays = prepare_image(
             output_path,
             image,
@@ -2251,6 +2445,7 @@ class TileFusion:
                     fused,
                     weight,
                     sub,
+                    np.ascontiguousarray(self._deskew_support_zy[local_z, local_y]),
                     self.z_profile[local_z],
                     self.y_profile[local_y],
                     self.x_profile[local_x],
@@ -2619,6 +2814,7 @@ class TileFusion:
         base = self.root.parents[0]
         metrics_path = base / self.metrics_filename
 
+        recomputed_metrics = False
         try:
             self.load_pairwise_metrics(metrics_path)
         except (FileNotFoundError, ValueError):
@@ -2627,6 +2823,9 @@ class TileFusion:
                 ch_idx=self.channel_to_use,
                 threshold=self.threshold,
             )
+            recomputed_metrics = True
+
+        if recomputed_metrics:
             self.save_pairwise_metrics(metrics_path)
 
         self.optimize_shifts(
