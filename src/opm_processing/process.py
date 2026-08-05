@@ -17,12 +17,14 @@ import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.simplefilter("ignore", category=FutureWarning)
 
+import hashlib
 import json
+import time
 from copy import deepcopy
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 import numpy as np
 import tensorstore as ts
@@ -40,6 +42,13 @@ from opm_processing.dataio.metadata import (
     extract_channels,
     extract_stage_positions,
     find_key,
+)
+from opm_processing.dataio.live import (
+    LIVE_POLL_INTERVAL_SECONDS,
+    LiveManifest,
+    ZarrTileReadiness,
+    iter_live_tiles,
+    resolve_live_sidecars,
 )
 from opm_processing.dataio.position_collection import (
     create_position_collection,
@@ -59,6 +68,57 @@ from opm_processing.imageprocessing.opmtools import (
 
 app = typer.Typer()
 app.pretty_exceptions_enable = False
+
+
+def _resolve_output_directory(root_path: Path, output: Path | None) -> Path:
+    """Return an existing directory for all processing artifacts."""
+    output_dir = (
+        root_path.parent if output is None else Path(output).expanduser().resolve()
+    )
+    if output_dir.exists() and not output_dir.is_dir():
+        raise ValueError(f"Processing output is not a directory: {output_dir}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir
+
+
+def _processed_dtype(save_float32: bool) -> np.dtype:
+    """Return the requested dtype for calibrated processing products."""
+    return np.dtype(np.float32 if save_float32 else np.uint16)
+
+
+def _camera_corrected_image(
+    raw: np.ndarray,
+    camera_offset: float,
+    camera_conversion: float,
+    illumination: np.ndarray,
+) -> np.ndarray:
+    """Apply camera and illumination correction without premature quantization."""
+    corrected = (
+        (np.asarray(raw, dtype=np.float32) - camera_offset) * camera_conversion
+    ) / np.asarray(illumination, dtype=np.float32)
+    return np.maximum(corrected, 0).astype(np.float32, copy=False)
+
+
+def _format_processed_output(data: np.ndarray, save_float32: bool) -> np.ndarray:
+    """Convert a completed float32 processing product for persistent storage."""
+    if save_float32:
+        return np.asarray(data, dtype=np.float32)
+    return np.clip(data, 0, np.iinfo(np.uint16).max).astype(np.uint16)
+
+
+def _output_conversion_step(save_float32: bool) -> dict[str, Any]:
+    """Describe the requested output conversion in processing provenance."""
+    if save_float32:
+        return {
+            "name": "float32_output",
+            "applied": True,
+            "parameters": {"dtype": "float32", "quantized": False},
+        }
+    return {
+        "name": "uint16_conversion",
+        "applied": True,
+        "parameters": {"clip_min": 0, "clip_max": 2**16 - 1},
+    }
 
 
 def _flatfield_software_tag() -> str:
@@ -137,6 +197,83 @@ def _load_or_estimate_flatfield(
     )
     _write_flatfield(path, flatfields, pixel_size_um)
     return flatfields
+
+
+def _load_provided_illumination(
+    path: Path,
+    expected_shape: tuple[int, int, int],
+) -> np.ndarray:
+    """Load a user-supplied CYX illumination image without estimating one."""
+    illumination_path = Path(path).expanduser().resolve()
+    if not illumination_path.is_file():
+        raise ValueError(f"Illumination file does not exist: {illumination_path}")
+    with TiffFile(illumination_path) as tif:
+        axes = tif.series[0].axes.upper()
+        illumination = np.asarray(tif.asarray(), dtype=np.float32)
+    if axes == "YX":
+        illumination = illumination[np.newaxis, ...]
+    elif axes != "CYX":
+        raise ValueError(
+            f"Live illumination must have CYX axes, or YX for one channel; got {axes!r}"
+        )
+    if tuple(illumination.shape) != expected_shape:
+        raise ValueError(
+            f"Live illumination shape {illumination.shape} does not match "
+            f"acquisition CYX shape {expected_shape}"
+        )
+    if not np.all(np.isfinite(illumination)) or np.any(illumination <= 0):
+        raise ValueError(
+            "Live illumination values must be finite and strictly positive"
+        )
+    return illumination
+
+
+def _file_sha256(path: Path) -> str:
+    """Return a stable SHA-256 digest for a processing input artifact."""
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _open_live_acquisition(
+    root_path: Path,
+) -> tuple[AcquisitionMetadata, LiveManifest, Path]:
+    """Wait for the manifest and OME-Zarr hierarchy required by live mode."""
+    root_path = Path(root_path).expanduser().resolve()
+    if not root_path.name.endswith((".zarr", ".ome.zarr")):
+        raise ValueError("--live requires the path of an OME-Zarr acquisition")
+    sidecars = resolve_live_sidecars(root_path)
+    while not sidecars.manifest.is_file():
+        print(
+            "Waiting "
+            f"{LIVE_POLL_INTERVAL_SECONDS:g} seconds for live manifest "
+            f"{sidecars.manifest}..."
+        )
+        time.sleep(LIVE_POLL_INTERVAL_SECONDS)
+    manifest = LiveManifest.read(sidecars.manifest)
+    if manifest.data_path != root_path:
+        raise ValueError(
+            "Live manifest data_path does not match the requested acquisition: "
+            f"{manifest.data_path} != {root_path}"
+        )
+    required_metadata = [root_path / "zarr.json", root_path / "OME" / "zarr.json"]
+    required_metadata.extend(
+        metadata_path
+        for position in range(manifest.index_sizes["p"])
+        for metadata_path in (
+            root_path / str(position) / "zarr.json",
+            root_path / str(position) / "0" / "zarr.json",
+        )
+    )
+    while not all(path.is_file() for path in required_metadata):
+        print(
+            f"Waiting {LIVE_POLL_INTERVAL_SECONDS:g} seconds for OME-Zarr metadata..."
+        )
+        time.sleep(LIVE_POLL_INTERVAL_SECONDS)
+    acquisition = manifest.apply(inspect_acquisition(root_path))
+    return acquisition, manifest, sidecars.log
 
 
 def _distribution_version(distribution: str) -> str:
@@ -234,6 +371,16 @@ def _apply_stage_axis_flips(
 def process(
     root_path: Path,
     deconvolve: bool = False,
+    save_float32: Annotated[
+        bool,
+        typer.Option(
+            "--save-float32",
+            help=(
+                "Keep calibrated fractional intensities and save processed "
+                "outputs as float32 instead of uint16."
+            ),
+        ),
+    ] = False,
     max_projection: bool = True,
     flatfield_correction: bool = False,
     create_fused_max_projection: bool = True,
@@ -250,6 +397,26 @@ def process(
     decon_psf_paths: list[Path] | None = None,
     asi_camera_conversion: float | None = None,
     write_fused_tiff: bool = False,
+    output: Annotated[
+        Path | None,
+        typer.Option(
+            "--output",
+            help=(
+                "Directory for processed artifacts. The directory is created "
+                "when it does not exist."
+            ),
+        ),
+    ] = None,
+    live: Annotated[
+        Path | None,
+        typer.Option(
+            "--live",
+            help=(
+                "Process complete tiles while acquisition is running, using this "
+                "CYX illumination OME-TIFF. Illumination is never estimated."
+            ),
+        ),
+    ] = None,
 ):
     """Postprocess qi2lab OPM dataset.
 
@@ -264,8 +431,14 @@ def process(
     ----------
     root_path: Path
         Path to OPM pymmcoregui zarr file.
+    output: Path or None, default = None
+        Directory for processed artifacts. Defaults to the source directory.
+    live: Path or None, default = None
+        Supplied illumination image and live-processing mode switch.
     deconvolve: bool, default = False
         Deconvolve the data using RLGC.
+    save_float32: bool, default = False
+        Save calibrated processing products as float32 instead of uint16.
     max_projection: bool, default = True
         Create a maximum projection datastore.
     flatfield_correction: bool, default = False
@@ -310,6 +483,47 @@ def process(
     # Current OPM-v2 acquisitions replace this fallback from normalized metadata.
     stage_axis_flips = (False, False, False)
 
+    if live is not None:
+        if flatfield_correction:
+            raise ValueError(
+                "--live supplies illumination directly and cannot be combined with "
+                "--flatfield-correction"
+            )
+        if time_range is not None or pos_range is not None:
+            raise ValueError("--live does not support time or position subranges")
+        acquisition, live_manifest, live_log_path = _open_live_acquisition(root_path)
+        root_path = acquisition.path
+        opm_mode = acquisition.mode.casefold()
+        if "mirror" not in opm_mode and "stage" not in opm_mode:
+            raise ValueError(
+                "--live currently supports mirror- and stage-scan acquisitions only"
+            )
+        output_dir = _resolve_output_directory(root_path, output)
+        process_skewed(
+            root_path=root_path,
+            zattrs=None,
+            output_dir=output_dir,
+            acquisition=acquisition,
+            deconvolve=deconvolve,
+            save_float32=save_float32,
+            max_projection=max_projection,
+            flatfield_correction=True,
+            create_fused_max_projection=create_fused_max_projection,
+            write_fused_max_projection_tiff=write_fused_max_projection_tiff,
+            z_downsample_level=z_downsample_level,
+            crop_after_deskew=crop_after_deskew,
+            decon_crop_scan=decon_crop_scan,
+            decon_gpu_id=decon_gpu_id,
+            decon_verbose=decon_verbose,
+            decon_fallback_step_scan=decon_fallback_step_scan,
+            decon_psf_paths=decon_psf_paths,
+            stage_axis_flips=acquisition.stage_axis_flips_xyz,
+            illumination_path=live,
+            live_manifest=live_manifest,
+            live_log_path=live_log_path,
+        )
+        return
+
     if root_path.suffix == ".zarr" or root_path.is_dir():
         acquisition: AcquisitionMetadata | None = None
         zattrs: dict | None = None
@@ -330,13 +544,16 @@ def process(
                 f"C={sizes.get('c', 1)}, Z={sizes.get('z', 1)}; "
                 f"channels={list(acquisition.channel_names)}"
             )
+        output_dir = _resolve_output_directory(root_path, output)
         print(f"Processing OPM mode: {opm_mode}")
         if "mirror" in opm_mode or "stage" in opm_mode:
             process_skewed(
                 root_path=root_path,
                 zattrs=zattrs,
+                output_dir=output_dir,
                 acquisition=acquisition,
                 deconvolve=deconvolve,
+                save_float32=save_float32,
                 max_projection=max_projection,
                 flatfield_correction=flatfield_correction,
                 create_fused_max_projection=create_fused_max_projection,
@@ -356,8 +573,10 @@ def process(
             process_projection(
                 root_path=root_path,
                 zattrs=zattrs,
+                output_dir=output_dir,
                 acquisition=acquisition,
                 deconvolve=deconvolve,
+                save_float32=save_float32,
                 flatfield_correction=flatfield_correction,
                 write_fused_max_projection_tiff=write_fused_max_projection_tiff,
                 time_range=time_range,
@@ -370,6 +589,7 @@ def process(
                 stage_axis_flips=stage_axis_flips,
             )
     elif root_path.suffixes[-2:] == [".ome", ".tif"]:
+        output_dir = _resolve_output_directory(root_path, output)
         with TiffFile(root_path) as tif:
             axes = tif.series[0].axes
             all_metadata = dict(tif.micromanager_metadata)
@@ -377,10 +597,12 @@ def process(
             asi_metadata = json.loads(all_metadata["Summary"]["SPIMAcqSettings"])
             process_ASI_SCOPE(
                 root_path=root_path,
+                output_dir=output_dir,
                 axes=axes,
                 micromanager_metadata=micromanager_metadata,
                 asi_metadata=asi_metadata,
                 deconvolve=deconvolve,
+                save_float32=save_float32,
                 max_projection=max_projection,
                 flatfield_correction=flatfield_correction,
                 create_fused_max_projection=create_fused_max_projection,
@@ -404,6 +626,7 @@ def process_skewed(
     zattrs: dict | None,
     acquisition: AcquisitionMetadata | None = None,
     deconvolve: bool = False,
+    save_float32: bool = False,
     max_projection: bool = True,
     flatfield_correction: bool = False,
     create_fused_max_projection: bool = True,
@@ -420,6 +643,10 @@ def process_skewed(
     decon_fallback_step_scan: int | None = None,
     decon_psf_paths: list[Path] | None = None,
     stage_axis_flips: tuple[bool, bool, bool] = (False, True, True),
+    output_dir: Path | None = None,
+    illumination_path: Path | None = None,
+    live_manifest: LiveManifest | None = None,
+    live_log_path: Path | None = None,
 ):
     """Postprocess qi2lab OPM dataset.
 
@@ -440,8 +667,18 @@ def process_skewed(
         Path to OPM pymmcoregui zarr file.
     zattrs: dict
         Metadata dictionary containing OPM data attributes.
+    output_dir: Path or None, default = None
+        Directory for processed artifacts. Defaults to the source directory.
+    illumination_path: Path or None, default = None
+        User-supplied CYX illumination image for live processing.
+    live_manifest: LiveManifest or None, default = None
+        Upfront acquisition plan enabling live tile discovery.
+    live_log_path: Path or None, default = None
+        Append-only acquisition lifecycle log.
     deconvolve: bool, default = False
         Deconvolve the data using RLGC.
+    save_float32: bool, default = False
+        Save calibrated processing products as float32 instead of uint16.
     max_projection: bool, default = True
         Create a maximum projection datastore.
     flatfield_correction: bool, default = True
@@ -489,6 +726,8 @@ def process_skewed(
         )
 
         decon_chunk_state = RlgcChunkState(decon_crop_scan)
+
+    output_dir = _resolve_output_directory(root_path, output_dir)
 
     if acquisition is not None:
         datastore = open_acquisition_datastore(acquisition)
@@ -542,6 +781,7 @@ def process_skewed(
     opm_tilt_deg = float(opm_tilt_deg)
     camera_offset = float(camera_offset)
     camera_conversion = float(camera_conversion)
+    output_dtype = _processed_dtype(save_float32)
     if decon_psf_paths is not None:
         if len(decon_psf_paths) != len(channels):
             raise ValueError("decon_psf_paths must contain one PSF per channel")
@@ -600,11 +840,52 @@ def process_skewed(
     # create array to hold one deskewed volume
     deskewed = np.zeros(
         (deskewed_shape[0] // z_downsample_level, deskewed_shape[1], deskewed_shape[2]),
-        dtype=np.uint16,
+        dtype=np.float32,
     )
 
-    flatfield_path = root_path.parents[0] / Path(
-        acquisition_stem(root_path) + "_flatfield.ome.tif"
+    flatfield_path = (
+        Path(illumination_path).expanduser().resolve()
+        if illumination_path is not None
+        else output_dir / Path(acquisition_stem(root_path) + "_flatfield.ome.tif")
+    )
+    provided_flatfields = (
+        _load_provided_illumination(
+            flatfield_path,
+            (
+                int(datastore.shape[2]),
+                int(datastore.shape[-2]),
+                int(datastore.shape[-1]),
+            ),
+        )
+        if illumination_path is not None
+        else None
+    )
+    illumination_parameters = (
+        {
+            "source": "provided",
+            "artifact": str(flatfield_path),
+            "sha256": _file_sha256(flatfield_path),
+            "estimated": False,
+        }
+        if illumination_path is not None
+        else {
+            "source": "estimated",
+            "estimator": "BaSiCPy",
+            "estimator_version": _distribution_version("basicpy"),
+            "configuration": "autotuned_then_smoothness_2_with_residual_calibration",
+            "sort_intensity": True,
+            "smoothness_flatfield": 2.0,
+            "sampling": "per_position_summaries_across_all_positions",
+            "planes_per_position": 10,
+            "fit_summary": "median",
+            "residual_summary": "75th_percentile",
+            "residual_calibration": "smoothed_separable_yx",
+            "working_size": "half_resolution_preserving_aspect_ratio",
+            "darkfield_estimation": False,
+            "artifact_schema": _flatfield_software_tag(),
+            "artifact": str(flatfield_path.resolve()),
+            "estimated": True,
+        }
     )
     output_kind = "deconvolved_deskewed" if deconvolve else "deskewed"
     processing_steps = [
@@ -621,21 +902,17 @@ def process_skewed(
         {
             "name": "illumination_correction",
             "applied": flatfield_correction,
-            "parameters": {
-                "estimator": "BaSiCPy",
-                "estimator_version": _distribution_version("basicpy"),
-                "configuration": "autotuned_then_smoothness_2_with_residual_calibration",
-                "sort_intensity": True,
-                "smoothness_flatfield": 2.0,
-                "sampling": "per_position_summaries_across_all_positions",
-                "planes_per_position": 10,
-                "fit_summary": "median",
-                "residual_summary": "75th_percentile",
-                "residual_calibration": "smoothed_separable_yx",
-                "working_size": "half_resolution_preserving_aspect_ratio",
-                "darkfield_estimation": False,
-                "artifact_schema": _flatfield_software_tag(),
-                "artifact": str(flatfield_path.resolve()),
+            "parameters": illumination_parameters,
+        },
+        {
+            "name": "live_acquisition",
+            "applied": live_manifest is not None,
+            "parameters": None
+            if live_manifest is None
+            else {
+                "acquisition_id": live_manifest.acquisition_id,
+                "manifest": str(live_manifest.path),
+                "readiness": "raw_zarr_chunk_presence",
             },
         },
         {
@@ -689,11 +966,7 @@ def process_skewed(
             "applied": crop_after_deskew,
             "parameters": {"crop_y_pixels_per_side": int(crop_y)},
         },
-        {
-            "name": "uint16_conversion",
-            "applied": True,
-            "parameters": {"clip_min": 0, "clip_max": 2**16 - 1},
-        },
+        _output_conversion_step(save_float32),
     ]
     processing_metadata = {
         "scan_axis_step_um": scan_axis_step_um,
@@ -722,11 +995,11 @@ def process_skewed(
     }
 
     if not (deconvolve):
-        output_path = root_path.parents[0] / Path(
+        output_path = output_dir / Path(
             acquisition_stem(root_path) + "_deskewed.ome.zarr"
         )
     else:
-        output_path = root_path.parents[0] / Path(
+        output_path = output_dir / Path(
             acquisition_stem(root_path) + "_decon_deskewed.ome.zarr"
         )
     output_collection = create_position_collection(
@@ -736,6 +1009,7 @@ def process_skewed(
         stage_positions=stage_positions[:pos_shape],
         channels=channels,
         attributes=processing_metadata,
+        dtype=output_dtype,
     )
     ts_store = output_collection.arrays
 
@@ -751,15 +1025,15 @@ def process_skewed(
 
         # create array to hold one maximum projection deskewed volume
         max_z_deskewed = np.zeros(
-            (1, deskewed_shape[1], deskewed_shape[2]), dtype=np.uint16
+            (1, deskewed_shape[1], deskewed_shape[2]), dtype=np.float32
         )
 
         if not (deconvolve):
-            max_z_output_path = root_path.parents[0] / Path(
+            max_z_output_path = output_dir / Path(
                 acquisition_stem(root_path) + "_max_z_deskewed.ome.zarr"
             )
         else:
-            max_z_output_path = root_path.parents[0] / Path(
+            max_z_output_path = output_dir / Path(
                 acquisition_stem(root_path) + "_max_z_decon_deskewed.ome.zarr"
             )
         max_z_metadata = _derived_processing_metadata(
@@ -783,58 +1057,67 @@ def process_skewed(
             stage_positions=stage_positions[:pos_shape],
             channels=channels,
             attributes=max_z_metadata,
+            dtype=output_dtype,
         )
         max_z_ts_store = max_z_collection.arrays
 
     if flatfield_correction:
-        flatfields = _load_or_estimate_flatfield(
-            flatfield_path,
-            datastore,
-            camera_offset,
-            camera_conversion,
-            pixel_size_um,
-        )
+        if provided_flatfields is not None:
+            flatfields = provided_flatfields
+        else:
+            flatfields = _load_or_estimate_flatfield(
+                flatfield_path,
+                datastore,
+                camera_offset,
+                camera_conversion,
+                pixel_size_um,
+            )
     else:
         flatfields = np.ones(
             (datastore.shape[2], datastore.shape[-2], datastore.shape[-1]),
             dtype=np.float32,
         )
 
-    # loop over all components and stream to zarr using tensorstore
-    ts_writes = []
-    if max_projection:
-        ts_max_writes = []
-
-    if time_range is not None:
-        time_iterator = tqdm(range(time_range[0], time_range[1]), desc="t")
+    # Loop over complete tiles and await each tile's output before moving on.
+    if live_manifest is not None:
+        if live_log_path is None:
+            raise ValueError("Live processing requires an acquisition lifecycle log")
+        readiness = ZarrTileReadiness(acquisition)
+        tile_groups = (
+            (t_idx, (pos_idx,))
+            for t_idx, pos_idx in iter_live_tiles(
+                readiness, live_manifest, live_log_path
+            )
+        )
     else:
-        time_iterator = tqdm(range(datastore.shape[0]), desc="t")
+        time_indices = (
+            range(time_range[0], time_range[1])
+            if time_range is not None
+            else range(datastore.shape[0])
+        )
+        position_indices = (
+            range(pos_range[0], pos_range[1])
+            if pos_range is not None
+            else range(datastore.shape[1])
+        )
+        tile_groups = (
+            (t_idx, position_indices) for t_idx in tqdm(time_indices, desc="t")
+        )
 
-    if pos_range is not None:
-        pos_iterator = tqdm(range(pos_range[0], pos_range[1]), desc="p", leave=False)
-    else:
-        pos_iterator = tqdm(range(datastore.shape[1]), desc="p", leave=False)
-
-    for t_idx in time_iterator:
-        for pos_idx in pos_iterator:
+    wrote_tile = False
+    for t_idx, current_positions in tile_groups:
+        for pos_idx in tqdm(current_positions, desc="p", leave=False):
+            wrote_tile = True
+            ts_writes = []
+            ts_max_writes = []
             for chan_idx in tqdm(range(datastore.shape[2]), desc="c", leave=False):
-                camera_corrected_data = (
-                    (
-                        (
-                            (
-                                np.squeeze(
-                                    datastore[t_idx, pos_idx, chan_idx, :]
-                                    .read()
-                                    .result()
-                                ).astype(np.float32)
-                                - camera_offset
-                            )
-                            * camera_conversion
-                        )
-                        / flatfields[chan_idx, :].astype(np.float32)
-                    )
-                    .clip(0, 2**16 - 1)
-                    .astype(np.uint16)
+                camera_corrected_data = _camera_corrected_image(
+                    np.squeeze(
+                        datastore[t_idx, pos_idx, chan_idx, :].read().result()
+                    ),
+                    camera_offset,
+                    camera_conversion,
+                    flatfields[chan_idx, :],
                 )
                 if scan_axis_reversed:
                     camera_corrected_data = np.flip(camera_corrected_data, axis=0)
@@ -885,6 +1168,7 @@ def process_skewed(
                         distance=scan_axis_step_um,
                         pixel_size=pixel_size_um,
                         downsample_factor=z_downsample_level,
+                        output_dtype=np.float32,
                     )
                 else:
                     if flyback_crop is not None:
@@ -896,6 +1180,7 @@ def process_skewed(
                             distance=scan_axis_step_um,
                             pixel_size=pixel_size_um,
                             downsample_factor=z_downsample_level,
+                            output_dtype=np.float32,
                         )
                     else:
                         deskewed = orthogonal_deskew(
@@ -904,6 +1189,7 @@ def process_skewed(
                             distance=scan_axis_step_um,
                             pixel_size=pixel_size_um,
                             downsample_factor=z_downsample_level,
+                            output_dtype=np.float32,
                         )
 
                 if crop_after_deskew:
@@ -913,37 +1199,42 @@ def process_skewed(
                     max_z_deskewed = np.max(deskewed, axis=0, keepdims=True)
                     # create future objects for async data writing
                     ts_max_writes.append(
-                        max_z_ts_store[pos_idx][t_idx, chan_idx].write(max_z_deskewed)
+                        max_z_ts_store[pos_idx][t_idx, chan_idx].write(
+                            _format_processed_output(max_z_deskewed, save_float32)
+                        )
                     )
 
                 # create future objects for async data writing
-                ts_writes.append(ts_store[pos_idx][t_idx, chan_idx].write(deskewed))
+                ts_writes.append(
+                    ts_store[pos_idx][t_idx, chan_idx].write(
+                        _format_processed_output(deskewed, save_float32)
+                    )
+                )
+            for ts_write in ts_writes:
+                ts_write.result()
+            if max_projection:
+                for ts_max_write in ts_max_writes:
+                    ts_max_write.result()
 
-    # wait for writes to finish
-    for ts_write in ts_writes:
-        ts_write.result()
-
-    if max_projection:
-        for ts_max_write in ts_max_writes:
-            ts_max_write.result()
-
-    del deskewed, ts_write, ts_store
-    if max_projection:
-        del max_z_deskewed, ts_max_write
+    if wrote_tile:
+        del deskewed
+        if max_projection:
+            del max_z_deskewed
+    del ts_store
 
     if create_fused_max_projection:
         if deconvolve:
-            max_z_output_path = root_path.parents[0] / Path(
+            max_z_output_path = output_dir / Path(
                 acquisition_stem(root_path) + "_max_z_decon_deskewed.ome.zarr"
             )
         else:
-            max_z_output_path = root_path.parents[0] / Path(
+            max_z_output_path = output_dir / Path(
                 acquisition_stem(root_path) + "_max_z_deskewed.ome.zarr"
             )
         max_z_ts_store = open_position_collection(max_z_output_path).arrays
 
         print("\nFusing max projection using stage positions...")
-        fused_output_path = root_path.parents[0] / Path(
+        fused_output_path = output_dir / Path(
             acquisition_stem(root_path) + "_max_z_fused.ome.zarr"
         )
 
@@ -983,7 +1274,7 @@ def process_skewed(
                 with TiffWriter(filename_path, bigtiff=True) as tif:
                     metadata = {
                         "axes": axes,
-                        "SignificantBits": 16,
+                        "SignificantBits": 32 if save_float32 else 16,
                         "PhysicalSizeX": pixel_size_um,
                         "PhysicalSizeXUnit": "µm",
                         "PhysicalSizeY": pixel_size_um,
@@ -1009,6 +1300,7 @@ def process_projection(
     zattrs: dict | None,
     acquisition: AcquisitionMetadata | None = None,
     deconvolve: bool = True,
+    save_float32: bool = False,
     flatfield_correction: bool = True,
     write_fused_max_projection_tiff: bool = True,
     time_range: tuple[int, int] = None,
@@ -1020,6 +1312,7 @@ def process_projection(
     decon_verbose: int = 1,
     decon_fallback_step_scan: int | None = None,
     stage_axis_flips: tuple[bool, bool, bool] = (False, True, True),
+    output_dir: Path | None = None,
 ):
     """Postprocess qi2lab OPM dataset.
 
@@ -1039,8 +1332,12 @@ def process_projection(
         Path to OPM pymmcoregui zarr file.
     zattrs: dict
         Metadata dictionary containing OPM data attributes.
+    output_dir: Path or None, default = None
+        Directory for processed artifacts. Defaults to the source directory.
     deconvolve: bool, default = False
         Deconvolve the data using RLGC.
+    save_float32: bool, default = False
+        Save calibrated processing products as float32 instead of uint16.
     flatfield_correction: bool, default = True
         Estimate and apply flatfield correction on raw data.
     write_fused_max_projection_tiff: bool, default = False
@@ -1080,6 +1377,8 @@ def process_projection(
 
         decon_chunk_state = RlgcChunkState(decon_crop_scan)
 
+    output_dir = _resolve_output_directory(root_path, output_dir)
+
     if acquisition is not None:
         datastore = open_acquisition_datastore(acquisition)
         pixel_size_um = acquisition.pixel_size_um
@@ -1109,6 +1408,7 @@ def process_projection(
     opm_tilt_deg = float(opm_tilt_deg)
     camera_offset = float(camera_offset)
     camera_conversion = float(camera_conversion)
+    output_dtype = _processed_dtype(save_float32)
     stage_positions = _apply_stage_axis_flips(stage_positions_raw, stage_axis_flips)
     stage_x_flipped, stage_y_flipped, stage_z_flipped = stage_axis_flips
 
@@ -1131,15 +1431,15 @@ def process_projection(
         )
 
     if deconvolve:
-        output_path = root_path.parents[0] / Path(
+        output_path = output_dir / Path(
             acquisition_stem(root_path) + "_decon_projection.ome.zarr"
         )
     else:
-        output_path = root_path.parents[0] / Path(
+        output_path = output_dir / Path(
             acquisition_stem(root_path) + "_projection.ome.zarr"
         )
     if not (output_path.exists()) or overwrite:
-        flatfield_path = root_path.parents[0] / Path(
+        flatfield_path = output_dir / Path(
             acquisition_stem(root_path) + "_flatfield.ome.tif"
         )
         output_kind = "deconvolved_projection" if deconvolve else "projection"
@@ -1209,11 +1509,7 @@ def process_projection(
                             "psf_source": "theoretical",
                         },
                     },
-                    {
-                        "name": "uint16_conversion",
-                        "applied": True,
-                        "parameters": {"clip_min": 0, "clip_max": 2**16 - 1},
-                    },
+                    _output_conversion_step(save_float32),
                 ],
             ),
         }
@@ -1225,6 +1521,7 @@ def process_projection(
             channels=channels,
             attributes=processing_metadata,
             overwrite=overwrite,
+            dtype=output_dtype,
         )
         ts_store = output_collection.arrays
 
@@ -1270,23 +1567,13 @@ def process_projection(
         for t_idx in time_iterator:
             for pos_idx in pos_iterator:
                 for chan_idx in tqdm(range(datastore.shape[2]), desc="c", leave=False):
-                    camera_corrected_data = (
-                        (
-                            (
-                                (
-                                    np.squeeze(
-                                        datastore[t_idx, pos_idx, chan_idx, :]
-                                        .read()
-                                        .result()
-                                    ).astype(np.float32)
-                                    - camera_offset
-                                )
-                                * camera_conversion
-                            )
-                            / flatfields[chan_idx, :].astype(np.float32)
-                        )
-                        .clip(0, 2**16 - 1)
-                        .astype(np.uint16)
+                    camera_corrected_data = _camera_corrected_image(
+                        np.squeeze(
+                            datastore[t_idx, pos_idx, chan_idx, :].read().result()
+                        ),
+                        camera_offset,
+                        camera_conversion,
+                        flatfields[chan_idx, :],
                     )
 
                     if deconvolve:
@@ -1333,7 +1620,9 @@ def process_projection(
                     # create future objects for async data writing
                     ts_writes.append(
                         ts_store[pos_idx][t_idx, chan_idx].write(
-                            deconvolved_data.astype(np.uint16)
+                            _format_processed_output(
+                                deconvolved_data, save_float32
+                            )
                         )
                     )
             if refresh_position_iterator:
@@ -1349,7 +1638,7 @@ def process_projection(
             ts_write.result()
 
         print("\nFusing using stage positions...")
-        fused_output_path = root_path.parents[0] / Path(
+        fused_output_path = output_dir / Path(
             acquisition_stem(root_path) + "_stagefused.ome.zarr"
         )
 
@@ -1374,7 +1663,7 @@ def process_projection(
         try:
             tiff_dir_path = fused_output_path.parent / Path("fused_tiff_output")
         except Exception:
-            fused_output_path = root_path.parents[0] / Path(
+            fused_output_path = output_dir / Path(
                 acquisition_stem(root_path) + "_stagefused.ome.zarr"
             )
             tiff_dir_path = fused_output_path.parent / Path("fused_tiff_output")
@@ -1401,7 +1690,7 @@ def process_projection(
             with TiffWriter(filename_path, bigtiff=True) as tif:
                 metadata = {
                     "axes": axes,
-                    "SignificantBits": 16,
+                    "SignificantBits": 32 if save_float32 else 16,
                     "PhysicalSizeX": pixel_size_um,
                     "PhysicalSizeXUnit": "µm",
                     "PhysicalSizeY": pixel_size_um,
@@ -1430,6 +1719,7 @@ def process_ASI_SCOPE(
     micromanager_metadata: dict,
     asi_metadata: dict,
     deconvolve: bool = False,
+    save_float32: bool = False,
     max_projection: bool = True,
     flatfield_correction: bool = False,
     create_fused_max_projection: bool = True,
@@ -1445,6 +1735,7 @@ def process_ASI_SCOPE(
     decon_fallback_step_scan: int | None = None,
     camera_conversion_override: float | None = None,
     stage_axis_flips: tuple[bool, bool, bool] = (False, True, True),
+    output_dir: Path | None = None,
 ):
     """Postprocess ASI SCOPE OPM dataset.
 
@@ -1469,6 +1760,8 @@ def process_ASI_SCOPE(
         Micromanager metadata dictionary containing OPM data attributes.
     asi_metadata: dict
         ASI metadata dictionary containing OPM data attributes.
+    output_dir: Path or None, default = None
+        Directory for processed artifacts. Defaults to the source directory.
     deconvolve: bool, default = False
         Deconvolve the data using RLGC.
     max_projection: bool, default = True
@@ -1516,6 +1809,8 @@ def process_ASI_SCOPE(
 
         decon_chunk_state = RlgcChunkState(decon_crop_scan)
 
+    output_dir = _resolve_output_directory(root_path, output_dir)
+
     import re
 
     import zarr
@@ -1547,6 +1842,7 @@ def process_ASI_SCOPE(
             "ASI camera conversion is absent from metadata; pass "
             "--asi-camera-conversion explicitly."
         )
+    output_dtype = _processed_dtype(save_float32)
     del tif
 
     asi_step_um = float(micromanager_metadata["z-step_um"])
@@ -1615,7 +1911,7 @@ def process_ASI_SCOPE(
     # create array to hold one deskewed volume
     deskewed = np.zeros(
         (deskewed_shape[0] // z_downsample_level, deskewed_shape[1], deskewed_shape[2]),
-        dtype=np.uint16,
+        dtype=np.float32,
     )
 
     processing_metadata = {
@@ -1640,15 +1936,15 @@ def process_ASI_SCOPE(
     }
 
     if not (deconvolve):
-        output_path = root_path.parents[0] / Path(
+        output_path = output_dir / Path(
             acquisition_stem(root_path) + "_deskewed.ome.zarr"
         )
     else:
-        output_path = root_path.parents[0] / Path(
+        output_path = output_dir / Path(
             acquisition_stem(root_path) + "_decon_deskewed.ome.zarr"
         )
     flatfield_path = (
-        root_path.parents[0]
+        output_dir
         / Path("flatfield")
         / Path(acquisition_stem(root_path) + "_flatfield.ome.tif")
     )
@@ -1720,11 +2016,7 @@ def process_ASI_SCOPE(
                 "applied": crop_after_deskew,
                 "parameters": {"crop_y_pixels_per_side": int(crop_y)},
             },
-            {
-                "name": "uint16_conversion",
-                "applied": True,
-                "parameters": {"clip_min": 0, "clip_max": 2**16 - 1},
-            },
+            _output_conversion_step(save_float32),
         ],
     )
     output_collection = create_position_collection(
@@ -1734,6 +2026,7 @@ def process_ASI_SCOPE(
         stage_positions=stage_positions[:pos_shape],
         channels=[str(value) for value in em_values],
         attributes=processing_metadata,
+        dtype=output_dtype,
     )
     ts_store = output_collection.arrays
 
@@ -1749,15 +2042,15 @@ def process_ASI_SCOPE(
 
         # create array to hold one maximum projection deskewed volume
         max_z_deskewed = np.zeros(
-            (1, deskewed_shape[1], deskewed_shape[2]), dtype=np.uint16
+            (1, deskewed_shape[1], deskewed_shape[2]), dtype=np.float32
         )
 
         if not (deconvolve):
-            max_z_output_path = root_path.parents[0] / Path(
+            max_z_output_path = output_dir / Path(
                 acquisition_stem(root_path) + "_max_z_deskewed.ome.zarr"
             )
         else:
-            max_z_output_path = root_path.parents[0] / Path(
+            max_z_output_path = output_dir / Path(
                 acquisition_stem(root_path) + "_max_z_decon_deskewed.ome.zarr"
             )
         max_z_metadata = _derived_processing_metadata(
@@ -1781,11 +2074,12 @@ def process_ASI_SCOPE(
             stage_positions=stage_positions[:pos_shape],
             channels=[str(value) for value in em_values],
             attributes=max_z_metadata,
+            dtype=output_dtype,
         )
         max_z_ts_store = max_z_collection.arrays
 
     if flatfield_correction:
-        flatfield_dir = root_path.parents[0] / Path("flatfield")
+        flatfield_dir = output_dir / Path("flatfield")
         if not (flatfield_dir.exists()):
             flatfield_dir.mkdir()
         flatfields = _load_or_estimate_flatfield(
@@ -1819,22 +2113,11 @@ def process_ASI_SCOPE(
     for t_idx in time_iterator:
         for pos_idx in pos_iterator:
             for chan_idx in tqdm(range(datastore.shape[2]), desc="c", leave=False):
-                camera_corrected_data = (
-                    (
-                        (
-                            np.squeeze(
-                                np.asarray(
-                                    datastore[t_idx, pos_idx, chan_idx, :],
-                                    dtype=np.float32,
-                                )
-                                - camera_offset
-                            )
-                            * camera_conversion
-                        )
-                        / flatfields[chan_idx, :].astype(np.float32)
-                    )
-                    .clip(0, 2**16 - 1)
-                    .astype(np.uint16)
+                camera_corrected_data = _camera_corrected_image(
+                    np.squeeze(datastore[t_idx, pos_idx, chan_idx, :]),
+                    camera_offset,
+                    camera_conversion,
+                    flatfields[chan_idx, :],
                 )
                 if "stage" in opm_mode:
                     flip_scan = True
@@ -1881,6 +2164,7 @@ def process_ASI_SCOPE(
                         distance=scan_axis_step_um,
                         pixel_size=pixel_size_um,
                         downsample_factor=z_downsample_level,
+                        output_dtype=np.float32,
                     )
                 else:
                     deskewed = orthogonal_deskew(
@@ -1889,6 +2173,7 @@ def process_ASI_SCOPE(
                         distance=scan_axis_step_um,
                         pixel_size=pixel_size_um,
                         downsample_factor=z_downsample_level,
+                        output_dtype=np.float32,
                     )
 
                 if crop_after_deskew:
@@ -1898,11 +2183,17 @@ def process_ASI_SCOPE(
                     max_z_deskewed = np.max(deskewed, axis=0, keepdims=True)
                     # create future objects for async data writing
                     ts_max_writes.append(
-                        max_z_ts_store[pos_idx][t_idx, chan_idx].write(max_z_deskewed)
+                        max_z_ts_store[pos_idx][t_idx, chan_idx].write(
+                            _format_processed_output(max_z_deskewed, save_float32)
+                        )
                     )
 
                 # create future objects for async data writing
-                ts_writes.append(ts_store[pos_idx][t_idx, chan_idx].write(deskewed))
+                ts_writes.append(
+                    ts_store[pos_idx][t_idx, chan_idx].write(
+                        _format_processed_output(deskewed, save_float32)
+                    )
+                )
 
     # wait for writes to finish
     for ts_write in ts_writes:
@@ -1918,17 +2209,17 @@ def process_ASI_SCOPE(
 
     if create_fused_max_projection:
         if deconvolve:
-            max_z_output_path = root_path.parents[0] / Path(
+            max_z_output_path = output_dir / Path(
                 acquisition_stem(root_path) + "_max_z_decon_deskewed.ome.zarr"
             )
         else:
-            max_z_output_path = root_path.parents[0] / Path(
+            max_z_output_path = output_dir / Path(
                 acquisition_stem(root_path) + "_max_z_deskewed.ome.zarr"
             )
         max_z_ts_store = open_position_collection(max_z_output_path).arrays
 
         print("\nFusing max projection using stage positions...")
-        fused_output_path = root_path.parents[0] / Path(
+        fused_output_path = output_dir / Path(
             acquisition_stem(root_path) + "_max_z_fused.ome.zarr"
         )
 
@@ -1969,7 +2260,7 @@ def process_ASI_SCOPE(
                 with TiffWriter(filename_path, bigtiff=True) as tif:
                     metadata = {
                         "axes": axes,
-                        "SignificantBits": 16,
+                        "SignificantBits": 32 if save_float32 else 16,
                         "PhysicalSizeX": pixel_size_um,
                         "PhysicalSizeXUnit": "µm",
                         "PhysicalSizeY": pixel_size_um,
@@ -2002,7 +2293,7 @@ def process_ASI_SCOPE(
                 with TiffWriter(filename_path, bigtiff=True) as tif:
                     metadata = {
                         "axes": axes,
-                        "SignificantBits": 16,
+                        "SignificantBits": 32 if save_float32 else 16,
                         "PhysicalSizeX": pixel_size_um,
                         "PhysicalSizeXUnit": "µm",
                         "PhysicalSizeY": pixel_size_um,

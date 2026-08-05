@@ -170,6 +170,12 @@ def _build_ome_xml(
     channel_names = list(channels or (f"channel-{index}" for index in range(c)))
     if len(channel_names) != c:
         raise ValueError("channels must contain one name per channel")
+    ome_pixel_type = {
+        "float32": "float",
+        "float64": "double",
+        "complex64": "complex",
+        "complex128": "double-complex",
+    }.get(dtype.name, dtype.name)
 
     images = []
     for position in range(positions):
@@ -195,7 +201,7 @@ def _build_ome_xml(
                 pixels=Pixels(
                     id=f"Pixels:{position}",
                     dimension_order="XYZCT",
-                    type=dtype.name,
+                    type=ome_pixel_type,
                     size_x=x,
                     size_y=y,
                     size_z=z,

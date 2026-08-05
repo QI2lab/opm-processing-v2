@@ -141,6 +141,95 @@ def require_gpu_backend() -> None:
     )
 
 
+_PROCESSED_SUFFIXES = (
+    "_decon_deskewed.ome.zarr",
+    "_decon_projection.ome.zarr",
+    "_decon_deskewed.zarr",
+    "_decon_projection.zarr",
+    "_deskewed.ome.zarr",
+    "_projection.ome.zarr",
+    "_deskewed.zarr",
+    "_projection.zarr",
+)
+_PROCESSED_PREFERENCE = {
+    "_deskewed.ome.zarr": 0,
+    "_projection.ome.zarr": 1,
+    "_deskewed.zarr": 2,
+    "_projection.zarr": 3,
+    "_decon_deskewed.ome.zarr": 4,
+    "_decon_projection.ome.zarr": 5,
+    "_decon_deskewed.zarr": 6,
+    "_decon_projection.zarr": 7,
+}
+
+
+def _processed_store_identity(path: Path) -> tuple[str, str] | None:
+    """Return the acquisition stem and processed suffix for a full tile store."""
+    for suffix in _PROCESSED_SUFFIXES:
+        if path.name.endswith(suffix):
+            stem = path.name[: -len(suffix)]
+            if stem.endswith("_max_z"):
+                return None
+            return stem, suffix
+    return None
+
+
+def resolve_fusion_input(
+    path: str | Path,
+) -> tuple[Path, Path, str, Path | None]:
+    """Locate fusion-ready processed data from a source or output directory.
+
+    Returns the output directory, processed collection, acquisition stem, and
+    source acquisition path when the latter can be resolved locally.
+    """
+    candidate = Path(path).expanduser().resolve()
+    if not candidate.is_dir():
+        raise ValueError(f"Fusion input is not a directory: {candidate}")
+
+    direct_identity = _processed_store_identity(candidate)
+    search_dir = candidate.parent if direct_identity is not None else candidate
+    if direct_identity is not None:
+        matches = [(candidate, *direct_identity)]
+    else:
+        matches = []
+        for item in search_dir.iterdir():
+            if not item.is_dir():
+                continue
+            identity = _processed_store_identity(item)
+            if identity is not None:
+                matches.append((item, *identity))
+
+    if matches:
+        stems = {stem for _, stem, _ in matches}
+        if len(stems) != 1:
+            found = ", ".join(sorted(stems))
+            raise ValueError(
+                f"Expected processed data for one acquisition in {search_dir}, "
+                f"found: {found}"
+            )
+        data_path, stem, _ = min(
+            matches,
+            key=lambda match: _PROCESSED_PREFERENCE[match[2]],
+        )
+        return search_dir, data_path, stem, None
+
+    source_path = resolve_acquisition_path(candidate)
+    output_dir = source_path.parent
+    stem = acquisition_stem(source_path)
+    checked = []
+    for suffix, _priority in sorted(
+        _PROCESSED_PREFERENCE.items(), key=lambda item: item[1]
+    ):
+        processed_path = output_dir / f"{stem}{suffix}"
+        checked.append(processed_path)
+        if processed_path.is_dir():
+            return output_dir, processed_path, stem, source_path
+    raise FileNotFoundError(
+        "Processed data store not found. Checked: "
+        + ", ".join(str(item) for item in checked)
+    )
+
+
 def _ssim(arr1: Any, arr2: Any, win_size: int) -> float:
     """Compute SSIM, routing to GPU kernel if available, else CPU skimage.
 
@@ -601,10 +690,10 @@ class TileFusion:
     Parameters
     ----------
     root_path : str or pathlib.Path
-        Path used to infer the processed datastore location. The code searches for:
-        `{stem}_deskewed.ome.zarr`, `{stem}_projection.ome.zarr`, followed by
-        their legacy `.zarr` names. Deconvolved products are used as fallbacks
-        only when no corresponding non-deconvolved product exists.
+        Source acquisition, processed collection, or processing output
+        directory. The code discovers deskewed or projection data there;
+        deconvolved products are fallbacks when a non-deconvolved product is
+        unavailable.
     blend_pixels : tuple[int, int, int], default=(20, 600, 400)
         Feather ramp widths (bz, by, bx) used to build 1D weight profiles.
     downsample_factors : tuple[int, int, int], default=(3, 5, 5)
@@ -671,7 +760,8 @@ class TileFusion:
         Parameters
         ----------
         root_path
-            Original acquisition path used to discover processed collections.
+            Source acquisition, processed collection, or processing output
+            directory used to discover processed data.
         blend_pixels
             Feathering width in ZYX voxels.
         downsample_factors
@@ -715,27 +805,12 @@ class TileFusion:
         None
             No value is returned.
         """
-        self.root = resolve_acquisition_path(root_path)
-        base = self.root.parents[0]
-        stem = acquisition_stem(self.root)
-
-        candidates = (
-            base / f"{stem}_deskewed.ome.zarr",
-            base / f"{stem}_projection.ome.zarr",
-            base / f"{stem}_deskewed.zarr",
-            base / f"{stem}_projection.zarr",
-            base / f"{stem}_decon_deskewed.ome.zarr",
-            base / f"{stem}_decon_projection.ome.zarr",
-            base / f"{stem}_decon_deskewed.zarr",
-            base / f"{stem}_decon_projection.zarr",
-        )
-        data_path = next((path for path in candidates if path.exists()), None)
-        if data_path is None:
-            checked = ", ".join(str(path) for path in candidates)
-            raise FileNotFoundError(
-                f"Processed data store not found. Checked: {checked}"
-            )
-        self.data = data_path
+        (
+            self.output_dir,
+            self.data,
+            self.acquisition_name,
+            source_path,
+        ) = resolve_fusion_input(root_path)
 
         if max_workers is None:
             max_workers = _default_fusion_workers()
@@ -758,6 +833,15 @@ class TileFusion:
         )
         collection = open_position_collection(self.data)
         self._input_attributes = dict(collection.attributes)
+        if source_path is None:
+            provenance = self._input_attributes.get("opm_processing")
+            source = provenance.get("source") if isinstance(provenance, dict) else None
+            source_value = source.get("path") if isinstance(source, dict) else None
+            if isinstance(source_value, str) and source_value:
+                source_path = Path(source_value).expanduser().resolve()
+        # Current processed metadata contains all fusion geometry. ``self.root``
+        # remains only as a legacy fallback when that embedded geometry is absent.
+        self.root = source_path if source_path is not None else self.data
         source_open_futures = [
             ts.open(
                 array.spec(retain_context=False),
@@ -894,6 +978,9 @@ class TileFusion:
     def _build_deskew_support_mask(self) -> np.ndarray:
         """Generate exact deskew support from metadata without reading pixels."""
         stored_input_shape = self._input_attributes.get("deskew_input_shape_zyx")
+        if self._is_2d and stored_input_shape is None:
+            # Projection processing does not deskew or pad its image plane.
+            return np.ones((1, int(self.y_dim)), dtype=bool)
         if (
             isinstance(stored_input_shape, (list, tuple))
             and len(stored_input_shape) == 3
@@ -2804,15 +2891,14 @@ class TileFusion:
         -------
         None
             Writes the fused NGFF store to:
-            `{base}/{stem}_fused.ome.zarr`
+            `{processing_output}/{stem}_fused.ome.zarr`
 
         Raises
         ------
         RuntimeError
             If required intermediate computations fail.
         """
-        base = self.root.parents[0]
-        metrics_path = base / self.metrics_filename
+        metrics_path = self.output_dir / self.metrics_filename
 
         recomputed_metrics = False
         try:
@@ -2850,7 +2936,7 @@ class TileFusion:
         self._compute_fused_image_space()
         self._pad_to_multiscale_multiple()
 
-        omezarr = base / f"{acquisition_stem(self.root)}_fused.ome.zarr"
+        omezarr = self.output_dir / f"{self.acquisition_name}_fused.ome.zarr"
         self.fused_ts, self.write_block_shape = self._prepare_fused_image(omezarr)
         self._fuse_by_blocks()
         self._write_multiscales()

@@ -10,7 +10,9 @@ from yaozarrs import open_group, v05
 from yaozarrs.write.v05 import prepare_image
 
 from opm_processing.fuse import app as fuse_app
+from opm_processing.imageprocessing import maxtilefusion as maxtilefusion_module
 from opm_processing.imageprocessing import tilefusion as tilefusion_module
+from opm_processing.imageprocessing.maxtilefusion import MaxTileFusion
 from opm_processing.imageprocessing.tilefusion import TileFusion
 
 
@@ -37,11 +39,97 @@ class _ArrayView:
 class _ArrayStore:
     """Small in-memory TensorStore substitute for numerical fusion."""
 
-    def __init__(self, shape):
-        self.data = np.zeros(shape, dtype=np.uint16)
+    def __init__(self, shape, dtype=np.uint16):
+        self.data = np.zeros(shape, dtype=dtype)
 
     def __getitem__(self, key):
         return _ArrayView(self, key)
+
+
+class _ReadResult:
+    """Completed read compatible with an in-memory TensorStore substitute."""
+
+    def __init__(self, value):
+        self.value = value
+
+    def result(self):
+        """Return the selected array."""
+        return self.value
+
+
+class _ReadView:
+    """Readable selection into an in-memory array."""
+
+    def __init__(self, value):
+        self.value = value
+
+    def read(self):
+        """Return an immediately completed read."""
+        return _ReadResult(self.value)
+
+
+class _ReadArray:
+    """Small read-only TensorStore substitute for projection fusion."""
+
+    def __init__(self, data):
+        self.data = np.asarray(data)
+        self.shape = self.data.shape
+        self.dtype = SimpleNamespace(numpy_dtype=self.data.dtype)
+
+    def __getitem__(self, key):
+        return _ReadView(self.data[key])
+
+
+@pytest.mark.parametrize(
+    ("dtype", "values"),
+    (
+        (np.uint16, (10, 30, 50)),
+        (np.float32, (0.25, 0.75, 1.25)),
+    ),
+)
+def test_max_projection_fusion_is_chunked_and_sparse(monkeypatch, dtype, values):
+    """Fuse distant tiles without allocating arrays the size of the full canvas."""
+    tile_shape = (4, 4)
+    tile_positions = np.asarray(((0, 0), (0, 2), (0, 10_000)), dtype=float)
+    fused_shape = (4, 10_004)
+    tiles = tuple(
+        _ReadArray(np.full((1, 1, 1, *tile_shape), value, dtype=dtype))
+        for value in values
+    )
+    fusion = MaxTileFusion.__new__(MaxTileFusion)
+    fusion.pad_y = 0
+    fusion.pad_x = 0
+    fusion.ts_dataset = tiles
+    fusion.tile_positions = tile_positions
+    fusion.pixel_size = np.asarray((1.0, 1.0))
+    fusion.offset = (0.0, 0.0)
+    fusion.time_dim = 1
+    fusion.channels = 1
+    fusion.tile_shape = tile_shape
+    fusion.fused_shape = fused_shape
+    fusion.time_range = None
+    fusion.chunk_size = 3
+    fusion.weight_mask = np.ones(tile_shape, dtype=np.float32)
+    fusion.output_dtype = np.dtype(dtype)
+    fusion.fused_ts = _ArrayStore((1, 1, 1, *fused_shape), dtype=dtype)
+
+    real_zeros = maxtilefusion_module.np.zeros
+
+    def reject_full_canvas(shape, *args, **kwargs):
+        if tuple(shape) == (fusion.channels, 1, *fusion.fused_shape):
+            raise AssertionError("fusion allocated the full mosaic canvas")
+        return real_zeros(shape, *args, **kwargs)
+
+    monkeypatch.setattr(maxtilefusion_module.np, "zeros", reject_full_canvas)
+
+    fusion.fuse_tiles()
+
+    expected = np.zeros((1, 1, 1, *fused_shape), dtype=dtype)
+    expected[0, 0, 0, :, :2] = values[0]
+    expected[0, 0, 0, :, 2:4] = (values[0] + values[1]) / 2
+    expected[0, 0, 0, :, 4:6] = values[1]
+    expected[0, 0, 0, :, 10_000:10_004] = values[2]
+    np.testing.assert_allclose(fusion.fused_ts.data, expected)
 
 
 def test_registration_pairs_include_every_physical_overlap() -> None:

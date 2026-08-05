@@ -130,6 +130,39 @@ Process a raw acquisition with:
 uv run process "/path/to/qi2lab_acquisition.zarr"
 ```
 
+Processing calculations remain in `float32` through camera-background
+subtraction, photon calibration, optional deconvolution, and deskewing. Outputs
+are converted to `uint16` only when they are written by default. For low-signal
+data with meaningful calibrated values below one, retain those fractional values
+in all processed OME-Zarr outputs with:
+
+```bash
+uv run process "/path/to/qi2lab_acquisition.zarr" --save-float32
+```
+
+This option also keeps maximum-Z and fused maximum-projection outputs as
+`float32`; it uses twice the storage of `uint16` output.
+
+To deskew complete tiles while a current opm-v2 mirror or stage acquisition is
+still being written, pass the illumination image as the value of `--live`:
+
+```bash
+uv run process "/path/to/acquisition.ome.zarr" --live "/path/to/illumination.ome.tif"
+uv run process "/path/to/acquisition.ome.zarr" --live "/path/to/illumination.ome.tif" --deconvolve
+```
+
+Live illumination must be `CYX`, or `YX` for a single-channel acquisition, and
+must match the raw camera dimensions. Live mode never estimates illumination
+and cannot be combined with `--flatfield-correction`, time ranges, or position
+ranges. It expects `acquisition.manifest.json` and `acquisition.log.jsonl` next
+to `acquisition.ome.zarr`. The immutable manifest provides the complete planned
+acquisition metadata, while the append-only log reports acquisition lifecycle
+events. Tile readiness is determined independently from the presence of every
+raw Zarr chunk in a `(time, position)` tile. When processing catches up, it
+polls approximately every 30 seconds. Fused outputs are created only after the
+log reports successful acquisition completion. The exact sidecar schema is in
+[LIVE_PROCESSING_CONTRACT.md](LIVE_PROCESSING_CONTRACT.md).
+
 Flatfield estimation is controlled only by `--flatfield-correction`. When it is
 enabled, the pipeline fits a rectangular working field downsampled twofold on
 each camera axis. It otherwise uses the installed BaSiCPy defaults, disables
@@ -150,7 +183,25 @@ conversion commands expose those series as one virtual `TPCZYX` TensorStore,
 without copying or reshaping the source data. Legacy root-array Zarr v2
 acquisitions remain supported by the compatibility path.
 
-The source acquisition remains unchanged. Processing creates OME-Zarr v0.5 outputs next to it. Per-position outputs are Bio-Formats2Raw collections; the position is represented by a separate `TCZYX` image series rather than a `P` axis inside an array. Maximum projections retain a singleton `Z` axis.
+The source acquisition remains unchanged. By default, processing creates
+OME-Zarr v0.5 outputs next to it. To place every processing artifact in a
+different directory, use `--output`; missing parent directories are created:
+
+```bash
+uv run process "/path/to/qi2lab_acquisition.zarr" --output "/path/to/processed"
+```
+
+The processed collections embed the geometry, stage positions, channel data,
+and source provenance needed by fusion. The output directory can therefore be
+passed directly to `fuse`, without copying the source acquisition into it:
+
+```bash
+uv run fuse "/path/to/processed"
+```
+
+Per-position outputs are Bio-Formats2Raw collections; the position is
+represented by a separate `TCZYX` image series rather than a `P` axis inside an
+array. Maximum projections retain a singleton `Z` axis.
 
 For an oblique acquisition with stem `qi2lab_acquisition`, processing can create:
 
@@ -213,8 +264,9 @@ Register and fuse processed tiles into a multiscale OME-Zarr v0.5 image with:
 uv run fuse "/path/to/qi2lab_acquisition.zarr"
 ```
 
-The path may be the acquisition `.ome.zarr` store itself or its containing
-directory, even when that directory already contains processed Zarr outputs.
+The path may be the acquisition `.ome.zarr` store itself, a processed
+collection, its containing directory, or the directory selected with
+`process --output`.
 
 Registration uses channel index 0 by default. Select another zero-based channel
 index without changing which channels are written to the fused output:

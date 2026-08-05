@@ -8,13 +8,19 @@ import pytest
 import numpy as np
 import zarr
 from tifffile import imread
+from yaozarrs import DimSpec, v05
+from yaozarrs.write.v05 import prepare_image
 
 from opm_processing.dataio.acquisition import (
     inspect_acquisition,
     open_acquisition_datastore,
 )
 from opm_processing.dataio.convert_timelapse_data import convert_timelapse
-from opm_processing.dataio.position_collection import create_position_collection
+from opm_processing.dataio.position_collection import (
+    create_position_collection,
+    open_position_collection,
+)
+from opm_processing.process import process
 
 
 @pytest.fixture
@@ -98,10 +104,88 @@ def current_opm_v2_stage_scan(tmp_path: Path) -> Path:
         data = np.empty((1, shape[2], shape[3], shape[4], shape[5]), dtype=np.uint16)
         zz, yy, xx = np.mgrid[: shape[3], : shape[4], : shape[5]]
         for channel in range(shape[2]):
-            data[0, channel] = (
-                1000 * position + 100 * channel + 10 * zz + 2 * yy + xx
-            )
+            data[0, channel] = 1000 * position + 100 * channel + 10 * zz + 2 * yy + xx
         root[str(position)]["0"][:] = data
+    return path
+
+
+@pytest.fixture
+def current_single_position_mirror_timelapse(tmp_path: Path) -> Path:
+    """Create the root-Image layout ome-writers uses for one position."""
+    path = tmp_path / "single_mirror.ome.zarr"
+    shape = (3, 1, 4, 5, 6)  # T, C, Z, Y, X
+    dims = [
+        DimSpec(name="t", size=shape[0], scale=1.0, unit="second"),
+        DimSpec(name="c", size=shape[1], scale=1.0),
+        DimSpec(name="z", size=shape[2], scale=0.4, unit="micrometer"),
+        DimSpec(name="y", size=shape[3], scale=0.115, unit="micrometer"),
+        DimSpec(name="x", size=shape[4], scale=0.115, unit="micrometer"),
+    ]
+    image = v05.Image(
+        multiscales=[v05.Multiscale.from_dims(dims, name="single-position")]
+    )
+    _, arrays = prepare_image(
+        path,
+        image,
+        datasets=[(shape, np.dtype(np.uint16))],
+        extra_attributes={
+            "opm_v2": {
+                "index_sizes": {"t": 3, "p": 1, "c": 1, "z": 4},
+                "acquisition_order": ["t", "p", "z", "c"],
+                "configuration": {
+                    "acq_config": {
+                        "opm_mode": "mirror",
+                        "DAQ": {
+                            "channel_states": [True],
+                            "channel_powers": [10.0],
+                            "channel_exposures_ms": [2.0],
+                        },
+                    }
+                },
+            }
+        },
+        chunks=(1, 1, 1, shape[-2], shape[-1]),
+        writer="tensorstore",
+        overwrite=True,
+    )
+    data = np.arange(np.prod(shape), dtype=np.uint16).reshape(shape) + 200
+    arrays["0"].write(data).result()
+
+    frames = []
+    for time in range(shape[0]):
+        for scan in range(shape[2]):
+            frames.append(
+                {
+                    "event_index": {"t": time, "p": 0, "c": 0, "z": scan},
+                    "event_metadata": {
+                        "DAQ": {
+                            "mode": "mirror",
+                            "image_mirror_step_um": 0.4,
+                            "current_channel": "488nm",
+                            "laser_powers": [10.0],
+                        },
+                        "Camera": {
+                            "exposure_ms": 2.0,
+                            "offset": 100.0,
+                            "e_to_ADU": 0.25,
+                        },
+                        "OPM": {
+                            "angle_deg": 30.0,
+                            "camera_mirror_orientation": "positive",
+                            "camera_XYstage_orientation": "positive",
+                            "camera_Zstage_orientation": "positive",
+                        },
+                        "Stage": {
+                            "x_pos": 100.0,
+                            "y_pos": 200.0,
+                            "z_pos": 30.0,
+                        },
+                    },
+                    "storage_index": [time, 0, scan],
+                }
+            )
+    root = zarr.open_group(path, mode="a")
+    root.attrs["ome_writers"] = {"frame_metadata": frames}
     return path
 
 
@@ -152,6 +236,68 @@ def test_current_stage_collection_opens_as_virtual_tpczyx(
             expected = 1000 * position + 100 * channel + 10 * zz + 2 * yy + xx
             actual = datastore[0, position, channel].read().result()
             np.testing.assert_array_equal(actual, expected)
+
+
+def test_single_position_root_image_opens_as_virtual_tpczyx(
+    current_single_position_mirror_timelapse: Path,
+) -> None:
+    """Normalize ome-writers' one-position Image layout with a P=1 axis."""
+    path = current_single_position_mirror_timelapse
+    metadata = inspect_acquisition(path)
+    datastore = open_acquisition_datastore(metadata)
+
+    assert metadata.storage_format == "opm-v2-ome-zarr-v3"
+    assert metadata.mode == "mirror"
+    assert metadata.axes == ("t", "p", "c", "z", "y", "x")
+    assert metadata.shape == (3, 1, 1, 4, 5, 6)
+    assert metadata.array_paths == ("0",)
+    assert metadata.scan_axis_step_um == pytest.approx(0.4)
+    assert metadata.stage_positions_zxy == ((30.0, 100.0, 200.0),)
+    assert tuple(datastore.shape) == metadata.shape
+    expected = (
+        np.arange(3 * 1 * 4 * 5 * 6, dtype=np.uint16).reshape(3, 1, 4, 5, 6) + 200
+    )
+    np.testing.assert_array_equal(datastore[:, 0].read().result(), expected)
+
+
+def test_single_position_mirror_timelapse_processes_every_timepoint(
+    current_single_position_mirror_timelapse: Path,
+) -> None:
+    """Deskew every timepoint from a one-position root Image acquisition."""
+    path = current_single_position_mirror_timelapse
+    process(
+        root_path=path,
+        max_projection=False,
+        create_fused_max_projection=False,
+        z_downsample_level=1,
+    )
+
+    output = open_position_collection(path.parent / "single_mirror_deskewed.ome.zarr")
+    assert output.shape[:3] == (3, 1, 1)
+    for time_index in range(3):
+        assert np.any(output.arrays[0][time_index].read().result())
+
+
+def test_single_position_mirror_timelapse_can_save_float32(
+    current_single_position_mirror_timelapse: Path,
+) -> None:
+    """Preserve fractional calibrated values for the reported acquisition layout."""
+    path = current_single_position_mirror_timelapse
+    process(
+        root_path=path,
+        save_float32=True,
+        max_projection=False,
+        create_fused_max_projection=False,
+        z_downsample_level=1,
+    )
+
+    output = open_position_collection(path.parent / "single_mirror_deskewed.ome.zarr")
+    values = np.asarray(output.arrays[0][0, 0].read().result())
+    assert values.dtype == np.float32
+    assert np.any((values > 0) & (values != np.floor(values)))
+    conversion = output.attributes["opm_processing"]["steps"][-1]
+    assert conversion["name"] == "float32_output"
+    assert conversion["parameters"]["quantized"] is False
 
 
 def test_timelapse_converter_accepts_current_collection(

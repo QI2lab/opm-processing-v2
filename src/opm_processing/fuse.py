@@ -31,6 +31,7 @@ from opm_processing.imageprocessing.tilefusion import (
     TileFusion,
     fusion_backend_status,
     require_gpu_backend,
+    resolve_fusion_input,
 )
 
 
@@ -86,7 +87,8 @@ def register_and_fuse(
     Parameters
     ----------
     root_path: Path
-        Path to an OPM acquisition Zarr store or its containing directory.
+        Path to an OPM acquisition, a processed collection, or the directory
+        selected with ``process --output``.
     registration_channel: int, default = 0
         Zero-based channel index to use for registration.
         If there is only one channel, this should be 0.
@@ -128,11 +130,16 @@ def register_and_fuse(
         No value is returned.
     """
     if regenerate_max_z:
-        acquisition_path = resolve_acquisition_path(root_path)
-        base = acquisition_path.parent
-        stem = acquisition_stem(acquisition_path)
-        fused_path = base / f"{stem}_fused.ome.zarr"
-        output_path = base / f"{stem}_max_z_fused.ome.zarr"
+        try:
+            output_dir, _processed_path, stem, _source_path = resolve_fusion_input(
+                root_path
+            )
+        except FileNotFoundError:
+            acquisition_path = resolve_acquisition_path(root_path)
+            output_dir = acquisition_path.parent
+            stem = acquisition_stem(acquisition_path)
+        fused_path = output_dir / f"{stem}_fused.ome.zarr"
+        output_path = output_dir / f"{stem}_max_z_fused.ome.zarr"
         regenerate_fused_max_projection(
             fused_path,
             output_path,

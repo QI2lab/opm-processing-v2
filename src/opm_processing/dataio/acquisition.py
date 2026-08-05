@@ -370,31 +370,45 @@ def _inspect_ome_zarr(path: Path, root: ZarrGroup) -> AcquisitionMetadata:
     if not isinstance(opm, dict):
         raise ValueError(f"OME-Zarr store lacks opm_v2 acquisition metadata: {path}")
     layout = root.ome_metadata()
-    if not isinstance(layout, v05.Bf2Raw):
-        raise ValueError(f"Expected an OME-Zarr v0.5 Bio-Formats2Raw layout: {path}")
-    ome_group = root["OME"]
-    if not isinstance(ome_group, ZarrGroup):
-        raise ValueError(f"OME metadata node is not a group: {path}")
-    series_metadata = ome_group.ome_metadata()
-    if not isinstance(series_metadata, v05.Series):
-        raise ValueError(f"OME group lacks typed series metadata: {path}")
-    series = series_metadata.series
+    if isinstance(layout, v05.Bf2Raw):
+        ome_group = root["OME"]
+        if not isinstance(ome_group, ZarrGroup):
+            raise ValueError(f"OME metadata node is not a group: {path}")
+        series_metadata = ome_group.ome_metadata()
+        if not isinstance(series_metadata, v05.Series):
+            raise ValueError(f"OME group lacks typed series metadata: {path}")
+        image_entries = [
+            (str(series_name), root[str(series_name)])
+            for series_name in series_metadata.series
+        ]
+    elif isinstance(layout, v05.Image):
+        # ome-writers stores one-position acquisitions directly as an Image
+        # group. Multi-position acquisitions use the Bio-Formats2Raw layout.
+        image_entries = [("", root)]
+    else:
+        raise ValueError(
+            f"Expected an OME-Zarr v0.5 Image or Bio-Formats2Raw layout: {path}"
+        )
+    if not image_entries:
+        raise ValueError(f"OME-Zarr acquisition has no image series: {path}")
 
     frame_sets: list[list[dict[str, Any]]] = []
     array_shapes: list[tuple[int, ...]] = []
+    array_paths: list[str] = []
     dimension_names: tuple[str, ...] = ()
     channel_names: list[str] = []
     pixel_size_um: float | None = None
-    for position_index, series_name in enumerate(series):
-        image_group = root[str(series_name)]
+    for position_index, (series_name, image_group) in enumerate(image_entries):
         if not isinstance(image_group, ZarrGroup):
-            raise ValueError(f"Series {series_name} is not an image group")
+            raise ValueError(f"Series {series_name or '<root>'} is not an image group")
         frame_sets.append(
             list(image_group.attrs.get("ome_writers", {}).get("frame_metadata", []))
         )
         image_metadata = image_group.ome_metadata()
         if not isinstance(image_metadata, v05.Image):
-            raise ValueError(f"Series {series_name} lacks typed OME image metadata")
+            raise ValueError(
+                f"Series {series_name or '<root>'} lacks typed OME image metadata"
+            )
         if len(image_metadata.multiscales) != 1:
             raise ValueError(f"Series {series_name} must contain one multiscale image")
         multiscale = image_metadata.multiscales[0]
@@ -402,6 +416,9 @@ def _inspect_ome_zarr(path: Path, root: ZarrGroup) -> AcquisitionMetadata:
             raise ValueError(f"Series {series_name} has no image datasets")
         dataset_path = multiscale.datasets[0].path
         array = image_group[dataset_path]
+        array_paths.append(
+            f"{series_name}/{dataset_path}" if series_name else str(dataset_path)
+        )
         shape = tuple(int(value) for value in (array.metadata.shape or ()))
         if not shape:
             raise ValueError(f"Series {series_name} has no array shape")
@@ -428,7 +445,7 @@ def _inspect_ome_zarr(path: Path, root: ZarrGroup) -> AcquisitionMetadata:
     if not dimension_names:
         dimension_names = tuple("tczyx"[-len(array_shapes[0]) :])
     axes = (dimension_names[0], "p", *dimension_names[1:])
-    shape = (array_shapes[0][0], len(series), *array_shapes[0][1:])
+    shape = (array_shapes[0][0], len(image_entries), *array_shapes[0][1:])
     sizes = opm.get("index_sizes", {})
     for axis, expected in sizes.items():
         if axis in axes and int(expected) != shape[axes.index(axis)]:
@@ -475,7 +492,11 @@ def _inspect_ome_zarr(path: Path, root: ZarrGroup) -> AcquisitionMetadata:
     )
     configured_step = _number(daq.get("scan_axis_step_um"))
     if configured_step is None:
+        configured_step = _number(daq.get("image_mirror_step_um"))
+    if configured_step is None:
         configured_step = _number(daq_config.get("scan_axis_step_um"))
+    if configured_step is None:
+        configured_step = _number(daq_config.get("image_mirror_step_um"))
     scan_step = abs(configured_step) if configured_step is not None else measured_step
     if measured_step is not None and configured_step is not None:
         tolerance = max(1e-6, abs(configured_step) * 1e-3)
@@ -499,10 +520,7 @@ def _inspect_ome_zarr(path: Path, root: ZarrGroup) -> AcquisitionMetadata:
         mode=mode,
         axes=axes,
         shape=shape,
-        array_paths=tuple(
-            f"{name}/{root[str(name)].ome_metadata().multiscales[0].datasets[0].path}"
-            for name in series
-        ),
+        array_paths=tuple(array_paths),
         acquisition_order=tuple(str(axis) for axis in opm.get("acquisition_order", [])),
         channels=channels,
         stage_positions_zxy=positions,
@@ -552,13 +570,12 @@ def open_acquisition_datastore(
         else inspect_acquisition(acquisition)
     )
     root = yaozarrs.open_group(metadata.path)
-    series_metadata = root["OME"].ome_metadata()
-    arrays = [
-        root[series_name][array_path.split("/", 1)[1]].to_tensorstore()
-        for series_name, array_path in zip(
-            series_metadata.series, metadata.array_paths, strict=True
-        )
-    ]
+    arrays = []
+    for array_path in metadata.array_paths:
+        node: Any = root
+        for component in array_path.split("/"):
+            node = node[component]
+        arrays.append(node.to_tensorstore())
     if not arrays:
         raise ValueError(f"Acquisition has no arrays: {metadata.path}")
     return ts.stack(arrays, axis=1)

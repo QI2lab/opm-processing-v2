@@ -304,6 +304,11 @@ class MaxTileFusion:
         self.time_dim, self.channels, self.z_dim, height, width = self.ts_dataset[
             0
         ].shape
+        self.output_dtype = np.dtype(self.ts_dataset[0].dtype.numpy_dtype)
+        if self.output_dtype not in (np.dtype(np.uint16), np.dtype(np.float32)):
+            raise ValueError(
+                "Maximum-projection fusion supports uint16 or float32 input"
+            )
         self.position_dim = len(self.ts_dataset)
         height -= 2 * self.pad_y
         width -= 2 * self.pad_x
@@ -451,7 +456,7 @@ class MaxTileFusion:
         _, arrays = prepare_image(
             self.output_path,
             image,
-            (shape, np.uint16),
+            (shape, self.output_dtype),
             chunks=(1, 1, 1, self.chunk_size, self.chunk_size),
             writer="tensorstore",
             overwrite=True,
@@ -459,9 +464,11 @@ class MaxTileFusion:
         return arrays["0"]
 
     def fuse_tiles(self):
-        """Fuse all tiles using weighted averaging and asynchronous writes.
+        """Fuse tiles into bounded spatial chunks.
 
-        This method ensures that all channels are fused separately and blended correctly.
+        Only chunks intersecting a tile are materialized. This keeps peak RAM
+        proportional to ``channels * chunk_size**2`` rather than to the full
+        mosaic canvas, which may include large empty gaps between stage positions.
 
         Parameters
         ----------
@@ -473,62 +480,122 @@ class MaxTileFusion:
         None
             No value is returned.
         """
-        if self.time_range is not None:
-            source_times = range(self.time_range[0], self.time_range[1])
-        else:
-            source_times = range(self.time_dim)
+        source_times = (
+            range(self.time_range[0], self.time_range[1])
+            if self.time_range is not None
+            else range(self.time_dim)
+        )
+        source_times = tuple(source_times)
 
-        for output_time, source_time in enumerate(
-            tqdm(source_times, desc="t", leave=True)
-        ):
-            accumulation = np.zeros(
-                (self.channels, 1, *self.fused_shape), dtype=np.float32
-            )
-            weight_sum = np.zeros_like(accumulation)
-            for tile_idx, (y, x) in enumerate(
-                tqdm(self.tile_positions, desc="p", leave=False)
+        tile_bounds = []
+        chunks_to_tiles: dict[tuple[int, int], list[int]] = {}
+        fused_height, fused_width = self.fused_shape
+        tile_height, tile_width = self.tile_shape
+        for tile_idx, (y, x) in enumerate(self.tile_positions):
+            y_start = int((y - self.offset[0]) / self.pixel_size[0])
+            x_start = int((x - self.offset[1]) / self.pixel_size[1])
+            y_end = y_start + tile_height
+            x_end = x_start + tile_width
+            tile_bounds.append((y_start, y_end, x_start, x_end))
+
+            visible_y_start = max(0, y_start)
+            visible_y_end = min(fused_height, y_end)
+            visible_x_start = max(0, x_start)
+            visible_x_end = min(fused_width, x_end)
+            if (
+                visible_y_start >= visible_y_end
+                or visible_x_start >= visible_x_end
             ):
-                # Read tile correctly from its respective position
-                tile = self.ts_dataset[tile_idx]
-                y_slice = slice(self.pad_y, -self.pad_y or None)
-                x_slice = slice(self.pad_x, -self.pad_x or None)
-                tile_data = (
-                    tile[source_time, :, 0, y_slice, x_slice]
-                    .read()
-                    .result()
-                    .astype(np.float32)
+                continue
+            first_chunk_y = (visible_y_start // self.chunk_size) * self.chunk_size
+            first_chunk_x = (visible_x_start // self.chunk_size) * self.chunk_size
+            for chunk_y in range(first_chunk_y, visible_y_end, self.chunk_size):
+                for chunk_x in range(first_chunk_x, visible_x_end, self.chunk_size):
+                    chunks_to_tiles.setdefault((chunk_y, chunk_x), []).append(tile_idx)
+
+        covered_chunks = sorted(chunks_to_tiles)
+        progress = tqdm(
+            total=len(source_times) * len(covered_chunks),
+            desc="max fusion",
+            leave=True,
+            unit="chunk",
+        )
+        for output_time, source_time in enumerate(source_times):
+            for chunk_y, chunk_x in covered_chunks:
+                chunk_y_end = min(chunk_y + self.chunk_size, fused_height)
+                chunk_x_end = min(chunk_x + self.chunk_size, fused_width)
+                chunk_height = chunk_y_end - chunk_y
+                chunk_width = chunk_x_end - chunk_x
+                accumulation = np.zeros(
+                    (self.channels, chunk_height, chunk_width), dtype=np.float32
+                )
+                weight_sum = np.zeros(
+                    (1, chunk_height, chunk_width), dtype=np.float32
                 )
 
-                # Ensure tile_data has explicit Z-dimension
-                tile_data = tile_data[
-                    :, np.newaxis, :, :
-                ]  # Shape: (C, 1, H_tile, W_tile)
+                for tile_idx in chunks_to_tiles[(chunk_y, chunk_x)]:
+                    y_start, y_end, x_start, x_end = tile_bounds[tile_idx]
+                    overlap_y_start = max(chunk_y, y_start)
+                    overlap_y_end = min(chunk_y_end, y_end)
+                    overlap_x_start = max(chunk_x, x_start)
+                    overlap_x_end = min(chunk_x_end, x_end)
+                    if (
+                        overlap_y_start >= overlap_y_end
+                        or overlap_x_start >= overlap_x_end
+                    ):
+                        continue
 
-                # Compute global indices
-                y_start = int((y - self.offset[0]) / self.pixel_size[0])
-                x_start = int((x - self.offset[1]) / self.pixel_size[1])
-                y_end = y_start + self.tile_shape[0]
-                x_end = x_start + self.tile_shape[1]
+                    tile_y_start = overlap_y_start - y_start
+                    tile_y_end = overlap_y_end - y_start
+                    tile_x_start = overlap_x_start - x_start
+                    tile_x_end = overlap_x_end - x_start
+                    output_y = slice(
+                        overlap_y_start - chunk_y, overlap_y_end - chunk_y
+                    )
+                    output_x = slice(
+                        overlap_x_start - chunk_x, overlap_x_end - chunk_x
+                    )
 
-                # Expand weight mask to match shape (C, 1, H_tile, W_tile)
-                weight_mask_reshaped = np.broadcast_to(
-                    self.weight_mask, (self.channels, 1, *self.weight_mask.shape)
+                    tile_data = (
+                        self.ts_dataset[tile_idx][
+                            source_time,
+                            :,
+                            0,
+                            self.pad_y + tile_y_start : self.pad_y + tile_y_end,
+                            self.pad_x + tile_x_start : self.pad_x + tile_x_end,
+                        ]
+                        .read()
+                        .result()
+                        .astype(np.float32)
+                    )
+                    weights = self.weight_mask[
+                        tile_y_start:tile_y_end,
+                        tile_x_start:tile_x_end,
+                    ]
+                    accumulation[:, output_y, output_x] += tile_data * weights
+                    weight_sum[:, output_y, output_x] += weights
+
+                fused = np.divide(
+                    accumulation,
+                    weight_sum,
+                    out=np.zeros_like(accumulation),
+                    where=weight_sum > 0,
                 )
-
-                accumulation[:, :, y_start:y_end, x_start:x_end] += (
-                    tile_data * weight_mask_reshaped
-                )
-                weight_sum[:, :, y_start:y_end, x_start:x_end] += weight_mask_reshaped
-
-            fused = np.divide(
-                accumulation,
-                weight_sum,
-                out=np.zeros_like(accumulation),
-                where=weight_sum > 0,
-            )
-            self.fused_ts[output_time].write(
-                np.rint(np.clip(fused, 0, np.iinfo(np.uint16).max)).astype(np.uint16)
-            ).result()
+                if self.output_dtype == np.dtype(np.float32):
+                    fused_output = fused
+                else:
+                    fused_output = np.rint(
+                        np.clip(fused, 0, np.iinfo(np.uint16).max)
+                    ).astype(np.uint16)
+                self.fused_ts[
+                    output_time,
+                    :,
+                    0,
+                    chunk_y:chunk_y_end,
+                    chunk_x:chunk_x_end,
+                ].write(fused_output).result()
+                progress.update()
+        progress.close()
 
     def run(self):
         """Run the full fusion pipeline.

@@ -85,7 +85,7 @@ def deskew_shape_estimator(
 
 
 @njit(parallel=True)
-def orthogonal_deskew(
+def _orthogonal_deskew_float32(
     data: ArrayLike,
     theta: float = 30.0,
     distance: float = 0.4,
@@ -218,32 +218,61 @@ def orthogonal_deskew(
                     + (1 - dz_before) * pixel_4
                 ) * inv_pixel_step
 
-                # Prevent small floating-point errors from accumulating
-                new_values = np.clip(new_values, 0, 65534)
+                # Suppress only negative interpolation noise. Float output must
+                # not inherit the dynamic-range limit of the legacy uint16 path.
+                new_values = np.maximum(new_values, 0)
 
                 # Accumulate safely
-                temp_buffer[y, :final_nx] = np.clip(
-                    temp_buffer[y, :final_nx] + new_values, 0, 65534
+                temp_buffer[y, :final_nx] = np.maximum(
+                    temp_buffer[y, :final_nx] + new_values, 0
                 )
 
         # Store the averaged downsampled z-slice
-        output[z_ds] = np.clip(
-            temp_buffer / downsample_factor, 0, 65534
-        )  # Prevent overflow after division
+        output[z_ds] = np.maximum(temp_buffer / downsample_factor, 0)
 
-    # Explicitly zero out padding before conversion
+    # Explicitly zero out padding.
     if pad_y > 0:
         output[:, -pad_y:, :] = 0
     if pad_x > 0:
         output[:, :, -pad_x:] = 0
 
-    # Convert to uint16 safely
-    output_uint16 = output.astype(np.uint16)
-
     if reverse_deskewed_z:
-        return np.flipud(output_uint16)
+        return np.flipud(output)
     else:
-        return output_uint16
+        return output
+
+
+def orthogonal_deskew(
+    data: ArrayLike,
+    theta: float = 30.0,
+    distance: float = 0.4,
+    pixel_size: float = 0.115,
+    reverse_deskewed_z=False,
+    divisible_by: int = 4,
+    downsample_factor: int = 2,
+    output_dtype: np.dtype | str = np.uint16,
+):
+    """Deskew oblique data and return either uint16 or precision-preserving float32.
+
+    The interpolation kernel always operates in float32. ``uint16`` remains the
+    default for compatibility; selecting ``float32`` avoids quantizing calibrated
+    sub-electron values.
+    """
+    output = _orthogonal_deskew_float32(
+        np.asarray(data),
+        theta=theta,
+        distance=distance,
+        pixel_size=pixel_size,
+        reverse_deskewed_z=reverse_deskewed_z,
+        divisible_by=divisible_by,
+        downsample_factor=downsample_factor,
+    )
+    dtype = np.dtype(output_dtype)
+    if dtype == np.dtype(np.float32):
+        return output
+    if dtype == np.dtype(np.uint16):
+        return np.clip(output, 0, np.iinfo(np.uint16).max).astype(np.uint16)
+    raise ValueError("orthogonal_deskew output_dtype must be uint16 or float32")
 
 
 def lab2cam(
