@@ -250,15 +250,9 @@ def orthogonal_deskew(
     reverse_deskewed_z=False,
     divisible_by: int = 4,
     downsample_factor: int = 2,
-    output_dtype: np.dtype | str = np.uint16,
 ):
-    """Deskew oblique data and return either uint16 or precision-preserving float32.
-
-    The interpolation kernel always operates in float32. ``uint16`` remains the
-    default for compatibility; selecting ``float32`` avoids quantizing calibrated
-    sub-electron values.
-    """
-    output = _orthogonal_deskew_float32(
+    """Deskew oblique data while preserving the float32 processing contract."""
+    return _orthogonal_deskew_float32(
         np.asarray(data),
         theta=theta,
         distance=distance,
@@ -267,12 +261,6 @@ def orthogonal_deskew(
         divisible_by=divisible_by,
         downsample_factor=downsample_factor,
     )
-    dtype = np.dtype(output_dtype)
-    if dtype == np.dtype(np.float32):
-        return output
-    if dtype == np.dtype(np.uint16):
-        return np.clip(output, 0, np.iinfo(np.uint16).max).astype(np.uint16)
-    raise ValueError("orthogonal_deskew output_dtype must be uint16 or float32")
 
 
 def lab2cam(
@@ -377,6 +365,8 @@ def chunked_orthogonal_deskew(
     camera_bkd: int = 100,
     camera_cf: float = 0.24,
     camera_qe: float = 0.9,
+    illumination: ArrayLike | None = None,
+    apply_stage_scan_gain: bool = False,
     z_downsample_level: int = 2,
     theta_deg: float = 30.0,
     scan_axis_step_um: float = 0.4,
@@ -449,7 +439,7 @@ def chunked_orthogonal_deskew(
     output_shape[1] = output_shape[1] - scan_crop
     if output_shape[1] <= 0:
         raise ValueError("scan_crop must be smaller than the deskewed Y size")
-    deskewed_image = np.zeros(output_shape, dtype=np.uint16)
+    deskewed_image = np.zeros(output_shape, dtype=np.float32)
 
     if chunk_size < output_shape[1]:
         idxs = chunk_indices(output_shape[1], chunk_size)
@@ -485,12 +475,26 @@ def chunked_orthogonal_deskew(
             np.int64(np.ceil(sp_stop * camera_to_scan)),
         )
 
-        raw_data = np.array(oblique_image[scan_px_start:scan_px_stop, :]).astype(
-            np.float32
-        )
-        raw_data = raw_data - camera_bkd
-        raw_data[raw_data < 0.0] = 0.0
-        raw_data = ((raw_data * camera_cf) / camera_qe).astype(np.uint16)
+        raw_uint16 = np.asarray(oblique_image[scan_px_start:scan_px_stop, :])
+        if raw_uint16.dtype != np.dtype(np.uint16):
+            raise TypeError(
+                f"chunked deskew requires uint16 raw input; received {raw_uint16.dtype}"
+            )
+        raw_data = raw_uint16.astype(np.float32)
+        raw_data -= np.float32(camera_bkd)
+        raw_data *= np.float32(camera_cf / camera_qe)
+        np.maximum(raw_data, np.float32(0), out=raw_data)
+        if apply_stage_scan_gain:
+            from opm_processing.imageprocessing.camera import (
+                correct_qi2lab_stage_scan_camera,
+            )
+
+            raw_data = correct_qi2lab_stage_scan_camera(raw_data, copy=False)
+        if illumination is not None:
+            illumination_array = np.asarray(illumination)
+            if illumination_array.dtype != np.dtype(np.float32):
+                raise TypeError("illumination must be float32")
+            raw_data /= illumination_array
         if deconvolve:
             effective_crop_scan = decon_chunk_state.determine_once(
                 tuple(int(size) for size in raw_data.shape),
@@ -508,7 +512,7 @@ def chunked_orthogonal_deskew(
             distance=scan_axis_step_um,
             pixel_size=pixel_size_um,
             downsample_factor=z_downsample_level,
-        ).astype(np.uint16)
+        )
 
         target_size = idx[1] - idx[0]
         pixel_step = scan_axis_step_um / pixel_size_um

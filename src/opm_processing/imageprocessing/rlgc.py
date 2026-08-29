@@ -667,6 +667,34 @@ def _axis_retained_bounds(retained_size: int, image_size: int) -> list[tuple[int
     return bounds
 
 
+def central_psf_plane(psf: np.ndarray) -> np.ndarray:
+    """Return a normalized 2D central plane from a 2D or skewed 3D PSF.
+
+    Parameters
+    ----------
+    psf : numpy.ndarray
+        A YX PSF or a skewed ZYX PSF. For an even Z extent, index ``Z // 2``
+        is used consistently with the PSF-centering convention in this module.
+
+    Returns
+    -------
+    numpy.ndarray
+        Nonnegative, unit-sum float32 PSF in YX order.
+    """
+    psf_array = np.asarray(psf, dtype=np.float32)
+    if psf_array.ndim == 3:
+        psf_array = psf_array[psf_array.shape[0] // 2]
+    elif psf_array.ndim != 2:
+        raise ValueError(f"Expected a 2D or 3D PSF, got shape {psf_array.shape}")
+    if not np.all(np.isfinite(psf_array)):
+        raise ValueError("PSF values must be finite")
+    psf_array = np.maximum(psf_array, 0)
+    psf_sum = float(np.sum(psf_array, dtype=np.float64))
+    if not psf_sum > 0:
+        raise ValueError("The central PSF plane must contain positive signal")
+    return (psf_array / psf_sum).astype(np.float32, copy=False)
+
+
 def rlgc(
     image: np.ndarray,
     psf: np.ndarray,
@@ -1297,3 +1325,66 @@ def chunked_rlgc(
                     next_crop_scan,
                 )
             attempted_crop_scan = next_crop_scan
+
+
+def rlgc_2d(
+    image: np.ndarray,
+    skewed_psf: np.ndarray,
+    gpu_id: int = 0,
+    safe_mode: bool = True,
+    limit: float = 0.1,
+    max_delta: float = 0.01,
+    rng_seed: int | None = 42,
+    verbose: int = 1,
+    release_memory: bool = True,
+    logger: logging.Logger | None = None,
+    log_prefix: str = "",
+) -> np.ndarray:
+    """Deconvolve one acquired YX image using the central plane of its PSF.
+
+    Non-spatial dimensions such as time, stage position, and channel must be
+    iterated by the caller. A singleton Z dimension is accepted and restored
+    on return so storage code can retain explicit TCZYX axes.
+
+    Parameters
+    ----------
+    image : numpy.ndarray
+        A YX image or singleton-Z ZYX image.
+    skewed_psf : numpy.ndarray
+        A YX PSF or skewed ZYX PSF. Only its central Z plane is used.
+
+    Returns
+    -------
+    numpy.ndarray
+        Float32 deconvolution with the same rank as ``image``.
+    """
+    image_array = np.asarray(image)
+    restore_z = image_array.ndim == 3 and image_array.shape[0] == 1
+    if restore_z:
+        image_yx = image_array[0]
+    elif image_array.ndim == 2:
+        image_yx = image_array
+    else:
+        raise ValueError(
+            "2D RLGC expects a YX image or singleton-Z ZYX image; "
+            f"got shape {image_array.shape}"
+        )
+
+    psf_yx = central_psf_plane(skewed_psf)
+    result = chunked_rlgc(
+        image=image_yx,
+        psf=psf_yx,
+        gpu_id=gpu_id,
+        crop_scan=1,
+        safe_mode=safe_mode,
+        limit=limit,
+        max_delta=max_delta,
+        rng_seed=rng_seed,
+        normalize_psf=False,
+        verbose=verbose,
+        release_memory=release_memory,
+        logger=logger,
+        log_prefix=_child_log_prefix(log_prefix, "path=2d_central_psf"),
+    )
+    result = np.asarray(result, dtype=np.float32)
+    return result[np.newaxis] if restore_z else result

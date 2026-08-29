@@ -2,16 +2,16 @@
 
 from __future__ import annotations
 
-import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import pytest
-import tensorstore as ts
+import zarr
 from scipy import ndimage
 
+from opm_processing.dataio.position_collection import create_position_collection
 from opm_processing.imageprocessing.opmtools import deskew_shape_estimator
 
 
@@ -274,7 +274,7 @@ def _write_opm_v2_zarr(
     chunks: tuple[int, ...],
     frame_metadatas: list[dict],
 ) -> None:
-    """Write image data and handler-style root metadata as Zarr v2.
+    """Write a current group-based OME-Zarr acquisition fixture.
 
     Parameters
     ----------
@@ -294,23 +294,62 @@ def _write_opm_v2_zarr(
     None
         No value is returned.
     """
-    store = ts.open(
-        {
-            "driver": "zarr",
-            "kvstore": {"driver": "file", "path": str(path)},
-        },
-        create=True,
-        delete_existing=True,
-        dtype=ts.uint16,
-        shape=raw_data.shape,
-        chunk_layout=ts.ChunkLayout(chunk_shape=chunks),
-        domain=ts.IndexDomain(shape=raw_data.shape, labels=labels),
-    ).result()
-    store.write(raw_data).result()
-    (path / ".zattrs").write_text(
-        json.dumps({"frame_metadatas": frame_metadatas}),
-        encoding="utf-8",
+    normalized = raw_data if "z" in labels else raw_data[:, :, :, None, :, :]
+    normalized_chunks = chunks if "z" in labels else (*chunks[:3], 1, *chunks[-2:])
+    time_count, position_count, channel_count, z_count, y_count, x_count = (
+        int(value) for value in normalized.shape
     )
+    frames_by_position: list[list[dict]] = [[] for _ in range(position_count)]
+    channel_names = [f"channel-{index}" for index in range(channel_count)]
+    stage_positions = [(0.0, 0.0, 0.0)] * position_count
+    pixel_size_um = 1.0
+    for frame in frame_metadatas:
+        event = frame["mda_event"]
+        index = event["index"]
+        metadata = event["metadata"]
+        position = int(index.get("p", 0))
+        channel = int(index.get("c", 0))
+        frames_by_position[position].append(frame)
+        channel_names[channel] = str(metadata["DAQ"]["current_channel"])
+        stage = metadata["Stage"]
+        stage_positions[position] = (
+            float(stage["z_pos"]),
+            float(stage["x_pos"]),
+            float(stage["y_pos"]),
+        )
+        pixel_size_um = float(frame["pixel_size_um"])
+
+    index_sizes = {"t": time_count, "p": position_count, "c": channel_count}
+    if z_count > 1:
+        index_sizes["z"] = z_count
+    collection = create_position_collection(
+        path,
+        normalized.shape,
+        (1.0, pixel_size_um, pixel_size_um),
+        stage_positions=stage_positions,
+        channels=channel_names,
+        attributes={
+            "opm_v2": {
+                "index_sizes": index_sizes,
+                "acquisition_order": [
+                    axis for axis in labels if axis not in {"y", "x"}
+                ],
+                "configuration": {"acq_config": {}},
+            }
+        },
+        chunks=(
+            normalized_chunks[0],
+            normalized_chunks[2],
+            normalized_chunks[3],
+            normalized_chunks[4],
+            normalized_chunks[5],
+        ),
+    )
+    for position, array in enumerate(collection.arrays):
+        array.write(normalized[:, position]).result()
+    root = zarr.open_group(path, mode="r+")
+    for position, frames in enumerate(frames_by_position):
+        root[str(position)].attrs["ome_writers"] = {"frame_metadata": frames}
 
 
 @pytest.fixture
@@ -659,6 +698,10 @@ def _create_opm_v2_tiled_ground_truth_zarr(
     recorded_stage_positions_zxy = (
         true_stage_offsets + recorded_errors
     ) * pixel_size_um
+    # Physical specimen-stage Z motion moves the sampled laboratory plane in
+    # the opposite direction. Fusion performs this stage-to-lab transform.
+    true_stage_positions_zxy[:, 0] *= -1
+    recorded_stage_positions_zxy[:, 0] *= -1
     # OPM stage Y and image-placement Y point in opposite directions.
     true_stage_positions_zxy[:, 1] *= -1
     recorded_stage_positions_zxy[:, 1] *= -1

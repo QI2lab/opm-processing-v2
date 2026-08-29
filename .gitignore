@@ -106,6 +106,9 @@ ENV/
 # ruff
 .ruff_cache/
 
+# codex
+.codex*
+
 # IDE settings
 .vscode/
 .idea/
@@ -113,3 +116,5 @@ src/opm_processing/test_flatfield.py
 tests/test_symlink.py
 src/cucim-cu12/
 src/cucim
+/diagnostics/
+AUDIT_REFACTOR_WORKFLOW.md

@@ -315,7 +315,7 @@ def generate_proj_psf(
     Returns
     -------
     numpy.ndarray
-        Normalized PSF in ZYX order with a singleton Z dimension.
+        Normalized central PSF plane in ZYX order with a singleton Z dimension.
     """
     silicone_lens = {
         "ni0": 1.4,  # immersion medium RI design value
@@ -332,7 +332,10 @@ def generate_proj_psf(
         nz=20, dz=0.115, nx=71, dxy=pixel_size_um, pz=pz, wvl=em_wvl, params=em_lens
     )
     psf = psf / np.sum(psf)
-    psf = np.squeeze(np.sum(psf, axis=0))
+    # A projection acquisition contains one observed YX plane. Use the central
+    # optical plane rather than integrating the 3D PSF along Z, which broadens
+    # the 2D deconvolution kernel.
+    psf = np.asarray(psf[psf.shape[0] // 2], dtype=np.float32)
     psf = psf / np.sum(psf)
     if psf.ndim == 2:
         psf = psf[np.newaxis, :, :]

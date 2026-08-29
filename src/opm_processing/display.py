@@ -3,14 +3,25 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 import napari
+import numpy as np
 import typer
 from napari.experimental import link_layers
-from yaozarrs import open_group
-
-from opm_processing.dataio.acquisition import acquisition_stem
+from yaozarrs import open_group, v05
+from opm_processing.dataio.acquisition import (
+    acquisition_stem,
+    resolve_acquisition_path,
+)
+from opm_processing.dataio.position_collection import (
+    PositionCollection,
+    open_position_collection,
+)
+from opm_processing.dataio.roi import (
+    roi_from_image_pixel_rectangle,
+    validate_registered_max_projection,
+)
 
 app = typer.Typer(pretty_exceptions_enable=False)
 
@@ -37,25 +48,19 @@ def _resolve_data_path(root_path: Path, to_display: str) -> Path:
     FileNotFoundError
         If no output exists for the requested mode.
     """
-    base = root_path.parent
-    stem = acquisition_stem(root_path)
+    acquisition_path = resolve_acquisition_path(root_path)
+    base = acquisition_path.parent
+    stem = acquisition_stem(acquisition_path)
     candidates = {
         "max-z": (
             base / f"{stem}_max_z_decon_deskewed.ome.zarr",
             base / f"{stem}_max_z_deskewed.ome.zarr",
-            base / f"{stem}_max_z_decon_deskewed.zarr",
-            base / f"{stem}_max_z_deskewed.zarr",
         ),
         "full": (
             base / f"{stem}_decon_deskewed.ome.zarr",
             base / f"{stem}_deskewed.ome.zarr",
-            base / f"{stem}_decon_deskewed.zarr",
-            base / f"{stem}_deskewed.zarr",
         ),
-        "fused-max-z": (
-            base / f"{stem}_max_z_fused.ome.zarr",
-            base / f"{stem}_max_z_fused.zarr",
-        ),
+        "fused-max-z": (base / f"{stem}_max_z_fused.ome.zarr",),
         "fused-full": (base / f"{stem}_fused.ome.zarr",),
     }
     if to_display not in candidates:
@@ -75,7 +80,7 @@ def _configure_collection_layers(
     layers: list[Any],
     pos_range: tuple[int, int] | None,
     time_range: tuple[int, int] | None,
-) -> None:
+) -> PositionCollection | None:
     """Apply collection selections to plugin-created lazy layers.
 
     Parameters
@@ -91,8 +96,9 @@ def _configure_collection_layers(
 
     Returns
     -------
-    None
-        No value is returned.
+    PositionCollection or None
+        The opened multi-position collection, or ``None`` when ``data_path``
+        is a single OME-NGFF Image such as a fused output.
     """
     if time_range is not None:
         time_start, time_stop = time_range
@@ -105,31 +111,40 @@ def _configure_collection_layers(
                 layer.data = layer.data[time_start:time_stop]
 
     root = open_group(data_path)
-    if "bioformats2raw.layout" not in root.attrs.get("ome", {}):
-        return
+    if not isinstance(root.ome_metadata(), v05.Bf2Raw):
+        return None
 
-    positions = len(root["OME"].attrs["ome"]["series"])
-    channels = len(root.attrs.get("channels", ())) or max(1, len(layers) // positions)
+    collection = open_position_collection(data_path)
+    positions = len(collection.arrays)
+    channels = len(collection.channel_names) or max(1, len(layers) // positions)
     start, stop = pos_range or (0, positions)
     if start < 0 or stop > positions or start >= stop:
         raise ValueError(f"pos_range must satisfy 0 <= start < stop <= {positions}")
 
-    stage_positions = root.attrs.get("stage_positions")
     for position in range(positions):
         position_layers = layers[position * channels : (position + 1) * channels]
         for layer in position_layers:
             layer.visible = start <= position < stop
-            if stage_positions is not None:
-                z, y, x = (float(value) for value in stage_positions[position])
+            if collection.stage_positions_zxy:
+                z, y, x = collection.stage_positions_zxy[position]
                 layer.translate = (0.0, z, y, x)
+    return collection
 
 
 @app.command()
 def display(
     root_path: Path,
-    to_display: str = "max-z",
+    to_display: str = "fused-max-z",
     time_range: tuple[int, int] | None = None,
     pos_range: tuple[int, int] | None = None,
+    roi_output: Path | None = None,
+    roi: Annotated[
+        bool,
+        typer.Option(
+            "--roi/--no-roi",
+            help="Create and save one processing ROI rectangle.",
+        ),
+    ] = True,
 ) -> None:
     """Display processed OPM data using the napari-ome-zarr reader.
 
@@ -143,6 +158,12 @@ def display(
         Value supplied for ``time range``.
     pos_range : tuple[int, int] | None
         Value supplied for ``pos range``.
+    roi_output : pathlib.Path or None
+        Output path for the physical-coordinate ROI JSON. When omitted in ROI
+        mode, defaults to ``<acquisition>_roi.json`` beside the displayed data.
+    roi : bool
+        Create and save one napari rectangle. Enabled by default; use
+        ``--no-roi`` for display-only use.
 
     Returns
     -------
@@ -150,20 +171,67 @@ def display(
         No value is returned.
     """
     data_path = _resolve_data_path(root_path, to_display)
+    save_roi = roi or roi_output is not None
+    if save_roi:
+        if to_display != "fused-max-z":
+            raise ValueError(
+                "ROI mode requires --to-display fused-max-z. Use --no-roi "
+                "to open another display mode."
+            )
+        validate_registered_max_projection(data_path)
+    if save_roi and roi_output is None:
+        acquisition_path = resolve_acquisition_path(root_path)
+        roi_output = data_path.parent / f"{acquisition_stem(acquisition_path)}_roi.json"
 
     viewer = napari.Viewer()
     layers = list(viewer.open(str(data_path), plugin="napari-ome-zarr"))
-    _configure_collection_layers(data_path, layers, pos_range, time_range)
+    collection = _configure_collection_layers(data_path, layers, pos_range, time_range)
 
-    root = open_group(data_path)
-    if "bioformats2raw.layout" in root.attrs.get("ome", {}):
-        channels = len(root.attrs.get("channels", ()))
-        if channels:
-            for channel in range(channels):
-                channel_layers = layers[channel::channels]
-                if len(channel_layers) > 1:
-                    link_layers(channel_layers, ("contrast_limits", "gamma"))
+    if collection is not None:
+        channels = len(collection.channel_names)
+        for channel in range(channels):
+            channel_layers = layers[channel::channels]
+            if len(channel_layers) > 1:
+                link_layers(channel_layers, ("contrast_limits", "gamma"))
+    roi_layer = None
+    if save_roi:
+        roi_layer = viewer.add_shapes(
+            name="processing ROI",
+            ndim=viewer.dims.ndim,
+            shape_type="rectangle",
+            edge_color="yellow",
+            face_color=[1.0, 1.0, 0.0, 0.15],
+        )
+        print(
+            "Draw exactly one rectangle in the 'processing ROI' layer, then "
+            "close napari to save it. All Z values will be retained."
+        )
     napari.run()
+    if save_roi:
+        if roi_layer is None or len(roi_layer.data) != 1:
+            raise ValueError("Draw exactly one rectangle before closing napari")
+        shape_types = np.atleast_1d(roi_layer.shape_type).tolist()
+        if shape_types != ["rectangle"]:
+            raise ValueError("The processing ROI layer must contain one rectangle")
+        vertices_canvas_world = np.asarray(
+            roi_layer.data_to_world(np.asarray(roi_layer.data[0])),
+            dtype=np.float64,
+        )
+        reference_layer = layers[0]
+        vertices_image_data = np.asarray(
+            [reference_layer.world_to_data(vertex) for vertex in vertices_canvas_world],
+            dtype=np.float64,
+        )
+        roi = roi_from_image_pixel_rectangle(data_path, vertices_image_data)
+        if roi_output is None:
+            raise RuntimeError("ROI output path was not resolved")
+        written = roi.write(roi_output)
+        selected = (
+            "determined during processing"
+            if roi.position_indices is None
+            else f"{len(roi.position_indices)} source positions"
+        )
+        print(f"Saved physical ROI selecting {selected}: {written}")
 
 
 def main() -> None:

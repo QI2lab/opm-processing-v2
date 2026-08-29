@@ -340,3 +340,35 @@ def test_rlgc_gpu_deconvolution_improves_synthetic_point_sample(cupy_gpu):
     rlgc.clear_rlgc_caches(clear_memory_pool=True)
 
 
+def test_rlgc_2d_selects_and_normalizes_central_psf_plane(monkeypatch):
+    """Use only the central Z plane while preserving the acquired image rank."""
+    rlgc = importlib.import_module("opm_processing.imageprocessing.rlgc")
+    image = np.arange(6 * 7, dtype=np.float32).reshape(6, 7)
+    skewed_psf = np.stack(
+        (
+            np.full((3, 5), 1.0, dtype=np.float32),
+            np.arange(1, 16, dtype=np.float32).reshape(3, 5),
+            np.full((3, 5), 100.0, dtype=np.float32),
+        )
+    )
+    calls = []
+
+    def fake_chunked_rlgc(*, image, psf, **kwargs):
+        calls.append((np.asarray(image), np.asarray(psf), kwargs))
+        return np.asarray(image, dtype=np.float32) + 1
+
+    monkeypatch.setattr(rlgc, "chunked_rlgc", fake_chunked_rlgc)
+
+    output_2d = rlgc.rlgc_2d(image, skewed_psf, verbose=0)
+    output_3d = rlgc.rlgc_2d(image[np.newaxis], skewed_psf, verbose=0)
+
+    np.testing.assert_array_equal(output_2d, image + 1)
+    np.testing.assert_array_equal(output_3d, (image + 1)[np.newaxis])
+    assert output_2d.dtype == output_3d.dtype == np.float32
+    assert len(calls) == 2
+    expected_psf = skewed_psf[1] / skewed_psf[1].sum()
+    for passed_image, passed_psf, kwargs in calls:
+        np.testing.assert_array_equal(passed_image, image)
+        np.testing.assert_allclose(passed_psf, expected_psf)
+        assert kwargs["crop_scan"] == 1
+        assert kwargs["normalize_psf"] is False

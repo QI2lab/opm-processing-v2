@@ -1,311 +1,88 @@
 # opm-processing-v2
 
-<!-- [![License](https://img.shields.io/pypi/l/opm-processing-v2.svg?color=green)](https://github.com/QI2lab/opm-processing-v2/blob/2b85d72afad0bbd6e2c52c1b733a5b5ac211a9ab/LICENSE)
-# [![PyPI](https://img.shields.io/pypi/v/opm-processing-v2.svg?color=green)](https://pypi.org/project/opm-processing-v2)
-# [![Python Version](https://img.shields.io/pypi/pyversions/opm-processing-v2.svg?color=green)](https://python.org)
-[![CI](https://github.com/qi2lab/opm-processing-v2/actions/workflows/ci.yml/badge.svg)](https://github.com/qi2lab/opm-processing-v2/actions/workflows/ci.yml)
-# [![codecov](https://codecov.io/gh/qi2lab/opm-processing-v2/branch/main/graph/badge.svg)](https://codecov.io/gh/qi2lab/opm-processing-v2) -->
+Post-processing for current qi2lab opm-v2 OME-Zarr acquisitions.
 
-## Overview 
+## Install
 
-This package is the 2nd generation of the Arizona State University Quantitative Imaging and Inference Lab (qi2lab) oblique plane microscopy (OPM) processing software. Currently, it assumes that data is generated using (1) our [2nd generation OPM control code](https://github.com/QI2lab/opm-v2) or (2) the [ASI single-objective light sheet](https://www.asiimaging.com/products/light-sheet-microscopy/single-objective-light-sheet/) Micromanager plugin. The ASI instrument support is experimental and will continue to evolve as we get more data examples from "in the wild" instruments. 
+Python 3.12 and [`uv`](https://docs.astral.sh/uv/) are required.
 
-The core algorithms can be used for any microscope that acquires data at a skewed angle, including diSPIM, LLSM, or OPM. Please open an issue if you would like help adapting the code to work with your microscope, we are happy to assist.
-
-The pipeline uses [yaozarrs](https://github.com/imaging-formats/yaozarrs/) for current OPM-v2 [OME-Zarr v0.5](https://ngff.openmicroscopy.org/0.5/) metadata and collection traversal, then exposes per-position image series through [TensorStore](https://google.github.io/tensorstore/) for processing. Legacy Zarr v2 root-array acquisitions remain supported. Multi-position outputs use the Bio-Formats2Raw collection layout, with one `TCZYX` OME-Zarr image series per position and a validated `OME/METADATA.ome.xml` companion. Fused outputs are single `TCZYX` OME-Zarr images. All arrays use regular chunks without sharding. Image processing (illumination correction, deconvolution, deskewing, downsampling, maximum Z projection, and 3D stitching and fusion) uses [Numba](https://numba.pydata.org/), [CuPy](https://cupy.dev/), and [cuCIM](https://github.com/rapidsai/cucim?tab=readme-ov-file).
-
-We rely on [BaSiCPy](https://github.com/peng-lab/BaSiCPy) to post-hoc estimate illumination profiles and a modified version of [gradient consensus Richardson-Lucy deconvolution](https://zenodo.org/records/10278919) to perform 3D deconvolution.
-
-## Installation
-
-This project uses one `uv` environment for processing, visualization, and
-development. The optional GPU environment installs the CUDA 12.9 runtime and
-toolkit wheels through the project dependencies. GPU execution also requires a
-compatible NVIDIA device and driver.
-
-Install `uv` if needed,
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-```
-
-On Windows, `uv` can also be installed from an existing Python environment,
-```powershell
-python -m pip install uv
-```
-
-Clone the repository and enter it,
-```bash
-git clone https://github.com/QI2lab/opm-processing-v2
-cd opm-processing-v2
-```
-
-Create and sync a CPU environment,
 ```bash
 uv sync
 ```
 
-On a machine with a compatible NVIDIA GPU and driver, include the GPU extra,
+For deconvolution and registration on a CUDA workstation:
+
 ```bash
 uv sync --extra gpu
 ```
 
-Run the substantive CUDA correctness tests with GPU availability required,
+Native Windows also requires the pure-Python `cucim.skimage` package from a
+local cuCIM checkout because RAPIDS does not publish its standard wheel there.
+
+## Commands
+
+Inspect an acquisition:
+
 ```bash
-OPM_REQUIRE_GPU=1 uv run --extra gpu --group dev pytest -m gpu -v
+uv run inspect-opm "/path/to/acquisition"
 ```
 
-Without ``OPM_REQUIRE_GPU=1`` the same tests skip cleanly on CPU-only machines.
-The required mode is intended for GPU workstations and GPU CI so a missing
-driver, CuPy, or cuCIM cannot produce a silently green test run.
+Process it (uint16 output by default):
 
-For development tools, include the `dev` group. Add `--extra gpu` on a GPU
-workstation,
+```bash
+uv run process "/path/to/acquisition"
+uv run process "/path/to/acquisition" --deconvolve --flatfield-correction
+uv run process "/path/to/acquisition" --save-float32
+```
+
+Use `--skip-empty-below VALUE` to zero empty channel tiles before illumination
+correction, deconvolution, and deskew. Use `--resume` to continue from completed
+tiles; without it, the selected output is overwritten.
+
+Process during acquisition by supplying a precomputed `CYX` illumination TIFF.
+The acquisition argument must be its containing directory:
+
+```bash
+uv run process "/path/to/acquisition-directory" --live "/path/to/illumination.ome.tif"
+```
+
+Register, fuse, and create the registered multiscale max-Z image:
+
+```bash
+uv run fuse "/path/to/acquisition-or-output-directory"
+```
+
+Draw and save a rectangular ROI from that registered max-Z image, then process
+and fuse the selected raw-data region:
+
+```bash
+uv run display "/path/to/acquisition"
+uv run process-ROI "/path/to/acquisition"
+```
+
+Both commands default to `<acquisition-stem>_roi.json`. Processing state is kept
+in one `<acquisition-stem>.processing.json` beside the outputs; image stores
+contain only OME/NGFF image metadata.
+
+See every option and default with:
+
+```bash
+uv run process --help
+uv run fuse --help
+uv run display --help
+uv run process-ROI --help
+```
+
+## Tests
+
 ```bash
 uv sync --group dev
+uv run pytest
+uv run ruff check .
 ```
 
-On native Windows, cuCIM is not available as a standard wheel. This project
-uses only the pure-Python `cucim.skimage` package, which can run with the
-Windows CuPy wheel installed by the GPU extra. The compiled `cucim.clara`
-image-I/O package is not available with this installation.
-
-After syncing the GPU extra, enable Windows Developer Mode or open an
-administrator PowerShell terminal so Git can create symbolic links. Configure
-Git before cloning cuCIM, then install its Python package from the local
-checkout. Current versions of `uv` require a local directory for editable
-installs, and the RAPIDS CUDA packaging logic must be disabled for this
-platform:
-
-```powershell
-git config --global --replace-all core.symlinks true
-git clone -c core.symlinks=true `
-    --branch v26.06.00 `
-    --depth 1 `
-    https://github.com/rapidsai/cucim.git `
-    .\src\cucim
-
-$env:RAPIDS_DISABLE_CUDA = "true"
-uv pip install --no-deps -e .\src\cucim\python\cucim
-Remove-Item Env:\RAPIDS_DISABLE_CUDA
-```
-
-Verify that CuPy and the cuCIM image-processing package import successfully:
-
-```powershell
-uv run --no-sync python -c "import cupy; import cucim; from cucim.skimage.registration import phase_cross_correlation; print(cucim.__version__, 'cuCIM skimage OK')"
-```
-
-On Windows, keep `--no-sync` on subsequent GPU commands. An exact `uv run`
-sync does not know about the manually installed local cuCIM package and removes
-it; omitting the GPU extra also removes CuPy. Re-run the sync and local cuCIM
-installation steps whenever project dependencies change.
-
-The CUDA 12 PyPI component wheels intentionally use separate package roots for
-the runtime and NVRTC libraries, so there is no valid single `CUDA_PATH` to set.
-CuPy documents this directly in its
-[`_get_cuda_path` implementation](https://github.com/cupy/cupy/blob/v14.1.1/cupy/_environment.py#L142-L191).
-On Windows this package suppresses CuPy's corresponding path warning only when
-both component-wheel layouts are present; CUDA availability and execution are
-still checked normally.
-
-## Usage
-
-Inspect an acquisition before processing it:
+Require rather than skip CUDA tests with:
 
 ```bash
-uv run inspect-opm "/path/to/acquisition_directory"
-```
-
-The path may be the `.ome.zarr` store itself or a directory containing exactly
-one acquisition store. This command uses yaozarrs to read only Zarr and OME
-metadata; it does not open TensorStore or read image chunks. Its JSON manifest
-reports the scan mode, logical `TPCZYX` shape, tile and scan-position counts,
-channel names, wavelengths, exposure times and powers, scan-axis spacing,
-pixel size, camera calibration, tile start/end positions, OPM orientations,
-and acquisition sidecars.
-
-Process a raw acquisition with:
-
-```bash
-uv run process "/path/to/qi2lab_acquisition.zarr"
-```
-
-Processing calculations remain in `float32` through camera-background
-subtraction, photon calibration, optional deconvolution, and deskewing. Outputs
-are converted to `uint16` only when they are written by default. For low-signal
-data with meaningful calibrated values below one, retain those fractional values
-in all processed OME-Zarr outputs with:
-
-```bash
-uv run process "/path/to/qi2lab_acquisition.zarr" --save-float32
-```
-
-This option also keeps maximum-Z and fused maximum-projection outputs as
-`float32`; it uses twice the storage of `uint16` output.
-
-To deskew complete tiles while a current opm-v2 mirror or stage acquisition is
-still being written, pass the illumination image as the value of `--live`:
-
-```bash
-uv run process "/path/to/acquisition.ome.zarr" --live "/path/to/illumination.ome.tif"
-uv run process "/path/to/acquisition.ome.zarr" --live "/path/to/illumination.ome.tif" --deconvolve
-```
-
-Live illumination must be `CYX`, or `YX` for a single-channel acquisition, and
-must match the raw camera dimensions. Live mode never estimates illumination
-and cannot be combined with `--flatfield-correction`, time ranges, or position
-ranges. It expects `acquisition.manifest.json` and `acquisition.log.jsonl` next
-to `acquisition.ome.zarr`. The immutable manifest provides the complete planned
-acquisition metadata, while the append-only log reports acquisition lifecycle
-events. Tile readiness is determined independently from the presence of every
-raw Zarr chunk in a `(time, position)` tile. When processing catches up, it
-polls approximately every 30 seconds. Fused outputs are created only after the
-log reports successful acquisition completion. The exact sidecar schema is in
-[LIVE_PROCESSING_CONTRACT.md](LIVE_PROCESSING_CONTRACT.md).
-
-Flatfield estimation is controlled only by `--flatfield-correction`. When it is
-enabled, the pipeline fits a rectangular working field downsampled twofold on
-each camera axis. It otherwise uses the installed BaSiCPy defaults, disables
-darkfield estimation because camera offset is already subtracted, and
-automatically selects CUDA when PyTorch reports it as available. BaSiCPy
-uses intensity sorting for these independent, non-time-lapse planes.
-Ten distributed scan planes are sampled from every tile and reduced to one
-per-tile median for the BaSiCPy fit. Autotuning runs before
-`smoothness_flatfield` is set to `2.0`, retaining the narrow detector feature.
-A separate 75th-percentile tile summary measures the remaining detector-fixed
-gain after BaSiCPy correction. Smoothed separable Y and X residual profiles are
-then folded into the illumination field; this corrects broad tile-axis shading
-without fitting a specimen-shaped two-dimensional residual.
-
-Current opm-v2 acquisitions are OME-Zarr v0.5 Bio-Formats2Raw collections:
-each tile is stored as a `TCZYX` image series. The processing and timelapse
-conversion commands expose those series as one virtual `TPCZYX` TensorStore,
-without copying or reshaping the source data. Legacy root-array Zarr v2
-acquisitions remain supported by the compatibility path.
-
-The source acquisition remains unchanged. By default, processing creates
-OME-Zarr v0.5 outputs next to it. To place every processing artifact in a
-different directory, use `--output`; missing parent directories are created:
-
-```bash
-uv run process "/path/to/qi2lab_acquisition.zarr" --output "/path/to/processed"
-```
-
-The processed collections embed the geometry, stage positions, channel data,
-and source provenance needed by fusion. The output directory can therefore be
-passed directly to `fuse`, without copying the source acquisition into it:
-
-```bash
-uv run fuse "/path/to/processed"
-```
-
-Per-position outputs are Bio-Formats2Raw collections; the position is
-represented by a separate `TCZYX` image series rather than a `P` axis inside an
-array. Maximum projections retain a singleton `Z` axis.
-
-For an oblique acquisition with stem `qi2lab_acquisition`, processing can create:
-
-| Output | Contents |
-| --- | --- |
-| `qi2lab_acquisition_deskewed.ome.zarr` | Deskewed per-position `TCZYX` collection |
-| `qi2lab_acquisition_decon_deskewed.ome.zarr` | Deconvolved and deskewed per-position `TCZYX` collection |
-| `qi2lab_acquisition_max_z_deskewed.ome.zarr` | Per-position maximum-Z projections |
-| `qi2lab_acquisition_max_z_decon_deskewed.ome.zarr` | Deconvolved per-position maximum-Z projections |
-| `qi2lab_acquisition_max_z_fused.ome.zarr` | Stage-position fused maximum-Z image |
-
-The `decon` filenames are selected when `--deconvolve` is enabled. Maximum-Z
-outputs are controlled by `--max-projection` and
-`--create-fused-max-projection`.
-
-For a projection acquisition, processing can create:
-
-| Output | Contents |
-| --- | --- |
-| `qi2lab_acquisition_projection.ome.zarr` | Per-position `TCZYX` collection with singleton `Z` |
-| `qi2lab_acquisition_decon_projection.ome.zarr` | Deconvolved per-position collection with singleton `Z` |
-| `qi2lab_acquisition_stagefused.ome.zarr` | Stage-position fused projection image |
-
-Per-position collections include axis, physical scale, channel, processing, and
-stage-position metadata. Their image and stage metadata is also represented in
-`OME/METADATA.ome.xml`. A namespaced `opm_processing` root attribute is written
-through `yaozarrs.Bf2RawBuilder.extra_attributes`; it records the source,
-software versions, timestamp, output kind, input selection, and ordered
-raw-to-processed operations with resolved parameters. Camera calibration, scan
-spacing/direction, excess-frame cropping, wavelengths, and stage orientation are
-read from acquisition metadata rather than supplied as CLI options. Fused images
-retain their `TCZYX` axes and physical scales in OME-Zarr metadata.
-
-### Display
-
-Open processed data through the `napari-ome-zarr` reader with:
-
-```bash
-uv run display "/path/to/qi2lab_acquisition.zarr" --to-display full
-```
-
-The command passes the OME-Zarr path directly to `napari-ome-zarr`; it does not load the complete array before opening napari. Use one of these views:
-
-| `--to-display` | Output selected |
-| --- | --- |
-| `full` | Deskewed per-position collection |
-| `max-z` | Per-position maximum-Z collection (default) |
-| `fused-max-z` | Stage-position fused maximum-Z image |
-| `fused-full` | Registered and fused multiscale image |
-
-For collection views, `--time-range START STOP` and `--pos-range START STOP`
-limit the visible range. Position layers retain their stage translations, and
-channel display settings are linked across positions.
-
-### Registration And Fusion
-
-Register and fuse processed tiles into a multiscale OME-Zarr v0.5 image with:
-
-```bash
-uv run fuse "/path/to/qi2lab_acquisition.zarr"
-```
-
-The path may be the acquisition `.ome.zarr` store itself, a processed
-collection, its containing directory, or the directory selected with
-`process --output`.
-
-Registration uses channel index 0 by default. Select another zero-based channel
-index without changing which channels are written to the fused output:
-
-```bash
-uv run fuse "/path/to/qi2lab_acquisition.zarr" --registration-channel 1
-```
-
-Fusion preserves each complete deskewed tile. Pixels that are zero in every
-channel are treated as invalid deskew padding, so the trapezoidal wedge
-contributes neither signal nor weight where tiles overlap.
-
-Fusion always reports its selected registration and scale-0 fusion backends.
-To require CUDA registration and fail on an incomplete GPU environment on
-Linux, run:
-
-```bash
-uv run --extra gpu fuse "/path/to/qi2lab_acquisition.zarr" --require-gpu
-```
-
-On Windows, after the GPU sync and local cuCIM installation above, use:
-
-```powershell
-uv run --no-sync fuse "C:\path\to\qi2lab_acquisition.zarr" --require-gpu
-```
-
-CUDA accelerates registration. Scale-0 fusion directly copies single-tile
-regions and reserves feather blending for actual overlaps. Independent output
-blocks render concurrently through GIL-releasing Numba CPU kernels, each source
-tile is read once per block, and each completed block is written once. Fused
-shapes are padded only to the smallest boundary that supports all configured
-multiscale factors, avoiding tile-sized padding.
-
-The command discovers the corresponding deskewed or projection collection and writes `/path/to/qi2lab_acquisition_fused.ome.zarr`. Registration is optimized per timepoint, and fusion writes a single chunked `TCZYX` image with an OME-Zarr multiscale pyramid. Open it with `--to-display fused-full`, or open the `.ome.zarr` directory directly in napari with the `napari-ome-zarr` reader.
-
-To overwrite the fused maximum-Z projection from scale 0 of an existing
-registered full-resolution fused image, without rerunning registration or
-full-volume fusion:
-
-```bash
-uv run fuse "/path/to/qi2lab_acquisition.zarr" --regenerate-max-z
+OPM_REQUIRE_GPU=1 uv run --extra gpu --group dev pytest -m gpu
 ```

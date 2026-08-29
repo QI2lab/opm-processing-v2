@@ -24,6 +24,7 @@ from opm_processing.dataio.acquisition import (
     acquisition_stem,
     resolve_acquisition_path,
 )
+from opm_processing.dataio.roi import PhysicalRoi
 from opm_processing.imageprocessing.maxtilefusion import (
     regenerate_fused_max_projection,
 )
@@ -68,11 +69,18 @@ def register_and_fuse(
         typer.Option(
             "--regenerate-max-z",
             help=(
-                "Only overwrite the fused maximum-Z projection using scale 0 "
-                "of the existing registered full-resolution fused image."
+                "Only overwrite the fused maximum-Z projection by projecting "
+                "every scale of the existing registered fused image."
             ),
         ),
     ] = False,
+    roi: Annotated[
+        Path | None,
+        typer.Option(
+            "--roi",
+            help="Physical ROI JSON created by display --roi-output.",
+        ),
+    ] = None,
 ):
     """Register and fuse processed OPM data.
 
@@ -121,8 +129,10 @@ def register_and_fuse(
     require_gpu : bool
         Fail instead of silently using CPU registration when CUDA is unavailable.
     regenerate_max_z : bool
-        Regenerate only the fused maximum-Z projection from the existing
-        registered full-resolution fused image.
+        Regenerate the fused maximum-Z multiscale pyramid from the existing
+        registered fused image.
+    roi : pathlib.Path or None
+        Restrict tile selection and the fused YX canvas while retaining all Z.
 
     Returns
     -------
@@ -174,8 +184,21 @@ def register_and_fuse(
         optimization_rel_threshold=optimization_rel_threshold,
         optimization_abs_threshold=optimization_abs_threshold,
         max_registration_shift_zyx=max_registration_shift_zyx,
+        roi_selection=None if roi is None else PhysicalRoi.read(roi),
     )
     tile_fuser.run()
+    fused_path = tile_fuser.output_dir / (
+        f"{tile_fuser.acquisition_name}_fused.ome.zarr"
+    )
+    max_z_path = tile_fuser.output_dir / (
+        f"{tile_fuser.acquisition_name}_max_z_fused.ome.zarr"
+    )
+    regenerate_fused_max_projection(
+        fused_path,
+        max_z_path,
+        max_workers=max_workers,
+    )
+    print(f"Created registered fused maximum-Z projection: {max_z_path}")
 
 
 # entry for point for CLI

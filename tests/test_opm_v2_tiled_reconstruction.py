@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import json
 
 import numpy as np
 import pytest
@@ -11,6 +10,10 @@ import pytest
 from opm_processing.dataio.position_collection import (
     open_image_array,
     open_position_collection,
+)
+from opm_processing.dataio.processing_state import (
+    ProcessingState,
+    processing_state_path,
 )
 from opm_processing.imageprocessing.tilefusion import TileFusion
 from opm_processing.process import process
@@ -310,7 +313,7 @@ def _assert_tiled_reconstruction(
     )
     assert deconvolved_collection.shape == deskewed_collection.shape
     np.testing.assert_allclose(
-        deconvolved_collection.attributes["stage_positions"],
+        deconvolved_collection.stage_positions_zxy,
         fixture.recorded_stage_positions_zxy,
     )
 
@@ -502,7 +505,8 @@ def test_reprocessing_recomputes_registration_before_fusing(
     del cupy_gpu
     fixture = opm_v2_tiled_ground_truth_zarr
     options = reconstruction_config.processing_options()
-    metrics_path = fixture.path.parent / "stitching_metrics.json"
+    state_path = processing_state_path(fixture.path.parent, fixture.path.stem)
+    processed_path = fixture.path.parent / f"{fixture.path.stem}_deskewed.ome.zarr"
 
     process(root_path=fixture.path, deconvolve=False, **options)
     first_fusion = TileFusion(
@@ -510,27 +514,25 @@ def test_reprocessing_recomputes_registration_before_fusing(
         **reconstruction_config.fusion_options(),
     )
     first_fusion.run()
-    first_cache = json.loads(metrics_path.read_text(encoding="utf-8"))
+    first_registration = ProcessingState.read(state_path).registration(processed_path)
 
     process(root_path=fixture.path, deconvolve=False, **options)
+    assert ProcessingState.read(state_path).document["registration"] == {}
     second_fusion = TileFusion(
         root_path=fixture.path,
         **reconstruction_config.fusion_options(),
     )
-    with pytest.raises(ValueError, match="different processed data"):
-        second_fusion.load_pairwise_metrics(metrics_path)
+    with pytest.raises(ValueError, match="no registration"):
+        second_fusion.load_pairwise_metrics()
 
     second_fusion.run()
-    second_cache = json.loads(metrics_path.read_text(encoding="utf-8"))
+    second_registration = ProcessingState.read(state_path).registration(processed_path)
     assert (
-        second_cache["source"]["processing_created_at"]
-        != first_cache["source"]["processing_created_at"]
+        second_registration["pairwise_metrics"]
+        == first_registration["pairwise_metrics"]
     )
-    processed_path = fixture.path.parent / f"{fixture.path.stem}_deskewed.ome.zarr"
-    current_created_at = open_position_collection(processed_path).attributes[
-        "opm_processing"
-    ]["created_at"]
-    assert second_cache["source"]["processing_created_at"] == current_created_at
+    assert second_registration["tiles"] == first_registration["tiles"]
+    assert not (fixture.path.parent / "stitching_metrics.json").exists()
     _assert_fused_overlap_matches_ground_truth(
         fixture,
         reconstruction_config,

@@ -8,9 +8,19 @@ from pathlib import Path
 import numpy as np
 from tqdm import tqdm
 
-from yaozarrs import DimSpec, open_group, v05
+from yaozarrs import open_group, v05
 from yaozarrs.write.v05 import prepare_image
 
+from opm_processing.dataio.ngff import (
+    downsample_yx,
+    round_spatial,
+    round_spatial_values,
+    round_tczyx_transform,
+)
+from opm_processing.dataio.processing_state import (
+    ProcessingState,
+    processing_state_path,
+)
 from opm_processing.imageprocessing.coordinates import (
     stage_positions_to_image_coordinates,
 )
@@ -44,87 +54,126 @@ def regenerate_fused_max_projection(
         raise FileNotFoundError(
             f"Full-resolution fused data store not found: {fused_path}"
         )
+    fused_suffix = "_fused.ome.zarr"
+    if not fused_path.name.endswith(fused_suffix):
+        raise ValueError(f"Unexpected registered fused-image name: {fused_path}")
+    acquisition_name = fused_path.name[: -len(fused_suffix)]
+    processing_state = ProcessingState.read(
+        processing_state_path(fused_path.parent, acquisition_name)
+    )
+    processed_path = processing_state.registered_output_for_fused(fused_path)
 
     source_root = open_group(fused_path)
     source_metadata = source_root.ome_metadata()
     if not isinstance(source_metadata, v05.Image):
         raise ValueError(f"Not an OME-Zarr v0.5 Image: {fused_path}")
     source_multiscale = source_metadata.multiscales[0]
-    source_dataset = source_multiscale.datasets[0]
-    source = source_root[source_dataset.path].to_tensorstore()
-    if source.rank != 5:
-        raise ValueError(
-            f"Expected full-resolution TCZYX fused data, received shape {source.shape}"
+    projection_datasets = []
+    projection_specs = []
+    levels = []
+    expected_time_channels: tuple[int, int] | None = None
+    for source_dataset in source_multiscale.datasets:
+        source = source_root[source_dataset.path].to_tensorstore()
+        if source.rank != 5:
+            raise ValueError(
+                "Expected TCZYX fused data at every multiscale level; "
+                f"{source_dataset.path!r} has shape {source.shape}"
+            )
+        time_dim, channel_dim, z_dim, y_dim, x_dim = (
+            int(value) for value in source.shape
         )
+        if expected_time_channels is None:
+            expected_time_channels = (time_dim, channel_dim)
+        elif (time_dim, channel_dim) != expected_time_channels:
+            raise ValueError(
+                "Fused multiscale levels must have identical T and C dimensions"
+            )
 
-    time_dim, channel_dim, z_dim, y_dim, x_dim = (int(value) for value in source.shape)
-    scale = np.asarray(source_dataset.scale_transform.scale, dtype=np.float64)
-    if scale.shape != (5,):
-        raise ValueError("Fused dataset scale transform must contain TCZYX values")
-    if source_dataset.translation_transform is None:
-        translation = np.zeros(5, dtype=np.float64)
-    else:
-        translation = np.asarray(
-            source_dataset.translation_transform.translation,
+        scale = np.asarray(source_dataset.scale_transform.scale, dtype=np.float64)
+        if scale.shape != (5,):
+            raise ValueError("Fused dataset scale transform must contain TCZYX values")
+        if source_dataset.translation_transform is None:
+            translation = np.zeros(5, dtype=np.float64)
+        else:
+            translation = np.asarray(
+                source_dataset.translation_transform.translation,
+                dtype=np.float64,
+            )
+        if translation.shape != (5,):
+            raise ValueError(
+                "Fused dataset translation transform must contain TCZYX values"
+            )
+        output_scale = np.asarray(round_tczyx_transform(scale), dtype=np.float64)
+        projection_translation = np.asarray(
+            round_tczyx_transform(translation),
             dtype=np.float64,
         )
-    if translation.shape != (5,):
-        raise ValueError(
-            "Fused dataset translation transform must contain TCZYX values"
+        projection_translation[2] += 0.5 * (z_dim - 1) * output_scale[2]
+        projection_datasets.append(
+            v05.Dataset(
+                path=source_dataset.path,
+                coordinateTransformations=[
+                    v05.ScaleTransformation(scale=output_scale.tolist()),
+                    v05.TranslationTransformation(
+                        translation=round_tczyx_transform(projection_translation)
+                    ),
+                ],
+            )
         )
-    projection_translation = translation.copy()
-    projection_translation[2] += 0.5 * (z_dim - 1) * scale[2]
 
+        source_chunks = tuple(
+            int(value) for value in source.chunk_layout.read_chunk.shape
+        )
+        chunk_y = min(y_dim, max(1, source_chunks[-2]))
+        chunk_x = min(x_dim, max(1, source_chunks[-1]))
+        source_dtype = np.dtype(source.dtype.numpy_dtype)
+        projection_specs.append(
+            ((time_dim, channel_dim, 1, y_dim, x_dim), source_dtype)
+        )
+        levels.append(
+            {
+                "path": source_dataset.path,
+                "source": source,
+                "shape": (time_dim, channel_dim, z_dim, y_dim, x_dim),
+                "chunk_y": chunk_y,
+                "chunk_x": chunk_x,
+                "z_step": min(z_dim, max(16, source_chunks[-3])),
+            }
+        )
+
+    if not levels:
+        raise ValueError("Fused image contains no multiscale datasets")
     projection_image = v05.Image(
         multiscales=[
             v05.Multiscale(
                 name="registered-fused-max-z",
                 axes=source_multiscale.axes,
-                datasets=[
-                    v05.Dataset(
-                        path="0",
-                        coordinateTransformations=[
-                            v05.ScaleTransformation(scale=scale.tolist()),
-                            v05.TranslationTransformation(
-                                translation=projection_translation.tolist()
-                            ),
-                        ],
-                    )
-                ],
+                datasets=projection_datasets,
             )
         ]
     )
 
-    source_chunks = tuple(int(value) for value in source.chunk_layout.read_chunk.shape)
-    chunk_y = min(y_dim, max(1, source_chunks[-2]))
-    chunk_x = min(x_dim, max(1, source_chunks[-1]))
-    source_dtype = np.dtype(source.dtype.numpy_dtype)
-    extra_attributes = {
-        key: value for key, value in source_root.attrs.items() if key != "ome"
-    }
-    fusion_attributes = dict(extra_attributes.get("opm_fusion", {}))
-    fusion_attributes["maximum_projection"] = {
-        "axis": "z",
-        "source": str(fused_path),
-        "source_dataset": source_dataset.path,
-        "full_resolution": True,
-        "registered": True,
-    }
-    extra_attributes["opm_fusion"] = fusion_attributes
     _, arrays = prepare_image(
         output_path,
         projection_image,
-        ((time_dim, channel_dim, 1, y_dim, x_dim), source_dtype),
-        extra_attributes=extra_attributes,
-        chunks=(1, 1, 1, chunk_y, chunk_x),
+        projection_specs,
+        extra_attributes={},
+        chunks=(
+            1,
+            1,
+            1,
+            int(levels[0]["chunk_y"]),
+            int(levels[0]["chunk_x"]),
+        ),
         writer="tensorstore",
         overwrite=True,
     )
-    output = arrays["0"]
-
-    z_step = min(z_dim, max(16, source_chunks[-3]))
-    chunk_total = (
-        time_dim * channel_dim * math.ceil(y_dim / chunk_y) * math.ceil(x_dim / chunk_x)
+    chunk_total = sum(
+        int(level["shape"][0])
+        * int(level["shape"][1])
+        * math.ceil(int(level["shape"][3]) / int(level["chunk_y"]))
+        * math.ceil(int(level["shape"][4]) / int(level["chunk_x"]))
+        for level in levels
     )
     workers = max_workers
     if workers is None:
@@ -132,6 +181,7 @@ def regenerate_fused_max_projection(
     workers = max(1, min(int(workers), chunk_total))
 
     def project_chunk(
+        level_index: int,
         time_index: int,
         channel_index: int,
         y_start: int,
@@ -140,6 +190,11 @@ def regenerate_fused_max_projection(
         x_stop: int,
     ) -> None:
         """Project one output-aligned YX chunk through every source Z plane."""
+        level = levels[level_index]
+        source = level["source"]
+        output = arrays[level["path"]]
+        z_dim = int(level["shape"][2])
+        z_step = int(level["z_step"])
         projection = None
         for z_start in range(0, z_dim, z_step):
             z_stop = min(z_start + z_step, z_dim)
@@ -183,29 +238,34 @@ def regenerate_fused_max_projection(
             progress.update()
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        for time_index in range(time_dim):
-            for channel_index in range(channel_dim):
-                for y_start in range(0, y_dim, chunk_y):
-                    y_stop = min(y_start + chunk_y, y_dim)
-                    for x_start in range(0, x_dim, chunk_x):
-                        x_stop = min(x_start + chunk_x, x_dim)
-                        pending.add(
-                            executor.submit(
-                                project_chunk,
-                                time_index,
-                                channel_index,
-                                y_start,
-                                y_stop,
-                                x_start,
-                                x_stop,
+        for level_index, level in enumerate(levels):
+            time_dim, channel_dim, _z_dim, y_dim, x_dim = level["shape"]
+            chunk_y = int(level["chunk_y"])
+            chunk_x = int(level["chunk_x"])
+            for time_index in range(int(time_dim)):
+                for channel_index in range(int(channel_dim)):
+                    for y_start in range(0, int(y_dim), chunk_y):
+                        y_stop = min(y_start + chunk_y, int(y_dim))
+                        for x_start in range(0, int(x_dim), chunk_x):
+                            x_stop = min(x_start + chunk_x, int(x_dim))
+                            pending.add(
+                                executor.submit(
+                                    project_chunk,
+                                    level_index,
+                                    time_index,
+                                    channel_index,
+                                    y_start,
+                                    y_stop,
+                                    x_start,
+                                    x_stop,
+                                )
                             )
-                        )
-                        if len(pending) >= 2 * workers:
-                            done, pending = wait(
-                                pending,
-                                return_when=FIRST_COMPLETED,
-                            )
-                            collect(done)
+                            if len(pending) >= 2 * workers:
+                                done, pending = wait(
+                                    pending,
+                                    return_when=FIRST_COMPLETED,
+                                )
+                                collect(done)
         while pending:
             done, pending = wait(
                 pending,
@@ -213,6 +273,10 @@ def regenerate_fused_max_projection(
             )
             collect(done)
     progress.close()
+    processing_state.set_registered_max_projection(
+        processed_path,
+        max_projection_path=output_path,
+    )
     return output_path
 
 
@@ -229,10 +293,13 @@ class MaxTileFusion:
     output_path : Path
         Path to the output TensorStore dataset.
     pixel_size : tuple of float
-        Pixel size (y, x) in physical units.
+        Pixel size in physical units, supplied as either (y, x) or (z, y, x).
     reverse_stage_y : bool, default=True
         Reverse the stage-derived Y placement coordinate without flipping tile
         pixels. OPM stage motion is opposite image Y.
+    reverse_stage_z : bool, default=True
+        Convert physical stage Z into the opposite laboratory-Z placement
+        coordinate before calculating its image-Y contribution.
     pad_yx : list of int, default  = [0, 0].
         Padding in y and x dimensions already applied to the dataset
     time_range: list of int, default = None
@@ -243,13 +310,16 @@ class MaxTileFusion:
         ts_dataset: str | Path,
         tile_positions: list[float, float],
         output_path: str | Path,
-        pixel_size: tuple[float, float],
+        pixel_size: Sequence[float],
+        spatial_offset_z_um: float = 0.0,
+        source_position_indices: Sequence[int] | None = None,
         pad_yx: Sequence[int] = (0, 0),
         time_range: tuple[int, int] | None = None,
         blend_pixels: tuple[int, int] = (380, 380),
         chunk_size: int = 512,
         padding_multiple: int = 8,
         reverse_stage_y: bool = True,
+        reverse_stage_z: bool = True,
         opm_angle_deg: float | None = None,
     ):
         """Initialize a maximum-projection tile fusion operation.
@@ -263,7 +333,11 @@ class MaxTileFusion:
         output_path
             Destination for the fused image.
         pixel_size
-            Physical YX pixel spacing.
+            Physical YX or ZYX pixel spacing.
+        spatial_offset_z_um
+            Physical Z coordinate represented by the singleton projection plane.
+        source_position_indices
+            Original acquisition position index for each input tile.
         pad_yx
             Existing YX padding to remove from each tile.
         time_range
@@ -277,6 +351,9 @@ class MaxTileFusion:
         reverse_stage_y
             Whether to reverse the stage-derived image-Y placement coordinate.
             Tile pixel arrays are not modified.
+        reverse_stage_z
+            Whether to reverse physical stage Z for laboratory-coordinate
+            placement. Tile pixels and the acquired scan axis are not modified.
         opm_angle_deg
             OPM angle used to map relative stage Z into deskewed image Y when
             `tile_positions` contains ZYX coordinates.
@@ -292,14 +369,36 @@ class MaxTileFusion:
         self.ts_dataset = tuple(ts_dataset)
 
         self.reverse_stage_y = bool(reverse_stage_y)
+        self.reverse_stage_z = bool(reverse_stage_z)
         placement_coordinates = stage_positions_to_image_coordinates(
             tile_positions,
             reverse_y=self.reverse_stage_y,
+            reverse_z=self.reverse_stage_z,
             opm_angle_deg=opm_angle_deg,
         )
         self.tile_positions = placement_coordinates[:, -2:]
+        if source_position_indices is None:
+            source_position_indices = range(len(self.tile_positions))
+        self.source_position_indices = tuple(
+            int(value) for value in source_position_indices
+        )
+        if len(self.source_position_indices) != len(self.tile_positions):
+            raise ValueError(
+                "source_position_indices must contain one value per input tile"
+            )
         self.output_path = Path(output_path)
-        self.pixel_size = pixel_size
+        pixel_size = tuple(float(value) for value in pixel_size)
+        if len(pixel_size) == 2:
+            self.z_pixel_size = 1.0
+            self.pixel_size = round_spatial_values(pixel_size)
+        elif len(pixel_size) == 3:
+            self.z_pixel_size = round_spatial(pixel_size[0])
+            self.pixel_size = round_spatial_values(pixel_size[-2:])
+        else:
+            raise ValueError("pixel_size must contain YX or ZYX spacing")
+        if any(value <= 0 for value in (*self.pixel_size, self.z_pixel_size)):
+            raise ValueError("pixel sizes must be positive")
+        self.spatial_offset_z_um = round_spatial(spatial_offset_z_um)
 
         self.time_dim, self.channels, self.z_dim, height, width = self.ts_dataset[
             0
@@ -370,7 +469,7 @@ class MaxTileFusion:
 
         fused_shape = (padded_final_ny, padded_final_nx)
 
-        return fused_shape, (min_y, min_x)
+        return fused_shape, (float(min_y), float(min_x))
 
     def generate_blending_weights(self, blend_pixels: tuple[int, int] | None = None):
         """Generate a feathered blending weight mask for a tile.
@@ -397,18 +496,20 @@ class MaxTileFusion:
         x = np.ones(w, dtype=np.float32)
 
         # Y blending
-        blend_zone_y = np.linspace(0, np.pi, blend_pixels_y)
-        feather_y = 0.5 * (1 - np.cos(blend_zone_y))
+        if blend_pixels_y:
+            blend_zone_y = np.linspace(0, np.pi, blend_pixels_y)
+            feather_y = 0.5 * (1 - np.cos(blend_zone_y))
 
-        y[:blend_pixels_y] = feather_y  # top
-        y[-blend_pixels_y:] = feather_y[::-1]  # bottom
+            y[:blend_pixels_y] = feather_y  # top
+            y[-blend_pixels_y:] = feather_y[::-1]  # bottom
 
         # X blending
-        blend_zone_x = np.linspace(0, np.pi, blend_pixels_x)
-        feather_x = 0.5 * (1 - np.cos(blend_zone_x))
+        if blend_pixels_x:
+            blend_zone_x = np.linspace(0, np.pi, blend_pixels_x)
+            feather_x = 0.5 * (1 - np.cos(blend_zone_x))
 
-        x[:blend_pixels_x] = feather_x  # left
-        x[-blend_pixels_x:] = feather_x[::-1]  # right
+            x[:blend_pixels_x] = feather_x  # left
+            x[-blend_pixels_x:] = feather_x[::-1]  # right
 
         weight_mask = np.outer(y, x)
         # Every covered pixel must retain a positive contribution. Exact zeros
@@ -432,36 +533,129 @@ class MaxTileFusion:
             time_to_use = self.time_range[1] - self.time_range[0]
         else:
             time_to_use = self.time_dim
-        shape = (time_to_use, self.channels, 1, *self.fused_shape)
-        dims = [
-            DimSpec(name="t", size=time_to_use),
-            DimSpec(name="c", size=self.channels),
-            DimSpec(name="z", size=1, scale=1.0, unit="micrometer"),
-            DimSpec(
-                name="y",
-                size=self.fused_shape[0],
-                scale=self.pixel_size[0],
-                unit="micrometer",
-            ),
-            DimSpec(
-                name="x",
-                size=self.fused_shape[1],
-                scale=self.pixel_size[1],
-                unit="micrometer",
-            ),
+        factors = tuple(
+            factor for factor in (1, 2, 4, 8, 16, 32) if factor <= min(self.fused_shape)
+        )
+        self.multiscale_factors_yx = factors
+        axes = [
+            {"name": "t", "type": "time"},
+            {"name": "c", "type": "channel"},
+            {"name": "z", "type": "space", "unit": "micrometer"},
+            {"name": "y", "type": "space", "unit": "micrometer"},
+            {"name": "x", "type": "space", "unit": "micrometer"},
         ]
+        datasets = []
+        specs = []
+        for level, factor in enumerate(factors):
+            datasets.append(
+                v05.Dataset(
+                    path=str(level),
+                    coordinateTransformations=[
+                        v05.ScaleTransformation(
+                            scale=round_tczyx_transform(
+                                (
+                                    1,
+                                    1,
+                                    self.z_pixel_size,
+                                    self.pixel_size[0] * factor,
+                                    self.pixel_size[1] * factor,
+                                )
+                            )
+                        ),
+                        v05.TranslationTransformation(
+                            translation=round_tczyx_transform(
+                                (
+                                    0,
+                                    0,
+                                    self.spatial_offset_z_um,
+                                    self.offset[0],
+                                    self.offset[1],
+                                )
+                            )
+                        ),
+                    ],
+                )
+            )
+            specs.append(
+                (
+                    (
+                        time_to_use,
+                        self.channels,
+                        1,
+                        (self.fused_shape[0] + factor - 1) // factor,
+                        (self.fused_shape[1] + factor - 1) // factor,
+                    ),
+                    self.output_dtype,
+                )
+            )
         image = v05.Image(
-            multiscales=[v05.Multiscale.from_dims(dims, name="fused-max-projection")]
+            multiscales=[
+                v05.Multiscale(
+                    name="fused-max-projection",
+                    axes=axes,
+                    datasets=datasets,
+                )
+            ]
         )
         _, arrays = prepare_image(
             self.output_path,
             image,
-            (shape, self.output_dtype),
+            specs,
+            extra_attributes={},
             chunks=(1, 1, 1, self.chunk_size, self.chunk_size),
             writer="tensorstore",
             overwrite=True,
         )
+        self.multiscale_arrays = tuple(
+            arrays[str(level)] for level in range(len(factors))
+        )
         return arrays["0"]
+
+    def write_multiscales(self) -> None:
+        """Stream strided YX pyramid levels from the fused level zero."""
+        for level, factor in enumerate(self.multiscale_factors_yx[1:], start=1):
+            target = self.multiscale_arrays[level]
+            target_height = int(target.shape[-2])
+            target_width = int(target.shape[-1])
+            source_height = int(self.fused_ts.shape[-2])
+            source_width = int(self.fused_ts.shape[-1])
+            output_step = max(1, self.chunk_size // factor)
+            progress = tqdm(
+                total=(
+                    int(target.shape[0])
+                    * math.ceil(target_height / output_step)
+                    * math.ceil(target_width / output_step)
+                ),
+                desc=f"max pyramid {factor}x",
+                leave=False,
+                unit="chunk",
+            )
+            for time_index in range(int(target.shape[0])):
+                for y_start in range(0, target_height, output_step):
+                    y_stop = min(y_start + output_step, target_height)
+                    for x_start in range(0, target_width, output_step):
+                        x_stop = min(x_start + output_step, target_width)
+                        source = np.asarray(
+                            self.fused_ts[
+                                time_index,
+                                :,
+                                0,
+                                y_start * factor : min(y_stop * factor, source_height),
+                                x_start * factor : min(x_stop * factor, source_width),
+                            ]
+                            .read()
+                            .result()
+                        )
+                        reduced = downsample_yx(source, factor)
+                        target[
+                            time_index,
+                            :,
+                            0,
+                            y_start:y_stop,
+                            x_start:x_stop,
+                        ].write(reduced).result()
+                        progress.update()
+            progress.close()
 
     def fuse_tiles(self):
         """Fuse tiles into bounded spatial chunks.
@@ -487,6 +681,30 @@ class MaxTileFusion:
         )
         source_times = tuple(source_times)
 
+        tile_channel_nonzero: dict[tuple[int, int], np.ndarray] = {}
+        zero_channel_count = 0
+        for source_time in source_times:
+            for tile_idx in range(len(self.ts_dataset)):
+                tile = np.asarray(
+                    self.ts_dataset[tile_idx][
+                        source_time,
+                        :,
+                        0,
+                        self.pad_y : self.pad_y + self.tile_shape[0],
+                        self.pad_x : self.pad_x + self.tile_shape[1],
+                    ]
+                    .read()
+                    .result()
+                )
+                present = np.any(tile != 0, axis=(-2, -1))
+                tile_channel_nonzero[(source_time, tile_idx)] = present
+                zero_channel_count += int(np.count_nonzero(~present))
+        if zero_channel_count:
+            print(
+                f"Excluding {zero_channel_count} zero maximum-projection "
+                "tile/channel images from fusion weights."
+            )
+
         tile_bounds = []
         chunks_to_tiles: dict[tuple[int, int], list[int]] = {}
         fused_height, fused_width = self.fused_shape
@@ -502,10 +720,7 @@ class MaxTileFusion:
             visible_y_end = min(fused_height, y_end)
             visible_x_start = max(0, x_start)
             visible_x_end = min(fused_width, x_end)
-            if (
-                visible_y_start >= visible_y_end
-                or visible_x_start >= visible_x_end
-            ):
+            if visible_y_start >= visible_y_end or visible_x_start >= visible_x_end:
                 continue
             first_chunk_y = (visible_y_start // self.chunk_size) * self.chunk_size
             first_chunk_x = (visible_x_start // self.chunk_size) * self.chunk_size
@@ -530,10 +745,13 @@ class MaxTileFusion:
                     (self.channels, chunk_height, chunk_width), dtype=np.float32
                 )
                 weight_sum = np.zeros(
-                    (1, chunk_height, chunk_width), dtype=np.float32
+                    (self.channels, chunk_height, chunk_width), dtype=np.float32
                 )
 
                 for tile_idx in chunks_to_tiles[(chunk_y, chunk_x)]:
+                    channel_present = tile_channel_nonzero[(source_time, tile_idx)]
+                    if not np.any(channel_present):
+                        continue
                     y_start, y_end, x_start, x_end = tile_bounds[tile_idx]
                     overlap_y_start = max(chunk_y, y_start)
                     overlap_y_end = min(chunk_y_end, y_end)
@@ -549,12 +767,8 @@ class MaxTileFusion:
                     tile_y_end = overlap_y_end - y_start
                     tile_x_start = overlap_x_start - x_start
                     tile_x_end = overlap_x_end - x_start
-                    output_y = slice(
-                        overlap_y_start - chunk_y, overlap_y_end - chunk_y
-                    )
-                    output_x = slice(
-                        overlap_x_start - chunk_x, overlap_x_end - chunk_x
-                    )
+                    output_y = slice(overlap_y_start - chunk_y, overlap_y_end - chunk_y)
+                    output_x = slice(overlap_x_start - chunk_x, overlap_x_end - chunk_x)
 
                     tile_data = (
                         self.ts_dataset[tile_idx][
@@ -573,7 +787,9 @@ class MaxTileFusion:
                         tile_x_start:tile_x_end,
                     ]
                     accumulation[:, output_y, output_x] += tile_data * weights
-                    weight_sum[:, output_y, output_x] += weights
+                    weight_sum[:, output_y, output_x] += (
+                        channel_present[:, None, None] * weights
+                    )
 
                 fused = np.divide(
                     accumulation,
@@ -611,3 +827,4 @@ class MaxTileFusion:
             No value is returned.
         """
         self.fuse_tiles()
+        self.write_multiscales()

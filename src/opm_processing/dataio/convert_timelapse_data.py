@@ -6,21 +6,18 @@ caller or read from acquisition metadata. Importing this module performs no I/O.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import numpy as np
-import tensorstore as ts
 import typer
 import yaml
 from tifffile import TiffWriter
+from tqdm import tqdm
 
 from opm_processing.dataio.acquisition import (
     inspect_acquisition,
     open_acquisition_datastore,
 )
-from opm_processing.dataio.metadata import find_key
-
 
 app = typer.Typer()
 
@@ -226,33 +223,6 @@ def save_as_tiff(
     _write_tiff(data_array, axes, pixel_size_um, output_path)
 
 
-def _open_datastore(zarr_dir: Path) -> ts.TensorStore:
-    """Open a Zarr v2 or v3 acquisition as a TensorStore.
-
-    Parameters
-    ----------
-    zarr_dir : Path
-        Value supplied for ``zarr dir``.
-
-    Returns
-    -------
-    ts.TensorStore
-        Result produced by the callable.
-    """
-    last_error: Exception | None = None
-    for driver in ("zarr3", "zarr"):
-        try:
-            return ts.open(
-                {
-                    "driver": driver,
-                    "kvstore": {"driver": "file", "path": str(zarr_dir)},
-                }
-            ).result()
-        except Exception as error:  # TensorStore uses different errors by driver.
-            last_error = error
-    raise ValueError(f"Unable to open datastore {zarr_dir}") from last_error
-
-
 def _selection_bounds(
     requested: tuple[int, int] | None,
     length: int,
@@ -329,36 +299,19 @@ def convert_timelapse(
         Result produced by the callable.
     """
     zarr_dir = Path(zarr_dir)
-    acquisition = None
-    if (zarr_dir / ".zattrs").is_file():
-        # Compatibility for legacy root-array acquisitions.
-        datastore = _open_datastore(zarr_dir)
-    else:
-        acquisition = inspect_acquisition(zarr_dir)
-        zarr_dir = acquisition.path
-        datastore = open_acquisition_datastore(acquisition)
+    acquisition = inspect_acquisition(zarr_dir)
+    zarr_dir = acquisition.path
+    datastore = open_acquisition_datastore(acquisition)
     if datastore.rank != 6:
         raise ValueError(f"Expected TPCZYX rank 6, got shape {datastore.shape}")
 
-    if acquisition is not None:
-        if acquisition.pixel_size_um is None:
-            raise ValueError("Acquisition metadata lacks pixel size")
-        pixel_size_um = acquisition.pixel_size_um
-        if camera_offset is None:
-            camera_offset = acquisition.camera_offset
-        if camera_conversion is None:
-            camera_conversion = acquisition.camera_conversion
-    else:
-        attrs_path = zarr_dir / ".zattrs"
-        with attrs_path.open() as stream:
-            attributes = json.load(stream)
-        pixel_size_um = float(find_key(attributes, "pixel_size_um"))
-        if camera_offset is None:
-            value = find_key(attributes, "offset")
-            camera_offset = None if value is None else float(value)
-        if camera_conversion is None:
-            value = find_key(attributes, "e_to_ADU")
-            camera_conversion = None if value is None else float(value)
+    if acquisition.pixel_size_um is None:
+        raise ValueError("Acquisition metadata lacks pixel size")
+    pixel_size_um = acquisition.pixel_size_um
+    if camera_offset is None:
+        camera_offset = acquisition.camera_offset
+    if camera_conversion is None:
+        camera_conversion = acquisition.camera_conversion
 
     t0, t1 = _selection_bounds(time_range, datastore.shape[0], "time_range")
     p0, p1 = _selection_bounds(stage_range, datastore.shape[1], "stage_range")
@@ -376,39 +329,44 @@ def convert_timelapse(
         )
 
     written: list[Path] = []
-    for position in range(p0, p1):
-        for scan in range(z0, z1):
-            selected = np.asarray(
-                datastore[t0:t1, position, :, scan, :, x0:x1].read().result(),
-                dtype=np.uint16,
-            )
-            channel_count = selected.shape[1]
-            axes = "TYX" if channel_count == 1 else "TCYX"
-            stem = f"pos_{position}_scan_{scan}"
-            if create_raw:
-                path = destination / f"{stem}.raw"
-                save_raw_with_yaml(selected, path)
-                written.extend((path, path.with_suffix(".yaml")))
-            if create_time_projection:
-                for channel in range(channel_count):
-                    path = destination / f"{stem}_c{channel}_time_mean.tiff"
-                    save_time_projection(
-                        selected[:, channel],
-                        pixel_size_um,
-                        path,
-                        camera_offset=float(camera_offset),
-                        camera_conversion=float(camera_conversion),
-                    )
-                    written.append(path)
-            if create_tiff:
-                path = destination / f"{stem}.tiff"
-                save_as_tiff(
-                    np.squeeze(selected, axis=1) if channel_count == 1 else selected,
+    planes = ((position, scan) for position in range(p0, p1) for scan in range(z0, z1))
+    for position, scan in tqdm(
+        planes,
+        total=(p1 - p0) * (z1 - z0),
+        desc="planes",
+        unit="plane",
+    ):
+        selected = np.asarray(
+            datastore[t0:t1, position, :, scan, :, x0:x1].read().result(),
+            dtype=np.uint16,
+        )
+        channel_count = selected.shape[1]
+        axes = "TYX" if channel_count == 1 else "TCYX"
+        stem = f"pos_{position}_scan_{scan}"
+        if create_raw:
+            path = destination / f"{stem}.raw"
+            save_raw_with_yaml(selected, path)
+            written.extend((path, path.with_suffix(".yaml")))
+        if create_time_projection:
+            for channel in range(channel_count):
+                path = destination / f"{stem}_c{channel}_time_mean.tiff"
+                save_time_projection(
+                    selected[:, channel],
                     pixel_size_um,
                     path,
-                    axes=axes,
+                    camera_offset=float(camera_offset),
+                    camera_conversion=float(camera_conversion),
                 )
                 written.append(path)
+        if create_tiff:
+            path = destination / f"{stem}.tiff"
+            save_as_tiff(
+                np.squeeze(selected, axis=1) if channel_count == 1 else selected,
+                pixel_size_um,
+                path,
+                axes=axes,
+            )
+            written.append(path)
     return written
 
 

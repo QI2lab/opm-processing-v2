@@ -219,28 +219,19 @@ def test_chunked_deskew_matches_direct_deskew_without_deconvolution(
     assert normalized_error < config.maximum_normalized_chunk_error
 
 
-def test_float32_deskew_preserves_sub_uint16_signal() -> None:
-    """Retain fractional calibrated signal until the caller selects storage dtype."""
+def test_deskew_preserves_float32_sub_uint16_signal() -> None:
+    """Deskew cannot quantize before the final storage boundary."""
     calibrated = np.full((4, 8, 5), 0.24, dtype=np.float32)
 
-    float_output = opmtools.orthogonal_deskew(
-        calibrated,
-        distance=0.4,
-        pixel_size=0.115,
-        downsample_factor=1,
-        output_dtype=np.float32,
-    )
-    uint_output = opmtools.orthogonal_deskew(
+    output = opmtools.orthogonal_deskew(
         calibrated,
         distance=0.4,
         pixel_size=0.115,
         downsample_factor=1,
     )
 
-    assert float_output.dtype == np.float32
-    assert np.any((float_output > 0) & (float_output < 1))
-    assert uint_output.dtype == np.uint16
-    assert not np.any(uint_output)
+    assert output.dtype == np.float32
+    assert np.any((output > 0) & (output < 1))
 
 
 @pytest.mark.gpu

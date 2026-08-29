@@ -54,7 +54,10 @@ def replace_hot_pixels(
     data: NDArray
         hotpixel corrected data
     """
-    data = xp.asarray(data, dtype=xp.float32)
+    input_data = np.asarray(data)
+    if input_data.dtype != np.dtype(np.uint16):
+        raise TypeError(f"raw hot-pixel input must be uint16; got {input_data.dtype}")
+    data = xp.asarray(input_data, dtype=xp.float32)
     noise_map = xp.asarray(noise_map, dtype=xp.float32)
 
     # threshold darkfield_image to generate bad pixel matrix
@@ -72,12 +75,12 @@ def replace_hot_pixels(
     data[data < 0] = 0
 
     if CUPY_AVIALABLE:
-        data = xp.asnumpy(data).astype(np.uint16)
+        data = xp.asnumpy(data).astype(np.float32, copy=False)
         gc.collect()
         cp.clear_memo()
         cp._default_memory_pool.free_all_blocks()
     else:
-        data = data.astype(np.uint16)
+        data = data.astype(np.float32, copy=False)
 
     return data
 

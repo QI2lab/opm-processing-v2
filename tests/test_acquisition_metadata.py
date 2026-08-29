@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+import importlib
 from pathlib import Path
 
 import pytest
 import numpy as np
 import zarr
 from tifffile import imread
-from yaozarrs import DimSpec, v05
+from yaozarrs import DimSpec, open_group, v05
 from yaozarrs.write.v05 import prepare_image
 
 from opm_processing.dataio.acquisition import (
@@ -21,6 +23,59 @@ from opm_processing.dataio.position_collection import (
     open_position_collection,
 )
 from opm_processing.process import process
+
+
+def test_position_collection_multiscales_round_spatial_metadata(
+    tmp_path: Path,
+) -> None:
+    """Round NGFF spacing/origins and preserve block-center coordinates."""
+    path = tmp_path / "rounded_projection.ome.zarr"
+    collection = create_position_collection(
+        path,
+        (1, 1, 1, 1, 17, 21),
+        (0.34567, 0.11549, 0.11651),
+        stage_positions=((1.23456, 2.34567, 3.45678),),
+        spatial_offset_um=(4.56789, 5.67891, 6.78912),
+        multiscale_factors_yx=(2, 4),
+    )
+
+    assert collection.multiscale_factors_yx == (1, 2, 4)
+    assert [tuple(level[0].shape) for level in collection.multiscale_arrays] == [
+        (1, 1, 1, 17, 21),
+        (1, 1, 1, 9, 11),
+        (1, 1, 1, 5, 6),
+    ]
+    reopened = open_group(path)
+    metadata = reopened["0"].ome_metadata()
+    assert isinstance(metadata, v05.Image)
+    datasets = metadata.multiscales[0].datasets
+    expected_scales = (
+        [1.0, 1.0, 0.346, 0.115, 0.117],
+        [1.0, 1.0, 0.346, 0.23, 0.234],
+        [1.0, 1.0, 0.346, 0.46, 0.468],
+    )
+    expected_translations = (
+        [0.0, 0.0, 4.568, 5.679, 6.789],
+        [0.0, 0.0, 4.568, 5.679, 6.789],
+        [0.0, 0.0, 4.568, 5.679, 6.789],
+    )
+    for dataset, scale, translation in zip(
+        datasets,
+        expected_scales,
+        expected_translations,
+    ):
+        assert dataset.scale_transform.scale == scale
+        assert dataset.translation_transform is not None
+        assert dataset.translation_transform.translation == translation
+
+    assert "stage_positions" not in reopened.attrs
+    assert "opm_multiscale_downsample" not in reopened.attrs
+    reopened_collection = open_position_collection(path)
+    assert reopened_collection.voxel_size_um == (0.346, 0.115, 0.117)
+    assert reopened_collection.stage_positions_zxy == ((1.235, 2.346, 3.457),)
+    assert reopened_collection.spatial_origins_zyx_um == ((4.568, 5.679, 6.789),)
+    opened_collection = open_position_collection(path)
+    assert opened_collection.multiscale_factors_yx == (1, 2, 4)
 
 
 @pytest.fixture
@@ -209,6 +264,14 @@ def test_current_stage_metadata_is_discovered_without_array_open(
         (30.0, 100.0, 200.0),
         (30.0, 100.0, 220.0),
     )
+    assert metadata.scan_start_positions_xyz == (
+        (100.0, 200.0, 30.0),
+        (100.0, 220.0, 30.0),
+    )
+    np.testing.assert_allclose(
+        metadata.scan_end_positions_xyz,
+        ((100.8, 200.0, 30.0), (100.8, 220.0, 30.0)),
+    )
     assert metadata.scan_axis == "x"
     assert metadata.scan_axis_step_um == pytest.approx(0.4)
     assert metadata.pixel_size_um == pytest.approx(0.115)
@@ -226,6 +289,16 @@ def test_current_stage_collection_opens_as_virtual_tpczyx(
     metadata = inspect_acquisition(current_opm_v2_stage_scan)
     datastore = open_acquisition_datastore(metadata)
 
+    assert metadata.is_2d is False
+    assert (
+        replace(
+            metadata,
+            axes=("t", "p", "c", "y", "x"),
+            shape=(1, 2, 2, 4, 5),
+        ).is_2d
+        is True
+    )
+    assert replace(metadata, shape=(1, 2, 2, 1, 4, 5)).is_2d is True
     assert datastore.rank == 6
     assert tuple(datastore.shape) == metadata.shape
     assert tuple(datastore.domain.labels) == ("t", "", "c", "z", "y", "x")
@@ -236,6 +309,39 @@ def test_current_stage_collection_opens_as_virtual_tpczyx(
             expected = 1000 * position + 100 * channel + 10 * zz + 2 * yy + xx
             actual = datastore[0, position, channel].read().result()
             np.testing.assert_array_equal(actual, expected)
+
+
+def test_singleton_z_acquisition_routes_around_deskew(
+    current_opm_v2_stage_scan: Path,
+    monkeypatch,
+) -> None:
+    """Dispatch Z=1 data to projection processing without calling deskew."""
+    process_module = importlib.import_module("opm_processing.process")
+    metadata = replace(
+        inspect_acquisition(current_opm_v2_stage_scan),
+        shape=(1, 2, 2, 1, 4, 5),
+    )
+    projection_calls = []
+
+    monkeypatch.setattr(process_module, "inspect_acquisition", lambda _path: metadata)
+    monkeypatch.setattr(
+        process_module,
+        "process_projection",
+        lambda **kwargs: projection_calls.append(kwargs),
+    )
+    monkeypatch.setattr(
+        process_module,
+        "process_skewed",
+        lambda **_kwargs: pytest.fail("2D acquisition entered deskew processing"),
+    )
+
+    process_module.process(
+        root_path=current_opm_v2_stage_scan,
+        deconvolve=False,
+    )
+
+    assert len(projection_calls) == 1
+    assert projection_calls[0]["acquisition"].is_2d is True
 
 
 def test_single_position_root_image_opens_as_virtual_tpczyx(
@@ -295,9 +401,7 @@ def test_single_position_mirror_timelapse_can_save_float32(
     values = np.asarray(output.arrays[0][0, 0].read().result())
     assert values.dtype == np.float32
     assert np.any((values > 0) & (values != np.floor(values)))
-    conversion = output.attributes["opm_processing"]["steps"][-1]
-    assert conversion["name"] == "float32_output"
-    assert conversion["parameters"]["quantized"] is False
+    assert not any(key.startswith("opm_") for key in output.attributes)
 
 
 def test_timelapse_converter_accepts_current_collection(

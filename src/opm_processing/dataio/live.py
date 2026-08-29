@@ -288,7 +288,12 @@ class _LiveArrayChunks:
     separator: str
 
     @classmethod
-    def read(cls, path: Path) -> "_LiveArrayChunks":
+    def read(
+        cls,
+        path: Path,
+        *,
+        require_frame_chunks: bool = True,
+    ) -> "_LiveArrayChunks":
         metadata_path = path / "zarr.json"
         with metadata_path.open(encoding="utf-8") as stream:
             metadata = json.load(stream)
@@ -311,7 +316,7 @@ class _LiveArrayChunks:
         )
         if len(chunk_shape) != len(shape):
             raise ValueError(f"Invalid chunk grid metadata: {path}")
-        if chunk_shape[:3] != (1, 1, 1):
+        if require_frame_chunks and chunk_shape[:3] != (1, 1, 1):
             raise ValueError(
                 "Live processing requires one-frame chunks along T, C, and Z; "
                 f"got {chunk_shape} at {path}"
@@ -369,14 +374,20 @@ def iter_live_tiles(
     *,
     poll_interval: float = LIVE_POLL_INTERVAL_SECONDS,
     sleeper: Callable[[float], None] = time.sleep,
+    completed_tiles: set[tuple[int, int]] | None = None,
 ) -> Iterator[tuple[int, int]]:
-    """Yield newly complete tiles until the acquisition reaches a terminal state."""
+    """Yield newly complete, unprocessed tiles until acquisition termination."""
     expected = {
         (time_index, position_index)
         for time_index in range(manifest.index_sizes["t"])
         for position_index in range(manifest.index_sizes["p"])
     }
-    yielded: set[tuple[int, int]] = set()
+    yielded = set(completed_tiles or ())
+    unexpected = yielded - expected
+    if unexpected:
+        raise ValueError(
+            f"Completed live tiles are outside the manifest plan: {sorted(unexpected)}"
+        )
     while True:
         available = sorted(readiness.ready_tiles() - yielded)
         for tile in available:

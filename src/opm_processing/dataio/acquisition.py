@@ -1,11 +1,13 @@
-"""Inspect and open current OME-Zarr OPM acquisitions with yaozarrs.
+"""Inspect and open current filesystem-backed OME-Zarr OPM acquisitions.
 
-``inspect_acquisition`` traverses only yaozarrs metadata objects. Pixel arrays
-are not opened until ``open_acquisition_datastore`` is called explicitly.
+Large stage scans embed complete frame histories in every position group.  The
+inspector reads only the initial records needed to recover each stage
+trajectory; pixel arrays are not opened until requested explicitly.
 """
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -72,6 +74,16 @@ class AcquisitionMetadata:
     def scan_position_count(self) -> int:
         """Return the number of scan-axis samples per tile."""
         return self.index_sizes.get("z", 1)
+
+    @property
+    def is_2d(self) -> bool:
+        """Return whether each acquired T/P/C item has one spatial image plane.
+
+        Time, position, and channel are iteration axes. An absent Z index and
+        an explicit singleton Z index both describe two-dimensional acquired
+        data; two or more Z samples describe a three-dimensional acquisition.
+        """
+        return self.index_sizes.get("z", 1) == 1
 
     @property
     def scan_span_um(self) -> float | None:
@@ -246,6 +258,66 @@ def _event_parts(frame: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]
     return event.get("index", {}), event.get("metadata", {})
 
 
+def _initial_frame_metadata(path: Path, count: int) -> list[dict[str, Any]]:
+    """Decode at most ``count`` leading frame records without loading the journal."""
+    if count < 1:
+        return []
+    marker = '"frame_metadata"'
+    decoder = json.JSONDecoder()
+    buffer = ""
+    cursor: int | None = None
+    frames: list[dict[str, Any]] = []
+    with Path(path).open("r", encoding="utf-8") as stream:
+        while len(frames) < count:
+            if cursor is None:
+                marker_index = buffer.find(marker)
+                if marker_index >= 0:
+                    array_start = buffer.find("[", marker_index + len(marker))
+                    if array_start >= 0:
+                        cursor = array_start + 1
+            if cursor is not None:
+                while len(frames) < count:
+                    while cursor < len(buffer) and buffer[cursor] in " \t\r\n,":
+                        cursor += 1
+                    if cursor < len(buffer) and buffer[cursor] == "]":
+                        return frames
+                    try:
+                        value, end = decoder.raw_decode(buffer, cursor)
+                    except json.JSONDecodeError:
+                        break
+                    if not isinstance(value, dict):
+                        raise ValueError(
+                            f"Frame metadata entries must be objects: {path}"
+                        )
+                    frames.append(value)
+                    cursor = end
+            chunk = stream.read(64 * 1024)
+            if not chunk:
+                if cursor is None:
+                    return []
+                if frames:
+                    return frames
+                raise ValueError(f"Invalid frame_metadata array: {path}")
+            buffer += chunk
+    return frames
+
+
+def _array_layout(path: Path) -> tuple[tuple[int, ...], tuple[str, ...]]:
+    """Read the small Zarr-v3 array document without opening its parent group."""
+    metadata_path = Path(path) / "zarr.json"
+    try:
+        document = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"Cannot read Zarr array metadata: {metadata_path}") from error
+    if document.get("zarr_format") != 3 or document.get("node_type") != "array":
+        raise ValueError(f"Expected a Zarr-v3 array: {path}")
+    shape = tuple(int(value) for value in document.get("shape", ()))
+    if not shape:
+        raise ValueError(f"Zarr array has no shape: {path}")
+    names = tuple(str(value).lower() for value in document.get("dimension_names", ()))
+    return shape, names
+
+
 def _first_by_channel(frames: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
     selected: dict[int, dict[str, Any]] = {}
     for frame in frames:
@@ -293,6 +365,8 @@ def _channel_metadata(
 
 def _positions_from_frame_sets(
     frame_sets: list[list[dict[str, Any]]],
+    *,
+    scan_position_count: int | None = None,
 ) -> tuple[
     tuple[tuple[float, float, float], ...],
     tuple[tuple[float, float, float], ...],
@@ -336,6 +410,14 @@ def _positions_from_frame_sets(
             continue
         start = trajectory[0][1]
         end = trajectory[-1][1]
+        if scan_position_count is not None and len(trajectory) > 1:
+            first_step = tuple(
+                trajectory[1][1][axis] - start[axis] for axis in range(3)
+            )
+            end = tuple(
+                start[axis] + first_step[axis] * (scan_position_count - 1)
+                for axis in range(3)
+            )
         starts_xyz.append(start)
         ends_xyz.append(end)
         positions_zxy.append((start[2], start[0], start[1]))
@@ -364,7 +446,7 @@ def _sidecars(path: Path) -> tuple[str, ...]:
 
 
 def _inspect_ome_zarr(path: Path, root: ZarrGroup) -> AcquisitionMetadata:
-    """Normalize an OME-Zarr collection using yaozarrs metadata models."""
+    """Normalize the current OPM OME-Zarr layout without parsing every journal."""
     attributes = root.attrs
     opm = attributes.get("opm_v2")
     if not isinstance(opm, dict):
@@ -377,81 +459,83 @@ def _inspect_ome_zarr(path: Path, root: ZarrGroup) -> AcquisitionMetadata:
         series_metadata = ome_group.ome_metadata()
         if not isinstance(series_metadata, v05.Series):
             raise ValueError(f"OME group lacks typed series metadata: {path}")
-        image_entries = [
-            (str(series_name), root[str(series_name)])
-            for series_name in series_metadata.series
-        ]
+        series_names = tuple(str(series_name) for series_name in series_metadata.series)
+        if not series_names:
+            raise ValueError(f"OME-Zarr acquisition has no image series: {path}")
+        first_image_group = root[series_names[0]]
+        if not isinstance(first_image_group, ZarrGroup):
+            raise ValueError(f"Series {series_names[0]} is not an image group")
     elif isinstance(layout, v05.Image):
         # ome-writers stores one-position acquisitions directly as an Image
         # group. Multi-position acquisitions use the Bio-Formats2Raw layout.
-        image_entries = [("", root)]
+        series_names = ("",)
+        first_image_group = root
     else:
         raise ValueError(
             f"Expected an OME-Zarr v0.5 Image or Bio-Formats2Raw layout: {path}"
         )
-    if not image_entries:
-        raise ValueError(f"OME-Zarr acquisition has no image series: {path}")
 
-    frame_sets: list[list[dict[str, Any]]] = []
+    image_metadata = first_image_group.ome_metadata()
+    if not isinstance(image_metadata, v05.Image):
+        raise ValueError(f"Series {series_names[0] or '<root>'} lacks OME metadata")
+    if len(image_metadata.multiscales) != 1:
+        raise ValueError("Each acquisition series must contain one multiscale image")
+    multiscale = image_metadata.multiscales[0]
+    if not multiscale.datasets:
+        raise ValueError("Acquisition image has no datasets")
+    dataset_path = str(multiscale.datasets[0].path)
+
     array_shapes: list[tuple[int, ...]] = []
     array_paths: list[str] = []
     dimension_names: tuple[str, ...] = ()
-    channel_names: list[str] = []
-    pixel_size_um: float | None = None
-    for position_index, (series_name, image_group) in enumerate(image_entries):
-        if not isinstance(image_group, ZarrGroup):
-            raise ValueError(f"Series {series_name or '<root>'} is not an image group")
-        frame_sets.append(
-            list(image_group.attrs.get("ome_writers", {}).get("frame_metadata", []))
-        )
-        image_metadata = image_group.ome_metadata()
-        if not isinstance(image_metadata, v05.Image):
-            raise ValueError(
-                f"Series {series_name or '<root>'} lacks typed OME image metadata"
-            )
-        if len(image_metadata.multiscales) != 1:
-            raise ValueError(f"Series {series_name} must contain one multiscale image")
-        multiscale = image_metadata.multiscales[0]
-        if len(multiscale.datasets) < 1:
-            raise ValueError(f"Series {series_name} has no image datasets")
-        dataset_path = multiscale.datasets[0].path
-        array = image_group[dataset_path]
-        array_paths.append(
-            f"{series_name}/{dataset_path}" if series_name else str(dataset_path)
-        )
-        shape = tuple(int(value) for value in (array.metadata.shape or ()))
-        if not shape:
-            raise ValueError(f"Series {series_name} has no array shape")
-        array_shapes.append(shape)
-        names = tuple(
-            str(value).lower()
-            for value in (getattr(array.metadata, "dimension_names", None) or [])
-        )
-        if names:
-            dimension_names = names
-        if position_index == 0:
-            if image_metadata.omero is not None:
-                channel_names = [
-                    str(channel.label or f"channel-{index}")
-                    for index, channel in enumerate(image_metadata.omero.channels)
-                ]
-            axes_model = [axis.name for axis in multiscale.axes]
-            scale = multiscale.datasets[0].scale_transform.scale
-            if "x" in axes_model:
-                pixel_size_um = _number(scale[axes_model.index("x")])
+    for series_name in series_names:
+        relative_path = f"{series_name}/{dataset_path}" if series_name else dataset_path
+        current_shape, current_names = _array_layout(path / relative_path)
+        array_paths.append(relative_path)
+        array_shapes.append(current_shape)
+        if current_names:
+            if dimension_names and current_names != dimension_names:
+                raise ValueError("All OPM position arrays must use the same dimensions")
+            dimension_names = current_names
 
     if any(shape != array_shapes[0] for shape in array_shapes[1:]):
         raise ValueError("All OPM position series must have the same array shape")
     if not dimension_names:
         dimension_names = tuple("tczyx"[-len(array_shapes[0]) :])
     axes = (dimension_names[0], "p", *dimension_names[1:])
-    shape = (array_shapes[0][0], len(image_entries), *array_shapes[0][1:])
+    shape = (array_shapes[0][0], len(series_names), *array_shapes[0][1:])
     sizes = opm.get("index_sizes", {})
     for axis, expected in sizes.items():
         if axis in axes and int(expected) != shape[axes.index(axis)]:
             raise ValueError(
                 f"opm_v2 index size {axis}={expected} disagrees with array shape {shape}"
             )
+
+    channel_names: list[str] = []
+    if image_metadata.omero is not None:
+        channel_names = [
+            str(channel.label or f"channel-{index}")
+            for index, channel in enumerate(image_metadata.omero.channels)
+        ]
+    pixel_size_um: float | None = None
+    axes_model = [axis.name for axis in multiscale.axes]
+    scale = multiscale.datasets[0].scale_transform.scale
+    if "x" in axes_model:
+        pixel_size_um = _number(scale[axes_model.index("x")])
+
+    channel_count = shape[axes.index("c")]
+    scan_position_count = shape[axes.index("z")] if "z" in axes else 1
+    initial_frame_count = channel_count * (2 if scan_position_count > 1 else 1)
+    if len(series_names) == 1 and not series_names[0]:
+        all_frames = list(
+            first_image_group.attrs.get("ome_writers", {}).get("frame_metadata", [])
+        )
+        frame_sets = [all_frames[:initial_frame_count]]
+    else:
+        frame_sets = [
+            _initial_frame_metadata(path / series_name / "zarr.json", initial_frame_count)
+            for series_name in series_names
+        ]
 
     frames = [frame for frame_set in frame_sets for frame in frame_set]
     first_frame = frames[0] if frames else {}
@@ -488,7 +572,8 @@ def _inspect_ome_zarr(path: Path, root: ZarrGroup) -> AcquisitionMetadata:
         channel_names, frames, configured_powers, configured_exposures
     )
     positions, starts, ends, scan_axis, measured_step = _positions_from_frame_sets(
-        frame_sets
+        frame_sets,
+        scan_position_count=scan_position_count,
     )
     configured_step = _number(daq.get("scan_axis_step_um"))
     if configured_step is None:
@@ -569,13 +654,19 @@ def open_acquisition_datastore(
         if isinstance(acquisition, AcquisitionMetadata)
         else inspect_acquisition(acquisition)
     )
-    root = yaozarrs.open_group(metadata.path)
     arrays = []
     for array_path in metadata.array_paths:
-        node: Any = root
-        for component in array_path.split("/"):
-            node = node[component]
-        arrays.append(node.to_tensorstore())
+        arrays.append(
+            ts.open(
+                {
+                    "driver": "zarr3",
+                    "kvstore": {
+                        "driver": "file",
+                        "path": str(metadata.path / array_path),
+                    },
+                }
+            ).result()
+        )
     if not arrays:
         raise ValueError(f"Acquisition has no arrays: {metadata.path}")
     return ts.stack(arrays, axis=1)
