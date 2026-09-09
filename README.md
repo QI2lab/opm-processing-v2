@@ -1,89 +1,88 @@
 # opm-processing-v2
 
-<!-- [![License](https://img.shields.io/pypi/l/opm-processing-v2.svg?color=green)](https://github.com/QI2lab/opm-processing-v2/blob/2b85d72afad0bbd6e2c52c1b733a5b5ac211a9ab/LICENSE)
-# [![PyPI](https://img.shields.io/pypi/v/opm-processing-v2.svg?color=green)](https://pypi.org/project/opm-processing-v2)
-# [![Python Version](https://img.shields.io/pypi/pyversions/opm-processing-v2.svg?color=green)](https://python.org)
-[![CI](https://github.com/qi2lab/opm-processing-v2/actions/workflows/ci.yml/badge.svg)](https://github.com/qi2lab/opm-processing-v2/actions/workflows/ci.yml)
-# [![codecov](https://codecov.io/gh/qi2lab/opm-processing-v2/branch/main/graph/badge.svg)](https://codecov.io/gh/qi2lab/opm-processing-v2) -->
+Post-processing for current qi2lab opm-v2 OME-Zarr acquisitions.
 
-## Overview 
+## Install
 
-This package is the 2nd generation of the Arizona State University Quantitative Imaging and Inference Lab (qi2lab) oblique plane microscopy (OPM) processing software. Currently, it assumes that data is generated using (1) our [2nd generation OPM control code](https://github.com/QI2lab/opm-v2) or (2) the [ASI single-objective light sheet](https://www.asiimaging.com/products/light-sheet-microscopy/single-objective-light-sheet/) Micromanager plugin. The ASI instrument support is experimental and will continue to evolve as we get more data examples from "in the wild" instruments. 
+Python 3.12 and [`uv`](https://docs.astral.sh/uv/) are required.
 
-The core algorithms can be used for any microscope that acquires data at a skewed angle, including diSPIM, LLSM, or OPM. Please open an issue if you would like help adapting the code to work with your microscope, we are happy to assist.
-
-The goal is provide highly performant data I/O via [Tensorstore](https://google.github.io/tensorstore/) and image processing (illumination correction, deconvolution, deskewing, downsampling, maximum Z projection, and 3D stitching+fusion) via [Numba](https://numba.pydata.org/), [CuPy](https://cupy.dev/), and [cuCIM](https://github.com/rapidsai/cucim?tab=readme-ov-file).
-
-We rely on [BaSiCPy](https://github.com/peng-lab/BaSiCPy) to post-hoc estimate illumination profiles and a modified version of [gradient consensus Richardson-Lucy deconvolution](https://zenodo.org/records/10278919) to perform 3D deconvolution.
-
-## Installation
-
-Create a python 3.12 environment,
 ```bash
-conda create -n opmprocessing python=3.12
+uv sync
 ```
 
-activate the environment,
+For deconvolution and registration on a CUDA workstation:
+
 ```bash
-conda activate opmprocessing
+uv sync --extra gpu
 ```
 
-install the repository and register the local CUDA installation. On Linux, this will finish the installation. On Windows, further steps are needed.
+Native Windows also requires the pure-Python `cucim.skimage` package from a
+local cuCIM checkout because RAPIDS does not publish its standard wheel there.
+
+## Commands
+
+Inspect an acquisition:
+
 ```bash
-pip install "opm-processing-v2 @ git+https://github.com/QI2lab/opm-processing-v2"
-setup-cuda
-conda deactivate opmprocessing
+uv run inspect-opm "/path/to/acquisition"
 ```
 
-On Windows, it is currently not possible to install [cuCIM](https://github.com/rapidsai/cucim) via the standard approach. The [current work-around](https://github.com/rapidsai/cucim/issues/454#issuecomment-3001600887) involves the following:
-1. Ensure you have followed the above steps through `setup-cuda`.
-2. Launch a terminal with administrative privileges.
-3. Activate the conda environment, `conda activate opmprocessing`.
-4. Allow symbolic links, `git config --global --add core.symlinks true`.
-5. Install cuCIM, `pip install -e "git+https://github.com/rapidsai/cucim.git@v25.04.00#egg=cucim-cu12&subdirectory=python/cucim"`.
+Process it (uint16 output by default):
 
-We will update installation instructions if the Windows installation is fixed.
-
-## Usage
-
-Activate the conda environment,
 ```bash
-conda activate opmprocessing
+uv run process "/path/to/acquisition"
+uv run process "/path/to/acquisition" --deconvolve --flatfield-correction
+uv run process "/path/to/acquisition" --save-float32
 ```
 
-To deskew raw data,
+Use `--skip-empty-below VALUE` to zero empty channel tiles before illumination
+correction, deconvolution, and deskew. Use `--resume` to continue from completed
+tiles; without it, the selected output is overwritten.
+
+Process during acquisition by supplying a precomputed `CYX` illumination TIFF.
+The acquisition argument must be its containing directory:
+
 ```bash
-process "/path/to/qi2lab_acquisition.zarr"
+uv run process "/path/to/acquisition-directory" --live "/path/to/illumination.ome.tif"
 ```
 
-If you get an error, make sure you ran `setup-cuda`!
+Register, fuse, and create the registered multiscale max-Z image:
 
-The defaults parameters generate different outputs depending if it acquisition is of oblique or projection data.
-
-For oblique data, there are three zarr3 compliant datastores:
-1. Full 3D data (`/path/to/qi2lab_acquisition_deskewed.zarr`) with dimensions `tpczyx`.
-2. Maximum Z projections (`/path/to/qi2lab_acquisition_max_z_deskewed.zarr`) with dimensions `tpcyx`. 
-3. Stage-position fused maximum z projections (`/path/to/qi2lab_acquisition_maxz.zarr`) with dimensions `tcyx`.
-
-For projection data, there are two zarr3 compliant datastores:
-1. Full 2D projection data (`/path/to/qi2lab_acquisition_deconvolved.zarr`) with dimensions `tpczyx`.
-2. Stage-position fused 2D projection data (`/path/to/qi2lab_acquisition_fused.zarr`) with dimensions `tcyx`.
-
-All datastores are camera offset and gain corrected. The fused datastore uses the provided stage positions, without optimization.
-
-To display deskewed data, 
 ```bash
-display "/path/to/qi2lab_acquisition.zarr" --to_display full
+uv run fuse "/path/to/acquisition-or-output-directory"
 ```
 
-There are three `to_display` options that correspond to the three datastores described above,
-1. full
-2. max-z
-3. fused-max-z
+Draw and save a rectangular ROI from that registered max-Z image, then process
+and fuse the selected raw-data region:
 
-To register and fuse optionally deconvolved and desekwed data into an ome-ngff v0.5 datastore,
 ```bash
-fuse "/path/to/qi2lab_acquisition.zarr"
+uv run display "/path/to/acquisition"
+uv run process-ROI "/path/to/acquisition"
 ```
 
-The registered, optionally deconvolved, and fused data will be in `/path/to/qi2lab_acquisition_fused_deskewed.ome.zarr`. This data can be viewed by dragging and dropping the folder into napari and selecting the `napari-ome-zarr` plugin for viewing.
+Both commands default to `<acquisition-stem>_roi.json`. Processing state is kept
+in one `<acquisition-stem>.processing.json` beside the outputs; image stores
+contain only OME/NGFF image metadata.
+
+See every option and default with:
+
+```bash
+uv run process --help
+uv run fuse --help
+uv run display --help
+uv run process-ROI --help
+```
+
+## Tests
+
+```bash
+uv sync --group dev
+uv run pytest
+uv run ruff check .
+```
+
+Require rather than skip CUDA tests with:
+
+```bash
+OPM_REQUIRE_GPU=1 uv run --extra gpu --group dev pytest -m gpu
+```
