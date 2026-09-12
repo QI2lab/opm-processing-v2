@@ -118,6 +118,6 @@ src/cucim-cu12/
 src/cucim
 /diagnostics/
 AUDIT_REFACTOR_WORKFLOW.md
-figures/*
+/figures/
 /.agents/
-/scrpts/
+/scripts/
