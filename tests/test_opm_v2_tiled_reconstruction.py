@@ -106,6 +106,7 @@ def _measure_correlation(
     candidate: np.ndarray,
     truth: np.ndarray,
     config: ReconstructionTestConfig,
+    observation_mask=None,
 ) -> float:
     """Measure masked correlation and enforce sufficient support.
 
@@ -127,6 +128,7 @@ def _measure_correlation(
         candidate,
         truth,
         truth_percentile=config.correlation_percentile,
+        observation_mask=observation_mask,
     )
     assert measurement.sample_count > config.minimum_correlation_samples
     return measurement.value
@@ -217,20 +219,40 @@ def _align_fused_to_ground_truth(
     return aligned
 
 
-def _tile_overlap_mask(
+def _tile_observation_mask(fixture, tile_shape):
+    """Select an observable interior using the physical inverse OPM transform."""
+    z, y, x = np.indices(tile_shape, dtype=np.float64)
+    camera_y = z / np.sin(np.deg2rad(30))
+    step = fixture.scan_axis_step_um / fixture.pixel_size_um
+    scan = (y - z / np.tan(np.deg2rad(30))) / step
+    scans, height, width = fixture.raw_data.shape[-3:]
+    scans -= int(fixture.mode == "stage")  # Fixture's excess leading scan.
+    # Keep the interpolation neighborhood inside the acquisition; do not
+    # infer support from reconstructed intensity or discard lost features.
+    return (
+        (scan >= 1)
+        & (scan < scans - 2)
+        & (camera_y >= step)
+        & (camera_y < height - 1 - step)
+        & (x < width)
+    )
+
+
+def _tile_observation_coverage(
     world_shape: tuple[int, int, int],
     tile_shape: tuple[int, int, int],
     tile_offsets_zyx_px,
+    tile_support,
 ) -> np.ndarray:
-    """Return voxels covered by at least two ground-truth tiles."""
+    """Count geometrically observable tiles at each ground-truth voxel."""
     coverage = np.zeros(world_shape, dtype=np.uint8)
     for offset in tile_offsets_zyx_px:
         slices = tuple(
             slice(int(start), int(start) + int(length))
             for start, length in zip(offset, tile_shape)
         )
-        coverage[slices] += 1
-    return coverage > 1
+        coverage[slices] += tile_support
+    return coverage
 
 
 def _assert_fused_overlap_matches_ground_truth(
@@ -248,10 +270,15 @@ def _assert_fused_overlap_matches_ground_truth(
         offset_um=fusion.offset_um,
         pixel_size_um=fusion._pixel_size,
     )
-    overlap = _tile_overlap_mask(
-        fixture.ground_truth.shape,
-        tuple(int(value) for value in fusion.position_arrays[0].shape[-3:]),
-        fixture.tile_offsets_zyx_px,
+    tile_shape = tuple(int(value) for value in fusion.position_arrays[0].shape[-3:])
+    overlap = (
+        _tile_observation_coverage(
+            fixture.ground_truth.shape,
+            tile_shape,
+            fixture.tile_offsets_zyx_px,
+            _tile_observation_mask(fixture, tile_shape),
+        )
+        > 1
     )
     overlap_correlation = _measure_correlation(
         reconstructed[overlap],
@@ -323,6 +350,7 @@ def _assert_tiled_reconstruction(
     deskewed_line_widths = []
     deconvolved_line_widths = []
     tile_shape = deskewed_collection.shape[-3:]
+    tile_support = _tile_observation_mask(fixture, tile_shape)
     for position, (z_offset, y_offset, x_offset) in enumerate(
         fixture.tile_offsets_zyx_px
     ):
@@ -333,8 +361,12 @@ def _assert_tiled_reconstruction(
         ]
         deskewed = deskewed_collection.arrays[position][0, 0].read().result()
         deconvolved = deconvolved_collection.arrays[position][0, 0].read().result()
-        deskewed_scores.append(_measure_correlation(deskewed, truth_tile, config))
-        deconvolved_scores.append(_measure_correlation(deconvolved, truth_tile, config))
+        deskewed_scores.append(
+            _measure_correlation(deskewed, truth_tile, config, tile_support)
+        )
+        deconvolved_scores.append(
+            _measure_correlation(deconvolved, truth_tile, config, tile_support)
+        )
         for (
             center_z,
             center_y,
@@ -413,6 +445,13 @@ def _assert_tiled_reconstruction(
         reconstructed,
         fixture.ground_truth,
         config,
+        _tile_observation_coverage(
+            fixture.ground_truth.shape,
+            tile_shape,
+            fixture.tile_offsets_zyx_px,
+            tile_support,
+        )
+        > 0,
     )
     assert fused_correlation > config.minimum_fused_correlation, {
         "fused_correlation": fused_correlation,
@@ -440,6 +479,7 @@ def _assert_tiled_reconstruction(
     assert abs(fused_width - deskewed_width) <= 1.0
 
 
+@pytest.mark.integration
 def test_tiled_opm_v2_reconstructs_registered_ground_truth(
     opm_v2_tiled_ground_truth_zarr,
     reconstruction_config,
@@ -468,6 +508,7 @@ def test_tiled_opm_v2_reconstructs_registered_ground_truth(
     )
 
 
+@pytest.mark.integration
 def test_spatial_tiling_reconstructs_registered_ground_truth(
     opm_v2_spatial_tiling_ground_truth_zarr,
     reconstruction_config,
@@ -496,6 +537,7 @@ def test_spatial_tiling_reconstructs_registered_ground_truth(
     )
 
 
+@pytest.mark.integration
 def test_reprocessing_recomputes_registration_before_fusing(
     opm_v2_tiled_ground_truth_zarr,
     reconstruction_config,

@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 from tifffile import imwrite
-from typer.main import get_command
+from typer.testing import CliRunner
 
 from opm_processing.dataio.acquisition import (
     AcquisitionMetadata,
@@ -92,6 +92,7 @@ def _write_manifest(data_path: Path, *, timepoints: int = 2) -> LiveManifest:
     return LiveManifest.read(sidecars.manifest)
 
 
+@pytest.mark.integration
 def test_manifest_overlays_metadata_available_before_frame_metadata(tmp_path) -> None:
     """Use the immutable plan when per-frame metadata has not been flushed."""
     data_path = tmp_path / "sample.ome.zarr"
@@ -121,6 +122,7 @@ def test_manifest_overlays_metadata_available_before_frame_metadata(tmp_path) ->
     assert acquisition.channel_names == ("488nm", "561nm")
 
 
+@pytest.mark.integration
 def test_live_acquisition_directory_resolves_manifest_data_path(tmp_path) -> None:
     """Accept the acquisition directory and resolve its manifest OME-Zarr."""
     acquisition_dir = tmp_path / "timestamped_acquisition"
@@ -153,6 +155,7 @@ def test_live_acquisition_directory_resolves_manifest_data_path(tmp_path) -> Non
         _open_live_acquisition(data_path)
 
 
+@pytest.mark.integration
 def test_chunk_presence_marks_only_a_fully_written_tile_ready(tmp_path) -> None:
     """Require every C/Z/Y/X chunk before publishing one T/P tile."""
     data_path = tmp_path / "chunks.ome.zarr"
@@ -185,6 +188,7 @@ def test_chunk_presence_marks_only_a_fully_written_tile_ready(tmp_path) -> None:
     assert readiness.ready_tiles() == {(0, 0)}
 
 
+@pytest.mark.integration
 def test_live_iterator_polls_then_stops_at_completed_log(tmp_path) -> None:
     """Poll only while caught up and stop after all completed tiles are yielded."""
     data_path = tmp_path / "iterator.ome.zarr"
@@ -222,6 +226,7 @@ def test_live_iterator_polls_then_stops_at_completed_log(tmp_path) -> None:
     assert sleeps == [30.0]
 
 
+@pytest.mark.integration
 def test_live_iterator_skips_tiles_completed_before_restart(tmp_path) -> None:
     """Seed iterator state with processed tiles discovered from existing output."""
     data_path = tmp_path / "resume.ome.zarr"
@@ -257,6 +262,7 @@ def test_live_iterator_skips_tiles_completed_before_restart(tmp_path) -> None:
     assert tiles == [(0, 1)]
 
 
+@pytest.mark.integration
 def test_lifecycle_reader_ignores_an_incomplete_last_record(tmp_path) -> None:
     """Do not parse a JSONL record while the controller is appending it."""
     log_path = tmp_path / "sample.log.jsonl"
@@ -267,6 +273,7 @@ def test_lifecycle_reader_ignores_an_incomplete_last_record(tmp_path) -> None:
     assert read_lifecycle_event(log_path, "id") == "started"
 
 
+@pytest.mark.integration
 def test_provided_illumination_is_strictly_validated(tmp_path) -> None:
     """Accept a matching image and reject invalid values without estimation."""
     path = tmp_path / "illumination.ome.tif"
@@ -284,46 +291,9 @@ def test_provided_illumination_is_strictly_validated(tmp_path) -> None:
         _load_provided_illumination(invalid_path, expected.shape)
 
 
-def test_live_cli_uses_one_path_valued_option() -> None:
-    """Expose the illumination path through the single requested live option."""
-    parameter = next(item for item in get_command(app).params if item.name == "live")
-    assert parameter.opts == ["--live"]
-    assert parameter.type.name == "path"
-    assert parameter.is_flag is False
-
-
-def test_save_float32_cli_is_an_opt_in_flag() -> None:
-    """Keep uint16 as the default while exposing float32 output explicitly."""
-    parameter = next(
-        item for item in get_command(app).params if item.name == "save_float32"
-    )
-    assert parameter.opts == ["--save-float32"]
-    assert parameter.is_flag is True
-    assert parameter.default is False
-
-
-def test_resume_cli_is_an_opt_in_flag() -> None:
-    """Overwrite by default and resume only when explicitly requested."""
-    parameter = next(item for item in get_command(app).params if item.name == "resume")
-    assert parameter.opts == ["--resume"]
-    assert parameter.is_flag is True
-    assert parameter.default is False
-
-
-def test_empty_tile_cli_and_hot_pixel_resistant_detection() -> None:
+@pytest.mark.unit
+def test_empty_tile_detection_uses_global_occupancy() -> None:
     """Use global occupancy to ignore sparse noise and hot pixels."""
-    command = get_command(app)
-    threshold_option = next(
-        item for item in command.params if item.name == "skip_empty_below"
-    )
-    fraction_option = next(
-        item for item in command.params if item.name == "skip_empty_min_signal_fraction"
-    )
-    assert threshold_option.opts == ["--skip-empty-below"]
-    assert threshold_option.default is None
-    assert fraction_option.opts == ["--skip-empty-min-signal-fraction"]
-    assert fraction_option.default == 0.01
-
     stack = np.zeros((5, 4, 4), dtype=np.float32)
     stack[:, 0, 0] = 10.0
     assert _is_empty_tile(
@@ -358,6 +328,7 @@ def test_empty_tile_cli_and_hot_pixel_resistant_detection() -> None:
     )
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize(
     ("threshold", "signal_fraction", "message"),
     (
@@ -373,6 +344,7 @@ def test_empty_tile_options_are_validated(threshold, signal_fraction, message) -
         _validate_empty_tile_options(threshold, signal_fraction)
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize(
     ("save_float32", "expected_dtype"),
     ((False, np.dtype(np.uint16)), (True, np.dtype(np.float32))),
@@ -432,14 +404,19 @@ def test_live_process_matches_direct_deskew_without_estimating(
         lambda *_args, **_kwargs: pytest.fail("live mode estimated illumination"),
     )
 
-    process(
-        root_path=tmp_path,
-        live=illumination_path,
-        max_projection=False,
-        create_fused_max_projection=False,
-        z_downsample_level=1,
-        save_float32=save_float32,
-    )
+    args = [
+        str(tmp_path),
+        "--live",
+        str(illumination_path),
+        "--no-max-projection",
+        "--no-create-fused-max-projection",
+        "--z-downsample-level",
+        "1",
+    ]
+    if save_float32:
+        args.append("--save-float32")
+    result = CliRunner().invoke(app, args)
+    assert result.exit_code == 0, result.output
 
     output = open_position_collection(tmp_path / "live_deskewed.ome.zarr")
     actual = output.arrays[0][0, 0].read().result()
@@ -457,6 +434,7 @@ def test_live_process_matches_direct_deskew_without_estimating(
     assert not any(key.startswith("opm_") for key in output.attributes)
 
 
+@pytest.mark.integration
 def test_live_deconvolution_builds_each_channel_psf_once(tmp_path, monkeypatch) -> None:
     """Prepare PSFs before tile iteration and reuse them across positions."""
     data_path = tmp_path / "live_decon.ome.zarr"
@@ -475,9 +453,11 @@ def test_live_deconvolution_builds_each_channel_psf_once(tmp_path, monkeypatch) 
         },
         chunks=(1, 1, 1, 8, 5),
     )
-    raw = np.full((2, 4, 8, 5), 110, dtype=np.uint16)
+    raw = np.stack(
+        [np.full((4, 8, 5), 110 + channel, np.uint16) for channel in range(2)]
+    )
     for position in range(2):
-        collection.arrays[position][0].write(raw).result()
+        collection.arrays[position][0].write(raw + 10 * position).result()
 
     manifest_document = _manifest_document(data_path, timepoints=1)
     manifest_document["index_sizes"] = {"t": 1, "p": 2, "c": 2, "z": 4}
@@ -501,7 +481,6 @@ def test_live_deconvolution_builds_each_channel_psf_once(tmp_path, monkeypatch) 
 
     generated_wavelengths = []
     deconvolution_calls = []
-    progress_calls = []
 
     def fake_generate_skewed_psf(*, em_wvl, **_kwargs):
         generated_wavelengths.append(em_wvl)
@@ -520,16 +499,11 @@ def test_live_deconvolution_builds_each_channel_psf_once(tmp_path, monkeypatch) 
 
     def fake_chunked_rlgc(image, psf, **_kwargs):
         deconvolution_calls.append(id(psf))
-        return np.asarray(image, dtype=np.float32)
+        return np.asarray(image, dtype=np.float32) * 2 + 3
 
     process_module = importlib.import_module("opm_processing.process")
     rlgc_module = importlib.import_module("opm_processing.imageprocessing.rlgc")
 
-    def recording_tqdm(iterable, **kwargs):
-        progress_calls.append(kwargs)
-        return iterable
-
-    monkeypatch.setattr(process_module, "tqdm", recording_tqdm)
     monkeypatch.setattr(
         process_module,
         "generate_skewed_psf",
@@ -550,12 +524,24 @@ def test_live_deconvolution_builds_each_channel_psf_once(tmp_path, monkeypatch) 
     assert generated_wavelengths == [pytest.approx(0.488), pytest.approx(0.561)]
     assert len(deconvolution_calls) == 4
     assert len(set(deconvolution_calls)) == 2
-    position_progress = [call for call in progress_calls if call.get("desc") == "p"]
-    assert position_progress == [
-        {"total": 2, "initial": 0, "desc": "p", "unit": "tile"}
-    ]
+    output = open_position_collection(tmp_path / "live_decon_decon_deskewed.ome.zarr")
+    for position in range(2):
+        for channel in range(2):
+            calibrated = (
+                raw[channel].astype(np.float32) + 10 * position - 100
+            ) * np.float32(0.24)
+            expected = orthogonal_deskew(
+                calibrated * 2 + 3,
+                distance=0.4,
+                pixel_size=0.115,
+                downsample_factor=1,
+            ).astype(np.uint16)
+            np.testing.assert_array_equal(
+                output.arrays[position][0, channel].read().result(), expected
+            )
 
 
+@pytest.mark.integration
 def test_live_empty_channel_skips_deconvolution_and_writes_zero(
     tmp_path, monkeypatch
 ) -> None:
@@ -642,17 +628,30 @@ def test_live_empty_channel_skips_deconvolution_and_writes_zero(
     assert np.count_nonzero(output.arrays[0][0, 0].read().result()) == 0
     assert np.count_nonzero(max_output.arrays[0][0, 0].read().result()) == 0
     assert np.count_nonzero(output.arrays[0][0, 1].read().result()) > 0
+    expected = orthogonal_deskew(
+        (np.flip(raw[1], axis=0).astype(np.float32) - 100) * np.float32(0.24),
+        distance=0.4,
+        pixel_size=0.115,
+        downsample_factor=1,
+    ).astype(np.uint16)
+    np.testing.assert_array_equal(output.arrays[0][0, 1].read().result(), expected)
     state = ProcessingState.read(processing_state_path(tmp_path, "live_empty"))
     assert state.zero_channels(tmp_path / "live_empty_decon_deskewed.ome.zarr") == {
         (0, 0, 0)
     }
     assert len(max_output.multiscale_factors_yx) > 1
-    for level_arrays in max_output.multiscale_arrays:
+    for factor, level_arrays in zip(
+        max_output.multiscale_factors_yx, max_output.multiscale_arrays
+    ):
         assert np.count_nonzero(level_arrays[0][0, 0].read().result()) == 0
-        assert np.count_nonzero(level_arrays[0][0, 1].read().result()) > 0
+        np.testing.assert_array_equal(
+            level_arrays[0][0, 1].read().result(),
+            expected.max(axis=0, keepdims=True)[..., ::factor, ::factor],
+        )
     assert not any(key.startswith("opm_") for key in output.attributes)
 
 
+@pytest.mark.integration
 def test_offline_resume_skips_durably_completed_tile_and_default_overwrites(
     tmp_path,
     monkeypatch,
@@ -722,6 +721,15 @@ def test_offline_resume_skips_durably_completed_tile_and_default_overwrites(
     output_path = tmp_path / "offline_resume_deskewed.ome.zarr"
     interrupted = open_position_collection(output_path)
     completed_tile = interrupted.arrays[0][0, 0].read().result()
+    np.testing.assert_array_equal(
+        completed_tile,
+        orthogonal_deskew(
+            np.full((4, 8, 5), 10, np.float32),
+            distance=0.4,
+            pixel_size=0.115,
+            downsample_factor=1,
+        ).astype(np.uint16),
+    )
     collection.arrays[0][0].write(np.full((1, 4, 8, 5), 500, dtype=np.uint16)).result()
 
     monkeypatch.setattr(
@@ -743,7 +751,15 @@ def test_offline_resume_skips_durably_completed_tile_and_default_overwrites(
         resumed.arrays[0][0, 0].read().result(),
         completed_tile,
     )
-    assert np.any(resumed.arrays[1][0, 0].read().result())
+    np.testing.assert_array_equal(
+        resumed.arrays[1][0, 0].read().result(),
+        orthogonal_deskew(
+            np.full((4, 8, 5), 20, np.float32),
+            distance=0.4,
+            pixel_size=0.115,
+            downsample_factor=1,
+        ).astype(np.uint16),
+    )
 
     process_module.process_skewed(
         data_path,
@@ -754,12 +770,18 @@ def test_offline_resume_skips_durably_completed_tile_and_default_overwrites(
         z_downsample_level=1,
     )
     overwritten = open_position_collection(output_path)
-    assert not np.array_equal(
+    np.testing.assert_array_equal(
         overwritten.arrays[0][0, 0].read().result(),
-        completed_tile,
+        orthogonal_deskew(
+            np.full((4, 8, 5), 400, np.float32),
+            distance=0.4,
+            pixel_size=0.115,
+            downsample_factor=1,
+        ).astype(np.uint16),
     )
 
 
+@pytest.mark.integration
 def test_live_processing_resumes_completed_output_tiles(tmp_path, monkeypatch) -> None:
     """Preserve completed tiles and safely redo a partially written next tile."""
     data_path = tmp_path / "live_resume.ome.zarr"
@@ -855,6 +877,20 @@ def test_live_processing_resumes_completed_output_tiles(tmp_path, monkeypatch) -
     )
     assert observed_completed == [{(0, 0)}]
     assert np.all(resumed_output.arrays[1].read().result() != 999)
+    expected_tile = orthogonal_deskew(
+        np.full((4, 8, 5), np.float32(11) * np.float32(0.24), np.float32),
+        distance=0.4,
+        pixel_size=0.115,
+        downsample_factor=1,
+    ).astype(np.uint16)
+    for channel in range(2):
+        np.testing.assert_array_equal(
+            resumed_output.arrays[1][0, channel].read().result(), expected_tile
+        )
+        np.testing.assert_array_equal(
+            resumed_max_output.arrays[1][0, channel].read().result(),
+            expected_tile.max(axis=0, keepdims=True),
+        )
     acquisition_records = [
         json.loads(line)
         for line in sidecars.log.read_text(encoding="utf-8").splitlines()

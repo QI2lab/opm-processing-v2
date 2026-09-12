@@ -124,6 +124,8 @@ minversion = "7.0"
 testpaths = ["tests"]
 addopts = "-p no:zarr"
 markers = [
+    "unit: isolated numerical or decision behavior with an independent expected result",
+    "integration: multiple processing components, real storage, or complete GPU solver execution",
     "gpu: correctness tests that execute CUDA code on a real NVIDIA GPU",
 ]
 filterwarnings = [

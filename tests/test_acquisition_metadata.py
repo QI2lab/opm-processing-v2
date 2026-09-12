@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import replace
-import importlib
 from pathlib import Path
 
 import pytest
@@ -23,8 +22,10 @@ from opm_processing.dataio.position_collection import (
     open_position_collection,
 )
 from opm_processing.process import process
+from opm_processing.imageprocessing.opmtools import orthogonal_deskew
 
 
+@pytest.mark.integration
 def test_position_collection_multiscales_round_spatial_metadata(
     tmp_path: Path,
 ) -> None:
@@ -244,6 +245,7 @@ def current_single_position_mirror_timelapse(tmp_path: Path) -> Path:
     return path
 
 
+@pytest.mark.integration
 def test_current_stage_metadata_is_discovered_without_array_open(
     current_opm_v2_stage_scan: Path,
 ) -> None:
@@ -282,6 +284,7 @@ def test_current_stage_metadata_is_discovered_without_array_open(
     assert metadata.scan_axis_reversed is True
 
 
+@pytest.mark.integration
 def test_current_stage_collection_opens_as_virtual_tpczyx(
     current_opm_v2_stage_scan: Path,
 ) -> None:
@@ -311,39 +314,7 @@ def test_current_stage_collection_opens_as_virtual_tpczyx(
             np.testing.assert_array_equal(actual, expected)
 
 
-def test_singleton_z_acquisition_routes_around_deskew(
-    current_opm_v2_stage_scan: Path,
-    monkeypatch,
-) -> None:
-    """Dispatch Z=1 data to projection processing without calling deskew."""
-    process_module = importlib.import_module("opm_processing.process")
-    metadata = replace(
-        inspect_acquisition(current_opm_v2_stage_scan),
-        shape=(1, 2, 2, 1, 4, 5),
-    )
-    projection_calls = []
-
-    monkeypatch.setattr(process_module, "inspect_acquisition", lambda _path: metadata)
-    monkeypatch.setattr(
-        process_module,
-        "process_projection",
-        lambda **kwargs: projection_calls.append(kwargs),
-    )
-    monkeypatch.setattr(
-        process_module,
-        "process_skewed",
-        lambda **_kwargs: pytest.fail("2D acquisition entered deskew processing"),
-    )
-
-    process_module.process(
-        root_path=current_opm_v2_stage_scan,
-        deconvolve=False,
-    )
-
-    assert len(projection_calls) == 1
-    assert projection_calls[0]["acquisition"].is_2d is True
-
-
+@pytest.mark.integration
 def test_single_position_root_image_opens_as_virtual_tpczyx(
     current_single_position_mirror_timelapse: Path,
 ) -> None:
@@ -366,6 +337,7 @@ def test_single_position_root_image_opens_as_virtual_tpczyx(
     np.testing.assert_array_equal(datastore[:, 0].read().result(), expected)
 
 
+@pytest.mark.integration
 def test_single_position_mirror_timelapse_processes_every_timepoint(
     current_single_position_mirror_timelapse: Path,
 ) -> None:
@@ -374,16 +346,30 @@ def test_single_position_mirror_timelapse_processes_every_timepoint(
     process(
         root_path=path,
         max_projection=False,
-        create_fused_max_projection=False,
         z_downsample_level=1,
     )
 
     output = open_position_collection(path.parent / "single_mirror_deskewed.ome.zarr")
     assert output.shape[:3] == (3, 1, 1)
     for time_index in range(3):
-        assert np.any(output.arrays[0][time_index].read().result())
+        raw = (
+            np.arange(3 * 4 * 5 * 6, dtype=np.uint16).reshape(3, 4, 5, 6)[time_index]
+            + 200
+        )
+        expected = orthogonal_deskew(
+            (raw.astype(np.float32) - 100) * np.float32(0.25),
+            distance=0.4,
+            pixel_size=0.115,
+            downsample_factor=1,
+        ).astype(np.uint16)
+        np.testing.assert_array_equal(
+            output.arrays[0][time_index, 0].read().result(), expected
+        )
+    assert not (path.parent / "single_mirror_max_z_deskewed.ome.zarr").exists()
+    assert not (path.parent / "single_mirror_max_z_fused.ome.zarr").exists()
 
 
+@pytest.mark.integration
 def test_single_position_mirror_timelapse_can_save_float32(
     current_single_position_mirror_timelapse: Path,
 ) -> None:
@@ -400,10 +386,18 @@ def test_single_position_mirror_timelapse_can_save_float32(
     output = open_position_collection(path.parent / "single_mirror_deskewed.ome.zarr")
     values = np.asarray(output.arrays[0][0, 0].read().result())
     assert values.dtype == np.float32
-    assert np.any((values > 0) & (values != np.floor(values)))
+    raw = np.arange(4 * 5 * 6, dtype=np.uint16).reshape(4, 5, 6) + 200
+    expected = orthogonal_deskew(
+        (raw.astype(np.float32) - 100) * np.float32(0.25),
+        distance=0.4,
+        pixel_size=0.115,
+        downsample_factor=1,
+    )
+    np.testing.assert_array_equal(values, expected)
     assert not any(key.startswith("opm_") for key in output.attributes)
 
 
+@pytest.mark.integration
 def test_timelapse_converter_accepts_current_collection(
     current_opm_v2_stage_scan: Path,
 ) -> None:

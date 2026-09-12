@@ -8,7 +8,11 @@ from typing import Annotated
 
 import typer
 
-from opm_processing.dataio.acquisition import acquisition_stem, inspect_acquisition
+from opm_processing.dataio.acquisition import (
+    AcquisitionMetadata,
+    acquisition_stem,
+    inspect_acquisition,
+)
 from opm_processing.dataio.processing_state import (
     ProcessingState,
     processing_state_path,
@@ -27,18 +31,65 @@ from opm_processing.process import process_skewed
 app = typer.Typer(pretty_exceptions_enable=False)
 
 
+def _resolve_roi_context(root_path: Path) -> tuple[AcquisitionMetadata, Path]:
+    """Locate raw data while retaining the directory used for ROI defaults."""
+    candidate = Path(root_path).expanduser().resolve()
+    try:
+        acquisition = inspect_acquisition(candidate)
+    except ValueError as acquisition_error:
+        if not candidate.is_dir() or any(
+            (candidate / marker).is_file() for marker in ("zarr.json", ".zattrs")
+        ):
+            raise
+        state_paths = sorted(candidate.glob("*.processing.json"))
+        if not state_paths:
+            raise ValueError(
+                f"Cannot locate a raw acquisition in {candidate}, and no "
+                "*.processing.json records its source. Pass the raw acquisition "
+                "path as the first argument and the ROI JSON as the second."
+            ) from acquisition_error
+        if len(state_paths) != 1:
+            matches = ", ".join(path.name for path in state_paths)
+            raise ValueError(
+                f"Expected one processing-state file in {candidate}, found "
+                f"{len(state_paths)}: {matches}. Pass the raw acquisition path "
+                "and ROI JSON explicitly to select an acquisition."
+            ) from acquisition_error
+        state = ProcessingState.read(state_paths[0])
+        recorded_source = state.document["source"].get("path")
+        if not isinstance(recorded_source, str) or not recorded_source.strip():
+            raise ValueError(
+                f"Processing state lacks a source acquisition path: {state.path}"
+            )
+        source_path = Path(recorded_source).expanduser().resolve()
+        if not source_path.is_dir():
+            raise FileNotFoundError(
+                f"Raw acquisition recorded in {state.path} is unavailable: "
+                f"{source_path}. Mount its drive or pass the current raw "
+                "acquisition path and ROI JSON explicitly."
+            )
+        acquisition = inspect_acquisition(source_path)
+        return acquisition, candidate
+    return acquisition, acquisition.path.parent
+
+
 @app.command()
 def process_roi(
     root_path: Annotated[
         Path,
-        typer.Argument(help="Raw acquisition directory or OME-Zarr path."),
+        typer.Argument(
+            help=(
+                "Raw acquisition directory, OME-Zarr path, or processed output "
+                "directory containing one <acquisition>.processing.json."
+            )
+        ),
     ],
     roi_json: Annotated[
         Path | None,
         typer.Argument(
             help=(
                 "ROI JSON written by display; defaults to "
-                "<acquisition>_roi.json beside the acquisition."
+                "<acquisition>_roi.json in the input directory."
             )
         ),
     ] = None,
@@ -58,23 +109,26 @@ def process_roi(
     resume: Annotated[
         bool,
         typer.Option(
-            "--resume",
+            "--resume/--no-resume",
             help=(
-                "Continue a compatible interrupted ROI run. Without this flag, "
-                "processed ROI tiles are overwritten."
+                "Resume from completed tiles/channels by default. Use "
+                "--no-resume to overwrite the processed ROI and start again."
             ),
         ),
-    ] = False,
+    ] = True,
     output: Annotated[
         Path | None,
         typer.Option(
             "--output",
-            help="Output directory; defaults to <acquisition>_roi beside the source.",
+            help=(
+                "Output directory; defaults to <acquisition>_roi in the input "
+                "directory (beside the source when a Zarr path is supplied)."
+            ),
         ),
     ] = None,
 ) -> None:
     """Process a napari-selected world-space ROI and fuse it when needed."""
-    acquisition = inspect_acquisition(root_path)
+    acquisition, context_dir = _resolve_roi_context(root_path)
     if acquisition.is_2d:
         raise ValueError(
             "process-ROI currently targets skewed 3D acquisitions; use process "
@@ -87,7 +141,7 @@ def process_roi(
         )
     stem = acquisition_stem(acquisition.path)
     resolved_roi_json = (
-        acquisition.path.parent / f"{stem}_roi.json"
+        context_dir / f"{stem}_roi.json"
         if roi_json is None
         else Path(roi_json).expanduser().resolve()
     )
@@ -96,7 +150,7 @@ def process_roi(
     output_dir = (
         Path(output).expanduser().resolve()
         if output is not None
-        else acquisition.path.parent / f"{stem}_roi"
+        else context_dir / f"{stem}_roi"
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 

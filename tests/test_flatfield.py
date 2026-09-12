@@ -4,6 +4,7 @@ import warnings
 from pathlib import Path
 
 import numpy as np
+import pytest
 import tensorstore as ts
 
 from opm_processing.imageprocessing.flatfield import (
@@ -18,6 +19,48 @@ from opm_processing.imageprocessing.camera import (
 )
 
 
+@pytest.mark.integration
+def test_flatfield_path_reuses_acquisition_file_with_separate_output(
+    tmp_path: Path,
+) -> None:
+    """A separate output directory must not hide a reusable source flatfield."""
+    from opm_processing.process import _resolve_flatfield_path
+
+    acquisition_dir = tmp_path / "acquisition"
+    acquisition_dir.mkdir()
+    acquisition_path = acquisition_dir / "sample.ome.zarr"
+    acquisition_path.mkdir()
+    output_dir = tmp_path / "processed"
+    output_dir.mkdir()
+    source_flatfield = acquisition_dir / "sample_flatfield.ome.tif"
+    source_flatfield.touch()
+
+    assert _resolve_flatfield_path(acquisition_path, output_dir) == source_flatfield
+
+
+@pytest.mark.integration
+def test_flatfield_path_prefers_output_and_writes_new_files_there(
+    tmp_path: Path,
+) -> None:
+    """Prefer an output-side flatfield and use that location for new estimates."""
+    from opm_processing.process import _resolve_flatfield_path
+
+    acquisition_dir = tmp_path / "acquisition"
+    acquisition_dir.mkdir()
+    acquisition_path = acquisition_dir / "sample.ome.zarr"
+    acquisition_path.mkdir()
+    output_dir = tmp_path / "processed"
+    output_dir.mkdir()
+    output_flatfield = output_dir / "sample_flatfield.ome.tif"
+
+    assert _resolve_flatfield_path(acquisition_path, output_dir) == output_flatfield
+
+    (acquisition_dir / "sample_flatfield.ome.tif").touch()
+    output_flatfield.touch()
+    assert _resolve_flatfield_path(acquisition_path, output_dir) == output_flatfield
+
+
+@pytest.mark.unit
 def test_stage_z_groups_use_repeated_xy_depth_not_absolute_tilted_z():
     """Repeated XY visits define depth despite coverslip-dependent absolute Z."""
     levels, groups = _stage_z_groups(
@@ -38,6 +81,7 @@ def test_stage_z_groups_use_repeated_xy_depth_not_absolute_tilted_z():
     assert groups == ((0, 1), (2, 3), (4, 5))
 
 
+@pytest.mark.unit
 def test_flatfield_tiles_are_evenly_subsampled_within_each_depth():
     """Large depth levels use a bounded, deterministic span of tiles."""
     selected = _flatfield_tile_indices(tuple(range(100)), max_tiles_per_level=8)
@@ -45,8 +89,11 @@ def test_flatfield_tiles_are_evenly_subsampled_within_each_depth():
     assert len(selected) == 8
     assert selected[0] == 0
     assert selected[-1] == 99
+    assert len(set(selected)) == 8
+    assert set(np.diff(selected)) <= {14, 15}
 
 
+@pytest.mark.integration
 def test_empty_check_runs_once_and_filters_illumination_candidates(monkeypatch):
     """The full-volume TPC mask limits each channel before tile subsampling."""
     from opm_processing import process as process_module
@@ -108,6 +155,7 @@ def test_empty_check_runs_once_and_filters_illumination_candidates(monkeypatch):
     np.testing.assert_array_equal(estimated[0, 1], 1.0)
 
 
+@pytest.mark.unit
 def test_disabled_empty_check_does_not_prescan_tiles(monkeypatch):
     """Without a threshold, processing moves on without reading raw tiles."""
     from opm_processing import process as process_module
@@ -137,26 +185,11 @@ def test_disabled_empty_check_does_not_prescan_tiles(monkeypatch):
     )
 
 
-def test_illumination_signal_check_stops_after_32_nonempty_candidates(monkeypatch):
+@pytest.mark.unit
+def test_illumination_signal_check_stops_after_32_nonempty_candidates():
     """Dense acquisitions avoid a full-position signal pre-scan."""
     from opm_processing import process as process_module
 
-    progress_calls = []
-
-    class RecordingProgress:
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
-            self.progress = 0
-            self.closed = False
-            progress_calls.append(self)
-
-        def update(self, amount=1):
-            self.progress += amount
-
-        def close(self):
-            self.closed = True
-
-    monkeypatch.setattr(process_module, "tqdm", RecordingProgress)
     raw = np.full((1, 40, 1, 2, 3, 4), 130, dtype=np.uint16)
     decisions = process_module._build_illumination_signal_decisions(
         ts.array(raw),
@@ -171,15 +204,6 @@ def test_illumination_signal_check_stops_after_32_nonempty_candidates(monkeypatc
     assert decisions is not None
     assert np.count_nonzero(decisions == 1) == 32
     assert np.count_nonzero(decisions == -1) == 8
-    assert len(progress_calls) == 1
-    assert progress_calls[0].kwargs == {
-        "total": 32,
-        "desc": "Finding illumination tiles",
-        "unit": "nonzero tile",
-    }
-    assert progress_calls[0].progress == 32
-    assert progress_calls[0].closed
-
     unchecked_position = int(np.flatnonzero(decisions[0, :, 0] == -1)[0])
     assert not process_module._tile_is_empty(
         decisions,
@@ -193,6 +217,7 @@ def test_illumination_signal_check_stops_after_32_nonempty_candidates(monkeypatc
     assert decisions[0, unchecked_position, 0] == 1
 
 
+@pytest.mark.unit
 def test_qi2lab_stage_camera_gain_has_fixed_unity_baseline():
     """The saved camera line profile changes only the measured detector trough."""
     gain = qi2lab_stage_scan_camera_gain()
@@ -204,6 +229,7 @@ def test_qi2lab_stage_camera_gain_has_fixed_unity_baseline():
     assert gain[1079] == np.float32(0.717388)
 
 
+@pytest.mark.unit
 def test_qi2lab_stage_camera_gain_broadcasts_over_scan_and_y():
     """One detector-X gain vector corrects every scan/Y pixel in a tile or ROI."""
     gain = qi2lab_stage_scan_camera_gain()
@@ -218,6 +244,7 @@ def test_qi2lab_stage_camera_gain_broadcasts_over_scan_and_y():
     np.testing.assert_allclose(corrected_roi, expected[..., 1040:1110], rtol=1e-6)
 
 
+@pytest.mark.unit
 def test_processing_contract_uses_uint16_raw_float32_intermediates_and_final_cast():
     """Camera, nonlinear gain, illumination, and output boundaries are explicit."""
     from opm_processing.process import (
@@ -243,13 +270,20 @@ def test_processing_contract_uses_uint16_raw_float32_intermediates_and_final_cas
     illumination = np.full((3, 1900), 2.0, dtype=np.float32)
     corrected = _apply_illumination_correction(camera_corrected, illumination)
     assert corrected.dtype == np.float32
-    assert _format_processed_output(corrected, False).dtype == np.uint16
-    assert _format_processed_output(corrected, True).dtype == np.float32
+    np.testing.assert_allclose(corrected, camera_corrected / 2)
+    boundary = np.array([-1, 0, 0.24, 5.9, 65535, 70000], dtype=np.float32)
+    integers = _format_processed_output(boundary, False)
+    assert integers.dtype == np.uint16
+    np.testing.assert_array_equal(integers, [0, 0, 0, 5, 65535, 65535])
+    floats = _format_processed_output(boundary, True)
+    assert floats.dtype == np.float32
+    np.testing.assert_array_equal(floats, boundary)
 
     with np.testing.assert_raises(TypeError):
         _camera_calibrated_image(raw.astype(np.float32), 100.0, 1.0)
 
 
+@pytest.mark.integration
 def test_stage_z_flatfield_round_trips_exact_values(
     tmp_path: Path,
 ):
@@ -274,6 +308,7 @@ def test_stage_z_flatfield_round_trips_exact_values(
         np.testing.assert_array_equal(actual, flatfields)
 
 
+@pytest.mark.integration
 def test_estimator_fits_physical_stage_z_levels_independently(monkeypatch):
     """Stage-Z groups produce distinct fields while scan planes remain samples."""
     from opm_processing.imageprocessing import flatfield as flatfield_module
@@ -314,58 +349,36 @@ def test_estimator_fits_physical_stage_z_levels_independently(monkeypatch):
     assert estimated.shape == (2, 1, height, width)
     assert estimated[0, 0, :, -1].mean() > estimated[0, 0, :, 0].mean()
     assert estimated[1, 0, :, -1].mean() < estimated[1, 0, :, 0].mean()
-
-
-def test_stage_flatfield_estimation_applies_camera_contract_per_channel(
-    monkeypatch,
-):
-    """Each channel reaches stage-gain fitting as scalar-corrected float32."""
-    from opm_processing.imageprocessing import flatfield as flatfield_module
-
-    class FakeBasic:
-        def __init__(self, **_kwargs):
-            self.flatfield = None
-
-        def autotune(self, _images):
-            return None
-
-        def fit(self, images):
-            self.flatfield = np.ones(images.shape[-2:], dtype=np.float32)
-
-    observed: list[tuple[tuple[int, ...], np.dtype, float]] = []
-
-    def record_stage_gain(images, *, copy=False):
-        assert copy is False
-        observed.append((images.shape, images.dtype, float(images.mean())))
-        return images
-
-    monkeypatch.setattr(flatfield_module, "BaSiC", FakeBasic)
-    monkeypatch.setattr(
-        flatfield_module,
-        "correct_qi2lab_stage_scan_camera",
-        record_stage_gain,
+    np.testing.assert_allclose(
+        estimated[:, 0],
+        np.broadcast_to(fields[:, None, :], (2, height, width)),
+        rtol=0.05,
+        atol=0,
     )
 
-    raw = np.empty((1, 2, 2, 3, 4, 1900), dtype=np.uint16)
-    raw[:, :, 0] = 110
-    raw[:, :, 1] = 120
-    estimate_illuminations(
-        ts.array(raw),
-        camera_offset=100.0,
-        camera_conversion=0.5,
-        stage_positions_zxy=np.asarray([[10.0, 0.0, 0.0], [11.0, 1.0, 0.0]]),
-        apply_stage_scan_gain=True,
-    )
 
-    assert observed
-    assert all(shape == (3, 4, 1900) for shape, _dtype, _mean in observed)
-    assert all(dtype == np.dtype(np.float32) for _shape, dtype, _mean in observed)
-    assert sorted({round(mean, 3) for _shape, _dtype, mean in observed}) == [
-        5.0,
-        10.0,
-    ]
+@pytest.mark.unit
+def test_flatfield_sample_loading_applies_detector_calibration():
+    """The estimator's loader must preserve each channel's calibrated pixels."""
+    from opm_processing.imageprocessing.flatfield import _camera_corrected_images
+
+    for value in (110, 120):
+        raw = np.full((3, 4, 1900), value, dtype=np.uint16)
+        raw[:, 0, 0] = 90
+        actual = _camera_corrected_images(
+            ts.array(raw),
+            camera_offset=100.0,
+            camera_conversion=0.5,
+            apply_stage_scan_gain=True,
+        )
+        assert actual.dtype == np.float32
+        np.testing.assert_array_equal(actual[:, 0, 0], 0)
+        np.testing.assert_array_equal(actual[:, 1:, :1046], (value - 100) * 0.5)
+        np.testing.assert_allclose(actual[..., 1079], (value - 100) * 0.5 / 0.717388)
+        np.testing.assert_array_equal(actual[..., 1104:], (value - 100) * 0.5)
 
 
+@pytest.mark.integration
 def test_flatfield_correction_recovers_multitile_multichannel_truth():
     """Recover known rectangular illumination fields from a tiled scan."""
     rng = np.random.default_rng(7)

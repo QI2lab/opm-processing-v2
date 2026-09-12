@@ -20,8 +20,9 @@ def masked_correlation(
     truth: np.ndarray,
     *,
     truth_percentile: float,
+    observation_mask: np.ndarray | None = None,
 ) -> CorrelationMeasurement:
-    """Measure correlation where both reconstruction and truth are supported.
+    """Measure correlation on truth-selected pixels, including lost signal.
 
     Parameters
     ----------
@@ -31,6 +32,8 @@ def masked_correlation(
         Value supplied for ``truth``.
     truth_percentile : float
         Value supplied for ``truth percentile``.
+    observation_mask : np.ndarray or None
+        Acquisition geometry selecting observable voxels, independent of output.
 
     Returns
     -------
@@ -41,39 +44,14 @@ def masked_correlation(
     truth_array = np.asarray(truth)
     if candidate_array.shape != truth_array.shape:
         raise ValueError("candidate and truth must have identical shapes")
-    supported = (candidate_array > 0) & (
-        truth_array > np.percentile(truth_array, truth_percentile)
-    )
+    supported = truth_array > np.percentile(truth_array, truth_percentile)
+    if observation_mask is not None:
+        supported &= observation_mask
     sample_count = int(np.count_nonzero(supported))
     if sample_count < 2:
         return CorrelationMeasurement(float("nan"), sample_count)
     value = float(np.corrcoef(candidate_array[supported], truth_array[supported])[0, 1])
     return CorrelationMeasurement(value, sample_count)
-
-
-def scale_invariant_rmse(candidate: np.ndarray, truth: np.ndarray) -> float:
-    """Return RMSE after fitting one nonnegative candidate intensity scale.
-
-    Parameters
-    ----------
-    candidate : np.ndarray
-        Value supplied for ``candidate``.
-    truth : np.ndarray
-        Value supplied for ``truth``.
-
-    Returns
-    -------
-    float
-        Result produced by the callable.
-    """
-    candidate_array = np.asarray(candidate, dtype=np.float64)
-    truth_array = np.asarray(truth, dtype=np.float64)
-    denominator = float(np.sum(candidate_array**2))
-    scale = max(
-        0.0,
-        float(np.sum(candidate_array * truth_array)) / max(denominator, 1e-12),
-    )
-    return float(np.sqrt(np.mean((scale * candidate_array - truth_array) ** 2)))
 
 
 def shell_line_width_x(
