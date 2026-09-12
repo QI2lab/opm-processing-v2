@@ -96,6 +96,7 @@ def _ssim_nearest_reference(
     return float(np.mean(score))
 
 
+@pytest.mark.unit
 def test_fft_convolution_matches_direct_reference(cupy_gpu):
     """Exercise cuFFT and validate all voxels against direct convolution.
 
@@ -125,28 +126,42 @@ def test_fft_convolution_matches_direct_reference(cupy_gpu):
     assert isinstance(actual_gpu, cp.ndarray)
     assert actual_gpu.device.id == cp.cuda.Device().id
 
-    padded_psf = cp.asnumpy(padded_psf_gpu)
-    expected = _direct_circular_convolution(image, padded_psf)
+    # Construct the impulse response independently of the padding under test.
+    expected_kernel = np.zeros(image.shape, dtype=np.float64)
+    expected_kernel[0, 0, 0] = 5 / 8
+    expected_kernel[-1, 0, 0] = 2 / 8
+    expected_kernel[0, 1, 0] = 1 / 8
+    np.testing.assert_allclose(cp.asnumpy(padded_psf_gpu), expected_kernel)
+    expected = _direct_circular_convolution(image, expected_kernel)
     np.testing.assert_allclose(cp.asnumpy(actual_gpu), expected, rtol=2e-5, atol=2e-5)
-    np.testing.assert_allclose(padded_psf.sum(), 1.0, atol=1e-6)
     rlgc.clear_rlgc_caches()
 
 
-def test_low_allocation_kld_matches_public_reference(cupy_gpu):
-    """Validate the scratch-buffer KLD implementation used by RLGC."""
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "p_values,q_values",
+    [([0, 1, 3, 20], [4, 0, 2, 1]), ([0, 0, 0], [0, 0, 0]), ([2, 2, 2], [9, 9, 9])],
+)
+def test_kld_matches_independent_probability_definition(cupy_gpu, p_values, q_values):
+    """Both CUDA paths must implement normalized, directed relative entropy."""
     cp = cupy_gpu
     rlgc = importlib.import_module("opm_processing.imageprocessing.rlgc")
-    rng = np.random.default_rng(83)
-    p = cp.asarray(rng.random((7, 11, 13), dtype=np.float32))
-    q = cp.asarray(rng.random((7, 11, 13), dtype=np.float32))
+    p = cp.asarray(p_values, dtype=cp.float32)
+    q = cp.asarray(q_values, dtype=cp.float32)
     scratch = cp.empty_like(p)
 
-    expected = rlgc.kl_div(p, q)
-    actual = rlgc._kl_div_into(p, q, scratch)
+    probability_p = np.asarray(p_values, dtype=np.float64) + 1e-4
+    probability_q = np.asarray(q_values, dtype=np.float64) + 1e-4
+    probability_p /= probability_p.sum()
+    probability_q /= probability_q.sum()
+    expected = np.sum(probability_p * np.log(probability_p / probability_q))
+    for actual in (rlgc.kl_div(p, q), rlgc._kl_div_into(p, q, scratch)):
+        np.testing.assert_allclose(actual, expected, rtol=2e-6, atol=2e-6)
+    np.testing.assert_array_equal(cp.asnumpy(p), p_values)
+    np.testing.assert_array_equal(cp.asnumpy(q), q_values)
 
-    np.testing.assert_allclose(actual, expected, rtol=2e-6, atol=2e-6)
 
-
+@pytest.mark.unit
 @pytest.mark.parametrize("shape", [(31, 37), (7, 23, 29)])
 def test_custom_cuda_ssim_matches_scipy_reference(cupy_gpu, shape):
     """Validate the custom RawModule kernels for both 2D and 3D images.
@@ -195,6 +210,7 @@ def test_custom_cuda_ssim_matches_scipy_reference(cupy_gpu, shape):
     np.testing.assert_allclose(constant_score, 1.0, atol=2e-6)
 
 
+@pytest.mark.unit
 def test_gpu_hot_pixel_replacement_matches_synthetic_sample(cupy_gpu):
     """Exercise cupyx median filtering on a representative camera defect.
 
@@ -229,6 +245,7 @@ def test_gpu_hot_pixel_replacement_matches_synthetic_sample(cupy_gpu):
     np.testing.assert_array_equal(corrected, expected)
 
 
+@pytest.mark.integration
 def test_gpu_registration_recovers_known_3d_translation(cupy_gpu):
     """Run cuCIM registration plus CUDA SSIM on a translated sample volume.
 
@@ -278,6 +295,7 @@ def test_gpu_registration_recovers_known_3d_translation(cupy_gpu):
     assert score > unregistered_score
 
 
+@pytest.mark.integration
 def test_rlgc_gpu_deconvolution_improves_synthetic_point_sample(cupy_gpu):
     """End-to-end GPU deconvolution must improve recovery of point emitters.
 
@@ -337,38 +355,242 @@ def test_rlgc_gpu_deconvolution_improves_synthetic_point_sample(cupy_gpu):
         return float(np.sqrt(np.mean((candidate * scale - truth) ** 2)))
 
     assert scale_invariant_rmse(restored) < 0.85 * scale_invariant_rmse(observed)
+    # Shape recovery alone can conceal a factor-of-two photon gain.
+    np.testing.assert_allclose(restored.sum(), observed.sum(), rtol=0.1)
+    assert np.mean((restored - truth) ** 2) < np.mean((observed - truth) ** 2)
     rlgc.clear_rlgc_caches(clear_memory_pool=True)
 
 
-def test_rlgc_2d_selects_and_normalizes_central_psf_plane(monkeypatch):
-    """Use only the central Z plane while preserving the acquired image rank."""
+@pytest.mark.integration
+def test_rlgc_preserves_stationary_intensity(cupy_gpu, monkeypatch):
+    """A balanced split of an exact constant prediction must have unit update."""
     rlgc = importlib.import_module("opm_processing.imageprocessing.rlgc")
-    image = np.arange(6 * 7, dtype=np.float32).reshape(6, 7)
-    skewed_psf = np.stack(
-        (
-            np.full((3, 5), 1.0, dtype=np.float32),
-            np.arange(1, 16, dtype=np.float32).reshape(3, 5),
-            np.full((3, 5), 100.0, dtype=np.float32),
-        )
+
+    class BalancedSplit:
+        """Provide the exact half-count observations for this fixed-point case."""
+
+        def binomial(self, counts, p):
+            """Split even counts equally so both gradients are exactly zero."""
+            return counts // 2
+
+    monkeypatch.setattr(rlgc.cp.random, "default_rng", lambda seed: BalancedSplit())
+    observed = np.full((1, 8, 8), 32, dtype=np.float32)
+    restored = rlgc.rlgc(observed, np.ones((1, 1, 1), dtype=np.float32))
+
+    np.testing.assert_allclose(restored, observed, rtol=1e-6)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("safe_mode", [True, False])
+def test_rlgc_stopping_is_invariant_to_split_labels(cupy_gpu, monkeypatch, safe_mode):
+    """Swapping the two halves on alternate iterations cannot change recovery."""
+    rlgc = importlib.import_module("opm_processing.imageprocessing.rlgc")
+    zz, yy, xx = np.mgrid[-2:3, -3:4, -3:4]
+    psf = np.exp(-(zz**2 / 1.1**2 + (yy**2 + xx**2) / 4) / 2)
+    psf = (psf / psf.sum()).astype(np.float32)
+    truth = np.zeros((9, 35, 37), np.float32)
+    truth[2, 9, 10] = 1800
+    truth[4, 18, 27] = 2400
+    truth[6, 26, 17] = 2100
+    observed = (
+        np.random.default_rng(31)
+        .poisson(ndimage.convolve(truth, psf, mode="reflect") + 0.25)
+        .astype(np.float32)
     )
-    calls = []
+    options = dict(safe_mode=safe_mode, rng_seed=17, limit=0.02, max_delta=0.005)
+    baseline = rlgc.rlgc(observed, psf, **options)
+    original_split = rlgc._split_observed_counts
+    calls = 0
 
-    def fake_chunked_rlgc(*, image, psf, **kwargs):
-        calls.append((np.asarray(image), np.asarray(psf), kwargs))
-        return np.asarray(image, dtype=np.float32) + 1
+    def relabeled_split(image, rng):
+        nonlocal calls
+        split = original_split(image, rng)
+        calls += 1
+        return image - split if calls % 2 == 0 else split
 
-    monkeypatch.setattr(rlgc, "chunked_rlgc", fake_chunked_rlgc)
+    monkeypatch.setattr(rlgc, "_split_observed_counts", relabeled_split)
+    actual = rlgc.rlgc(observed, psf, **options)
+    assert calls > 2  # Exercise stopping beyond the first relabeling.
+    np.testing.assert_allclose(actual, baseline, rtol=1e-6, atol=1e-5)
+    assert np.mean((actual - truth) ** 2) < np.mean((observed - truth) ** 2)
 
-    output_2d = rlgc.rlgc_2d(image, skewed_psf, verbose=0)
-    output_3d = rlgc.rlgc_2d(image[np.newaxis], skewed_psf, verbose=0)
 
-    np.testing.assert_array_equal(output_2d, image + 1)
-    np.testing.assert_array_equal(output_3d, (image + 1)[np.newaxis])
-    assert output_2d.dtype == output_3d.dtype == np.float32
-    assert len(calls) == 2
-    expected_psf = skewed_psf[1] / skewed_psf[1].sum()
-    for passed_image, passed_psf, kwargs in calls:
-        np.testing.assert_array_equal(passed_image, image)
-        np.testing.assert_allclose(passed_psf, expected_psf)
-        assert kwargs["crop_scan"] == 1
-        assert kwargs["normalize_psf"] is False
+@pytest.mark.integration
+@pytest.mark.parametrize("scan_planes", [1, 5])
+def test_rlgc_preserves_smooth_low_count_background(cupy_gpu, scan_planes):
+    """Local stopping must preserve resolved background instead of flat patches."""
+    rlgc = importlib.import_module("opm_processing.imageprocessing.rlgc")
+    yy, xx = np.mgrid[:64, :96]
+    background = 1.5 + 0.3 * np.sin(2 * np.pi * xx / 96)
+    background += 0.15 * np.cos(2 * np.pi * yy / 64)
+    truth = np.broadcast_to(background, (scan_planes, 64, 96)).astype(np.float32)
+    zz, py, px = np.mgrid[-1:2, -5:6, -5:6]
+    psf = np.exp(-(zz**2 + (py**2 + px**2) / 2.5**2) / 2)
+    if scan_planes == 1:
+        psf = psf[1:2]
+    psf = (psf / psf.sum()).astype(np.float32)
+    observed = ndimage.convolve(truth, psf, mode="reflect")
+
+    restored = rlgc.rlgc(observed, psf, max_delta=0.1)
+
+    assert np.isfinite(restored).all()
+    assert restored.min() >= 0
+    assert float(np.sqrt(np.mean((restored - truth) ** 2))) < 0.04
+    assert np.mean(np.abs(restored - observed.mean()) < 1e-5) < 0.001
+    np.testing.assert_allclose(restored.mean(), truth.mean(), rtol=0.01)
+
+
+@pytest.mark.unit
+def test_rlgc_fractional_split_is_unbiased_and_preserves_counts(cupy_gpu):
+    """Both halves must have equal expected signal, including sub-count pixels."""
+    cp = cupy_gpu
+    rlgc = importlib.import_module("opm_processing.imageprocessing.rlgc")
+    levels = np.array([0, 0.24, 0.96, 1, 1.44, 2.88, 12.24], dtype=np.float32)
+    observed = cp.asarray(np.broadcast_to(levels[:, None], (len(levels), 200_000)))
+    split1 = rlgc._split_observed_counts(observed, cp.random.default_rng(73))
+    split2 = observed - split1
+
+    assert bool(cp.all(split1 >= 0)) and bool(cp.all(split2 >= 0))
+    np.testing.assert_allclose(
+        cp.asnumpy(split1 + split2), cp.asnumpy(observed), atol=1e-6
+    )
+    for split in (split1, split2):
+        np.testing.assert_allclose(
+            cp.asnumpy(split.mean(axis=1)), levels / 2, atol=0.01
+        )
+        # Independently assigned unit counts and the residual weighted count
+        # have variance sum(weight**2)/4. Deterministic halving must fail.
+        expected_variance = (np.floor(levels) + (levels % 1) ** 2) / 4
+        np.testing.assert_allclose(
+            cp.asnumpy(split.var(axis=1)), expected_variance, rtol=0.02, atol=1e-5
+        )
+
+
+@pytest.mark.unit
+def test_rlgc_integer_split_has_binomial_distribution(cupy_gpu):
+    """Four photons split into 0..4 counts with binomial probabilities."""
+    cp = cupy_gpu
+    rlgc = importlib.import_module("opm_processing.imageprocessing.rlgc")
+    observed = cp.full(200_000, 4, dtype=cp.float32)
+    actual = cp.asnumpy(
+        rlgc._split_observed_counts(observed, cp.random.default_rng(19))
+    )
+    np.testing.assert_array_equal(actual, actual.astype(np.int64))
+    np.testing.assert_allclose(
+        np.bincount(actual.astype(np.int64), minlength=5) / actual.size,
+        np.array([1, 4, 6, 4, 1]) / 16,
+        atol=0.004,
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("seed", [7, 31, 83])
+@pytest.mark.parametrize(
+    "read_noise_e", [0.7, 1.0, 1.6], ids=["ultra-quiet", "standard", "fast"]
+)
+def test_rlgc_recovers_dim_emitter_with_camera_noise(cupy_gpu, seed, read_noise_e):
+    """Recover an emitter with ORCA-Fusion BT shot, read, and quantization noise."""
+    rlgc = importlib.import_module("opm_processing.imageprocessing.rlgc")
+    rng = np.random.default_rng(seed)
+    zz, yy, xx = np.mgrid[-3:4, -6:7, -6:7]
+    psf = np.exp(-0.5 * ((zz / 1.2) ** 2 + ((yy + 2 * zz) / 2) ** 2 + (xx / 2) ** 2))
+    psf = (psf / psf.sum()).astype(np.float32)
+    truth = np.zeros((9, 48, 64), dtype=np.float32)
+    truth[4, 24, 32] = 100
+    # Hamamatsu C15440-20UP: 0.24 electrons/ADU, 100 ADU offset,
+    # 0.7/1.0/1.6 electrons RMS read noise across the three scan modes.
+    # See the manufacturer's
+    # ORCA-Fusion/ORCA-Fusion BT technical note, specifications, page 15:
+    # https://www.hamamatsu.com/content/dam/hamamatsu-photonics/sites/documents/99_SALES_LIBRARY/sys/SCAS0138E_C14440-20UP_tec.pdf
+    # Shot noise acts on electrons before ADC conversion. Multiplying a
+    # Poisson draw by 0.24 instead would incorrectly reduce its variance.
+    background_electrons = rng.poisson(1.5, truth.shape)
+    background_electrons = background_electrons + rng.normal(
+        0, read_noise_e, truth.shape
+    )
+    injected = rng.poisson(ndimage.convolve(truth, psf, mode="reflect")).astype(
+        np.float32
+    )
+
+    def calibrate_camera(electrons):
+        """Digitize electron charge, then apply the pipeline's camera calibration."""
+        adu = np.clip(np.rint(100 + electrons / 0.24), 0, 65535).astype(np.uint16)
+        return np.maximum((adu.astype(np.float32) - 100) * 0.24, 0)
+
+    background = calibrate_camera(background_electrons)
+    observed = calibrate_camera(background_electrons + injected)
+    restored_background = rlgc.rlgc(background, psf, rng_seed=seed)
+    restored = rlgc.rlgc(observed, psf, rng_seed=seed)
+    response = restored - restored_background
+
+    # Score the complete estimate against the expected object, not a sampled
+    # noise realization. Paired subtraction below cancels retained background
+    # grain and cannot establish whole-image reconstruction accuracy by itself.
+    expected_object = truth.astype(np.float64) + 1.5
+    observed_mse = np.mean((observed - expected_object) ** 2)
+    restored_mse = np.mean((restored - expected_object) ** 2)
+    assert restored_mse < observed_mse, {
+        "restored_mse": restored_mse,
+        "observed_mse": observed_mse,
+    }
+    assert np.mean((restored_background.astype(np.float64) - 1.5) ** 2) < np.mean(
+        (background.astype(np.float64) - 1.5) ** 2
+    )
+
+    # Paired background subtraction isolates the response to the known emitter.
+    # The core contains the emitter's true location, so useful deconvolution
+    # must move signal into it. A no-op cannot pass this strict improvement.
+    core = (slice(3, 6), slice(22, 27), slice(30, 35))
+    # Compare concentration with the actually measured blurred signal. Keep
+    # the flux bound against the injected electron count, including any signal
+    # lost during camera calibration's clipping of negative measurements.
+    measured_signal = observed - background
+    core_gain = float(response[core].sum() / measured_signal[core].sum())
+    flux_ratio = float(response.sum() / injected.sum())
+    assert core_gain > 1.0, {"core_gain": core_gain, "flux_ratio": flux_ratio}
+    np.testing.assert_allclose(flux_ratio, 1.0, rtol=0.2)
+    assert np.isfinite(restored).all()
+    assert restored.min() >= 0
+
+
+@pytest.mark.integration
+def test_rlgc_empty_image_remains_empty(cupy_gpu):
+    """Data-derived initialization must not introduce signal into an empty image."""
+    rlgc = importlib.import_module("opm_processing.imageprocessing.rlgc")
+    observed = np.zeros((3, 12, 16), dtype=np.float32)
+    psf = np.ones((3, 3, 3), dtype=np.float32)
+    restored = rlgc.rlgc(observed, psf)
+    np.testing.assert_array_equal(restored, observed)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("singleton_z", [False, True])
+def test_rlgc_2d_recovers_points_using_central_psf(cupy_gpu, singleton_z):
+    """Run the real wrapper and solver against independently blurred YX truth."""
+    rlgc = importlib.import_module("opm_processing.imageprocessing.rlgc")
+    yy, xx = np.mgrid[-3:4, -3:4]
+    central = np.exp(-(yy**2 + xx**2) / 8).astype(np.float32)
+    central /= central.sum()
+    skewed_psf = np.stack(
+        (np.ones_like(central), central * 7, np.ones_like(central) * 100)
+    )
+    truth = np.zeros((41, 43), np.float32)
+    truth[12, 13] = 2000
+    truth[28, 30] = 3000
+    observed = (
+        np.random.default_rng(31)
+        .poisson(ndimage.convolve(truth, central, mode="reflect") + 0.25)
+        .astype(np.float32)
+    )
+    if singleton_z:
+        observed = observed[None]
+        truth = truth[None]
+    restored = rlgc.rlgc_2d(observed, skewed_psf, limit=0.02, max_delta=0.005)
+    assert restored.shape == truth.shape
+    assert restored.dtype == np.float32
+    assert np.mean((restored - truth) ** 2) < np.mean((observed - truth) ** 2)
+    np.testing.assert_allclose(restored.sum(), observed.sum(), rtol=0.1)
+    np.testing.assert_array_equal(
+        np.unravel_index(np.argmax(restored), restored.shape),
+        np.unravel_index(np.argmax(truth), truth.shape),
+    )

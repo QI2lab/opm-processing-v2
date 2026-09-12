@@ -7,7 +7,7 @@ import pytest
 from scipy import ndimage
 
 from opm_processing.imageprocessing import opmtools
-from tests.testing_utils import scale_invariant_rmse, shell_line_width_x
+from tests.testing_utils import shell_line_width_x
 
 
 @dataclass(frozen=True)
@@ -169,6 +169,7 @@ def _chunked_deskew(
     )
 
 
+@pytest.mark.integration
 def test_chunked_deskew_matches_direct_deskew_without_deconvolution(
     chunked_deskew_sample,
     chunked_deskew_config,
@@ -208,32 +209,39 @@ def test_chunked_deskew_matches_direct_deskew_without_deconvolution(
     center = tuple(int(round(value)) for value in sample.center_zyx)
     assert direct[center] < 0.2 * direct.max()
 
-    supported = (actual > 0) & (direct > 0)
+    supported = direct > 0
     assert (
         np.corrcoef(actual[supported], direct[supported])[0, 1]
         > config.minimum_chunk_correlation
     )
-    normalized_error = scale_invariant_rmse(actual, direct) / np.sqrt(
-        np.mean(direct.astype(np.float64) ** 2)
-    )
+    normalized_error = np.sqrt(
+        np.mean((actual.astype(np.float64) - direct) ** 2)
+    ) / np.sqrt(np.mean(direct.astype(np.float64) ** 2))
     assert normalized_error < config.maximum_normalized_chunk_error
 
 
-def test_deskew_preserves_float32_sub_uint16_signal() -> None:
-    """Deskew cannot quantize before the final storage boundary."""
+@pytest.mark.unit
+@pytest.mark.parametrize("scan_step", [0.23, 0.4, 0.8])
+def test_deskew_preserves_fractional_photon_density(scan_step) -> None:
+    """An interior constant field scales with the raw-to-output voxel volume."""
     calibrated = np.full((4, 8, 5), 0.24, dtype=np.float32)
 
     output = opmtools.orthogonal_deskew(
         calibrated,
-        distance=0.4,
+        distance=scan_step,
         pixel_size=0.115,
         downsample_factor=1,
     )
 
     assert output.dtype == np.float32
-    assert np.any((output > 0) & (output < 1))
+    # At 30 degrees, V_raw = scan_step * pixel_size**2 * sin(30),
+    # while V_output = pixel_size**3. No integer cast or arbitrary gain.
+    expected = 0.24 * 0.115 / (scan_step * 0.5)
+    np.testing.assert_allclose(output[1, 7, :5], expected, rtol=1e-6)
+    np.testing.assert_array_equal(output[..., 5:], 0)
 
 
+@pytest.mark.integration
 @pytest.mark.gpu
 def test_chunked_deskew_with_gpu_deconvolution_improves_ground_truth(
     chunked_deskew_sample,

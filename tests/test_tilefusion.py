@@ -85,6 +85,7 @@ class _ReadArray:
         return _ReadView(self.data[key])
 
 
+@pytest.mark.integration
 def test_max_projection_pyramid_clamps_partial_source_edge_chunks() -> None:
     """Never request factor-rounded source bounds beyond level-zero shape."""
     source = np.arange(1 * 3 * 1 * 17 * 19, dtype=np.uint16).reshape(1, 3, 1, 17, 19)
@@ -103,6 +104,7 @@ def test_max_projection_pyramid_clamps_partial_source_edge_chunks() -> None:
     )
 
 
+@pytest.mark.unit
 def test_stage_z_is_reversed_only_for_lab_placement() -> None:
     """Negate physical stage Z and its Y shear without touching input pixels."""
     stage_positions = np.asarray(
@@ -122,6 +124,7 @@ def test_stage_z_is_reversed_only_for_lab_placement() -> None:
     np.testing.assert_array_equal(stage_positions, original)
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize(
     ("dtype", "values"),
     (
@@ -174,6 +177,7 @@ def test_max_projection_fusion_is_chunked_and_sparse(monkeypatch, dtype, values)
     np.testing.assert_allclose(fusion.fused_ts.data, expected)
 
 
+@pytest.mark.unit
 def test_zero_max_projection_tile_does_not_reduce_weighted_fusion() -> None:
     """Exclude a globally zero projection channel from its neighbor's weights."""
     tile_shape = (3, 4)
@@ -205,6 +209,7 @@ def test_zero_max_projection_tile_does_not_reduce_weighted_fusion() -> None:
     )
 
 
+@pytest.mark.integration
 def test_max_projection_fusion_writes_centered_multiscales_and_offsets(
     tmp_path,
 ) -> None:
@@ -266,6 +271,7 @@ def test_max_projection_fusion_writes_centered_multiscales_and_offsets(
         )
 
 
+@pytest.mark.unit
 def test_registration_pairs_include_every_physical_overlap() -> None:
     """Match main by retaining face, edge, and corner overlaps."""
     positions = [(z, y, x) for z in (0.0, 8.0) for y in (0.0, 8.0) for x in (0.0, 8.0)]
@@ -285,6 +291,7 @@ def test_registration_pairs_include_every_physical_overlap() -> None:
     assert set(pairs) == expected
 
 
+@pytest.mark.unit
 def test_registration_pairs_use_each_cropped_tile_shape() -> None:
     """Detect ROI overlap from crop-adjusted origins and variable extents."""
     positions = [(0.0, 0.0, 0.0), (0.0, 0.0, 6.0), (0.0, 0.0, 10.0)]
@@ -300,6 +307,7 @@ def test_registration_pairs_use_each_cropped_tile_shape() -> None:
     assert pairs == [(0, 1)]
 
 
+@pytest.mark.unit
 def test_shift_optimization_supports_variable_tiles_per_timepoint() -> None:
     """Optimize global tile IDs without assuming rectangular T-by-P storage."""
     fusion = TileFusion.__new__(TileFusion)
@@ -319,6 +327,7 @@ def test_shift_optimization_supports_variable_tiles_per_timepoint() -> None:
     np.testing.assert_allclose(fusion.global_offsets[4], (0, 3, 0), atol=1e-12)
 
 
+@pytest.mark.unit
 def test_block_fusion_does_not_infer_support_from_pixel_values(monkeypatch):
     """Include legitimate zero-valued pixels when geometry marks them valid."""
     fusion = TileFusion.__new__(TileFusion)
@@ -374,6 +383,7 @@ def test_block_fusion_does_not_infer_support_from_pixel_values(monkeypatch):
     np.testing.assert_array_equal(fusion.fused_ts.data, expected)
 
 
+@pytest.mark.unit
 def test_block_fusion_has_no_zero_weight_line_at_masked_wedge_boundary(
     monkeypatch,
 ):
@@ -432,6 +442,7 @@ def test_block_fusion_has_no_zero_weight_line_at_masked_wedge_boundary(
     np.testing.assert_array_equal(fusion.fused_ts.data, expected)
 
 
+@pytest.mark.unit
 def test_zero_tile_channel_contributes_neither_signal_nor_fusion_weight(
     monkeypatch,
 ):
@@ -484,6 +495,7 @@ def test_zero_tile_channel_contributes_neither_signal_nor_fusion_weight(
     )
 
 
+@pytest.mark.unit
 def test_single_nonzero_channel_contributor_is_copied_in_overlap(monkeypatch):
     """Copy one valid channel unchanged while blending another channel."""
     fusion = TileFusion.__new__(TileFusion)
@@ -548,6 +560,7 @@ def test_single_nonzero_channel_contributor_is_copied_in_overlap(monkeypatch):
     )
 
 
+@pytest.mark.unit
 def test_zero_registration_channel_is_excluded_before_patch_reads() -> None:
     """Do not schedule registration reads for a pair containing a zero tile."""
     fusion = TileFusion.__new__(TileFusion)
@@ -581,6 +594,7 @@ def test_zero_registration_channel_is_excluded_before_patch_reads() -> None:
     assert fusion.pairwise_metrics == {}
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize(
     ("downsample_method", "is_2d", "padded_shape"),
     (
@@ -733,6 +747,7 @@ def test_multiscale_storage_round_trip_matches_reference(
     assert not any(key.startswith("opm_") for key in reopened.attrs)
 
 
+@pytest.mark.integration
 def test_fused_multiscale_storage_preserves_float32_source_contract(tmp_path):
     """Float32 processed tiles create float32 fused output at every level."""
     fusion = TileFusion.__new__(TileFusion)
@@ -769,6 +784,7 @@ def test_fused_multiscale_storage_preserves_float32_source_contract(tmp_path):
         )
 
 
+@pytest.mark.integration
 def test_regenerate_max_z_flag_preserves_multiscale_pyramid_round_trip(
     tmp_path,
 ) -> None:

@@ -90,6 +90,18 @@ def _resolve_output_directory(root_path: Path, output: Path | None) -> Path:
     return output_dir
 
 
+def _resolve_flatfield_path(root_path: Path, output_dir: Path) -> Path:
+    """Reuse an existing output- or acquisition-side flatfield when available."""
+    filename = f"{acquisition_stem(root_path)}_flatfield.ome.tif"
+    output_path = output_dir / filename
+    if output_path.exists():
+        return output_path
+    acquisition_path = root_path.parent / filename
+    if acquisition_path.exists():
+        return acquisition_path
+    return output_path
+
+
 def _processed_dtype(save_float32: bool) -> np.dtype:
     """Return the requested dtype for calibrated processing products."""
     return np.dtype(np.float32 if save_float32 else np.uint16)
@@ -137,14 +149,14 @@ def _open_variable_resume_collection(
     if actual_shapes != expected_shapes:
         raise ValueError(
             "Existing ROI output shapes are incompatible with this run: "
-            f"{actual_shapes} != {expected_shapes}. Omit --resume to overwrite it."
+            f"{actual_shapes} != {expected_shapes}. Use --no-resume to overwrite it."
         )
     actual_dtypes = {np.dtype(array.dtype.numpy_dtype) for array in collection.arrays}
     if actual_dtypes != {np.dtype(expected_dtype)}:
         raise ValueError(
             "Existing ROI output dtype is incompatible with this run: "
             f"{sorted(str(dtype) for dtype in actual_dtypes)} != {expected_dtype}. "
-            "Omit --resume to overwrite it."
+            "Use --no-resume to overwrite it."
         )
     return collection
 
@@ -164,7 +176,7 @@ def _initialize_processing_state(
     if resume and output_preexisting and not state_path.is_file():
         raise ValueError(
             "Existing output has no current processing-state JSON and cannot be "
-            f"resumed: {state_path}. Omit --resume to overwrite it."
+            f"resumed: {state_path}. Use overwrite mode to restart."
         )
     state = ProcessingState.open(
         state_path,
@@ -177,13 +189,13 @@ def _initialize_processing_state(
         except ValueError as error:
             raise ValueError(
                 "Existing output has no current processing run and cannot be "
-                f"resumed: {output_path}. Omit --resume to overwrite it."
+                f"resumed: {output_path}. Use overwrite mode to restart."
             ) from error
     state.initialize_run(
         output_path,
         configuration=configuration,
         roi_series=roi_series,
-        overwrite=not resume,
+        overwrite=not resume or not output_preexisting,
     )
     return state
 
@@ -241,6 +253,20 @@ def _format_processed_output(data: np.ndarray, save_float32: bool) -> np.ndarray
     if save_float32:
         return data
     return np.clip(data, 0, np.iinfo(np.uint16).max).astype(np.uint16)
+
+
+def _write_checkpointed_roi_channel(
+    target: Any,
+    value: np.ndarray | np.generic,
+    state: ProcessingState,
+    output_path: Path,
+    channel_key: tuple[int, int, int],
+    *,
+    is_zero: bool,
+) -> None:
+    """Finish a cropped channel write before recording it as resumable."""
+    target.write(value).result()
+    state.complete_channel(output_path, *channel_key, is_zero=is_zero)
 
 
 def _queue_position_pyramid_writes(
@@ -529,6 +555,7 @@ def _load_or_estimate_flatfield(
             expected_shape,
         )
         if calibration is not None:
+            print(f"Using existing flatfield: {path}")
             return calibration
         print("Existing flatfield uses an obsolete estimator; re-estimating it.")
 
@@ -954,7 +981,8 @@ def process(
     skip_empty_min_signal_fraction: float, default = 0.01
         Minimum fraction of channel-volume pixels that must meet the threshold.
     max_projection: bool, default = True
-        Create a maximum projection datastore.
+        Create a maximum projection datastore. Disabling this also disables the
+        fused maximum projection, which depends on that datastore.
     flatfield_correction: bool, default = False
         Estimate and apply flatfield correction on raw data.
     create_fused_max_projection: bool, default = True
@@ -1149,7 +1177,8 @@ def process_skewed(
     skip_empty_min_signal_fraction: float, default = 0.01
         Minimum fraction of channel-volume pixels that must meet the threshold.
     max_projection: bool, default = True
-        Create a maximum projection datastore.
+        Create a maximum projection datastore. Disabling this also disables the
+        fused maximum projection, which depends on that datastore.
     flatfield_correction: bool, default = True
         Estimate and apply flatfield correction on raw data.
     create_fused_max_projection: bool, default = True
@@ -1186,6 +1215,12 @@ def process_skewed(
         raise ValueError(
             "A 2D acquisition must use projection processing and cannot be deskewed"
         )
+    # Fusion consumes the per-position maximum-projection datastore.  Treat
+    # --no-max-projection as disabling that dependent output as well instead of
+    # trying to open a datastore that was intentionally never created.
+    create_fused_max_projection = bool(
+        max_projection and create_fused_max_projection
+    )
     skip_empty_below, skip_empty_min_signal_fraction = _validate_empty_tile_options(
         skip_empty_below,
         skip_empty_min_signal_fraction,
@@ -1356,7 +1391,7 @@ def process_skewed(
     flatfield_path = (
         Path(illumination_path).expanduser().resolve()
         if illumination_path is not None
-        else output_dir / Path(acquisition_stem(root_path) + "_flatfield.ome.tif")
+        else _resolve_flatfield_path(root_path, output_dir)
     )
     provided_flatfields = (
         _load_provided_illumination(
@@ -1677,6 +1712,11 @@ def process_skewed(
 
     wrote_tile = False
     zero_channels = processing_state.zero_channels(output_path)
+    completed_channels = (
+        processing_state.completed_channels(output_path)
+        if roi_selection is not None
+        else set()
+    )
     for t_idx, current_positions in tile_groups:
         for pos_idx in current_positions:
             ts_writes = []
@@ -1712,7 +1752,29 @@ def process_skewed(
                 if skewed_roi is None:
                     continue
             wrote_tile = True
-            for chan_idx in tqdm(range(datastore.shape[2]), desc="c", leave=False):
+            tile_completed_channels = {
+                channel
+                for time, position, channel in completed_channels
+                if time == int(t_idx) and position == int(pos_idx)
+            }
+            if tile_completed_channels:
+                print(
+                    f"Resuming time {t_idx}, position {pos_idx}: "
+                    f"{len(tile_completed_channels)} of {datastore.shape[2]} "
+                    "channels complete."
+                )
+            for chan_idx in tqdm(
+                (
+                    channel
+                    for channel in range(datastore.shape[2])
+                    if channel not in tile_completed_channels
+                ),
+                total=datastore.shape[2],
+                initial=len(tile_completed_channels),
+                desc="c",
+                leave=False,
+            ):
+                channel_key = (int(t_idx), int(pos_idx), int(chan_idx))
                 if _known_empty_tile(signal_mask, t_idx, pos_idx, chan_idx):
                     zero_channels.add((int(t_idx), int(pos_idx), int(chan_idx)))
                     zero_value = output_dtype.type(0)
@@ -1721,8 +1783,13 @@ def process_skewed(
                             ts_store[pos_idx][t_idx, chan_idx].write(zero_value)
                         )
                     else:
-                        ts_writes.append(
-                            ts_store[roi_series_index][0, chan_idx].write(zero_value)
+                        _write_checkpointed_roi_channel(
+                            ts_store[roi_series_index][0, chan_idx],
+                            zero_value,
+                            processing_state,
+                            output_path,
+                            channel_key,
+                            is_zero=True,
                         )
                     if max_projection:
                         ts_max_writes.extend(
@@ -1801,8 +1868,13 @@ def process_skewed(
                             ts_store[pos_idx][t_idx, chan_idx].write(zero_value)
                         )
                     else:
-                        ts_writes.append(
-                            ts_store[roi_series_index][0, chan_idx].write(zero_value)
+                        _write_checkpointed_roi_channel(
+                            ts_store[roi_series_index][0, chan_idx],
+                            zero_value,
+                            processing_state,
+                            output_path,
+                            channel_key,
+                            is_zero=True,
                         )
                     if max_projection:
                         ts_max_writes.extend(
@@ -1927,8 +1999,13 @@ def process_skewed(
                         ts_store[pos_idx][t_idx, chan_idx].write(formatted)
                     )
                 else:
-                    ts_writes.append(
-                        ts_store[roi_series_index][0, chan_idx].write(formatted)
+                    _write_checkpointed_roi_channel(
+                        ts_store[roi_series_index][0, chan_idx],
+                        formatted,
+                        processing_state,
+                        output_path,
+                        channel_key,
+                        is_zero=channel_key in zero_channels,
                     )
             for ts_write in ts_writes:
                 ts_write.result()
@@ -2186,9 +2263,7 @@ def process_projection(
     output_preexisting = output_path.exists()
     fused_output_path: Path | None = None
     signal_mask: np.ndarray | None = None
-    flatfield_path = output_dir / Path(
-        acquisition_stem(root_path) + "_flatfield.ome.tif"
-    )
+    flatfield_path = _resolve_flatfield_path(root_path, output_dir)
     signal_mask = (
         None
         if not flatfield_correction or flatfield_path.exists()

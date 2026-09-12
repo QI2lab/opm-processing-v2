@@ -19,7 +19,6 @@ from tqdm import tqdm
 
 from opm_processing.cuda import preload_cuda_libraries
 
-
 preload_cuda_libraries()
 
 import cupy as cp  # noqa: E402
@@ -695,6 +694,27 @@ def central_psf_plane(psf: np.ndarray) -> np.ndarray:
     return (psf_array / psf_sum).astype(np.float32, copy=False)
 
 
+def _split_observed_counts(
+    observed: cp.ndarray, rng: cp.random.Generator
+) -> cp.ndarray:
+    """Return one nonnegative, unbiased half of nonnegative float32 counts.
+
+    Whole counts follow the usual binomial split. Assign each fractional
+    remainder entirely to either half with equal probability, instead of
+    always putting it in the second half. The complementary half is
+    ``observed - result``, preserving the measured data. For fractional data
+    this is a weighted-count approximation, not an exact Poisson noise model.
+    Integer-only inputs retain the original binomial samples and RNG sequence.
+    """
+    counts = observed.astype(cp.int64)
+    split = rng.binomial(counts, p=0.5).astype(cp.float32)
+    remainder = observed - counts.astype(cp.float32)
+    if bool(cp.any(remainder)):
+        remainder *= rng.random(observed.shape, dtype=cp.float32) < 0.5
+        split += remainder
+    return split
+
+
 def rlgc(
     image: np.ndarray,
     psf: np.ndarray,
@@ -712,7 +732,12 @@ def rlgc(
     """Richardson-Lucy Gradient Consensus deconvolution.
 
     The implementation follows the non-accelerated reference loop with
-    split-KLD stopping and the consensus-gated multiplicative update.
+    split-KLD stopping and the consensus-gated multiplicative update. The
+    initial estimate is the normalized backprojection of the measured image,
+    equivalent to one full-data RL step from a positive constant estimate for
+    a unit-sum PSF.
+    Starting directly from noisy measurements retains background noise that
+    subsequent consensus updates may not remove.
 
     Parameters
     ----------
@@ -811,17 +836,21 @@ def rlgc(
         prev_kld1 = np.inf
         prev_kld2 = np.inf
 
-        recon = cp.full(
-            padded_shape,
-            cp.mean(observed_core),
-            dtype=cp.float32,
-        )
+        # Normalized backprojection: one full-data RL step from a constant
+        # for a unit-sum PSF. Do not seed with noisy measurements: consensus
+        # can freeze that noise into the reconstruction.
+        recon = cp.zeros(padded_shape, dtype=cp.float32)
+        recon[observed_slices] = observed_core
+        recon = fft_conv(recon, otfT, padded_shape)
+        recon /= update_norm
+        cp.maximum(recon, cp.float32(0), out=recon)
+        enforce_symmetric_boundary(recon, pad_width)
         next_recon = cp.empty_like(recon)
         kld_scratch = cp.empty_like(observed_core)
 
         if logging_enabled:
             logger.info(
-                "%ssolver_started image_shape=%s padded_shape=%s psf_shape=%s reference_core=non_accelerated safe_mode=%s pad_yx=%s",
+                "%ssolver_started image_shape=%s padded_shape=%s psf_shape=%s reference_core=non_accelerated initialization=normalized_backprojection safe_mode=%s pad_yx=%s",
                 log_tag,
                 tuple(int(v) for v in image.shape),
                 padded_shape,
@@ -833,9 +862,7 @@ def rlgc(
         while True:
             iter_start_time = timeit.default_timer() if logging_enabled else None
 
-            observed_counts = observed_core.astype(cp.int64)
-            split1_core = rng.binomial(observed_counts, p=0.5)
-            del observed_counts
+            split1_core = _split_observed_counts(observed_core, rng)
             split1 = cp.zeros(padded_shape, dtype=cp.float32)
             split1[observed_slices] = split1_core
             del split1_core
@@ -851,6 +878,19 @@ def rlgc(
                 kld_scratch,
             )
             kld2 = _kl_div_into(predicted_core, split2_core, kld_scratch)
+
+            # A fresh split is drawn each iteration. Evaluate the previous
+            # estimate against this same split: comparing scores from different
+            # draws can roll back a useful update solely due to sampling noise
+            # (or even because the names of the two halves were exchanged).
+            if num_iters:
+                previous_prediction = fft_conv(next_recon, otf, padded_shape)
+                previous_core = previous_prediction[observed_slices]
+                prev_kld1 = _kl_div_into(
+                    previous_core, split1[observed_slices], kld_scratch
+                )
+                prev_kld2 = _kl_div_into(previous_core, split2_core, kld_scratch)
+                del previous_prediction, previous_core
 
             if safe_mode:
                 should_restore = (kld1 > prev_kld1) or (kld2 > prev_kld2)
@@ -872,9 +912,6 @@ def rlgc(
                         float(prev_kld2),
                     )
                 break
-
-            prev_kld1 = kld1
-            prev_kld2 = kld2
 
             Hu *= cp.float32(0.5)
             Hu += cp.float32(1e-12)
@@ -899,6 +936,9 @@ def rlgc(
             del split1
 
             cp.add(HTratio1, HTratio2, out=HTratio1)
+            # Each split was divided by half the prediction. Average the two
+            # backprojections to recover the full-data RL update with unit gain.
+            HTratio1 *= cp.float32(0.5)
             del HTratio2
             filter_update(recon, HTratio1, consensus_map, next_recon)
             enforce_symmetric_boundary(next_recon, pad_width)
@@ -1332,8 +1372,8 @@ def rlgc_2d(
     skewed_psf: np.ndarray,
     gpu_id: int = 0,
     safe_mode: bool = True,
-    limit: float = 0.1,
-    max_delta: float = 0.01,
+    limit: float = 0.05,
+    max_delta: float = 0.05,
     rng_seed: int | None = 42,
     verbose: int = 1,
     release_memory: bool = True,

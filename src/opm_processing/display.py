@@ -25,6 +25,59 @@ from opm_processing.dataio.roi import (
 
 app = typer.Typer(pretty_exceptions_enable=False)
 
+_DISPLAY_OUTPUT_SUFFIXES = {
+    "max-z": (
+        "_max_z_decon_deskewed.ome.zarr",
+        "_max_z_deskewed.ome.zarr",
+    ),
+    "full": (
+        "_decon_deskewed.ome.zarr",
+        "_deskewed.ome.zarr",
+    ),
+    "fused-max-z": ("_max_z_fused.ome.zarr",),
+    "fused-full": ("_fused.ome.zarr",),
+}
+
+
+def _processed_output_stem(path: Path) -> str | None:
+    """Return the acquisition stem encoded by a recognized display output."""
+    for suffixes in _DISPLAY_OUTPUT_SUFFIXES.values():
+        for suffix in suffixes:
+            if path.name.endswith(suffix):
+                return path.name[: -len(suffix)]
+    return None
+
+
+def _resolve_display_context(root_path: Path) -> tuple[Path, str]:
+    """Resolve the output directory and acquisition stem for display lookup."""
+    candidate = Path(root_path).expanduser().resolve()
+    direct_stem = _processed_output_stem(candidate)
+    if direct_stem is not None:
+        return candidate.parent, direct_stem
+
+    try:
+        acquisition_path = resolve_acquisition_path(candidate)
+    except ValueError as acquisition_error:
+        if not candidate.is_dir():
+            raise
+        processed_stems = {
+            stem
+            for item in candidate.iterdir()
+            if item.is_dir()
+            for stem in (_processed_output_stem(item),)
+            if stem is not None
+        }
+        if len(processed_stems) == 1:
+            return candidate, processed_stems.pop()
+        if len(processed_stems) > 1:
+            found = ", ".join(sorted(processed_stems))
+            raise ValueError(
+                f"Expected processed data for one acquisition in {candidate}, "
+                f"found: {found}"
+            ) from acquisition_error
+        raise
+    return acquisition_path.parent, acquisition_stem(acquisition_path)
+
 
 def _resolve_data_path(root_path: Path, to_display: str) -> Path:
     """Resolve a display mode to the first existing processed dataset.
@@ -48,30 +101,19 @@ def _resolve_data_path(root_path: Path, to_display: str) -> Path:
     FileNotFoundError
         If no output exists for the requested mode.
     """
-    acquisition_path = resolve_acquisition_path(root_path)
-    base = acquisition_path.parent
-    stem = acquisition_stem(acquisition_path)
-    candidates = {
-        "max-z": (
-            base / f"{stem}_max_z_decon_deskewed.ome.zarr",
-            base / f"{stem}_max_z_deskewed.ome.zarr",
-        ),
-        "full": (
-            base / f"{stem}_decon_deskewed.ome.zarr",
-            base / f"{stem}_deskewed.ome.zarr",
-        ),
-        "fused-max-z": (base / f"{stem}_max_z_fused.ome.zarr",),
-        "fused-full": (base / f"{stem}_fused.ome.zarr",),
-    }
-    if to_display not in candidates:
-        choices = ", ".join(candidates)
+    if to_display not in _DISPLAY_OUTPUT_SUFFIXES:
+        choices = ", ".join(_DISPLAY_OUTPUT_SUFFIXES)
         raise ValueError(f"to_display must be one of: {choices}")
-    for candidate in candidates[to_display]:
+    base, stem = _resolve_display_context(root_path)
+    candidates = tuple(
+        base / f"{stem}{suffix}" for suffix in _DISPLAY_OUTPUT_SUFFIXES[to_display]
+    )
+    for candidate in candidates:
         if candidate.exists():
             return candidate
     raise FileNotFoundError(
         f"No {to_display} output found. Checked: "
-        + ", ".join(str(path) for path in candidates[to_display])
+        + ", ".join(str(path) for path in candidates)
     )
 
 
@@ -178,10 +220,21 @@ def display(
                 "ROI mode requires --to-display fused-max-z. Use --no-roi "
                 "to open another display mode."
             )
-        validate_registered_max_projection(data_path)
+        try:
+            validate_registered_max_projection(data_path)
+        except (FileNotFoundError, ValueError):
+            command_path = Path(root_path).expanduser().resolve()
+            raise typer.BadParameter(
+                "ROI mode requires a registered maximum-Z projection from fuse.\n"
+                f'Run: uv run fuse "{command_path}"\n'
+                "Then rerun display. For display-only use --no-roi.",
+                param_hint="root_path",
+            ) from None
     if save_roi and roi_output is None:
-        acquisition_path = resolve_acquisition_path(root_path)
-        roi_output = data_path.parent / f"{acquisition_stem(acquisition_path)}_roi.json"
+        stem = _processed_output_stem(data_path)
+        if stem is None:
+            raise RuntimeError(f"Cannot derive acquisition stem from {data_path}")
+        roi_output = data_path.parent / f"{stem}_roi.json"
 
     viewer = napari.Viewer()
     layers = list(viewer.open(str(data_path), plugin="napari-ome-zarr"))

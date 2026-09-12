@@ -1581,7 +1581,7 @@ lxml = [
 
 [[package]]
 name = "opm-processing-v2"
-version = "0.10.0"
+version = "0.2.2"
 source = { editable = "." }
 dependencies = [
     { name = "basicpy" },

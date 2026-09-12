@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 from yaozarrs import v05
 from yaozarrs.write.v05 import prepare_image
 
@@ -24,7 +25,6 @@ from opm_processing.dataio.position_collection import (
 from opm_processing.dataio.processing_state import ProcessingState
 from opm_processing.imageprocessing.tilefusion import TileFusion
 from opm_processing import display as display_module
-from opm_processing import process_roi as process_roi_module
 
 
 def _record_registration(
@@ -64,6 +64,7 @@ def _record_registration(
     return maximum, state
 
 
+@pytest.mark.integration
 def test_napari_world_rectangle_round_trips_grid_and_all_z(tmp_path: Path) -> None:
     """Save a pyramid-independent ROI plus every overlapping stage-Z level."""
     source = tmp_path / "sample_max_z_fused.ome.zarr"
@@ -133,6 +134,7 @@ def test_napari_world_rectangle_round_trips_grid_and_all_z(tmp_path: Path) -> No
     assert reopened == roi
 
 
+@pytest.mark.integration
 def test_napari_image_pixels_are_converted_to_ngff_physical_coordinates(
     tmp_path: Path,
 ) -> None:
@@ -199,6 +201,7 @@ def test_napari_image_pixels_are_converted_to_ngff_physical_coordinates(
     assert roi.bounds_yx_um == (-7984.269, -7945.169, 622.29, 703.71)
 
 
+@pytest.mark.integration
 def test_roi_rejects_stage_only_fused_max_projection(tmp_path: Path) -> None:
     """A process-time stage mosaic is not a registered ROI canvas."""
     source = tmp_path / "stage_only_max.ome.zarr"
@@ -238,6 +241,7 @@ def test_roi_rejects_stage_only_fused_max_projection(tmp_path: Path) -> None:
         validate_registered_max_projection(source)
 
 
+@pytest.mark.integration
 def test_display_resolves_store_stem_from_acquisition_directory(
     tmp_path: Path,
     monkeypatch,
@@ -263,6 +267,93 @@ def test_display_resolves_store_stem_from_acquisition_directory(
     )
 
 
+@pytest.mark.integration
+def test_display_resolves_separate_processed_output_directory(tmp_path: Path) -> None:
+    """Display outputs remain discoverable when the raw acquisition is elsewhere."""
+    output_dir = tmp_path / "processed"
+    output_dir.mkdir()
+    deskewed_path = output_dir / "sample_deskewed.ome.zarr"
+    max_z_path = output_dir / "sample_max_z_deskewed.ome.zarr"
+    fused_max_z_path = output_dir / "sample_max_z_fused.ome.zarr"
+    for path in (deskewed_path, max_z_path, fused_max_z_path):
+        path.mkdir()
+
+    assert display_module._resolve_data_path(output_dir, "full") == deskewed_path
+    assert display_module._resolve_data_path(output_dir, "max-z") == max_z_path
+    assert (
+        display_module._resolve_data_path(output_dir, "fused-max-z") == fused_max_z_path
+    )
+    assert (
+        display_module._resolve_data_path(deskewed_path, "fused-max-z")
+        == fused_max_z_path
+    )
+
+
+@pytest.mark.integration
+def test_display_no_roi_opens_process_time_fused_projection(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Explicit view-only display does not require registration from fuse."""
+    output_dir = tmp_path / "processed"
+    output_dir.mkdir()
+    fused_max_z_path = output_dir / "sample_max_z_fused.ome.zarr"
+    collection = create_position_collection(
+        fused_max_z_path,
+        (2, 1, 1, 1, 4, 4),
+        (1.0, 1.0, 1.0),
+    )
+    pixels = np.arange(32, dtype=np.uint16).reshape(2, 1, 1, 4, 4)
+    collection.arrays[0].write(pixels).result()
+    layers = []
+
+    class FakeViewer:
+        def open(self, path: str, *, plugin: str):
+            loaded = open_position_collection(path).arrays[0].read().result()
+            layers.append(SimpleNamespace(data=loaded[:, 0], multiscale=False))
+            return layers
+
+    monkeypatch.setattr(display_module.napari, "Viewer", FakeViewer)
+    monkeypatch.setattr(display_module.napari, "run", lambda: None)
+    monkeypatch.setattr(
+        display_module,
+        "validate_registered_max_projection",
+        lambda _path: (_ for _ in ()).throw(
+            AssertionError("view-only display must not validate ROI registration")
+        ),
+    )
+
+    display_module.display(fused_max_z_path, roi=False, time_range=(1, 2))
+
+    assert len(layers) == 1
+    np.testing.assert_array_equal(layers[0].data, pixels[1:2, 0])
+
+
+@pytest.mark.integration
+def test_display_default_roi_error_instructs_user_to_run_fuse(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """The default ROI workflow reports its missing prerequisite actionably."""
+    output_dir = tmp_path / "processed"
+    output_dir.mkdir()
+    (output_dir / "sample_max_z_fused.ome.zarr").mkdir()
+    monkeypatch.setattr(
+        display_module,
+        "validate_registered_max_projection",
+        lambda _path: (_ for _ in ()).throw(
+            ValueError("Expected one registered maximum projection, found 0")
+        ),
+    )
+
+    with np.testing.assert_raises_regex(
+        display_module.typer.BadParameter,
+        r'(?s)Run: uv run fuse ".*processed".*display-only use --no-roi',
+    ):
+        display_module.display(output_dir)
+
+
+@pytest.mark.integration
 def test_display_uses_standard_ome_collection_channels_and_stage_positions(
     tmp_path: Path,
 ) -> None:
@@ -278,11 +369,11 @@ def test_display_uses_standard_ome_collection_channels_and_stage_positions(
     layers = [
         SimpleNamespace(
             multiscale=False,
-            data=np.zeros((2, 1, 4, 4), dtype=np.uint16),
+            data=np.stack((np.full((1, 4, 4), index), np.full((1, 4, 4), 10 + index))),
             visible=True,
             translate=None,
         )
-        for _ in range(4)
+        for index in range(4)
     ]
 
     display_module._configure_collection_layers(
@@ -294,6 +385,8 @@ def test_display_uses_standard_ome_collection_channels_and_stage_positions(
 
     assert [layer.visible for layer in layers] == [False, False, True, True]
     assert [layer.data.shape for layer in layers] == [(1, 1, 4, 4)] * 4
+    for index, layer in enumerate(layers):
+        np.testing.assert_array_equal(layer.data, np.full((1, 1, 4, 4), 10 + index))
     assert [layer.translate for layer in layers] == [
         (0.0, 1.0, 10.0, 20.0),
         (0.0, 1.0, 10.0, 20.0),
@@ -302,6 +395,7 @@ def test_display_uses_standard_ome_collection_channels_and_stage_positions(
     ]
 
 
+@pytest.mark.integration
 def test_display_configures_single_fused_image_without_collection_open(
     tmp_path: Path,
     monkeypatch,
@@ -340,7 +434,7 @@ def test_display_configures_single_fused_image_without_collection_open(
     )
     layer = SimpleNamespace(
         multiscale=False,
-        data=np.zeros((2, 1, 8, 8), dtype=np.uint16),
+        data=np.stack((np.full((1, 8, 8), 7), np.full((1, 8, 8), 19))),
     )
 
     def fail_collection_open(_path: Path) -> None:
@@ -361,8 +455,10 @@ def test_display_configures_single_fused_image_without_collection_open(
 
     assert collection is None
     assert layer.data.shape == (1, 1, 8, 8)
+    np.testing.assert_array_equal(layer.data, np.full((1, 1, 8, 8), 19))
 
 
+@pytest.mark.unit
 def test_world_roi_maps_to_skewed_scan_x_and_keeps_all_camera_y() -> None:
     """Enclose the diagonal lab-Y preimage without defining a camera-Y crop."""
     bounds = world_roi_to_skewed_bounds(
@@ -390,6 +486,7 @@ def test_world_roi_maps_to_skewed_scan_x_and_keeps_all_camera_y() -> None:
                 assert bounds.scan_start <= scan < bounds.scan_stop
 
 
+@pytest.mark.unit
 def test_registered_tile_origin_is_selected_per_timepoint() -> None:
     """Use registered placement for each timepoint when mapping back to a tile."""
     roi = PhysicalRoi(
@@ -415,6 +512,7 @@ def test_registered_tile_origin_is_selected_per_timepoint() -> None:
     assert roi.tile_origin_yx_um(1, 4, (99.0, 99.0)) == (11.0, 32.0)
 
 
+@pytest.mark.integration
 def test_roi_fusion_keeps_multiple_stage_z_levels_and_crops_only_yx(
     tmp_path: Path,
     monkeypatch,
@@ -483,6 +581,7 @@ def test_roi_fusion_keeps_multiple_stage_z_levels_and_crops_only_yx(
     assert fusion.unpadded_shape == (6, 5, 4)
 
 
+@pytest.mark.integration
 def test_variable_roi_tiles_are_stored_cropped_and_reopened(
     tmp_path: Path,
     monkeypatch,
@@ -496,16 +595,16 @@ def test_variable_roi_tiles_are_stored_cropped_and_reopened(
             "position_index": 7,
             "origin_zyx_um": [0.0, 10.0, 20.0],
             "shape_tczyx": list(shapes[0]),
-            "skewed_shape_syx": [2, 4, 4],
-            "deskew_crop_yx": [0, 4, 0, 4],
+            "skewed_shape_syx": [16, 4, 4],
+            "deskew_crop_yx": [4, 8, 0, 4],
         },
         {
             "time_index": 0,
             "position_index": 8,
             "origin_zyx_um": [0.0, 12.0, 22.0],
             "shape_tczyx": list(shapes[1]),
-            "skewed_shape_syx": [2, 4, 3],
-            "deskew_crop_yx": [2, 7, 0, 3],
+            "skewed_shape_syx": [16, 4, 3],
+            "deskew_crop_yx": [6, 11, 0, 3],
         },
     ]
     collection = create_variable_position_collection(
@@ -519,6 +618,10 @@ def test_variable_roi_tiles_are_stored_cropped_and_reopened(
     )
     collection.arrays[0].write(np.full(shapes[0], 10, dtype=np.uint16)).result()
     collection.arrays[1].write(np.full(shapes[1], 30, dtype=np.uint16)).result()
+    # Z=0 has no valid deskew interpolation; Z=1 is supported throughout
+    # both interior Y crops. Store physically valid synthetic tile data.
+    for array in collection.arrays:
+        array[:, :, 0].write(np.uint16(0)).result()
 
     reopened = open_position_collection(processed_path)
     assert [tuple(array.shape) for array in reopened.arrays] == list(shapes)
@@ -565,6 +668,7 @@ def test_variable_roi_tiles_are_stored_cropped_and_reopened(
         max_workers=1,
         multiscale_factors=(2,),
         chunk_shape_yx=(4, 4),
+        blend_pixels=(0, 0, 0),
     )
     assert fusion._variable_roi_tiles is True
     assert fusion._reuse_registered_roi_placements is False
@@ -585,112 +689,9 @@ def test_variable_roi_tiles_are_stored_cropped_and_reopened(
     assert registration_calls
     fused = np.asarray(fusion.fused_ts.read().result())
     assert fused.shape == (1, 1, 2, 8, 6)
-    assert int(fused.max()) == 30
-
-
-def test_process_roi_defaults_to_deconvolution_and_hands_positions_to_fusion(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    """The command orchestrates deconvolution and one exact fusion selection."""
-    acquisition_path = tmp_path / "sample.ome.zarr"
-    acquisition_path.mkdir()
-    roi_path = tmp_path / "selection.json"
-    PhysicalRoi(
-        bounds_yx_um=(1.0, 3.0, 2.0, 4.0),
-        source_path=tmp_path / "sample_max_z_fused.ome.zarr",
-        grid_origin_yx_um=(0.0, 0.0),
-        pixel_size_yx_um=(1.0, 1.0),
-        position_indices=(7, 3),
-    ).write(roi_path)
-    acquisition = SimpleNamespace(
-        path=acquisition_path,
-        is_2d=False,
-        stage_axis_flips_xyz=(False, True, True),
-    )
-    calls: dict[str, object] = {}
-
-    monkeypatch.setattr(
-        process_roi_module, "inspect_acquisition", lambda _path: acquisition
-    )
-    monkeypatch.setattr(
-        process_roi_module,
-        "validate_registered_max_projection",
-        lambda _path: None,
-    )
-
-    def fake_process_skewed(**kwargs) -> None:
-        calls["process"] = kwargs
-
-    monkeypatch.setattr(process_roi_module, "process_skewed", fake_process_skewed)
-    monkeypatch.setattr(
-        process_roi_module.ProcessingState,
-        "read",
-        lambda _path: SimpleNamespace(
-            roi_series=lambda _output: (
-                {"time_index": 0, "position_index": 3},
-                {"time_index": 0, "position_index": 7},
-            )
-        ),
-    )
-
-    class FakeFusion:
-        def __init__(self, **kwargs) -> None:
-            calls["fusion"] = kwargs
-
-        def run(self) -> None:
-            calls["fusion_ran"] = True
-
-    monkeypatch.setattr(process_roi_module, "TileFusion", FakeFusion)
-    monkeypatch.setattr(
-        process_roi_module,
-        "regenerate_fused_max_projection",
-        lambda source, destination: calls.update(max_z=(source, destination)),
-    )
-
-    process_roi_module.process_roi(acquisition_path, roi_path)
-
-    process_call = calls["process"]
-    assert isinstance(process_call, dict)
-    assert process_call["deconvolve"] is True
-    assert process_call["max_projection"] is False
-    assert process_call["create_fused_max_projection"] is False
-    assert process_call["resume"] is False
-    fusion_call = calls["fusion"]
-    assert isinstance(fusion_call, dict)
-    assert fusion_call["roi_selection"].position_indices == (3, 7)
-    assert calls["fusion_ran"] is True
-    assert calls["max_z"] == (
-        tmp_path / "sample_roi" / "sample_fused.ome.zarr",
-        tmp_path / "sample_roi" / "sample_max_z_fused.ome.zarr",
-    )
-
-
-def test_process_roi_uses_display_default_json_path(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    """Omitting the JSON argument resolves the filename produced by display."""
-    acquisition_path = tmp_path / "sample.ome.zarr"
-    acquisition_path.mkdir()
-    acquisition = SimpleNamespace(
-        path=acquisition_path,
-        is_2d=False,
-        stage_axis_flips_xyz=(False, True, True),
-    )
-    expected_roi_path = tmp_path / "sample_roi.json"
-    seen: dict[str, Path] = {}
-
-    monkeypatch.setattr(
-        process_roi_module, "inspect_acquisition", lambda _path: acquisition
-    )
-
-    def fake_read(path: Path) -> PhysicalRoi:
-        seen["path"] = Path(path)
-        raise RuntimeError("stop after resolving the default")
-
-    monkeypatch.setattr(process_roi_module.PhysicalRoi, "read", fake_read)
-    with np.testing.assert_raises_regex(RuntimeError, "stop after resolving"):
-        process_roi_module.process_roi(acquisition_path)
-
-    assert seen["path"] == expected_roi_path
+    expected = np.zeros((1, 1, 2, 8, 6), np.uint16)
+    expected[..., :4, :4] = 10
+    expected[..., 2:7, 2:5] = 30
+    expected[..., 2:4, 2:4] = 20
+    expected[:, :, 0] = 0
+    np.testing.assert_array_equal(fused, expected)

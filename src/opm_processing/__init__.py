@@ -9,6 +9,6 @@ os.environ.setdefault("NVRTC_OPTIONS", "--std=c++17")
 os.environ.setdefault("CCCL_IGNORE_DEPRECATED_CPP_DIALECT", "1")
 suppress_spurious_cupy_cuda_path_warning()
 
-__version__ = "0.6.0"
+__version__ = "0.2.2"
 __author__ = "Douglas Shepherd"
 __email__ = "douglas.shepherd@asu.edu"

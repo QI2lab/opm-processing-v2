@@ -152,11 +152,12 @@ class ProcessingState:
             "path": key,
             "configuration_sha256": _configuration_fingerprint(configuration),
         }
+        series = [_json_value(item) for item in roi_series]
         outputs = self.document["outputs"]
         existing = outputs.get(key)
         if existing is not None and not overwrite:
             comparable = {name: existing.get(name) for name in expected}
-            if comparable != expected:
+            if comparable != expected or existing.get("roi_series", []) != series:
                 raise ValueError(
                     f"Existing processing run is incompatible with {output_path}"
                 )
@@ -166,7 +167,6 @@ class ProcessingState:
             "completed_tiles": [],
             "zero_channels": [],
         }
-        series = [_json_value(item) for item in roi_series]
         if series:
             record["roi_series"] = series
         outputs[key] = record
@@ -199,6 +199,36 @@ class ProcessingState:
             tuple(map(int, item))
             for item in self.run(output_path).get("zero_channels", ())
         }
+
+    def completed_channels(self, output_path: Path) -> set[tuple[int, int, int]]:
+        """Return durable T/P/C checkpoints; older runs have only tile records."""
+        return {
+            tuple(map(int, item))
+            for item in self.run(output_path).get("completed_channels", ())
+        }
+
+    def complete_channel(
+        self,
+        output_path: Path,
+        time_index: int,
+        position_index: int,
+        channel_index: int,
+        *,
+        is_zero: bool = False,
+    ) -> None:
+        """Atomically checkpoint a channel after its output write completes."""
+        run = self.run(output_path)
+        key = (int(time_index), int(position_index), int(channel_index))
+        completed = self.completed_channels(output_path)
+        completed.add(key)
+        zero = self.zero_channels(output_path)
+        if is_zero:
+            zero.add(key)
+        else:
+            zero.discard(key)
+        run["completed_channels"] = _tile_records(completed)
+        run["zero_channels"] = _tile_records(zero)
+        self.save()
 
     def roi_series(self, output_path: Path) -> tuple[dict[str, Any], ...]:
         """Return the required source and crop mapping for variable ROI series."""

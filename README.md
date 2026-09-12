@@ -60,9 +60,28 @@ uv run display "/path/to/acquisition"
 uv run process-ROI "/path/to/acquisition"
 ```
 
+`process-ROI` resumes by default. Rerun the same command after an interruption:
+completed tiles and channels are skipped, and any channel whose write was not
+checkpointed is processed again. Existing runs with tile-only checkpoints retain
+their completed tiles and repeat the unfinished tile. Resume requires the same
+processing settings and ROI tile mapping; use `--no-resume` to overwrite the ROI
+output and start again.
+
 Both commands default to `<acquisition-stem>_roi.json`. Processing state is kept
 in one `<acquisition-stem>.processing.json` beside the outputs; image stores
 contain only OME/NGFF image metadata.
+
+When processed outputs are stored separately from the raw acquisition, pass
+their directory to `process-ROI`. It reads the raw source path from the single
+`<acquisition-stem>.processing.json` there, loads the ROI JSON from that directory,
+and writes to its `<acquisition-stem>_roi` subdirectory. The raw acquisition must
+still be accessible. You can also specify the raw data, ROI JSON, and destination
+explicitly:
+
+```bash
+uv run process-ROI "/path/to/processed-outputs"
+uv run process-ROI "/path/to/raw.ome.zarr" "/path/to/selection_roi.json" --output "/path/to/roi-output"
+```
 
 See every option and default with:
 

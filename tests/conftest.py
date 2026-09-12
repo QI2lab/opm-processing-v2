@@ -15,6 +15,18 @@ from opm_processing.dataio.position_collection import create_position_collection
 from opm_processing.imageprocessing.opmtools import deskew_shape_estimator
 
 
+def pytest_collection_modifyitems(items):
+    """Require an explicit, unambiguous unit or integration classification."""
+    for item in items:
+        categories = [
+            name for name in ("unit", "integration") if item.get_closest_marker(name)
+        ]
+        if len(categories) != 1:
+            raise pytest.UsageError(
+                f"{item.nodeid} must have exactly one of unit or integration"
+            )
+
+
 @pytest.fixture(scope="module")
 def cupy_gpu():
     """Return CuPy after proving CUDA execution, or honor GPU skip policy.
@@ -853,4 +865,139 @@ def opm_v2_spatial_tiling_ground_truth_zarr(
     return _create_opm_v2_tiled_ground_truth_zarr(
         tmp_path,
         config=_tiled_acquisition_config(str(request.param)),
+    )
+
+
+@pytest.fixture
+def roi_run(tmp_path: Path, monkeypatch):
+    """Build a three-channel acquisition with two selected nonzero positions."""
+    from types import SimpleNamespace
+    from opm_processing import process_roi as roi_command
+    from opm_processing.dataio.acquisition import AcquisitionMetadata, ChannelMetadata
+    from opm_processing.dataio.roi import PhysicalRoi
+    from opm_processing.imageprocessing.opmtools import orthogonal_deskew
+    import importlib
+
+    process = importlib.import_module("opm_processing.process")
+    rlgc = importlib.import_module("opm_processing.imageprocessing.rlgc")
+    source = tmp_path / "sample.ome.zarr"
+    raw = create_position_collection(
+        source,
+        (1, 3, 3, 8, 12, 14),
+        (0.4, 0.115, 0.115),
+        channels=("488nm", "561nm", "637nm"),
+    )
+    for position, array in enumerate(raw.arrays):
+        for channel in range(3):
+            array[0, channel].write(np.uint16(110 + 20 * position + channel)).result()
+    metadata = AcquisitionMetadata(
+        path=source,
+        storage_format="opm-v2-ome-zarr-v3",
+        mode="mirror",
+        axes=("t", "p", "c", "z", "y", "x"),
+        shape=(1, 3, 3, 8, 12, 14),
+        array_paths=("0/0", "1/0", "2/0"),
+        acquisition_order=("t", "p", "z", "c"),
+        channels=tuple(
+            ChannelMetadata(index, f"{wavelength}nm", wavelength, 2.0, 10.0)
+            for index, wavelength in enumerate((488, 561, 637))
+        ),
+        stage_positions_zxy=((0.0, 0.0, 0.0),) * 3,
+        scan_start_positions_xyz=(),
+        scan_end_positions_xyz=(),
+        scan_axis="x",
+        scan_axis_step_um=0.4,
+        pixel_size_um=0.115,
+        angle_deg=30.0,
+        camera_offset=100.0,
+        camera_conversion=1.0,
+        excess_scan_positions=0,
+        excess_scan_start_positions=0,
+        excess_scan_end_positions=0,
+        orientations=(),
+        sidecar_paths=(),
+    )
+    roi = PhysicalRoi(
+        bounds_yx_um=(0.23, 2.3, 0.23, 1.38),
+        source_path=tmp_path / "sample_max_z_fused.ome.zarr",
+        grid_origin_yx_um=(0.0, 0.0),
+        pixel_size_yx_um=(0.115, 0.115),
+        position_indices=(1, 2),
+        tile_footprints=tuple(
+            {
+                "time_index": 0,
+                "position_index": position,
+                "origin_zyx_um": [0.0, 0.0, 0.0],
+                "bounds_yx_um": [0.0, 4.0, 0.0, 1.61],
+            }
+            for position in (1, 2)
+        ),
+    )
+    roi_path = roi.write(tmp_path / "sample_roi.json")
+
+    def inspect_source(path):
+        if Path(path) in (source, source.parent):
+            return metadata
+        raise ValueError("Directory does not contain a raw acquisition")
+
+    monkeypatch.setattr(roi_command, "inspect_acquisition", inspect_source)
+    monkeypatch.setattr(
+        roi_command, "validate_registered_max_projection", lambda path: path
+    )
+    monkeypatch.setattr(
+        roi_command, "TileFusion", lambda **kwargs: SimpleNamespace(run=lambda: None)
+    )
+    monkeypatch.setattr(
+        roi_command, "regenerate_fused_max_projection", lambda *args: None
+    )
+    monkeypatch.setattr(
+        process, "generate_skewed_psf", lambda **kwargs: np.ones((1, 1, 1), np.float32)
+    )
+    monkeypatch.setattr(
+        rlgc,
+        "RlgcChunkState",
+        lambda *args: SimpleNamespace(
+            determine_once=lambda *args, **kwargs: 8,
+            remember_successful_crop=lambda *args: None,
+        ),
+    )
+    decon_calls = []
+
+    def deconvolve(image, psf, **kwargs):
+        decon_calls.append(float(np.max(image)))
+        return image.copy()
+
+    monkeypatch.setattr(rlgc, "chunked_rlgc", deconvolve)
+    return SimpleNamespace(
+        process=process,
+        source=source,
+        metadata=metadata,
+        raw=raw,
+        roi=roi,
+        roi_path=roi_path,
+        output_dir=tmp_path / "sample_roi",
+        decon_calls=decon_calls,
+        expected_tiles=tuple(
+            np.stack(
+                [
+                    orthogonal_deskew(
+                        np.full((8, 12, 14), 10 + 20 * position + channel, np.float32),
+                        distance=0.4,
+                        pixel_size=0.115,
+                        downsample_factor=2,
+                    )[:, 2:20, 2:12]
+                    for channel in range(3)
+                ]
+            )[None].astype(np.uint16)
+            for position in (1, 2)
+        ),
+        overwritten_tile=np.broadcast_to(
+            orthogonal_deskew(
+                np.full((8, 12, 14), 800, np.float32),
+                distance=0.4,
+                pixel_size=0.115,
+                downsample_factor=2,
+            )[None, None, :, 2:20, 2:12],
+            (1, 3, 3, 18, 10),
+        ).astype(np.uint16),
     )
