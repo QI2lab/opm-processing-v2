@@ -814,7 +814,7 @@ class TileFusion:
         chunk_shape_yx: tuple[int, int] = (1024, 1024),
         optimization_rel_threshold: float = 0.5,
         optimization_abs_threshold: float = 1.5,
-        max_registration_shift_zyx: tuple[int, int, int] = (20, 50, 100),
+        max_registration_shift_zyx: tuple[int, int, int] = (20, 100, 100),
         reverse_stage_y: bool = True,
         reverse_stage_z: bool | None = None,
         roi_selection: PhysicalRoi | None = None,
@@ -1281,6 +1281,10 @@ class TileFusion:
             raise ValueError(
                 "Acquisition metadata lacks the deskew geometry parameters"
             ) from error
+        reconstruction = self.processing_state.run(self.data).get("reconstruction")
+        if reconstruction is not None:
+            scan_count, raw_camera_y, _ = map(int, reconstruction["shape_syx"])
+            scan_step_um = float(reconstruction["scan_axis_step_um"])
         z_downsample = int(round(float(self._pixel_size[0]) / raw_pixel_size_um))
         if z_downsample < 1:
             raise ValueError("Deskew Z downsampling must be positive")
@@ -1847,6 +1851,7 @@ class TileFusion:
                     tuple[int, int, int, float],
                 ] = {}
                 candidate_scores: dict[tuple[int, int], float] = {}
+                rejected_shifts: list[tuple[int, int, int]] = []
                 pair_specs = []
                 input_itemsize = int(
                     np.dtype(self.position_arrays[0].dtype.numpy_dtype).itemsize
@@ -2082,6 +2087,7 @@ class TileFusion:
                         or abs(dy_s) > max_shift[1]
                         or abs(dx_s) > max_shift[2]
                     ):
+                        rejected_shifts.append((dz_s, dy_s, dx_s))
                         if self._debug:
                             print(
                                 "Dropping link (%d, %d) shift=%s exceeds max=%s",
@@ -2104,6 +2110,18 @@ class TileFusion:
                     pending_read_bytes -= int(pair_bytes)
                     fill_read_ahead()
                 progress.close()
+                if rejected_shifts:
+                    largest = tuple(
+                        int(value)
+                        for value in np.max(np.abs(rejected_shifts), axis=0)
+                    )
+                    print(
+                        f"Registration warning: {len(rejected_shifts)} pairs at "
+                        f"time index {t} exceeded the ZYX shift limits "
+                        f"{self.max_registration_shift_zyx} pixels; largest "
+                        f"measured absolute corrections were {largest}. "
+                        "Check --max-registration-shift-zyx if tiles remain misaligned."
+                    )
                 if self._debug:
                     print(
                         "Registration source cache: TensorStore native LRU, "
@@ -2370,6 +2388,41 @@ class TileFusion:
 
             self.global_offsets[list(tile_indices), :] = d_opt
 
+    def report_registration_connectivity(self) -> None:
+        """Report overlapping tiles left in separate registration components."""
+        for time_index, tile_indices in enumerate(self._tiles_by_time):
+            parent = {index: index for index in tile_indices}
+
+            def find(index: int) -> int:
+                while parent[index] != index:
+                    parent[index] = parent[parent[index]]
+                    index = parent[index]
+                return index
+
+            for left, right in self.pairwise_metrics:
+                if left in parent and right in parent:
+                    parent[find(right)] = find(left)
+            overlapping = _select_registration_pairs(
+                [self._tile_positions[index] for index in tile_indices],
+                [self._tile_shapes[index] for index in tile_indices],
+                self._pixel_size,
+                is_2d=self._is_2d,
+            )
+            disconnected = [
+                (tile_indices[left], tile_indices[right])
+                for left, right in overlapping
+                if find(tile_indices[left]) != find(tile_indices[right])
+            ]
+            if disconnected:
+                components = len({find(index) for pair in disconnected for index in pair})
+                print(
+                    f"Registration warning: overlapping tiles at time index "
+                    f"{time_index} remain in {components} disconnected components. "
+                    "Fusion will retain stage placement between those components; "
+                    "they are not mutually registered. Check the registration "
+                    "channel, threshold, and --max-registration-shift-zyx."
+                )
+
     def save_pairwise_metrics(self) -> None:
         """Persist pairwise links in the acquisition processing state."""
         self.processing_state.save_registration(
@@ -2421,7 +2474,7 @@ class TileFusion:
             "channel_index": self.channel_to_use,
             "stage_y_reversed": self.reverse_stage_y,
             "stage_z_reversed_to_lab": self.reverse_stage_z,
-            "stage_z_to_image_y": "signed-relative-cotangent-opm-angle-v2",
+            "stage_z_to_image_y": "none-orthogonal-stage-placement-v3",
             "pair_selection": "all-thick-overlaps-nearest-thin-z-overlaps-v2",
             "acceptance": "threshold-only-no-forced-bridges-v2",
             "overlap_roi": "full-physical-overlap-main-v1",
@@ -3305,6 +3358,7 @@ class TileFusion:
                 rel_thresh=self.optimization_rel_threshold,
                 abs_thresh=self.optimization_abs_threshold,
             )
+            self.report_registration_connectivity()
 
         gc.collect()
         if USING_GPU and cp is not None:

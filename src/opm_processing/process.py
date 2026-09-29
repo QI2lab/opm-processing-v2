@@ -20,6 +20,7 @@ warnings.simplefilter("ignore", category=FutureWarning)
 import hashlib
 import math
 import time
+import traceback
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -77,6 +78,61 @@ app = typer.Typer()
 app.pretty_exceptions_enable = False
 
 PROCESS_MAX_Z_FACTORS_YX = (2, 4, 8, 16, 32)
+
+
+def _progress_tile_groups(tiles, requested_tiles, completed_tiles, acquisition_order):
+    """Report completed acquisition groups using the recorded outer axis."""
+    axis = next((axis for axis in acquisition_order if axis in ("t", "p")), None)
+    description, unit = {
+        "t": ("time", "timepoint"),
+        "p": ("positions", "position"),
+        None: ("volumes", "volume"),
+    }[axis]
+
+    def group_key(tile):
+        return tile[0] if axis == "t" else tile[1] if axis == "p" else tile
+
+    requested = set(requested_tiles)
+    pending = requested - set(completed_tiles)
+    total_groups = len({group_key(tile) for tile in requested})
+    remaining = {}
+    for tile in pending:
+        key = group_key(tile)
+        remaining[key] = remaining.get(key, 0) + 1
+    with tqdm(
+        total=total_groups,
+        initial=total_groups - len(remaining),
+        desc=description,
+        unit=unit,
+    ) as progress:
+        for time_index, position_index in tiles:
+            yield time_index, (position_index,)
+            # Resume after the caller has processed and checkpointed this
+            # volume. A timepoint may contain several selected positions.
+            tile = (time_index, position_index)
+            if tile in pending:
+                pending.remove(tile)
+                key = group_key(tile)
+                remaining[key] -= 1
+                if remaining[key] == 0:
+                    progress.update(1)
+
+
+def _psf_wavelength_um(channel: str) -> float:
+    """Use the longest wavelength in a single or combined laser channel label."""
+    try:
+        wavelengths_nm = [
+            float(part.strip().lower().removesuffix("nm").strip())
+            for part in str(channel).split("+")
+        ]
+        if not all(math.isfinite(value) and value > 0 for value in wavelengths_nm):
+            raise ValueError("Wavelengths must be finite and positive")
+    except ValueError as error:
+        raise ValueError(
+            f"Cannot determine a PSF wavelength from channel {channel!r}; "
+            "supply --decon-psf-paths for channels without wavelength labels"
+        ) from error
+    return max(wavelengths_nm) / 1000
 
 
 def _resolve_output_directory(root_path: Path, output: Path | None) -> Path:
@@ -920,6 +976,19 @@ def process(
     decon_verbose: int = 1,
     decon_fallback_step_scan: int | None = None,
     decon_psf_paths: list[Path] | None = None,
+    decon_scan_upsample: Annotated[
+        int | None,
+        typer.Option(
+            "--decon-scan-upsample",
+            min=1,
+            help=(
+                "Opt into experimental undersampled RLGC with this integer scan "
+                "upsampling factor. Requires --deconvolve and a 3D scan. "
+                "Uses a full volume on the GPU; supplied PSFs must use the finer "
+                "scan spacing."
+            ),
+        ),
+    ] = None,
     resume: Annotated[
         bool,
         typer.Option(
@@ -973,6 +1042,9 @@ def process(
         Without this flag, existing processed outputs are overwritten.
     deconvolve: bool, default = False
         Deconvolve the data using RLGC.
+    decon_scan_upsample: int or None, default = None
+        Select experimental RLGC at acquired scan spacing divided by this
+        integer factor. Requires deconvolution; no scan chunking is supported.
     save_float32: bool, default = False
         Save calibrated processing products as float32 instead of uint16.
     skip_empty_below: float or None, default = None
@@ -1025,6 +1097,17 @@ def process(
         skip_empty_min_signal_fraction,
     )
 
+    if decon_scan_upsample is not None:
+        if not deconvolve:
+            raise typer.BadParameter("--decon-scan-upsample requires --deconvolve")
+        if decon_scan_upsample < 1 or int(decon_scan_upsample) != decon_scan_upsample:
+            raise typer.BadParameter("--decon-scan-upsample must be a positive integer")
+        if decon_crop_scan is not None or decon_fallback_step_scan is not None:
+            raise typer.BadParameter(
+                "Experimental undersampled RLGC uses a full GPU volume; "
+                "--decon-crop-scan and --decon-fallback-step-scan are unsupported"
+            )
+
     if live is not None:
         if flatfield_correction:
             raise ValueError(
@@ -1060,6 +1143,7 @@ def process(
             decon_verbose=decon_verbose,
             decon_fallback_step_scan=decon_fallback_step_scan,
             decon_psf_paths=decon_psf_paths,
+            decon_scan_upsample=decon_scan_upsample,
             illumination_path=live,
             live_manifest=live_manifest,
             live_log_path=live_log_path,
@@ -1099,6 +1183,8 @@ def process(
         "resume": resume,
     }
     if acquisition.is_2d or "projection" in opm_mode:
+        if decon_scan_upsample is not None:
+            raise typer.BadParameter("--decon-scan-upsample requires a 3D mirror or stage scan")
         process_projection(
             **common,
             eager_deconvolution=eager_mode,
@@ -1106,6 +1192,7 @@ def process(
     elif "mirror" in opm_mode or "stage" in opm_mode:
         process_skewed(
             **common,
+            decon_scan_upsample=decon_scan_upsample,
             max_projection=max_projection,
             create_fused_max_projection=create_fused_max_projection,
             z_downsample_level=z_downsample_level,
@@ -1141,6 +1228,7 @@ def process_skewed(
     live_log_path: Path | None = None,
     roi_selection: PhysicalRoi | None = None,
     resume: bool = False,
+    decon_scan_upsample: int | None = None,
 ):
     """Postprocess qi2lab OPM dataset.
 
@@ -1215,6 +1303,11 @@ def process_skewed(
         raise ValueError(
             "A 2D acquisition must use projection processing and cannot be deskewed"
         )
+    if decon_scan_upsample is not None:
+        if not deconvolve or decon_scan_upsample < 1 or int(decon_scan_upsample) != decon_scan_upsample:
+            raise ValueError("decon_scan_upsample requires deconvolution and a positive integer")
+        if roi_selection is not None or decon_crop_scan is not None or decon_fallback_step_scan is not None:
+            raise ValueError("Experimental undersampled RLGC does not yet support ROI or scan chunking")
     # Fusion consumes the per-position maximum-projection datastore.  Treat
     # --no-max-projection as disabling that dependent output as well instead of
     # trying to open a datastore that was intentionally never created.
@@ -1225,13 +1318,15 @@ def process_skewed(
         skip_empty_below,
         skip_empty_min_signal_fraction,
     )
-    if deconvolve:
+    if deconvolve and decon_scan_upsample is None:
         from opm_processing.imageprocessing.rlgc import (
             RlgcChunkState,
             chunked_rlgc,
         )
 
         decon_chunk_state = RlgcChunkState(decon_crop_scan)
+    elif deconvolve:
+        from opm_processing.imageprocessing.rlgc_undersampled import rlgc_undersampled
 
     output_dir = _resolve_output_directory(root_path, output_dir)
 
@@ -1240,6 +1335,13 @@ def process_skewed(
     if acquisition.scan_axis_step_um is None:
         raise ValueError("Acquisition metadata lacks a scan-axis step")
     scan_axis_step_um = acquisition.scan_axis_step_um
+    reconstruction_step_um = scan_axis_step_um / (decon_scan_upsample or 1)
+    if decon_scan_upsample is not None:
+        print(
+            f"Experimental undersampled RLGC: factor={decon_scan_upsample}, "
+            f"acquired step={scan_axis_step_um:g} um, "
+            f"reconstruction step={reconstruction_step_um:g} um (full GPU volume)"
+        )
     excess_scan_positions = (
         acquisition.excess_scan_start_positions or acquisition.excess_scan_positions
     )
@@ -1279,9 +1381,9 @@ def process_skewed(
         else:
             psfs = [
                 generate_skewed_psf(
-                    em_wvl=float(int(str(channel).rstrip("nm")) / 1000),
+                    em_wvl=_psf_wavelength_um(channel),
                     pixel_size_um=pixel_size_um,
-                    scan_axis_step_um=scan_axis_step_um,
+                    scan_axis_step_um=reconstruction_step_um,
                     theta_deg=opm_tilt_deg,
                     pz=0.0,
                     plot=False,
@@ -1300,10 +1402,15 @@ def process_skewed(
         datastore.shape[-2],
         datastore.shape[-1],
     )
+    if decon_scan_upsample is not None:
+        deskew_input_shape = (
+            (deskew_input_shape[0] - 1) * decon_scan_upsample + 1,
+            *deskew_input_shape[1:],
+        )
     deskewed_shape, _pad_y, _pad_x, crop_y = deskew_shape_estimator(
         deskew_input_shape,
         theta=opm_tilt_deg,
-        distance=scan_axis_step_um,
+        distance=reconstruction_step_um,
         pixel_size=pixel_size_um,
         crop_after_deskew=crop_after_deskew,
     )
@@ -1461,6 +1568,15 @@ def process_skewed(
             }
         ),
     }
+    if decon_scan_upsample is not None:
+        processing_configuration["deconvolution"].update(
+            backend="rlgc_undersampled",
+            scan_upsample_factor=int(decon_scan_upsample),
+        )
+        processing_configuration["reconstruction"] = {
+            "shape_syx": tuple(int(size) for size in deskew_input_shape),
+            "scan_axis_step_um": float(reconstruction_step_um),
+        }
     roi_series = tuple(
         {
             key: plan[key]
@@ -1654,20 +1770,21 @@ def process_skewed(
                 "Resuming live processing with "
                 f"{len(completed_live_tiles)} of {live_tile_count} tiles complete."
             )
-        live_progress_description = "p" if live_timepoints == 1 else "tiles"
-        live_tiles = tqdm(
+        tile_groups = _progress_tile_groups(
             iter_live_tiles(
                 readiness,
                 live_manifest,
                 live_log_path,
                 completed_tiles=completed_live_tiles,
             ),
-            total=live_tile_count,
-            initial=len(completed_live_tiles),
-            desc=live_progress_description,
-            unit="tile",
+            (
+                (time_index, position_index)
+                for time_index in range(live_timepoints)
+                for position_index in range(live_positions)
+            ),
+            completed_live_tiles,
+            live_manifest.acquisition_order,
         )
-        tile_groups = ((t_idx, (pos_idx,)) for t_idx, pos_idx in live_tiles)
     else:
         completed_tiles = processing_state.completed_tiles(output_path)
         if max_projection:
@@ -1701,14 +1818,12 @@ def process_skewed(
         remaining_tiles = (
             tile for tile in requested_tiles if tile not in completed_requested_tiles
         )
-        offline_tiles = tqdm(
+        tile_groups = _progress_tile_groups(
             remaining_tiles,
-            total=len(requested_tiles),
-            initial=len(completed_requested_tiles),
-            desc="tiles",
-            unit="tile",
+            requested_tiles,
+            completed_requested_tiles,
+            acquisition.acquisition_order,
         )
-        tile_groups = ((t_idx, (pos_idx,)) for t_idx, pos_idx in offline_tiles)
 
     wrote_tile = False
     zero_channels = processing_state.zero_channels(output_path)
@@ -1905,22 +2020,30 @@ def process_skewed(
                         decon_input = camera_corrected_data[
                             excess_scan_positions:, :, :
                         ]
-                    effective_crop_scan = decon_chunk_state.determine_once(
-                        tuple(int(size) for size in decon_input.shape),
-                        [tuple(int(size) for size in psf.shape) for psf in psfs],
-                        gpu_id=decon_gpu_id,
-                    )
-                    deconvolved_data = chunked_rlgc(
-                        decon_input,
-                        np.asarray(psfs[chan_idx]),
-                        crop_scan=effective_crop_scan,
-                        gpu_id=decon_gpu_id,
-                        verbose=decon_verbose,
-                        fallback_step_scan=decon_fallback_step_scan,
-                        on_successful_crop_scan=(
-                            decon_chunk_state.remember_successful_crop
-                        ),
-                    )
+                    if decon_scan_upsample is not None:
+                        deconvolved_data = rlgc_undersampled(
+                            decon_input,
+                            np.asarray(psfs[chan_idx]),
+                            scan_upsample_factor=decon_scan_upsample,
+                            gpu_id=decon_gpu_id,
+                        )
+                    else:
+                        effective_crop_scan = decon_chunk_state.determine_once(
+                            tuple(int(size) for size in decon_input.shape),
+                            [tuple(int(size) for size in psf.shape) for psf in psfs],
+                            gpu_id=decon_gpu_id,
+                        )
+                        deconvolved_data = chunked_rlgc(
+                            decon_input,
+                            np.asarray(psfs[chan_idx]),
+                            crop_scan=effective_crop_scan,
+                            gpu_id=decon_gpu_id,
+                            verbose=decon_verbose,
+                            fallback_step_scan=decon_fallback_step_scan,
+                            on_successful_crop_scan=(
+                                decon_chunk_state.remember_successful_crop
+                            ),
+                        )
                     deconvolved_data = _require_float32(
                         deconvolved_data,
                         "deconvolution",
@@ -1928,7 +2051,7 @@ def process_skewed(
                     deskewed = orthogonal_deskew(
                         deconvolved_data,
                         theta=opm_tilt_deg,
-                        distance=scan_axis_step_um,
+                        distance=reconstruction_step_um,
                         pixel_size=pixel_size_um,
                         downsample_factor=z_downsample_level,
                     )
@@ -2229,7 +2352,7 @@ def process_projection(
         else:
             psfs = [
                 generate_proj_psf(
-                    em_wvl=float(int(str(channel).rstrip("nm")) / 1000),
+                    em_wvl=_psf_wavelength_um(channel),
                     pixel_size_um=pixel_size_um,
                 )
                 for channel in tqdm(channels, desc="PSFs", unit="PSF")
@@ -2559,13 +2682,13 @@ def run_estimate_illuminations(
     None
         No value is returned.
     """
-    from opm_processing.cuda import preload_cuda_libraries
-
-    preload_cuda_libraries()
-
-    from opm_processing.imageprocessing.flatfield import estimate_illuminations
-
     try:
+        from opm_processing.cuda import preload_cuda_libraries
+
+        preload_cuda_libraries()
+
+        from opm_processing.imageprocessing.flatfield import estimate_illuminations
+
         flatfields = estimate_illuminations(
             datastore,
             camera_offset,
@@ -2576,6 +2699,7 @@ def run_estimate_illuminations(
         )
         conn.send(flatfields)
     except Exception as e:
+        e.add_note("Flatfield worker traceback:\n" + traceback.format_exc())
         conn.send(e)
     finally:
         conn.close()
@@ -2622,8 +2746,19 @@ def call_estimate_illuminations(
         ),
     )
     p.start()
-    result = parent_conn.recv()
-    p.join()
+    child_conn.close()
+    try:
+        try:
+            result = parent_conn.recv()
+        except EOFError as error:
+            p.join()
+            raise RuntimeError(
+                f"Flatfield estimation subprocess exited without a result "
+                f"(exit code {p.exitcode})"
+            ) from error
+    finally:
+        parent_conn.close()
+        p.join()
 
     if p.exitcode != 0:
         raise RuntimeError("Subprocess failed")

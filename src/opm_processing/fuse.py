@@ -62,7 +62,7 @@ def register_and_fuse(
     max_in_flight_writes: int = 2,
     optimization_rel_threshold: float = 0.5,
     optimization_abs_threshold: float = 1.5,
-    max_registration_shift_zyx: tuple[int, int, int] = (20, 50, 100),
+    max_registration_shift_zyx: tuple[int, int, int] = (20, 100, 100),
     require_gpu: bool = False,
     regenerate_max_z: Annotated[
         bool,

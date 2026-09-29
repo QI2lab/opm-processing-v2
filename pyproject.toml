@@ -56,6 +56,9 @@ dependencies = [
     "typer",
     "yaozarrs[io,write-tensorstore] @ git+https://github.com/dpshepherd/yaozarrs.git@fix-v3-extra-attributes-location",
     "zarr>3.0.8",
+    "napari-animation>=0.0.10",
+    "pynvvideocodec>=2.2.3 ; sys_platform == 'linux' or sys_platform == 'win32'",
+    "imageio-ffmpeg>=0.6",
 ]
 
 [project.optional-dependencies]
@@ -78,9 +81,11 @@ name = "nvidia"
 url = "https://pypi.nvidia.com"
 
 [tool.uv]
-default-groups = []
+default-groups = ["gpu"]
 
 [dependency-groups]
+# Keep the GPU extra selected during ordinary sync/run on CUDA workstations.
+gpu = ["opm-processing-v2[gpu]; sys_platform == 'win32' or sys_platform == 'linux'"]
 dev = [
     "ipython",
     "pdbpp",  # https://github.com/pdbpp/pdbpp
@@ -103,6 +108,8 @@ process-ROI = "opm_processing.process_roi:main"
 inspect-opm = "opm_processing.dataio.acquisition:main"
 convert-timelapse = "opm_processing.dataio.convert_timelapse_data:app"
 display = "opm_processing.display:main"
+export-projections = "opm_processing.export_projections:main"
+encode-projections = "opm_processing.encode_projections:main"
 fuse = "opm_processing.fuse:main"
 
 # [project.entry-points."some.group"]

@@ -379,6 +379,57 @@ def test_flatfield_sample_loading_applies_detector_calibration():
 
 
 @pytest.mark.integration
+def test_single_tile_depth_fields_recover_known_illumination():
+    """Fit separate depth fields from scan planes with the real BaSiC solver."""
+    rng = np.random.default_rng(37)
+    height, width = 32, 64
+    yy, xx = np.meshgrid(
+        np.linspace(-1, 1, height), np.linspace(-1, 1, width), indexing="ij"
+    )
+    fields = np.stack((1 + 0.25 * xx + 0.1 * yy, 1 - 0.2 * xx + 0.15 * yy))
+    specimen = rng.uniform(750, 1250, (2, 12, height, width))
+    raw = np.rint(specimen * fields[:, None] / 0.25 + 100).astype(np.uint16)
+    estimated = estimate_illuminations(
+        ts.array(raw[None, :, None]),
+        camera_offset=100.0,
+        camera_conversion=0.25,
+        stage_positions_zxy=np.asarray(((10, 20, 30), (0, 20, 30))),
+    )
+    assert estimated.shape == (2, 1, height, width)
+    assert np.all(np.isfinite(estimated))
+    assert np.all(estimated > 0)
+    for depth in range(2):
+        assert (
+            np.corrcoef(estimated[depth, 0].ravel(), fields[depth].ravel())[0, 1] > 0.95
+        )
+        calibrated = (raw[depth].astype(float) - 100) * 0.25
+        corrected = calibrated / estimated[depth, 0]
+        before = np.mean(np.abs(calibrated - specimen[depth]))
+        after = np.mean(np.abs(corrected - specimen[depth]))
+        assert after < 0.35 * before
+
+
+@pytest.mark.integration
+def test_flatfield_worker_preserves_error_and_original_traceback():
+    """A one-image input fails clearly and carries its subprocess traceback."""
+    from opm_processing.process import call_estimate_illuminations
+
+    with pytest.raises(ValueError, match="at least two sampled images") as error:
+        call_estimate_illuminations(
+            ts.array(np.ones((1, 1, 1, 1, 16, 32), dtype=np.uint16)),
+            0.0,
+            1.0,
+            np.asarray(((0, 0, 0),)),
+            False,
+            None,
+        )
+    notes = "\n".join(error.value.__notes__)
+    assert "Flatfield worker traceback:" in notes
+    assert "estimate_illuminations" in notes
+    assert "flatfield.py" in notes
+
+
+@pytest.mark.integration
 def test_flatfield_correction_recovers_multitile_multichannel_truth():
     """Recover known rectangular illumination fields from a tiled scan."""
     rng = np.random.default_rng(7)

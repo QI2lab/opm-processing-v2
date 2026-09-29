@@ -182,7 +182,9 @@ def _tiled_acquisition_config(
             ((0, 0, 0), (1, 0, 0), (1, 0, 0)),
         ),
         "thin_z_staggered": (
-            ((0, 0, 0), (11, 0, 0), (22, 0, 0)),
+            # Explicit Y moves keep the thin overlap's oblique support aligned.
+            # These lab origins previously came from the erroneous Z-to-Y shear.
+            ((0, 0, 0), (11, 19, 0), (22, 38, 0)),
             ((0, 0, 0), (0, 0, 2), (0, 0, 2)),
         ),
         "yx_grid_z_staggered": (
@@ -596,9 +598,9 @@ def _create_opm_v2_tiled_ground_truth_zarr(
     theta_deg = config.theta_deg
     camera_shape = config.camera_shape_zyx
     true_stage_offsets = np.asarray(config.tile_offsets_zyx_px, dtype=np.float64)
-    true_image_offsets = true_stage_offsets.copy()
-    true_image_offsets[:, 1] += true_stage_offsets[:, 0] / np.tan(np.deg2rad(theta_deg))
-    true_image_offsets = np.rint(true_image_offsets).astype(np.int64)
+    # Stage translations are orthogonal; the camera-plane tilt is modeled
+    # below when sampling each tile, not by shearing its laboratory origin.
+    true_image_offsets = np.rint(true_stage_offsets).astype(np.int64)
     excess_scan_positions = 1 if mode == "stage" else 0
     stored_scan_count = camera_shape[0] + excess_scan_positions
     shape = (
@@ -832,16 +834,24 @@ def opm_v2_tiled_ground_truth_zarr(request, tmp_path) -> OpmV2TiledGroundTruthFi
 
 @pytest.fixture(
     params=(
-        "yx_grid",
-        "z_staggered",
-        "thin_z_staggered",
-        "yx_grid_z_staggered",
+        ("yx_grid", "mirror"),
+        ("z_staggered", "mirror"),
+        ("thin_z_staggered", "mirror"),
+        ("yx_grid_z_staggered", "mirror"),
+        ("yx_grid", "stage"),
+        ("z_staggered", "stage"),
+        ("thin_z_staggered", "stage"),
+        ("yx_grid_z_staggered", "stage"),
     ),
     ids=(
         "yx-grid",
         "z-staggered",
         "thin-z-staggered",
         "yx-grid-z-staggered",
+        "stage-yx-grid",
+        "stage-z-staggered",
+        "stage-thin-z-staggered",
+        "stage-yx-grid-z-staggered",
     ),
 )
 def opm_v2_spatial_tiling_ground_truth_zarr(
@@ -862,9 +872,10 @@ def opm_v2_spatial_tiling_ground_truth_zarr(
     OpmV2TiledGroundTruthFixture
         Result produced by the callable.
     """
+    configuration, mode = request.param
     return _create_opm_v2_tiled_ground_truth_zarr(
         tmp_path,
-        config=_tiled_acquisition_config(str(request.param)),
+        config=_tiled_acquisition_config(configuration, mode=mode),
     )
 
 

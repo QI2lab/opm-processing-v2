@@ -268,12 +268,27 @@ def estimate_illuminations(
                 (selected_positions[group_position], scan_indices)
                 for group_position, scan_indices in samples_per_position
             ]
-            n_fit_images = len(sample_indices)
+            # One tile per depth is common for Z-only acquisitions. Collapsing
+            # its scan planes to one median leaves BaSiC without independent
+            # observations (and its baseline becomes a scalar). Keep the scan
+            # planes as samples in this case; retain tile summaries for mosaics.
+            single_tile = len(sample_indices) == 1
+            n_fit_images = (
+                len(sample_indices[0][1]) if single_tile else len(sample_indices)
+            )
+            if n_fit_images < 2:
+                raise ValueError(
+                    "Flatfield estimation requires at least two sampled images "
+                    f"at depth {stage_level_index}, channel {chan_idx}; "
+                    "only one tile with one scan plane is available."
+                )
             fit_images = np.empty(
                 (n_fit_images, *working_shape),
                 dtype=np.float32,
             )
-            calibration_images = np.empty_like(fit_images)
+            calibration_images = np.empty(
+                (len(sample_indices), *working_shape), dtype=np.float32
+            )
             for image_index, (pos_idx, scan_indices) in enumerate(sample_indices):
                 temp_images = _camera_corrected_images(
                     datastore[0, pos_idx, chan_idx, scan_indices, :, :],
@@ -282,7 +297,10 @@ def estimate_illuminations(
                     apply_stage_scan_gain=apply_stage_scan_gain,
                 )
                 resized = _resize_image_stack(temp_images, working_shape)
-                fit_images[image_index] = np.median(resized, axis=0)
+                if single_tile:
+                    fit_images[:] = resized
+                else:
+                    fit_images[image_index] = np.median(resized, axis=0)
                 calibration_images[image_index] = np.percentile(
                     resized,
                     75,

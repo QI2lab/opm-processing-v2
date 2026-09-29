@@ -1,7 +1,6 @@
 """Coordinate transforms shared by projection and volumetric tile fusion."""
 
 from collections.abc import Sequence
-import math
 
 import numpy as np
 
@@ -56,8 +55,9 @@ def stage_positions_to_image_coordinates(
         Whether to convert physical stage Z into the opposite laboratory-Z
         placement coordinate. Ignored for two-dimensional YX positions.
     opm_angle_deg
-        OPM illumination angle used to map relative stage Z motion into the
-        orthogonally deskewed image-Y coordinate. Requires ZYX positions.
+        Retained for compatibility. The illumination angle affects deskewing,
+        not placement of the resulting orthogonal tiles. Stage Z motion must
+        not introduce an additional image-Y translation.
 
     Returns
     -------
@@ -75,13 +75,6 @@ def stage_positions_to_image_coordinates(
         coordinates[:, -2] *= -1.0
     if reverse_z and coordinates.shape[1] == 3:
         coordinates[:, 0] *= -1.0
-    if opm_angle_deg is not None:
-        if coordinates.shape[1] != 3:
-            raise ValueError("OPM Z-to-Y placement requires ZYX stage positions")
-        angle_rad = math.radians(float(opm_angle_deg))
-        tangent = math.tan(angle_rad)
-        if not math.isfinite(tangent) or abs(tangent) < 1e-12:
-            raise ValueError("OPM angle must have a finite nonzero tangent")
-        relative_z = coordinates[:, 0] - coordinates[0, 0]
-        coordinates[:, 1] += relative_z / tangent
+    # Deskewing already maps the oblique camera planes into orthogonal XYZ.
+    # Applying a Z-dependent Y shear here would shear the tile origins again.
     return coordinates

@@ -169,6 +169,10 @@ class ProcessingState:
         }
         if series:
             record["roi_series"] = series
+        if "reconstruction" in configuration:
+            # Fusion needs the effective deskew input geometry when a solver
+            # reconstructs additional scan planes. Keep raw metadata intact.
+            record["reconstruction"] = _json_value(configuration["reconstruction"])
         outputs[key] = record
         self.document["registration"].pop(key, None)
         self.save()

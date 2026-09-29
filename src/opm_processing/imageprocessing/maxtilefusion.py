@@ -289,7 +289,7 @@ class MaxTileFusion:
     tensorstore_path : str or Path
         Path to the input TensorStore dataset.
     tile_positions : list of tuple of float
-        List of (y, x) coordinates representing tile positions.
+        List of physical YX or ZYX stage coordinates representing tile positions.
     output_path : Path
         Path to the output TensorStore dataset.
     pixel_size : tuple of float
@@ -299,7 +299,7 @@ class MaxTileFusion:
         pixels. OPM stage motion is opposite image Y.
     reverse_stage_z : bool, default=True
         Convert physical stage Z into the opposite laboratory-Z placement
-        coordinate before calculating its image-Y contribution.
+        coordinate. This does not affect the projection's XY placement.
     pad_yx : list of int, default  = [0, 0].
         Padding in y and x dimensions already applied to the dataset
     time_range: list of int, default = None
@@ -329,7 +329,7 @@ class MaxTileFusion:
         ts_dataset
             Per-position TensorStore arrays to fuse.
         tile_positions
-            Physical YX position of each tile.
+            Physical YX or ZYX position of each tile. Z does not change XY placement.
         output_path
             Destination for the fused image.
         pixel_size
@@ -355,8 +355,8 @@ class MaxTileFusion:
             Whether to reverse physical stage Z for laboratory-coordinate
             placement. Tile pixels and the acquired scan axis are not modified.
         opm_angle_deg
-            OPM angle used to map relative stage Z into deskewed image Y when
-            `tile_positions` contains ZYX coordinates.
+            Retained for compatibility. Deskewed tile placement is independent
+            of the OPM angle.
 
         Returns
         -------

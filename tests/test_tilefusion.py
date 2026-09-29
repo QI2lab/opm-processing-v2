@@ -1,10 +1,12 @@
 """Numerical unit and storage integration tests for tile fusion."""
 
 from types import MethodType, SimpleNamespace
+import inspect
 
 import numpy as np
 import pytest
 import tensorstore as ts
+from scipy.ndimage import gaussian_filter
 from skimage.measure import block_reduce as block_reduce_cpu
 from typer.testing import CliRunner
 from yaozarrs import open_group, v05
@@ -105,8 +107,10 @@ def test_max_projection_pyramid_clamps_partial_source_edge_chunks() -> None:
 
 
 @pytest.mark.unit
-def test_stage_z_is_reversed_only_for_lab_placement() -> None:
-    """Negate physical stage Z and its Y shear without touching input pixels."""
+@pytest.mark.parametrize("angle", (None, 30.0, 45.0))
+@pytest.mark.parametrize("reverse_z", (False, True))
+def test_stage_z_is_reversed_only_for_lab_placement(angle, reverse_z) -> None:
+    """A depth-only stage move preserves both orthogonal XY coordinates."""
     stage_positions = np.asarray(
         ((10.0, 20.0, 30.0), (14.0, 20.0, 30.0)),
         dtype=np.float64,
@@ -116,12 +120,34 @@ def test_stage_z_is_reversed_only_for_lab_placement() -> None:
     coordinates = stage_positions_to_image_coordinates(
         stage_positions,
         reverse_y=True,
-        reverse_z=True,
-        opm_angle_deg=45.0,
+        reverse_z=reverse_z,
+        opm_angle_deg=angle,
     )
 
-    np.testing.assert_allclose(coordinates[1] - coordinates[0], (-4.0, -4.0, 0.0))
+    np.testing.assert_allclose(
+        coordinates[1] - coordinates[0],
+        (-4.0 if reverse_z else 4.0, 0.0, 0.0),
+    )
     np.testing.assert_array_equal(stage_positions, original)
+
+
+@pytest.mark.integration
+def test_max_projection_depth_tiles_share_xy_footprint(tmp_path) -> None:
+    """Depth tiles with fixed stage XY must fuse into a single tile footprint."""
+    source = np.arange(64, dtype=np.uint16).reshape(1, 1, 1, 8, 8)
+    fusion = MaxTileFusion(
+        ts_dataset=(_ReadArray(source), _ReadArray(source)),
+        tile_positions=((3939.54, -7456.06, 4207.16), (3800.09, -7456.06, 4207.16)),
+        output_path=tmp_path / "depth_max_z_fused.ome.zarr",
+        pixel_size=(0.23, 0.115, 0.115),
+        opm_angle_deg=30.0,
+        blend_pixels=(0, 0),
+        chunk_size=4,
+    )
+    fusion.run()
+
+    np.testing.assert_array_equal(fusion.tile_positions[0], fusion.tile_positions[1])
+    np.testing.assert_array_equal(fusion.fused_ts.read().result(), source)
 
 
 @pytest.mark.unit
@@ -592,6 +618,68 @@ def test_zero_registration_channel_is_excluded_before_patch_reads() -> None:
     fusion.refine_tile_positions_with_cross_correlation(ch_idx=0)
 
     assert fusion.pairwise_metrics == {}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("limit_y", (None, 50))
+def test_depth_registration_handles_large_xy_drift(limit_y, capsys):
+    """Recover a thin-Z overlap with 60-pixel Y drift, or explain rejection."""
+    rng = np.random.default_rng(71)
+    truth = gaussian_filter(rng.uniform(0, 1000, (44, 240, 270)), (1, 2, 2))
+    truth = np.rint(truth).astype(np.uint16)
+    volumes = (truth[:32, 60:240, :200], truth[12:44, :180, 70:270])
+    fusion = TileFusion.__new__(TileFusion)
+    fusion.downsample_factors = (3, 5, 5)
+    fusion.ssim_window = 15
+    fusion.threshold = 0.7
+    fusion.pairwise_metrics = {}
+    fusion.position_dim = 2
+    fusion.time_dim = 1
+    fusion.z_dim, fusion.y_dim, fusion.x_dim = volumes[0].shape
+    fusion._pixel_size = (1.0, 1.0, 1.0)
+    fusion._tile_positions = [(0.0, 0.0, 0.0), (12.0, 0.0, 0.0)]
+    fusion._tile_shapes = [volumes[0].shape] * 2
+    fusion._tiles_by_time = ((0, 1),)
+    fusion._tile_time_indices = [0, 0]
+    fusion._is_2d = False
+    fusion._max_workers = 1
+    fusion.max_registration_shift_zyx = (
+        inspect.signature(TileFusion).parameters["max_registration_shift_zyx"].default
+    )
+    if limit_y is not None:
+        fusion.max_registration_shift_zyx = (20, limit_y, 100)
+    fusion._debug = False
+    fusion._tile_channel_nonzero = {(0, 0): True, (1, 0): True}
+    fusion.position_arrays = tuple(ts.array(volume[None, None]) for volume in volumes)
+
+    fusion.refine_tile_positions_with_cross_correlation()
+    fusion.optimize_shifts()
+    fusion.report_registration_connectivity()
+
+    output = capsys.readouterr().out
+    if limit_y is None:
+        assert set(fusion.pairwise_metrics) == {(0, 1)}
+        np.testing.assert_allclose(fusion.global_offsets[1], (0, -60, 70), atol=1)
+        assert "Registration warning" not in output
+    else:
+        assert fusion.pairwise_metrics == {}
+        assert "exceeded the ZYX shift limits" in output
+        assert "disconnected components" in output
+        assert "not mutually registered" in output
+
+
+@pytest.mark.unit
+def test_separate_fields_do_not_warn_about_registration_connectivity(capsys):
+    """Genuinely disjoint fields do not imply missing registration links."""
+    fusion = TileFusion.__new__(TileFusion)
+    fusion._tiles_by_time = ((0, 1),)
+    fusion._tile_shapes = [(8, 8, 8)] * 2
+    fusion._pixel_size = (1.0, 1.0, 1.0)
+    fusion._tile_positions = [(0, 0, 0), (0, 0, 100)]
+    fusion._is_2d = False
+    fusion.pairwise_metrics = {}
+    fusion.report_registration_connectivity()
+    assert not capsys.readouterr().out
 
 
 @pytest.mark.integration
