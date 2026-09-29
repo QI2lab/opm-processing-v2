@@ -14,6 +14,8 @@ from opm_processing.imageprocessing.flatfield import (
     estimate_illuminations,
 )
 from opm_processing.imageprocessing.camera import (
+    camera_correct,
+    illumination_correct,
     correct_qi2lab_stage_scan_camera,
     qi2lab_stage_scan_camera_gain,
 )
@@ -168,7 +170,7 @@ def test_disabled_empty_check_does_not_prescan_tiles(monkeypatch):
 
     monkeypatch.setattr(
         process_module,
-        "_camera_calibrated_image",
+        "camera_correct",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError),
     )
     assert (
@@ -247,14 +249,10 @@ def test_qi2lab_stage_camera_gain_broadcasts_over_scan_and_y():
 @pytest.mark.unit
 def test_processing_contract_uses_uint16_raw_float32_intermediates_and_final_cast():
     """Camera, nonlinear gain, illumination, and output boundaries are explicit."""
-    from opm_processing.process import (
-        _apply_illumination_correction,
-        _camera_calibrated_image,
-        _format_processed_output,
-    )
+    from opm_processing.process import _format_processed_output
 
     raw = np.full((2, 3, 1900), 110, dtype=np.uint16)
-    camera_corrected = _camera_calibrated_image(
+    camera_corrected = camera_correct(
         raw,
         100.0,
         1.0,
@@ -268,7 +266,7 @@ def test_processing_contract_uses_uint16_raw_float32_intermediates_and_final_cas
     )
 
     illumination = np.full((3, 1900), 2.0, dtype=np.float32)
-    corrected = _apply_illumination_correction(camera_corrected, illumination)
+    corrected = illumination_correct(camera_corrected, illumination)
     assert corrected.dtype == np.float32
     np.testing.assert_allclose(corrected, camera_corrected / 2)
     boundary = np.array([-1, 0, 0.24, 5.9, 65535, 70000], dtype=np.float32)
@@ -280,7 +278,7 @@ def test_processing_contract_uses_uint16_raw_float32_intermediates_and_final_cas
     np.testing.assert_array_equal(floats, boundary)
 
     with np.testing.assert_raises(TypeError):
-        _camera_calibrated_image(raw.astype(np.float32), 100.0, 1.0)
+        camera_correct(raw.astype(np.float32), 100.0, 1.0)
 
 
 @pytest.mark.integration

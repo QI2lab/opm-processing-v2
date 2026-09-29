@@ -189,7 +189,7 @@ def render(data, illumination, module, scope, chunked):
         if scope == 2:
             chunk = module.camera_correct(chunk, 100, 0.24 / 0.9)
         if module is opmtools:
-            deskewed = module._orthogonal_deskew_float32(chunk, zero_initialized=False)
+            deskewed = module.orthogonal_deskew(chunk, zero_initialized=False)
         else:
             deskewed = module.orthogonal_deskew(chunk)
         local = max(0, int(np.rint(start - first * (0.4 / 0.115))))

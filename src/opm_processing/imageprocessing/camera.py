@@ -102,7 +102,7 @@ def correct_qi2lab_stage_scan_camera(
 
 
 @njit(inline="always")
-def _calibrated_pixel(
+def calibrated_pixel(
     raw: np.uint16, offset: np.float32, conversion: np.float32
 ) -> np.float32:
     """Apply the camera transfer function to one ADC count.
@@ -125,7 +125,7 @@ def _calibrated_pixel(
 
 
 @njit(parallel=True, error_model="numpy")
-def _camera_kernel(
+def camera_correct_rows(
     raw: np.ndarray, offset: np.float32, conversion: np.float32, gain: np.ndarray
 ) -> np.ndarray:
     """Correct independent camera rows in parallel.
@@ -151,11 +151,11 @@ def _camera_kernel(
         if gain.size:
             for x in range(nx):
                 output[s, y, x] = (
-                    _calibrated_pixel(raw[s, y, x], offset, conversion) / gain[x]
+                    calibrated_pixel(raw[s, y, x], offset, conversion) / gain[x]
                 )
         else:
             for x in range(nx):
-                output[s, y, x] = _calibrated_pixel(raw[s, y, x], offset, conversion)
+                output[s, y, x] = calibrated_pixel(raw[s, y, x], offset, conversion)
     return output
 
 
@@ -199,9 +199,9 @@ def camera_correct(
         gain = qi2lab_stage_scan_camera_gain()[start:stop]
     offset, conversion = np.float32(camera_offset), np.float32(camera_conversion)
     if raw.ndim == 3:
-        return _camera_kernel(raw, offset, conversion, gain)
+        return camera_correct_rows(raw, offset, conversion, gain)
     if raw.ndim == 2:
-        return _camera_kernel(raw[None], offset, conversion, gain)[0]
+        return camera_correct_rows(raw[None], offset, conversion, gain)[0]
     # Preserve NumPy broadcasting for less common input dimensionalities.
     calibrated = np.maximum(
         (raw.astype(np.float32) - offset) * conversion, np.float32(0)
@@ -212,7 +212,7 @@ def camera_correct(
 
 
 @njit(parallel=True, error_model="numpy")
-def _illumination_kernel(
+def illumination_correct_rows(
     calibrated: np.ndarray, illumination: np.ndarray
 ) -> np.ndarray:
     """Divide independent camera rows by a detector illumination profile.
@@ -260,7 +260,7 @@ def illumination_correct(
         raise TypeError("Calibrated data and illumination must be float32")
     if illumination.shape == calibrated.shape[-2:]:
         if calibrated.ndim == 3:
-            return _illumination_kernel(calibrated, illumination)
+            return illumination_correct_rows(calibrated, illumination)
         if calibrated.ndim == 2:
-            return _illumination_kernel(calibrated[None], illumination)[0]
+            return illumination_correct_rows(calibrated[None], illumination)[0]
     return calibrated / illumination

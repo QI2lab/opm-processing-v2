@@ -87,7 +87,7 @@ def deskew_shape_estimator(
 
 
 @njit(inline="always")
-def _deskew_row(
+def deskew_row(
     z: int,
     y: int,
     planes: int,
@@ -151,7 +151,7 @@ def _deskew_row(
 
 
 @njit(inline="always")
-def _deskew_sample(
+def deskew_sample(
     data: np.ndarray, x: int, geometry: tuple, gain: np.float32
 ) -> np.float32:
     """Interpolate one pixel from a previously located source quartet.
@@ -163,7 +163,7 @@ def _deskew_sample(
     x : int
         Detector column, unchanged by deskewing.
     geometry : tuple
-        Source indices and weights returned by ``_deskew_row``.
+        Source indices and weights returned by ``deskew_row``.
     gain : np.float32
         Reciprocal scan spacing in camera-pixel units.
 
@@ -185,7 +185,7 @@ def _deskew_sample(
 
 
 @njit(parallel=True)
-def _interpolate_rows(
+def interpolate_rows(
     data: ArrayLike,
     output: np.ndarray,
     final_ny: int,
@@ -243,7 +243,7 @@ def _interpolate_rows(
                 for x in range(padded_x):
                     output[z_ds, y, x] = np.float32(0)
             continue
-        g0 = _deskew_row(
+        g0 = deskew_row(
             z_ds * downsample_factor,
             y,
             planes,
@@ -258,17 +258,16 @@ def _interpolate_rows(
             if zero_initialized and not g0[0]:
                 continue
             for x in range(nx):
-                output[z_ds, y, x] = _deskew_sample(data, x, g0, gain)
+                output[z_ds, y, x] = deskew_sample(data, x, g0, gain)
         elif downsample_factor == 2:
-            g1 = _deskew_row(
+            g1 = deskew_row(
                 z_ds * 2 + 1, y, planes, ny, final_nz, step, tangent, sine, cosine
             )
             if zero_initialized and not g0[0] and not g1[0]:
                 continue
             for x in range(nx):
                 total = np.float32(
-                    _deskew_sample(data, x, g0, gain)
-                    + _deskew_sample(data, x, g1, gain)
+                    deskew_sample(data, x, g0, gain) + deskew_sample(data, x, g1, gain)
                 )
                 output[z_ds, y, x] = total / np.float32(2)
         else:
@@ -277,72 +276,18 @@ def _interpolate_rows(
             for z in range(
                 z_ds * downsample_factor, min((z_ds + 1) * downsample_factor, final_nz)
             ):
-                geometry = _deskew_row(
+                geometry = deskew_row(
                     z, y, planes, ny, final_nz, step, tangent, sine, cosine
                 )
                 if geometry[0]:
                     for x in range(nx):
-                        output[z_ds, y, x] += _deskew_sample(data, x, geometry, gain)
+                        output[z_ds, y, x] += deskew_sample(data, x, geometry, gain)
             for x in range(nx):
                 output[z_ds, y, x] /= np.float32(downsample_factor)
         if not zero_initialized:
             for x in range(nx, padded_x):
                 output[z_ds, y, x] = np.float32(0)
     return output
-
-
-def _orthogonal_deskew_float32(
-    data: ArrayLike,
-    theta: float = 30.0,
-    distance: float = 0.4,
-    pixel_size: float = 0.115,
-    reverse_deskewed_z: bool = False,
-    divisible_by: int = 4,
-    downsample_factor: int = 2,
-    zero_initialized: bool = True,
-) -> np.ndarray:
-    """Allocate a deskew output and invoke the shared row kernel.
-
-    Parameters
-    ----------
-    data : ArrayLike
-        Oblique volume in scan, detector-Y, detector-X order.
-    theta : float
-        Angle relative to the coverslip in degrees.
-    distance, pixel_size : float
-        Scan spacing and detector pixel size in micrometers.
-    reverse_deskewed_z : bool
-        Reverse the output Z axis.
-    divisible_by : int
-        Pad output Y and X to multiples of this integer.
-    downsample_factor : int
-        Laboratory Z averaging factor.
-    zero_initialized : bool
-        Allocate zeros for direct volumes; allocate empty for chunked volumes.
-
-    Returns
-    -------
-    np.ndarray
-        Float32 laboratory ZYX data.
-    """
-    shape, pad_y, _, _ = deskew_shape_estimator(
-        data.shape, theta, distance, pixel_size, False, divisible_by
-    )
-    final_nz, final_ny = shape[0], shape[1] - pad_y
-    shape[0] = max(1, final_nz // downsample_factor)
-    output = (np.zeros if zero_initialized else np.empty)(tuple(shape), np.float32)
-    _interpolate_rows(
-        data,
-        output,
-        final_ny,
-        final_nz,
-        theta,
-        distance,
-        pixel_size,
-        downsample_factor,
-        zero_initialized,
-    )
-    return output[::-1] if reverse_deskewed_z else output
 
 
 def orthogonal_deskew(
@@ -353,6 +298,8 @@ def orthogonal_deskew(
     reverse_deskewed_z: bool = False,
     divisible_by: int = 4,
     downsample_factor: int = 2,
+    *,
+    zero_initialized: bool = True,
 ) -> np.ndarray:
     """Deskew oblique data into a float32 laboratory volume.
 
@@ -372,6 +319,8 @@ def orthogonal_deskew(
         Pad Y and X to multiples of this integer.
     downsample_factor : int
         Average this many laboratory Z planes; the default remains two.
+    zero_initialized : bool
+        Use a zero-filled allocation; False writes every voxel explicitly for chunks.
 
     Returns
     -------
@@ -379,15 +328,25 @@ def orthogonal_deskew(
         Float32 ZYX volume with sampling
         ``(pixel_size * downsample_factor, pixel_size, pixel_size)``.
     """
-    return _orthogonal_deskew_float32(
-        np.asarray(data),
+    data = np.asarray(data)
+    shape, pad_y, _, _ = deskew_shape_estimator(
+        data.shape, theta, distance, pixel_size, False, divisible_by
+    )
+    final_nz, final_ny = shape[0], shape[1] - pad_y
+    shape[0] = max(1, final_nz // downsample_factor)
+    output = (np.zeros if zero_initialized else np.empty)(tuple(shape), np.float32)
+    interpolate_rows(
+        data,
+        output,
+        final_ny,
+        final_nz,
         theta,
         distance,
         pixel_size,
-        reverse_deskewed_z,
-        divisible_by,
         downsample_factor,
+        zero_initialized,
     )
+    return output[::-1] if reverse_deskewed_z else output
 
 
 def lab2cam(
@@ -626,7 +585,7 @@ def chunked_orthogonal_deskew(
                 crop_scan=effective_crop_scan,
                 on_successful_crop_scan=(decon_chunk_state.remember_successful_crop),
             )
-        temp_deskew = _orthogonal_deskew_float32(
+        temp_deskew = orthogonal_deskew(
             raw_data,
             theta=theta_deg,
             distance=scan_axis_step_um,

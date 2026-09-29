@@ -64,8 +64,8 @@ from opm_processing.imageprocessing.coordinates import (
     stage_positions_to_image_coordinates,
 )
 from opm_processing.imageprocessing.camera import (
-    camera_correct as _camera_calibrated_image,
-    illumination_correct as _apply_illumination_correction,
+    camera_correct,
+    illumination_correct,
     QI2LAB_STAGE_SCAN_DETECTOR_WIDTH,
 )
 from opm_processing.imageprocessing.maxtilefusion import MaxTileFusion
@@ -423,7 +423,7 @@ def _build_illumination_signal_decisions(
                         position,
                         channel,
                     )
-                    calibrated = _camera_calibrated_image(
+                    calibrated = camera_correct(
                         raw,
                         camera_offset,
                         camera_conversion,
@@ -1920,7 +1920,7 @@ def process_skewed(
                     )
                 else:
                     raw_data = np.squeeze(raw_data)
-                camera_calibrated_data = _camera_calibrated_image(
+                camera_calibrated_data = camera_correct(
                     raw_data,
                     camera_offset,
                     camera_conversion,
@@ -1964,7 +1964,7 @@ def process_skewed(
                             )
                         )
                     continue
-                camera_corrected_data = _apply_illumination_correction(
+                camera_corrected_data = illumination_correct(
                     camera_calibrated_data,
                     illumination,
                 )
@@ -2482,7 +2482,7 @@ def process_projection(
             raw_data = np.squeeze(
                 datastore[t_idx, pos_idx, chan_idx, :].read().result()
             )
-            camera_calibrated_data = _camera_calibrated_image(
+            camera_calibrated_data = camera_correct(
                 raw_data,
                 camera_offset,
                 camera_conversion,
@@ -2502,7 +2502,7 @@ def process_projection(
                     ts_store[pos_idx][t_idx, chan_idx].write(output_dtype.type(0))
                 )
                 continue
-            camera_corrected_data = _apply_illumination_correction(
+            camera_corrected_data = illumination_correct(
                 camera_calibrated_data,
                 flatfields[stage_z_indices[pos_idx], chan_idx, :],
             )

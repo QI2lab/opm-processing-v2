@@ -33,7 +33,7 @@ invariance, Z averaging, and known intensities across the default chunk boundary
 using a mocked store.
 
 Performance checks are optional integration tests in `tests/benchmarks`, skipped
-unless `--run-benchmarks` is given. See [the test instructions](../tests/README.md#optional-cpu-pipeline-benchmarks).
+unless `--run-benchmarks` is given. See [the test instructions](../tests/README.md).
 They load the local `main` implementation from git, validate every output voxel,
 exclude compilation and warmup, and report medians without speed assertions.
 Timing covers CPU correction and deskew, not disk I/O or deconvolution.
@@ -74,8 +74,7 @@ omitted stages removed. Do not subtract separate rows to estimate stage costs.
 | Chunked | 4 | Camera + illumination + interpolation | 28.5575 | 11.3179 | 2.52x |
 | Chunked | 16 | Camera + illumination + interpolation | 25.7509 | 11.0732 | 2.33x |
 
-The CPU-selected suite completed with 193 passed, 18 optional benchmarks skipped,
-and 57 GPU-marked cases deselected. Nine existing fusion/registration integration
-cases attempted CUDA execution and failed because CuPy could not find toolkit
-headers. All nine failures reproduced against an isolated copy of the same main
-commit. GPU solver validation remains limited by that environment issue.
+The full correctness suite passed with `OPM_REQUIRE_GPU=1`: **259 passed**,
+with only the 18 optional benchmarks skipped. Run pytest in the project environment;
+`uv run --with pytest` creates a temporary overlay that can prevent CUDA header
+and library discovery on Windows.
