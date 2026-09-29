@@ -64,7 +64,8 @@ from opm_processing.imageprocessing.coordinates import (
     stage_positions_to_image_coordinates,
 )
 from opm_processing.imageprocessing.camera import (
-    correct_qi2lab_stage_scan_camera,
+    camera_correct,
+    illumination_correct,
     QI2LAB_STAGE_SCAN_DETECTOR_WIDTH,
 )
 from opm_processing.imageprocessing.maxtilefusion import MaxTileFusion
@@ -256,51 +257,12 @@ def _initialize_processing_state(
     return state
 
 
-def _camera_calibrated_image(
-    raw: np.ndarray,
-    camera_offset: float,
-    camera_conversion: float,
-    *,
-    detector_x_offset: int = 0,
-    apply_stage_scan_gain: bool = False,
-) -> np.ndarray:
-    """Convert uint16 raw data and apply all detector calibration in float32."""
-    raw_array = np.asarray(raw)
-    if raw_array.dtype != np.dtype(np.uint16):
-        raise TypeError(
-            "Raw acquisition data must be uint16 before camera correction; "
-            f"received {raw_array.dtype}"
-        )
-    calibrated = raw_array.astype(np.float32)
-    calibrated -= np.float32(camera_offset)
-    calibrated *= np.float32(camera_conversion)
-    np.maximum(calibrated, np.float32(0), out=calibrated)
-    if apply_stage_scan_gain:
-        calibrated = correct_qi2lab_stage_scan_camera(
-            calibrated,
-            x_offset=detector_x_offset,
-            copy=False,
-        )
-    return _require_float32(calibrated, "camera correction")
-
-
 def _require_float32(data: np.ndarray, stage: str) -> np.ndarray:
     """Enforce the processing contract at a float32 intermediate boundary."""
     result = np.asarray(data)
     if result.dtype != np.dtype(np.float32):
         raise TypeError(f"{stage} must produce float32 data; received {result.dtype}")
     return result
-
-
-def _apply_illumination_correction(
-    calibrated: np.ndarray,
-    illumination: np.ndarray,
-) -> np.ndarray:
-    """Apply illumination correction after an input passes empty-tile detection."""
-    calibrated = _require_float32(calibrated, "camera correction")
-    illumination = _require_float32(illumination, "illumination profile")
-    corrected = calibrated / illumination
-    return _require_float32(corrected, "illumination correction")
 
 
 def _format_processed_output(data: np.ndarray, save_float32: bool) -> np.ndarray:
@@ -461,7 +423,7 @@ def _build_illumination_signal_decisions(
                         position,
                         channel,
                     )
-                    calibrated = _camera_calibrated_image(
+                    calibrated = camera_correct(
                         raw,
                         camera_offset,
                         camera_conversion,
@@ -1958,7 +1920,7 @@ def process_skewed(
                     )
                 else:
                     raw_data = np.squeeze(raw_data)
-                camera_calibrated_data = _camera_calibrated_image(
+                camera_calibrated_data = camera_correct(
                     raw_data,
                     camera_offset,
                     camera_conversion,
@@ -2002,7 +1964,7 @@ def process_skewed(
                             )
                         )
                     continue
-                camera_corrected_data = _apply_illumination_correction(
+                camera_corrected_data = illumination_correct(
                     camera_calibrated_data,
                     illumination,
                 )
@@ -2520,7 +2482,7 @@ def process_projection(
             raw_data = np.squeeze(
                 datastore[t_idx, pos_idx, chan_idx, :].read().result()
             )
-            camera_calibrated_data = _camera_calibrated_image(
+            camera_calibrated_data = camera_correct(
                 raw_data,
                 camera_offset,
                 camera_conversion,
@@ -2540,7 +2502,7 @@ def process_projection(
                     ts_store[pos_idx][t_idx, chan_idx].write(output_dtype.type(0))
                 )
                 continue
-            camera_corrected_data = _apply_illumination_correction(
+            camera_corrected_data = illumination_correct(
                 camera_calibrated_data,
                 flatfields[stage_z_indices[pos_idx], chan_idx, :],
             )

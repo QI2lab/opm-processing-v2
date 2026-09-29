@@ -310,3 +310,65 @@ def test_chunked_deskew_with_gpu_deconvolution_improves_ground_truth(
     )
     assert width_with < width_without
     assert abs(width_with - truth_width) < abs(width_without - truth_width)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("factor", [1, 2, 3, 20])
+def test_deskew_x_ramp_and_z_averaging(factor):
+    """A uniform YZ field retains detector X and the existing averaging gain.
+
+    Parameters
+    ----------
+    factor : int
+        Laboratory Z bin size, including a bin larger than the volume height.
+    """
+    ramp = np.arange(38, dtype=np.float32)[::2] + 10
+    data = np.broadcast_to(ramp, (40, 33, 19))
+    actual = opmtools.orthogonal_deskew(data, downsample_factor=factor)
+    fine = opmtools.orthogonal_deskew(data, downsample_factor=1)
+    nz = fine.shape[0]
+    expected = np.zeros_like(actual)
+    for z in range(actual.shape[0]):
+        expected[z] = fine[z * factor : min((z + 1) * factor, nz)].sum(axis=0) / factor
+    np.testing.assert_allclose(actual, expected, rtol=3e-7, atol=1e-6)
+    np.testing.assert_allclose(
+        fine[6, 45, :19], ramp * np.float32(2 * 0.115 / 0.4), rtol=3e-7
+    )
+    np.testing.assert_array_equal(actual[..., 19:], 0)
+    np.testing.assert_array_equal(actual[:, 0, :], 0)
+    np.testing.assert_array_equal(
+        opmtools.orthogonal_deskew(
+            data, downsample_factor=factor, reverse_deskewed_z=True
+        ),
+        actual[::-1],
+    )
+
+
+@pytest.mark.integration
+def test_default_chunking_calibrates_and_retains_detector_ramp():
+    """A mocked long scan crosses the default split and retains known photons."""
+    from unittest.mock import MagicMock
+
+    shape = (5000, 16, 12)
+    profile = np.full(shape[1:], 0.5, np.float32)
+    photons = np.arange(12, dtype=np.float32) + 10
+    # Camera offset 100 ADU, conversion 0.25 photons/ADU, illumination 0.5.
+    raw = np.broadcast_to((100 + photons * 2).astype(np.uint16), shape)
+    store = MagicMock()
+    store.shape = shape
+    store.__getitem__.side_effect = raw.__getitem__
+    output = opmtools.chunked_orthogonal_deskew(
+        store,
+        camera_cf=0.25,
+        camera_qe=1,
+        illumination=profile,
+    )
+    reads = [call.args[0][0] for call in store.__getitem__.call_args_list]
+    assert len(reads) == 2
+    assert reads[1].start < reads[0].stop
+    assert output.shape[1] > 15000
+    # Both sides of the production Y=15000 boundary have complete support.
+    expected = photons * np.float32(2 * 0.115 / 0.4)
+    for y in (14999, 15000, 15001):
+        np.testing.assert_allclose(output[1, y], expected, rtol=3e-7)
+    np.testing.assert_array_equal(profile, 0.5)
