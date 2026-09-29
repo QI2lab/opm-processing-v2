@@ -315,3 +315,31 @@ clears an existing explicit base directory, so choose a dedicated test path.
 Validation reprocessed cached copies of five volumes, without overwriting the
 G: acquisition. These tests cannot certify every real low-photon acquisition
 or an unavailable GPU.
+
+## Optional CPU pipeline benchmarks
+
+Normal test runs focus on correctness. Performance cases carry both `integration`
+and `benchmark` markers and are skipped unless `--run-benchmarks` is supplied:
+
+```powershell
+uv run --no-sync --with pytest python -m pytest tests/benchmarks --run-benchmarks -s
+```
+
+Use `-k small`, `-k large`, or `-k chunked` to select a workload. The dimensions
+(scan, camera Y, camera X) are 10 x 256 x 1900, 500 x 512 x 1900, and
+5000 x 512 x 1900. The chunked case crosses the existing 15000-output-row
+threshold; it does not force a smaller chunk size. It needs roughly 90 GiB of
+available RAM. Run benchmarks alone on an idle machine.
+
+Each workload measures interpolation, camera plus interpolation, and camera plus
+illumination plus interpolation at 4 and 16 Numba threads. Z averaging remains 2.
+The reference is loaded from the local `main` branch; each result records its
+commit. One full warmup for each implementation excludes compilation and checks
+all output pixels (`rtol=1e-6`, `atol=1e-5`). Reports print raw trial times and
+medians of five trials, or three for chunked data. No speed threshold determines
+whether a test passes.
+
+Full-pipeline chunked timings use the production chunk wrapper, including overlap,
+assembly, and cleanup. The other chunked scopes use that same default schedule
+with the omitted correction stages removed. These are CPU processing measurements:
+input simulation, disk I/O, deconvolution, and output encoding are excluded.

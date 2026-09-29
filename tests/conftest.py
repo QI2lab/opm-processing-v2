@@ -15,9 +15,40 @@ from opm_processing.dataio.position_collection import create_position_collection
 from opm_processing.imageprocessing.opmtools import deskew_shape_estimator
 
 
-def pytest_collection_modifyitems(items):
-    """Require an explicit, unambiguous unit or integration classification."""
+def pytest_addoption(parser):
+    """Register an explicit opt-in for hardware-dependent performance runs.
+
+    Parameters
+    ----------
+    parser : pytest.Parser
+        Command-line parser receiving the benchmark switch.
+    """
+    parser.addoption(
+        "--run-benchmarks",
+        action="store_true",
+        help="Run optional speed benchmarks against main",
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    """Classify correctness tests and skip benchmarks unless requested.
+
+    Parameters
+    ----------
+    config : pytest.Config
+        Parsed command-line options, including benchmark opt-in.
+    items : list of pytest.Item
+        Collected tests to classify and optionally mark as skipped.
+    """
     for item in items:
+        if item.get_closest_marker("benchmark") and not config.getoption(
+            "--run-benchmarks"
+        ):
+            item.add_marker(
+                pytest.mark.skip(
+                    reason="Optional speed benchmark: use --run-benchmarks"
+                )
+            )
         categories = [
             name for name in ("unit", "integration") if item.get_closest_marker(name)
         ]

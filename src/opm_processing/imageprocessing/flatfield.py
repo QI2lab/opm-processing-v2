@@ -10,7 +10,7 @@ from tqdm import tqdm
 
 from opm_processing.cuda import preload_cuda_libraries
 from opm_processing.imageprocessing.camera import (
-    correct_qi2lab_stage_scan_camera,
+    camera_correct,
 )
 from opm_processing.imageprocessing.coordinates import stage_z_level_indices
 
@@ -94,31 +94,37 @@ def _camera_corrected_images(
     camera_conversion: float,
     apply_stage_scan_gain: bool,
 ) -> np.ndarray:
-    """Load uint16 raw images and apply detector calibration in float32."""
-    images = _read_images(selection)
-    images -= np.float32(camera_offset)
-    images *= np.float32(camera_conversion)
-    np.maximum(images, np.float32(0), out=images)
-    if apply_stage_scan_gain:
-        images = correct_qi2lab_stage_scan_camera(images, copy=False)
-    return images
+    """Load raw images and apply the shared camera calibration.
 
+    Parameters
+    ----------
+    selection : array-like or TensorStore
+        Uint16 camera images or a readable selection of the acquisition store.
+    camera_offset : float
+        Electronic background in ADU.
+    camera_conversion : float
+        Calibrated intensity per ADU.
+    apply_stage_scan_gain : bool
+        Divide by the measured detector-X response after dark subtraction.
 
-def _read_images(selection) -> np.ndarray:
-    """Read uint16 raw acquisition data and convert it once to float32."""
+    Returns
+    -------
+    np.ndarray
+        Float32 calibrated images with a leading image axis for 2D selections.
+    """
     try:
         images = selection.read().result()
     except (AttributeError, TypeError):
         images = np.asarray(selection)
     images = np.asarray(images)
-    if images.dtype != np.dtype(np.uint16):
-        raise TypeError(
-            f"Illumination estimation requires uint16 raw data; received {images.dtype}"
-        )
-    images = images.astype(np.float32)
     if images.ndim == 2:
         images = images[np.newaxis, ...]
-    return images
+    return camera_correct(
+        images,
+        camera_offset,
+        camera_conversion,
+        apply_stage_scan_gain=apply_stage_scan_gain,
+    )
 
 
 def _resize_image_stack(
