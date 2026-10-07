@@ -1,6 +1,5 @@
 """Ground-truth integration test for illumination correction."""
 
-import warnings
 from pathlib import Path
 
 import numpy as np
@@ -16,50 +15,74 @@ from opm_processing.imageprocessing.flatfield import (
 from opm_processing.imageprocessing.camera import (
     camera_correct,
     illumination_correct,
-    correct_qi2lab_stage_scan_camera,
     qi2lab_stage_scan_camera_gain,
 )
 
 
-@pytest.mark.unit
-def test_flatfield_path_reuses_acquisition_file_with_separate_output(
+@pytest.mark.integration
+@pytest.mark.parametrize("output_flatfield", (False, True))
+def test_processing_uses_existing_flatfield_with_separate_output(
+    opm_v2_projection_zarr,
     tmp_path: Path,
+    output_flatfield: bool,
 ) -> None:
-    """A separate output directory must not hide a reusable source flatfield."""
-    from opm_processing.process import _resolve_flatfield_path
+    """Verify source reuse and output precedence through saved pixel values.
 
-    acquisition_dir = tmp_path / "acquisition"
-    acquisition_dir.mkdir()
-    acquisition_path = acquisition_dir / "sample.ome.zarr"
-    acquisition_path.mkdir()
+    Parameters
+    ----------
+    opm_v2_projection_zarr : OpmV2ProjectionFixture
+        Simulated acquisition with camera calibration and raw images on disk.
+    tmp_path : pathlib.Path
+        Temporary directory containing the acquisition and processed output.
+    output_flatfield : bool
+        Write an output-side field that must take precedence over the source field.
+
+    Returns
+    -------
+    None
+        Reopened processed intensities match the selected calibration field.
+    """
+    from opm_processing.dataio.acquisition import acquisition_stem
+    from opm_processing.dataio.position_collection import open_position_collection
+    from opm_processing.process import write_flatfield, process
+
+    acquisition = opm_v2_projection_zarr
     output_dir = tmp_path / "processed"
     output_dir.mkdir()
-    source_flatfield = acquisition_dir / "sample_flatfield.ome.tif"
-    source_flatfield.touch()
+    filename = f"{acquisition_stem(acquisition.path)}_flatfield.ome.tif"
+    field_shape = (1, acquisition.raw_data.shape[2], *acquisition.raw_data.shape[-2:])
+    source_field = np.full(field_shape, 2.0, dtype=np.float32)
+    selected_field = source_field
+    write_flatfield(
+        acquisition.path.parent / filename, source_field, acquisition.pixel_size_um
+    )
+    if output_flatfield:
+        selected_field = np.full(field_shape, 1.25, dtype=np.float32)
+        write_flatfield(
+            output_dir / filename, selected_field, acquisition.pixel_size_um
+        )
 
-    assert _resolve_flatfield_path(acquisition_path, output_dir) == source_flatfield
-
-
-@pytest.mark.unit
-def test_flatfield_path_prefers_output_and_writes_new_files_there(
-    tmp_path: Path,
-) -> None:
-    """Prefer an output-side flatfield and use that location for new estimates."""
-    from opm_processing.process import _resolve_flatfield_path
-
-    acquisition_dir = tmp_path / "acquisition"
-    acquisition_dir.mkdir()
-    acquisition_path = acquisition_dir / "sample.ome.zarr"
-    acquisition_path.mkdir()
-    output_dir = tmp_path / "processed"
-    output_dir.mkdir()
-    output_flatfield = output_dir / "sample_flatfield.ome.tif"
-
-    assert _resolve_flatfield_path(acquisition_path, output_dir) == output_flatfield
-
-    (acquisition_dir / "sample_flatfield.ome.tif").touch()
-    output_flatfield.touch()
-    assert _resolve_flatfield_path(acquisition_path, output_dir) == output_flatfield
+    process(
+        root_path=acquisition.path,
+        output=output_dir,
+        flatfield_correction=True,
+        deconvolve=False,
+        save_float32=True,
+        write_fused_max_projection_tiff=False,
+    )
+    saved = (
+        open_position_collection(
+            output_dir / f"{acquisition_stem(acquisition.path)}_projection.ome.zarr"
+        )
+        .arrays[0]
+        .read()
+        .result()
+    )
+    calibrated = (
+        acquisition.raw_data[:, 0].astype(np.float32) - acquisition.camera_offset
+    ) * acquisition.camera_conversion
+    expected = (calibrated / selected_field[0])[:, :, np.newaxis]
+    np.testing.assert_allclose(saved, expected, rtol=1e-6)
 
 
 @pytest.mark.unit
@@ -127,7 +150,7 @@ def test_empty_check_runs_once_and_filters_illumination_candidates(monkeypatch):
     raw[0, 0, 0, :, :, :4] = 130
     raw[0, 2, 0, :, :, :4] = 130
     datastore = ts.array(raw)
-    signal_decisions = process_module._build_illumination_signal_decisions(
+    signal_decisions = process_module.build_illumination_signal_decisions(
         datastore,
         np.zeros(4, dtype=np.int64),
         camera_offset=100.0,
@@ -174,7 +197,7 @@ def test_disabled_empty_check_does_not_prescan_tiles(monkeypatch):
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError),
     )
     assert (
-        process_module._build_illumination_signal_decisions(
+        process_module.build_illumination_signal_decisions(
             FailOnRead(),
             np.zeros(2, dtype=np.int64),
             camera_offset=100.0,
@@ -193,7 +216,7 @@ def test_illumination_signal_check_stops_after_32_nonempty_candidates():
     from opm_processing import process as process_module
 
     raw = np.full((1, 40, 1, 2, 3, 4), 130, dtype=np.uint16)
-    decisions = process_module._build_illumination_signal_decisions(
+    decisions = process_module.build_illumination_signal_decisions(
         ts.array(raw),
         np.zeros(40, dtype=np.int64),
         camera_offset=100.0,
@@ -207,7 +230,7 @@ def test_illumination_signal_check_stops_after_32_nonempty_candidates():
     assert np.count_nonzero(decisions == 1) == 32
     assert np.count_nonzero(decisions == -1) == 8
     unchecked_position = int(np.flatnonzero(decisions[0, :, 0] == -1)[0])
-    assert not process_module._tile_is_empty(
+    assert not process_module.tile_is_empty(
         decisions,
         0,
         unchecked_position,
@@ -232,24 +255,9 @@ def test_qi2lab_stage_camera_gain_has_fixed_unity_baseline():
 
 
 @pytest.mark.unit
-def test_qi2lab_stage_camera_gain_broadcasts_over_scan_and_y():
-    """One detector-X gain vector corrects every scan/Y pixel in a tile or ROI."""
-    gain = qi2lab_stage_scan_camera_gain()
-    expected = np.full((3, 5, 1900), 42.0, dtype=np.float32)
-    measured = expected * gain[np.newaxis, np.newaxis, :]
-
-    corrected = correct_qi2lab_stage_scan_camera(measured)
-    np.testing.assert_allclose(corrected, expected, rtol=1e-6)
-
-    roi = measured[..., 1040:1110]
-    corrected_roi = correct_qi2lab_stage_scan_camera(roi, x_offset=1040)
-    np.testing.assert_allclose(corrected_roi, expected[..., 1040:1110], rtol=1e-6)
-
-
-@pytest.mark.unit
 def test_processing_contract_uses_uint16_raw_float32_intermediates_and_final_cast():
     """Camera, nonlinear gain, illumination, and output boundaries are explicit."""
-    from opm_processing.process import _format_processed_output
+    from opm_processing.process import format_processed_output
 
     raw = np.full((2, 3, 1900), 110, dtype=np.uint16)
     camera_corrected = camera_correct(
@@ -270,15 +278,12 @@ def test_processing_contract_uses_uint16_raw_float32_intermediates_and_final_cas
     assert corrected.dtype == np.float32
     np.testing.assert_allclose(corrected, camera_corrected / 2)
     boundary = np.array([-1, 0, 0.24, 5.9, 65535, 70000], dtype=np.float32)
-    integers = _format_processed_output(boundary, False)
+    integers = format_processed_output(boundary, False)
     assert integers.dtype == np.uint16
     np.testing.assert_array_equal(integers, [0, 0, 0, 5, 65535, 65535])
-    floats = _format_processed_output(boundary, True)
+    floats = format_processed_output(boundary, True)
     assert floats.dtype == np.float32
     np.testing.assert_array_equal(floats, boundary)
-
-    with np.testing.assert_raises(TypeError):
-        camera_correct(raw.astype(np.float32), 100.0, 1.0)
 
 
 @pytest.mark.unit
@@ -287,8 +292,8 @@ def test_stage_z_flatfield_round_trips_exact_values(
 ):
     """The reusable illumination retains every stage/channel field exactly."""
     from opm_processing.process import (
-        _read_current_flatfield,
-        _write_flatfield,
+        read_current_flatfield,
+        write_flatfield,
     )
 
     for stage_level_count in (1, 2):
@@ -299,9 +304,9 @@ def test_stage_z_flatfield_round_trips_exact_values(
         )
         if stage_level_count > 1:
             flatfields[1] *= 1.25
-        _write_flatfield(path, flatfields, 0.115)
+        write_flatfield(path, flatfields, 0.115)
 
-        actual = _read_current_flatfield(path, flatfields.shape)
+        actual = read_current_flatfield(path, flatfields.shape)
         assert actual is not None
         np.testing.assert_array_equal(actual, flatfields)
 
@@ -410,6 +415,8 @@ def test_single_tile_depth_fields_recover_known_illumination():
 @pytest.mark.unit
 def test_flatfield_correction_recovers_multitile_multichannel_truth():
     """Recover known rectangular illumination fields from a tiled scan."""
+    from opm_processing.process import call_estimate_illuminations
+
     rng = np.random.default_rng(7)
     positions, channels, scan_planes = 6, 2, 12
     height, width = 64, 128
@@ -441,18 +448,17 @@ def test_flatfield_correction_recovers_multitile_multichannel_truth():
         + camera_offset
     ).astype(np.uint16)
     datastore = ts.array(raw[np.newaxis, ...])
+    stage_positions = np.zeros((positions, 3))
+    stage_positions[:, 1] = np.arange(positions) * 100.0
 
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore",
-            message="sort_intensity=False while is_timelapse=False.*",
-            category=UserWarning,
-        )
-        estimated = estimate_illuminations(
-            datastore,
-            camera_offset,
-            camera_conversion,
-        )
+    estimated = call_estimate_illuminations(
+        datastore,
+        camera_offset,
+        camera_conversion,
+        stage_positions_zxy=stage_positions,
+        apply_stage_scan_gain=False,
+        signal_mask=None,
+    )[0]
 
     camera_corrected = (raw.astype(np.float32) - camera_offset) * camera_conversion
     corrected = camera_corrected / estimated[np.newaxis, :, np.newaxis, :, :]

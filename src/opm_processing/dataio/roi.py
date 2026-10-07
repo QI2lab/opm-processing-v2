@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from yaozarrs import open_group, v05
+from yaozarrs import open_group
 
 from opm_processing.dataio.ngff import round_spatial, round_spatial_values
 from opm_processing.dataio.position_collection import open_position_collection
@@ -25,7 +25,18 @@ ROI_SCHEMA = "opm-processing-roi-v1"
 def _registered_projection_context(
     path: Path,
 ) -> tuple[ProcessingState, Path, dict[str, Any]]:
-    """Return the state, processed tiles, and registration for a max-Z image."""
+    """Return the state, processed tiles, and registration for a max-Z image.
+
+    Parameters
+    ----------
+    path : Path
+        Registered maximum-Z fusion image used as the processing ROI canvas.
+
+    Returns
+    -------
+    tuple
+        Processing journal, source processed collection, and completed registration record.
+    """
     suffix = "_max_z_fused.ome.zarr"
     if not path.name.endswith(suffix):
         raise ValueError(
@@ -36,14 +47,22 @@ def _registered_projection_context(
     )
     processed_path = state.registered_output_for_max_projection(path)
     registration = state.registration(processed_path)
-    tiles = registration.get("tiles")
-    if not isinstance(tiles, list) or not tiles:
-        raise ValueError("Registration state lacks final per-tile origins")
     return state, processed_path, registration
 
 
 def _registered_tile_footprints(path: Path) -> tuple[dict[str, Any], ...]:
-    """Derive registered YX footprints from state plus standard OME metadata."""
+    """Derive registered YX footprints from state plus standard OME metadata.
+
+    Parameters
+    ----------
+    path : Path
+        Registered maximum-Z fusion image whose source tile footprints are read.
+
+    Returns
+    -------
+    tuple[dict[str, Any], ...]
+        Registered tile origins, physical YX bounds, and source time/position indices.
+    """
     state, processed_path, registration = _registered_projection_context(path)
     if state.roi_series(processed_path):
         raise ValueError("ROI selection requires a full-acquisition fusion")
@@ -51,13 +70,10 @@ def _registered_tile_footprints(path: Path) -> tuple[dict[str, Any], ...]:
     pixel_y, pixel_x = collection.voxel_size_um[-2:]
     footprints = []
     for tile in registration["tiles"]:
-        try:
-            position_index = int(tile["position_index"])
-            time_index = int(tile["time_index"])
-            origin = tuple(float(value) for value in tile["origin_zyx_um"])
-            tile_shape = collection.arrays[position_index].shape
-        except (IndexError, KeyError, TypeError, ValueError) as error:
-            raise ValueError("Registration state contains an invalid tile") from error
+        position_index = int(tile["position_index"])
+        time_index = int(tile["time_index"])
+        origin = tuple(float(value) for value in tile["origin_zyx_um"])
+        tile_shape = collection.arrays[position_index].shape
         footprints.append(
             {
                 "time_index": time_index,
@@ -79,12 +95,19 @@ def _registered_tile_footprints(path: Path) -> tuple[dict[str, Any], ...]:
 
 
 def validate_registered_max_projection(path: str | Path) -> Path:
-    """Require an ROI canvas projected from registered full-volume fusion."""
+    """Require an ROI canvas projected from registered full-volume fusion.
+
+    Parameters
+    ----------
+    path : str | Path
+        Registered maximum-Z fusion image selected as the processing ROI canvas.
+
+    Returns
+    -------
+    Path
+        Absolute registered maximum-Z image path after checking its processing association.
+    """
     source = Path(path).expanduser().resolve()
-    root = open_group(source)
-    metadata = root.ome_metadata()
-    if not isinstance(metadata, v05.Image):
-        raise ValueError("ROI export requires a single fused OME-Zarr Image canvas")
     _registered_tile_footprints(source)
     return source
 
@@ -101,32 +124,29 @@ class PhysicalRoi:
     tile_footprints: tuple[dict[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
-        """Validate and normalize the immutable ROI contract."""
+        """Require a nonempty physical YX rectangle."""
         y0, y1, x0, x1 = (float(value) for value in self.bounds_yx_um)
-        if not all(math.isfinite(value) for value in (y0, y1, x0, x1)):
-            raise ValueError("ROI bounds must be finite")
         if y0 >= y1 or x0 >= x1:
             raise ValueError("ROI bounds must satisfy min < max on Y and X")
-        if any(float(value) <= 0 for value in self.pixel_size_yx_um):
-            raise ValueError("ROI pixel sizes must be positive")
-        if self.position_indices is not None and any(
-            int(value) < 0 for value in self.position_indices
-        ):
-            raise ValueError("ROI position indices must be nonnegative")
 
     @classmethod
     def read(cls, path: str | Path) -> PhysicalRoi:
-        """Read and validate an ROI JSON file."""
+        """Read the physical ROI exported by display.
+
+        Parameters
+        ----------
+        path : str | Path
+            Exported ROI JSON file.
+
+        Returns
+        -------
+        PhysicalRoi
+            Physical bounds, display grid, and registered source tile footprints.
+        """
         roi_path = Path(path).expanduser().resolve()
         document = json.loads(roi_path.read_text(encoding="utf-8"))
-        if document.get("schema") != ROI_SCHEMA:
-            raise ValueError(f"Unsupported ROI schema in {roi_path}")
-        if document.get("all_z") is not True:
-            raise ValueError("ROI must explicitly retain all Z values")
-        bounds = document.get("bounds_yx_um")
-        grid = document.get("source_grid")
-        if not isinstance(bounds, dict) or not isinstance(grid, dict):
-            raise ValueError("ROI JSON lacks bounds or source-grid metadata")
+        bounds = document["bounds_yx_um"]
+        grid = document["source_grid"]
         positions = document.get("position_indices")
         return cls(
             bounds_yx_um=(
@@ -143,11 +163,22 @@ class PhysicalRoi:
                 if positions is None
                 else tuple(sorted({int(value) for value in positions}))
             ),
-            tile_footprints=tuple(document.get("tile_footprints", ())),
+            tile_footprints=tuple(document["tile_footprints"]),
         )
 
     def write(self, path: str | Path) -> Path:
-        """Write the stable ROI JSON interchange format."""
+        """Write the stable ROI JSON interchange format.
+
+        Parameters
+        ----------
+        path : str | Path
+            Destination ROI JSON file.
+
+        Returns
+        -------
+        Path
+            Destination of the saved ROI JSON document.
+        """
         roi_path = Path(path).expanduser().resolve()
         roi_path.parent.mkdir(parents=True, exist_ok=True)
         y0, y1, x0, x1 = self.bounds_yx_um
@@ -177,7 +208,22 @@ class PhysicalRoi:
         position_index: int,
         fallback: tuple[float, float],
     ) -> tuple[float, float]:
-        """Return the registered tile origin when available, otherwise stage placement."""
+        """Return the registered tile origin when available, otherwise stage placement.
+
+        Parameters
+        ----------
+        time_index : int
+            Acquisition timepoint index.
+        position_index : int
+            Acquisition position index.
+        fallback : tuple[float, float]
+            Stage-derived YX origin used when no registered footprint is available.
+
+        Returns
+        -------
+        tuple[float, float]
+            Registered YX origin for the tile, or the supplied stage-derived fallback.
+        """
         matches = [
             item
             for item in self.tile_footprints
@@ -192,9 +238,7 @@ class PhysicalRoi:
             ]
         if not matches:
             return fallback
-        bounds = matches[0].get("bounds_yx_um")
-        if not isinstance(bounds, list) or len(bounds) != 4:
-            return fallback
+        bounds = matches[0]["bounds_yx_um"]
         return float(bounds[0]), float(bounds[2])
 
     def registered_tile_origin_zyx_um(
@@ -202,7 +246,20 @@ class PhysicalRoi:
         time_index: int,
         position_index: int,
     ) -> tuple[float, float, float] | None:
-        """Return the original registered full-fusion placement for one tile."""
+        """Return the original registered full-fusion placement for one tile.
+
+        Parameters
+        ----------
+        time_index : int
+            Acquisition timepoint index.
+        position_index : int
+            Acquisition position index.
+
+        Returns
+        -------
+        tuple[float, float, float] | None
+            Registered ZYX origin for the tile, or None without a matching footprint.
+        """
         matches = [
             item
             for item in self.tile_footprints
@@ -211,9 +268,7 @@ class PhysicalRoi:
         ]
         if not matches:
             return None
-        origin = matches[0].get("origin_zyx_um")
-        if not isinstance(origin, list) or len(origin) != 3:
-            return None
+        origin = matches[0]["origin_zyx_um"]
         return tuple(float(value) for value in origin)
 
 
@@ -244,6 +299,32 @@ def world_roi_to_skewed_bounds(
     Camera Y is never cropped because it parameterizes lab Z. The scan bounds
     enclose the diagonal preimage of the requested lab-Y interval over every
     camera-Y row.
+
+    Parameters
+    ----------
+    roi_bounds_yx_um : tuple[float, float, float, float]
+        Physical ROI bounds in Y-min, Y-max, X-min, X-max order.
+    tile_origin_yx_um : tuple[float, float]
+        Registered physical YX origin of the source tile, in micrometers.
+    skewed_shape_syx : tuple[int, int, int]
+        Raw tile dimensions in scan, camera-Y, camera-X order.
+    pixel_size_um : float
+        Camera pixel spacing in micrometers.
+    scan_step_um : float
+        Acquisition displacement between scan planes, in micrometers.
+    angle_deg : float
+        Oblique detector-plane angle relative to the coverslip, in degrees.
+    crop_y_pixels : int
+        Leading deskewed Y pixels removed before positioning the tile.
+    halo_scan : int
+        Extra raw scan planes retained on each side for reconstruction support.
+    halo_x : int
+        Extra camera columns retained on each side for reconstruction support.
+
+    Returns
+    -------
+    SkewedRoiBounds | None
+        Raw scan/X crop enclosing the physical ROI, or None without tile overlap.
     """
     scan_count, camera_y, camera_x = (int(value) for value in skewed_shape_syx)
     roi_y0, roi_y1, roi_x0, roi_x1 = roi_bounds_yx_um
@@ -273,11 +354,20 @@ def world_roi_to_skewed_bounds(
 
 
 def _level_zero_grid(path: Path) -> tuple[tuple[float, float], tuple[float, float]]:
-    """Return the level-zero physical YX origin and spacing from an NGFF Image."""
+    """Return the level-zero physical YX origin and spacing from an NGFF Image.
+
+    Parameters
+    ----------
+    path : Path
+        OME-NGFF image whose level-zero physical grid is read.
+
+    Returns
+    -------
+    tuple[tuple[float, float], tuple[float, float]]
+        Physical YX origin and spacing of the NGFF level-zero image.
+    """
     root = open_group(path)
     metadata = root.ome_metadata()
-    if not isinstance(metadata, v05.Image):
-        raise ValueError("ROI export requires a single fused OME-Zarr Image canvas")
     dataset = metadata.multiscales[0].datasets[0]
     scale = dataset.scale_transform.scale
     translation = (
@@ -296,13 +386,39 @@ def align_bounds_to_grid(
     origin_yx_um: tuple[float, float],
     pixel_size_yx_um: tuple[float, float],
 ) -> tuple[float, float, float, float]:
-    """Expand physical bounds to the enclosing level-zero pixel grid."""
+    """Expand physical bounds to the enclosing level-zero pixel grid.
+
+    Parameters
+    ----------
+    bounds_yx_um : tuple[float, float, float, float]
+        Physical ROI bounds in Y-min, Y-max, X-min, X-max order.
+    origin_yx_um : tuple[float, float]
+        Physical YX origin of the image grid, in micrometers.
+    pixel_size_yx_um : tuple[float, float]
+        Physical YX grid spacing, in micrometers.
+
+    Returns
+    -------
+    tuple[float, float, float, float]
+        Enclosing physical bounds snapped outward to level-zero pixel edges.
+    """
     y0, y1, x0, x1 = (float(value) for value in bounds_yx_um)
     oy, ox = (float(value) for value in origin_yx_um)
     sy, sx = (float(value) for value in pixel_size_yx_um)
 
     def snap_grid_index(value: float) -> float:
-        """Remove floating-point noise around an exact integer grid edge."""
+        """Remove floating-point noise around an exact integer grid edge.
+
+        Parameters
+        ----------
+        value : float
+            Fractional grid edge before rounding near-integer floating-point noise.
+
+        Returns
+        -------
+        float
+            Grid index with near-integer floating-point noise removed.
+        """
         nearest = round(value)
         return float(nearest) if math.isclose(value, nearest, abs_tol=1e-7) else value
 
@@ -318,36 +434,28 @@ def align_bounds_to_grid(
     )
 
 
-def intersecting_position_indices(
-    bounds_yx_um: tuple[float, float, float, float],
-    footprints: list[dict[str, Any]],
-) -> tuple[int, ...]:
-    """Return source positions whose physical YX footprints overlap an ROI."""
-    roi_y0, roi_y1, roi_x0, roi_x1 = bounds_yx_um
-    return tuple(
-        sorted(
-            {
-                int(footprint["position_index"])
-                for footprint in intersecting_tile_footprints(
-                    bounds_yx_um,
-                    footprints,
-                )
-            }
-        )
-    )
-
-
 def intersecting_tile_footprints(
     bounds_yx_um: tuple[float, float, float, float],
     footprints: list[dict[str, Any]],
 ) -> tuple[dict[str, Any], ...]:
-    """Return complete per-timepoint tile records intersecting an ROI."""
+    """Return complete per-timepoint tile records intersecting an ROI.
+
+    Parameters
+    ----------
+    bounds_yx_um : tuple[float, float, float, float]
+        ROI bounds in Y-min, Y-max, X-min, X-max order, in micrometers.
+    footprints : list[dict[str, Any]]
+        Registered tile records containing physical bounds and source indices.
+
+    Returns
+    -------
+    tuple[dict[str, Any], ...]
+        Copies of records with positive-area overlap, in acquisition order.
+    """
     roi_y0, roi_y1, roi_x0, roi_x1 = bounds_yx_um
     selected = []
     for footprint in footprints:
-        bounds = footprint.get("bounds_yx_um")
-        if not isinstance(bounds, list) or len(bounds) != 4:
-            continue
+        bounds = footprint["bounds_yx_um"]
         tile_y0, tile_y1, tile_x0, tile_x1 = (float(value) for value in bounds)
         if (
             tile_y1 > roi_y0
@@ -363,7 +471,20 @@ def roi_from_world_rectangle(
     source_path: str | Path,
     vertices_world: np.ndarray,
 ) -> PhysicalRoi:
-    """Create a physical ROI from napari rectangle vertices in world coordinates."""
+    """Create a physical ROI from napari rectangle vertices in world coordinates.
+
+    Parameters
+    ----------
+    source_path : str | Path
+        Source acquisition or registered image associated with these outputs.
+    vertices_world : np.ndarray
+        Napari rectangle vertices expressed in physical image coordinates.
+
+    Returns
+    -------
+    PhysicalRoi
+        Pixel-aligned physical ROI and source registered tile footprints.
+    """
     source = validate_registered_max_projection(source_path)
     vertices = np.asarray(vertices_world, dtype=np.float64)
     if vertices.ndim != 2 or vertices.shape[0] < 2 or vertices.shape[1] < 2:
@@ -407,6 +528,18 @@ def roi_from_image_pixel_rectangle(
     caller must first map the shape vertices through the reference Image
     layer's ``world_to_data`` transform. This function then applies the
     authoritative level-zero NGFF scale and translation.
+
+    Parameters
+    ----------
+    source_path : str | Path
+        Source acquisition or registered image associated with these outputs.
+    vertices_image_data : np.ndarray
+        Napari rectangle vertices expressed in image pixel coordinates.
+
+    Returns
+    -------
+    PhysicalRoi
+        Physical ROI transformed from rectangle vertices on the display image grid.
     """
     source = Path(source_path).expanduser().resolve()
     vertices = np.asarray(vertices_image_data, dtype=np.float64)

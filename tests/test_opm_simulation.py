@@ -3,7 +3,7 @@
 import numpy as np
 import pytest
 
-from opm_processing.imageprocessing.opm_simulation import (
+from scripts.opm_simulation import (
     acquire_sphere,
     camera_noise,
     meridian_sphere,

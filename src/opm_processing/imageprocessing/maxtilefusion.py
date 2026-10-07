@@ -50,13 +50,7 @@ def regenerate_fused_max_projection(
     """
     fused_path = Path(fused_path).expanduser().resolve()
     output_path = Path(output_path).expanduser().resolve()
-    if not fused_path.is_dir():
-        raise FileNotFoundError(
-            f"Full-resolution fused data store not found: {fused_path}"
-        )
     fused_suffix = "_fused.ome.zarr"
-    if not fused_path.name.endswith(fused_suffix):
-        raise ValueError(f"Unexpected registered fused-image name: {fused_path}")
     acquisition_name = fused_path.name[: -len(fused_suffix)]
     processing_state = ProcessingState.read(
         processing_state_path(fused_path.parent, acquisition_name)
@@ -65,44 +59,21 @@ def regenerate_fused_max_projection(
 
     source_root = open_group(fused_path)
     source_metadata = source_root.ome_metadata()
-    if not isinstance(source_metadata, v05.Image):
-        raise ValueError(f"Not an OME-Zarr v0.5 Image: {fused_path}")
     source_multiscale = source_metadata.multiscales[0]
     projection_datasets = []
     projection_specs = []
     levels = []
-    expected_time_channels: tuple[int, int] | None = None
     for source_dataset in source_multiscale.datasets:
         source = source_root[source_dataset.path].to_tensorstore()
-        if source.rank != 5:
-            raise ValueError(
-                "Expected TCZYX fused data at every multiscale level; "
-                f"{source_dataset.path!r} has shape {source.shape}"
-            )
         time_dim, channel_dim, z_dim, y_dim, x_dim = (
             int(value) for value in source.shape
         )
-        if expected_time_channels is None:
-            expected_time_channels = (time_dim, channel_dim)
-        elif (time_dim, channel_dim) != expected_time_channels:
-            raise ValueError(
-                "Fused multiscale levels must have identical T and C dimensions"
-            )
 
         scale = np.asarray(source_dataset.scale_transform.scale, dtype=np.float64)
-        if scale.shape != (5,):
-            raise ValueError("Fused dataset scale transform must contain TCZYX values")
-        if source_dataset.translation_transform is None:
-            translation = np.zeros(5, dtype=np.float64)
-        else:
-            translation = np.asarray(
-                source_dataset.translation_transform.translation,
-                dtype=np.float64,
-            )
-        if translation.shape != (5,):
-            raise ValueError(
-                "Fused dataset translation transform must contain TCZYX values"
-            )
+        translation = np.asarray(
+            source_dataset.translation_transform.translation,
+            dtype=np.float64,
+        )
         output_scale = np.asarray(round_tczyx_transform(scale), dtype=np.float64)
         projection_translation = np.asarray(
             round_tczyx_transform(translation),
@@ -141,8 +112,6 @@ def regenerate_fused_max_projection(
             }
         )
 
-    if not levels:
-        raise ValueError("Fused image contains no multiscale datasets")
     projection_image = v05.Image(
         multiscales=[
             v05.Multiscale(
@@ -189,7 +158,30 @@ def regenerate_fused_max_projection(
         x_start: int,
         x_stop: int,
     ) -> None:
-        """Project one output-aligned YX chunk through every source Z plane."""
+        """Project one output-aligned YX chunk through every source Z plane.
+
+        Parameters
+        ----------
+        level_index : int
+            Source and destination pyramid level index.
+        time_index : int
+            Timepoint to project.
+        channel_index : int
+            Channel to project.
+        y_start : int
+            Inclusive Y bound in level pixels.
+        y_stop : int
+            Exclusive Y bound in level pixels.
+        x_start : int
+            Inclusive X bound in level pixels.
+        x_stop : int
+            Exclusive X bound in level pixels.
+
+        Returns
+        -------
+        None
+            Writes the maximum projection directly to its destination chunk.
+        """
         level = levels[level_index]
         source = level["source"]
         output = arrays[level["path"]]
@@ -214,8 +206,6 @@ def regenerate_fused_max_projection(
                 projection = slab_max
             else:
                 np.maximum(projection, slab_max, out=projection)
-        if projection is None:
-            raise RuntimeError("Cannot project an empty Z axis")
         output[
             time_index,
             channel_index,
@@ -233,6 +223,13 @@ def regenerate_fused_max_projection(
     pending: set[Future[None]] = set()
 
     def collect(done: set[Future[None]]) -> None:
+        """Collect completed projection writes and advance chunk progress.
+
+        Parameters
+        ----------
+        done : set[Future[None]]
+            Completed futures whose results are collected and checked.
+        """
         for future in done:
             future.result()
             progress.update()
@@ -382,32 +379,20 @@ class MaxTileFusion:
         self.source_position_indices = tuple(
             int(value) for value in source_position_indices
         )
-        if len(self.source_position_indices) != len(self.tile_positions):
-            raise ValueError(
-                "source_position_indices must contain one value per input tile"
-            )
         self.output_path = Path(output_path)
         pixel_size = tuple(float(value) for value in pixel_size)
         if len(pixel_size) == 2:
             self.z_pixel_size = 1.0
             self.pixel_size = round_spatial_values(pixel_size)
-        elif len(pixel_size) == 3:
+        else:
             self.z_pixel_size = round_spatial(pixel_size[0])
             self.pixel_size = round_spatial_values(pixel_size[-2:])
-        else:
-            raise ValueError("pixel_size must contain YX or ZYX spacing")
-        if any(value <= 0 for value in (*self.pixel_size, self.z_pixel_size)):
-            raise ValueError("pixel sizes must be positive")
         self.spatial_offset_z_um = round_spatial(spatial_offset_z_um)
 
         self.time_dim, self.channels, self.z_dim, height, width = self.ts_dataset[
             0
         ].shape
         self.output_dtype = np.dtype(self.ts_dataset[0].dtype.numpy_dtype)
-        if self.output_dtype not in (np.dtype(np.uint16), np.dtype(np.float32)):
-            raise ValueError(
-                "Maximum-projection fusion supports uint16 or float32 input"
-            )
         self.position_dim = len(self.ts_dataset)
         height -= 2 * self.pad_y
         width -= 2 * self.pad_x
@@ -431,11 +416,6 @@ class MaxTileFusion:
 
     def compute_fused_image_space(self):
         """Compute the overall fused image size in yx given tile positions.
-
-        Parameters
-        ----------
-        None
-            This callable has no parameters.
 
         Returns
         -------
@@ -519,15 +499,10 @@ class MaxTileFusion:
     def create_fused_image(self):
         """Create the fused TCZYX image through yaozarrs.
 
-        Parameters
-        ----------
-        None
-            This callable has no parameters.
-
         Returns
         -------
         object
-            Result produced by the callable.
+            TensorStore handle for the level-zero fused projection.
         """
         if self.time_range is not None:
             time_to_use = self.time_range[1] - self.time_range[0]
@@ -663,11 +638,6 @@ class MaxTileFusion:
         Only chunks intersecting a tile are materialized. This keeps peak RAM
         proportional to ``channels * chunk_size**2`` rather than to the full
         mosaic canvas, which may include large empty gaps between stage positions.
-
-        Parameters
-        ----------
-        None
-            This callable has no parameters.
 
         Returns
         -------
@@ -815,11 +785,6 @@ class MaxTileFusion:
 
     def run(self):
         """Run the full fusion pipeline.
-
-        Parameters
-        ----------
-        None
-            This callable has no parameters.
 
         Returns
         -------

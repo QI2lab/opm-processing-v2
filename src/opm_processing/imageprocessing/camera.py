@@ -72,33 +72,17 @@ QI2LAB_STAGE_SCAN_GAIN_VALUES = np.asarray(
 
 
 def qi2lab_stage_scan_camera_gain() -> np.ndarray:
-    """Return the fixed detector-X gain measured for the qi2lab stage camera."""
+    """Return the fixed detector-X gain measured for the qi2lab stage camera.
+
+    Returns
+    -------
+    np.ndarray
+        Float32 detector-X response with unity outside the measured gain interval.
+    """
     gain = np.ones(QI2LAB_STAGE_SCAN_DETECTOR_WIDTH, dtype=np.float32)
     stop = QI2LAB_STAGE_SCAN_GAIN_START_X + QI2LAB_STAGE_SCAN_GAIN_VALUES.size
     gain[QI2LAB_STAGE_SCAN_GAIN_START_X:stop] = QI2LAB_STAGE_SCAN_GAIN_VALUES
     return gain
-
-
-def correct_qi2lab_stage_scan_camera(
-    images: np.ndarray,
-    *,
-    x_offset: int = 0,
-    copy: bool = True,
-) -> np.ndarray:
-    """Divide by the fixed qi2lab stage-scan gain, broadcasting over scan/Y."""
-    corrected = np.asarray(images, dtype=np.float32)
-    if copy:
-        corrected = corrected.copy()
-    start = int(x_offset)
-    stop = start + int(corrected.shape[-1])
-    if start < 0 or stop > QI2LAB_STAGE_SCAN_DETECTOR_WIDTH:
-        raise ValueError(
-            "The qi2lab stage-scan gain requires detector-X coordinates within "
-            f"0:{QI2LAB_STAGE_SCAN_DETECTOR_WIDTH}; received {start}:{stop}"
-        )
-    gain = qi2lab_stage_scan_camera_gain()[start:stop]
-    corrected /= gain.reshape((1,) * (corrected.ndim - 1) + (gain.size,))
-    return corrected
 
 
 @njit(inline="always")
@@ -188,8 +172,6 @@ def camera_correct(
         Calibrated float32 data with the input shape. The input is unchanged.
     """
     raw = np.asarray(raw)
-    if raw.dtype != np.uint16:
-        raise TypeError("Raw acquisition data must be uint16 before camera correction")
     gain = np.empty(0, np.float32)
     if apply_stage_scan_gain:
         start = int(detector_x_offset)
@@ -256,8 +238,6 @@ def illumination_correct(
         Float32 intensities divided by the profile. Neither input is modified.
     """
     calibrated, illumination = np.asarray(calibrated), np.asarray(illumination)
-    if calibrated.dtype != np.float32 or illumination.dtype != np.float32:
-        raise TypeError("Calibrated data and illumination must be float32")
     if illumination.shape == calibrated.shape[-2:]:
         if calibrated.ndim == 3:
             return illumination_correct_rows(calibrated, illumination)

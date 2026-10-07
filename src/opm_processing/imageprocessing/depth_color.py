@@ -14,7 +14,20 @@ from cmap import Colormap
 
 @lru_cache(maxsize=32)
 def depth_palette(planes: int, colormap: str = "turbo") -> np.ndarray:
-    """Sample a 256-color LUT with the reference plugin's one-based slice mapping."""
+    """Sample a 256-color LUT with the reference plugin's one-based slice mapping.
+
+    Parameters
+    ----------
+    planes : int
+        Number of depth planes represented by the palette.
+    colormap : str
+        Colormap name used to encode depth.
+
+    Returns
+    -------
+    np.ndarray
+        Per-plane RGB colors sampled from the selected colormap.
+    """
     if planes < 1:
         raise ValueError("Depth axis must contain at least one plane.")
     lut = np.rint(Colormap(colormap).lut(256)[:, :3] * 255).astype(np.uint8)
@@ -25,7 +38,24 @@ def depth_palette(planes: int, colormap: str = "turbo") -> np.ndarray:
 
 
 def depth_projection(volume, axis, limits, colormap="turbo"):
-    """Color the raw-intensity maximum's depth; first voxel wins an exact tie."""
+    """Color the raw-intensity maximum's depth; first voxel wins an exact tie.
+
+    Parameters
+    ----------
+    volume
+        ZYX image volume to project.
+    axis
+        Volume axis collapsed by the maximum projection.
+    limits
+        Fixed lower and upper intensity display limits.
+    colormap
+        Colormap name used to encode depth.
+
+    Returns
+    -------
+    np.ndarray
+        Uint8 RGB maximum projection colored by the brightest voxel depth.
+    """
     low, high = limits
     if volume.ndim != 3 or axis not in (0, 1, 2) or not high > low:
         raise ValueError(
@@ -44,7 +74,22 @@ def depth_projection(volume, axis, limits, colormap="turbo"):
 
 
 def depth_legends(shape, spacing, colormap="turbo"):
-    """Describe local voxel-center depth ranges for XY/Z, XZ/Y and YZ/X."""
+    """Describe local voxel-center depth ranges for XY/Z, XZ/Y and YZ/X.
+
+    Parameters
+    ----------
+    shape
+        Source volume dimensions in ZYX order.
+    spacing
+        Physical voxel spacing in ZYX order, in micrometers.
+    colormap
+        Colormap name used to encode depth.
+
+    Returns
+    -------
+    list[dict]
+        Colorbar labels and physical depth extents for the XY, XZ, and YZ views.
+    """
     return [
         dict(
             projection=projection,

@@ -53,32 +53,10 @@ def pytest_collection_modifyitems(items):
 
 @pytest.fixture(scope="module")
 def cupy_gpu():
-    """Return CuPy after proving CUDA execution, or honor GPU skip policy.
-
-    Parameters
-    ----------
-    None
-        This callable has no parameters.
-
-    Returns
-    -------
-    object
-        Result produced by the callable.
-    """
+    """Return CuPy after proving CUDA execution, or honor GPU skip policy."""
 
     def unavailable(message: str) -> None:
-        """Fail required GPU runs or skip optional GPU runs.
-
-        Parameters
-        ----------
-        message : str
-            Value supplied for ``message``.
-
-        Returns
-        -------
-        None
-            No value is returned.
-        """
+        """Fail required GPU runs or skip optional GPU runs."""
         if os.environ.get("OPM_REQUIRE_GPU") == "1":
             pytest.fail(message, pytrace=False)
         pytest.skip(message)
@@ -178,20 +156,7 @@ class TiledAcquisitionConfig:
 def _tiled_acquisition_config(
     name: str, *, mode: str = "mirror"
 ) -> TiledAcquisitionConfig:
-    """Build one named spatial configuration without module-level constants.
-
-    Parameters
-    ----------
-    name : str
-        Value supplied for ``name``.
-    mode : str
-        Value supplied for ``mode``.
-
-    Returns
-    -------
-    TiledAcquisitionConfig
-        Result produced by the callable.
-    """
+    """Build one named spatial configuration without module-level constants."""
     configurations = {
         "x_overlap": (
             ((0, 0, 0), (0, 0, 14)),
@@ -242,38 +207,7 @@ def _opm_v2_frame_metadata(
     hardware_triggered: bool | None = None,
     additional_event_metadata: dict | None = None,
 ) -> dict:
-    """Build one upstream-compatible ``FrameMetaV1`` dictionary.
-
-    Parameters
-    ----------
-    index : dict[str, int]
-        Value supplied for ``index``.
-    daq_metadata : dict
-        Value supplied for ``daq metadata``.
-    opm_metadata : dict
-        Value supplied for ``opm metadata``.
-    stage_metadata : dict
-        Value supplied for ``stage metadata``.
-    camera_shape_yx : tuple[int, int]
-        Value supplied for ``camera shape yx``.
-    pixel_size_um : float
-        Value supplied for ``pixel size um``.
-    camera_offset : float
-        Value supplied for ``camera offset``.
-    camera_conversion : float
-        Value supplied for ``camera conversion``.
-    runner_time_ms : float
-        Value supplied for ``runner time ms``.
-    hardware_triggered : bool | None
-        Value supplied for ``hardware triggered``.
-    additional_event_metadata : dict | None
-        Value supplied for ``additional event metadata``.
-
-    Returns
-    -------
-    dict
-        Result produced by the callable.
-    """
+    """Build one upstream-compatible ``FrameMetaV1`` dictionary."""
     event_metadata = {
         "DAQ": daq_metadata,
         "Camera": {
@@ -312,26 +246,7 @@ def _write_opm_v2_zarr(
     chunks: tuple[int, ...],
     frame_metadatas: list[dict],
 ) -> None:
-    """Write a current group-based OME-Zarr acquisition fixture.
-
-    Parameters
-    ----------
-    path : Path
-        Value supplied for ``path``.
-    raw_data : np.ndarray
-        Value supplied for ``raw data``.
-    labels : tuple[str, ...]
-        Value supplied for ``labels``.
-    chunks : tuple[int, ...]
-        Value supplied for ``chunks``.
-    frame_metadatas : list[dict]
-        Value supplied for ``frame metadatas``.
-
-    Returns
-    -------
-    None
-        No value is returned.
-    """
+    """Write a current group-based OME-Zarr acquisition fixture."""
     normalized = raw_data if "z" in labels else raw_data[:, :, :, None, :, :]
     normalized_chunks = chunks if "z" in labels else (*chunks[:3], 1, *chunks[-2:])
     time_count, position_count, channel_count, z_count, y_count, x_count = (
@@ -398,16 +313,6 @@ def opm_v2_projection_zarr(tmp_path) -> OpmV2ProjectionFixture:
     - ``handlers/opm_mirror_handler.py`` defines shape/chunks/labels and .zattrs.
     - ``engine/setup_events_v2.py`` defines projection event metadata.
     - pymmcore-plus ``FrameMetaV1`` defines the enclosing frame metadata.
-
-    Parameters
-    ----------
-    tmp_path : object
-        Value supplied for ``tmp path``.
-
-    Returns
-    -------
-    OpmV2ProjectionFixture
-        Result produced by the callable.
     """
     path = tmp_path / "opm_v2_projection.zarr"
     shape = (2, 1, 2, 16, 18)  # T, P, C, Y, X; projection has no Z index.
@@ -483,20 +388,7 @@ def opm_v2_projection_zarr(tmp_path) -> OpmV2ProjectionFixture:
 
 @pytest.fixture(params=("mirror", "stage"), ids=("mirror-scan", "stage-scan"))
 def opm_v2_skewed_zarr(request, tmp_path) -> OpmV2SkewedFixture:
-    """Create normal skewed OPM-v2 acquisitions for both scan mechanisms.
-
-    Parameters
-    ----------
-    request : object
-        Value supplied for ``request``.
-    tmp_path : object
-        Value supplied for ``tmp path``.
-
-    Returns
-    -------
-    OpmV2SkewedFixture
-        Result produced by the callable.
-    """
+    """Create normal skewed OPM-v2 acquisitions for both scan mechanisms."""
     mode = str(request.param)
     path = tmp_path / f"opm_v2_{mode}.zarr"
     shape = (1, 1, 1, 8, 12, 14)  # T, P, C, Z, Y, X
@@ -600,18 +492,6 @@ def _create_opm_v2_tiled_ground_truth_zarr(
     The forward model samples a laboratory-frame ground truth on the tilted
     camera planes used by OPM and convolves each skewed stack with the same
     compact PSF supplied to processing.
-
-    Parameters
-    ----------
-    tmp_path : Path
-        Value supplied for ``tmp path``.
-    config : TiledAcquisitionConfig
-        Value supplied for ``config``.
-
-    Returns
-    -------
-    OpmV2TiledGroundTruthFixture
-        Result produced by the callable.
     """
     if len(config.tile_offsets_zyx_px) != len(config.recorded_position_errors_zyx_px):
         raise ValueError("Each tile must have one recorded position error")
@@ -836,20 +716,7 @@ def _create_opm_v2_tiled_ground_truth_zarr(
 
 @pytest.fixture(params=("mirror", "stage"), ids=("mirror-tiled", "stage-tiled"))
 def opm_v2_tiled_ground_truth_zarr(request, tmp_path) -> OpmV2TiledGroundTruthFixture:
-    """Create the original two-tile X-overlap acquisition in both scan modes.
-
-    Parameters
-    ----------
-    request : object
-        Value supplied for ``request``.
-    tmp_path : object
-        Value supplied for ``tmp path``.
-
-    Returns
-    -------
-    OpmV2TiledGroundTruthFixture
-        Result produced by the callable.
-    """
+    """Create the original two-tile X-overlap acquisition in both scan modes."""
     return _create_opm_v2_tiled_ground_truth_zarr(
         tmp_path,
         config=_tiled_acquisition_config("x_overlap", mode=str(request.param)),
@@ -882,20 +749,7 @@ def opm_v2_spatial_tiling_ground_truth_zarr(
     request,
     tmp_path,
 ) -> OpmV2TiledGroundTruthFixture:
-    """Create each distinct multi-axis tiling configuration as a test case.
-
-    Parameters
-    ----------
-    request : object
-        Value supplied for ``request``.
-    tmp_path : object
-        Value supplied for ``tmp path``.
-
-    Returns
-    -------
-    OpmV2TiledGroundTruthFixture
-        Result produced by the callable.
-    """
+    """Create each distinct multi-axis tiling configuration as a test case."""
     configuration, mode = request.param
     return _create_opm_v2_tiled_ground_truth_zarr(
         tmp_path,
@@ -976,9 +830,6 @@ def roi_run(tmp_path: Path, monkeypatch):
         raise ValueError("Directory does not contain a raw acquisition")
 
     monkeypatch.setattr(roi_command, "inspect_acquisition", inspect_source)
-    monkeypatch.setattr(
-        roi_command, "validate_registered_max_projection", lambda path: path
-    )
     monkeypatch.setattr(
         roi_command, "TileFusion", lambda **kwargs: SimpleNamespace(run=lambda: None)
     )

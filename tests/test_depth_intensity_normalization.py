@@ -201,7 +201,13 @@ def test_scaled_uint16_output_clips_and_float32_preserves_range():
         fusion._cast_fusion_values(scaled).ravel(), (65535, 500)
     )
     fusion.output_dtype = np.dtype(np.float32)
+    assert fusion._cast_fusion_values(scaled) is scaled
     np.testing.assert_array_equal(
         fusion._cast_fusion_values(scaled).ravel(), (80000, 500)
     )
+    fusion._depth_intensity_gains[:] = 1
+    fusion.output_dtype = np.dtype(np.uint16)
+    unscaled = fusion._cast_fusion_values(fusion._scale_depth_source(0, source))
+    assert unscaled is source
+    np.testing.assert_array_equal(unscaled.ravel(), (40000, 1000))
     np.testing.assert_array_equal(source.ravel(), (40000, 1000))

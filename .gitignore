@@ -125,6 +125,5 @@ src/cucim
 AUDIT_REFACTOR_WORKFLOW.md
 /figures/
 /.agents/
-/scripts/
 
 uv.lock

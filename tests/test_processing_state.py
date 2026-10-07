@@ -110,7 +110,6 @@ def test_processing_state_round_trip_has_exact_durable_ground_truth(
     (
         ({"schema": "old"}, "schema"),
         ({"schema_version": 0}, "version"),
-        ({"outputs": []}, "outputs"),
     ),
 )
 def test_processing_state_rejects_noncurrent_contract(
@@ -118,7 +117,7 @@ def test_processing_state_rejects_noncurrent_contract(
     mutation,
     message,
 ) -> None:
-    """Reject legacy or structurally invalid state documents."""
+    """Reject state from an incompatible schema or software version."""
     source = tmp_path / "sample.ome.zarr"
     source.mkdir()
     path = processing_state_path(tmp_path, "sample")

@@ -33,6 +33,20 @@ def _flatfield_sample_indices(
     BaSiCPy needs independent images containing varied specimen content.  In a
     tiled stage scan, sampling only adjacent tiles can make specimen structure
     common to the fit and therefore indistinguishable from illumination.
+
+    Parameters
+    ----------
+    n_positions : int
+        Number of independently acquired stage positions.
+    n_scan_planes : int
+        Number of acquired scan planes per tile.
+    planes_per_position : int
+        Maximum raw planes sampled from each position for illumination fitting.
+
+    Returns
+    -------
+    list[tuple[int, list[int]]]
+        Positions and reproducible scan-plane samples used for the illumination fit.
     """
     samples_per_position = min(n_scan_planes, planes_per_position)
 
@@ -57,12 +71,23 @@ def _stage_z_groups(
     n_positions: int,
     stage_positions_zxy: np.ndarray | None,
 ) -> tuple[tuple[float, ...], tuple[tuple[int, ...], ...]]:
-    """Group tiles by repeated acquisition depth at the same stage XY."""
+    """Group tiles by repeated acquisition depth at the same stage XY.
+
+    Parameters
+    ----------
+    n_positions : int
+        Number of independently acquired stage positions.
+    stage_positions_zxy : np.ndarray | None
+        Acquisition-ordered stage coordinates in micrometers, or None for one depth group.
+
+    Returns
+    -------
+    tuple
+        Repeated-depth level labels and ordered source tile groups.
+    """
     if stage_positions_zxy is None:
         return (0.0,), (tuple(range(n_positions)),)
     positions = np.asarray(stage_positions_zxy, dtype=float)
-    if positions.shape != (n_positions, 3):
-        raise ValueError("stage positions must have shape (positions, 3)")
     indices = stage_z_level_indices(positions)
     groups = tuple(
         tuple(int(value) for value in np.flatnonzero(indices == level))
@@ -76,7 +101,20 @@ def _flatfield_tile_indices(
     *,
     max_tiles_per_level: int = 32,
 ) -> tuple[int, ...]:
-    """Select evenly distributed tiles independently within one depth level."""
+    """Select evenly distributed tiles independently within one depth level.
+
+    Parameters
+    ----------
+    positions : tuple[int, ...]
+        Source tile indices within one acquisition depth.
+    max_tiles_per_level : int
+        Maximum spatially distributed tiles sampled from one depth.
+
+    Returns
+    -------
+    tuple[int, ...]
+        Spatially distributed source positions selected within the depth level.
+    """
     if max_tiles_per_level < 1:
         raise ValueError("max_tiles_per_level must be positive")
     if len(positions) <= max_tiles_per_level:
@@ -131,7 +169,20 @@ def _resize_image_stack(
     images: np.ndarray,
     output_shape: tuple[int, int],
 ) -> np.ndarray:
-    """Resize an image stack using BaSiCPy's interpolation convention."""
+    """Resize an image stack using BaSiCPy's interpolation convention.
+
+    Parameters
+    ----------
+    images : np.ndarray
+        Calibrated float32 image or stack with camera-X as its last axis.
+    output_shape : tuple[int, int]
+        Requested detector YX working dimensions for the fit.
+
+    Returns
+    -------
+    np.ndarray
+        Float32 image stack resized with the BaSiCPy interpolation convention.
+    """
     resized = F.interpolate(
         torch.from_numpy(images[:, np.newaxis, :, :]),
         size=output_shape,
@@ -143,7 +194,18 @@ def _resize_image_stack(
 
 
 def _flatfield_working_shape(image_shape: tuple[int, int]) -> tuple[int, int]:
-    """Use a rectangular working field downsampled twofold on each axis."""
+    """Use a rectangular working field downsampled twofold on each axis.
+
+    Parameters
+    ----------
+    image_shape : tuple[int, int]
+        Input image dimensions in scan, camera-Y, camera-X order.
+
+    Returns
+    -------
+    tuple[int, int]
+        Detector YX working dimensions reduced twofold, with each dimension at least one.
+    """
     return tuple(max(1, int(size) // 2) for size in image_shape)
 
 
@@ -151,7 +213,20 @@ def _separable_residual_calibration(
     flatfield: np.ndarray,
     observations: np.ndarray,
 ) -> np.ndarray:
-    """Calibrate residual detector-coordinate gain on independent tile summaries."""
+    """Calibrate residual detector-coordinate gain on independent tile summaries.
+
+    Parameters
+    ----------
+    flatfield : np.ndarray
+        Fitted detector illumination profile.
+    observations : np.ndarray
+        Independent tile summaries used to estimate residual detector gain.
+
+    Returns
+    -------
+    np.ndarray
+        Mean-normalized float32 illumination with residual detector profiles applied.
+    """
     corrected = observations / flatfield[np.newaxis, :, :]
     residual = np.median(corrected, axis=0)
     residual /= np.median(residual)
@@ -233,12 +308,6 @@ def estimate_illuminations(
     n_channels = int(datastore.shape[2])
     if signal_mask is not None:
         signal_mask = np.asarray(signal_mask, dtype=bool)
-        expected_mask_shape = tuple(int(value) for value in datastore.shape[:3])
-        if signal_mask.shape != expected_mask_shape:
-            raise ValueError(
-                f"signal_mask must have TPC shape {expected_mask_shape}; "
-                f"received {signal_mask.shape}"
-            )
 
     progress = tqdm(
         total=len(position_groups) * n_channels,

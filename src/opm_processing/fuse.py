@@ -4,21 +4,9 @@ Fuse qi2lab OPM data.
 This file registers and fuses deskewed qi2lab OPM data.
 """
 
-import multiprocessing as mp
-import sys
-
-if sys.platform.startswith("linux"):
-    mp.set_start_method("forkserver", force=True)
-elif sys.platform.startswith("win"):
-    mp.set_start_method("spawn", force=True)
-
-import warnings
+from pathlib import Path
 from typing import Annotated
 
-warnings.filterwarnings("ignore", category=UserWarning)
-warnings.simplefilter("ignore", category=FutureWarning)
-
-from pathlib import Path
 import typer
 from opm_processing.dataio.acquisition import (
     acquisition_stem,
@@ -62,7 +50,25 @@ def register_and_fuse(
     max_in_flight_writes: int = 2,
     optimization_rel_threshold: float = 0.5,
     optimization_abs_threshold: float = 1.5,
-    max_registration_shift_zyx: tuple[int, int, int] = (20, 100, 100),
+    max_registration_shift_zyx: Annotated[
+        tuple[int, int, int] | None,
+        typer.Option(
+            help=(
+                "Maximum ZYX corrections in pixels. Default: infer per-pair "
+                "limits from stage spacing and scan geometry."
+            ),
+        ),
+    ] = None,
+    normalize_depth_intensity: Annotated[
+        bool,
+        typer.Option(
+            "--normalize-depth-intensity/--no-normalize-depth-intensity",
+            help=(
+                "Match brightness between depth layers using one gain per "
+                "channel shared by all XY tiles at each depth."
+            ),
+        ),
+    ] = True,
     require_gpu: bool = False,
     regenerate_max_z: Annotated[
         bool,
@@ -81,63 +87,54 @@ def register_and_fuse(
             help="Physical ROI JSON created by display --roi-output.",
         ),
     ] = None,
-):
-    """Register and fuse processed OPM data.
-
-    This code assumes data is already processed and on disk.
-
-    Usage: `fuse "/path/to/qi2lab_acquisition.zarr"
-
-    Output will be in `/path/to/qi2lab_acquisition_fused.ome.zarr`
-
-    <acq_type> will be either deskewed or projection depending on OPM mode.
+) -> None:
+    """Register processed OPM tiles, fuse them, and save a maximum projection.
 
     Parameters
     ----------
-    root_path: Path
-        Path to an OPM acquisition, a processed collection, or the directory
-        selected with ``process --output``.
-    registration_channel: int, default = 0
-        Zero-based channel index to use for registration.
-        If there is only one channel, this should be 0.
-        If there are multiple channels, this should be the index of the channel
-        to use for registration.
-
+    root_path : pathlib.Path
+        Raw acquisition path, processed tile store, or processing output directory.
+    registration_channel : int
+        Zero-based channel used to align overlapping tiles.
     blend_pixels : tuple[int, int, int]
-        Value supplied for ``blend pixels``.
+        Feathering widths in Z, Y, and X pixels at each tile edge.
     downsample_factors : tuple[int, int, int]
-        Value supplied for ``downsample factors``.
+        Z, Y, and X sampling factors used during overlap registration.
     ssim_window : int
-        Value supplied for ``ssim window``.
+        Window width used to score registered overlaps with structural similarity.
     registration_threshold : float
-        Value supplied for ``registration threshold``.
+        Minimum structural similarity required to accept a pairwise registration.
     chunk_shape_yx : tuple[int, int]
-        Value supplied for ``chunk shape yx``.
+        Y and X dimensions of output fusion blocks.
     fusion_ram_fraction : float
-        Value supplied for ``fusion ram fraction``.
+        Fraction of available host RAM used to size concurrent fusion blocks.
     max_workers : int or None
-        Number of CPU fusion workers. By default, uses up to eight physical
-        cores so each concurrent block retains efficient Z depth.
+        CPU fusion workers; None uses up to eight physical cores.
     max_in_flight_writes : int
-        Value supplied for ``max in flight writes``.
+        Maximum queued fusion-block writes before waiting for disk output.
     optimization_rel_threshold : float
-        Value supplied for ``optimization rel threshold``.
+        Median-residual multiplier used to reject registration outliers.
     optimization_abs_threshold : float
-        Value supplied for ``optimization abs threshold``.
-    max_registration_shift_zyx : tuple[int, int, int]
-        Value supplied for ``max registration shift zyx``.
+        Minimum residual cutoff in effective registration sampling bins.
+    max_registration_shift_zyx : tuple[int, int, int] or None
+        Maximum ZYX corrections in pixels; None derives limits from stage spacing
+        and scan geometry for each overlap.
+    normalize_depth_intensity : bool
+        Match registered depth layers using channel gains shared across XY tiles
+        at each depth and timepoint. Save the gains alongside the fused image.
     require_gpu : bool
-        Fail instead of silently using CPU registration when CUDA is unavailable.
+        Require CUDA registration instead of allowing the CPU backend.
     regenerate_max_z : bool
-        Regenerate the fused maximum-Z multiscale pyramid from the existing
-        registered fused image.
+        Regenerate all maximum-Z pyramid levels from the existing fused image
+        without registering or fusing tiles again.
     roi : pathlib.Path or None
-        Restrict tile selection and the fused YX canvas while retaining all Z.
+        Display-exported ROI restricting positions and fused YX bounds while
+        retaining every Z plane; None fuses the full acquisition.
 
     Returns
     -------
     None
-        No value is returned.
+        Registered fused data and its maximum-Z pyramid are written to disk.
     """
     if regenerate_max_z:
         try:
@@ -148,72 +145,57 @@ def register_and_fuse(
             acquisition_path = resolve_acquisition_path(root_path)
             output_dir = acquisition_path.parent
             stem = acquisition_stem(acquisition_path)
-        fused_path = output_dir / f"{stem}_fused.ome.zarr"
-        output_path = output_dir / f"{stem}_max_z_fused.ome.zarr"
-        regenerate_fused_max_projection(
-            fused_path,
-            output_path,
-            max_workers=max_workers,
+    else:
+        status = fusion_backend_status(max_workers=max_workers)
+        if require_gpu:
+            require_gpu_backend()
+        print(
+            "Fusion backends: "
+            f"registration={status['registration_backend']}; "
+            f"fusion={status['fusion_backend']} "
+            f"({status['fusion_workers']} block workers)"
         )
-        print(f"Regenerated fused maximum-Z projection: {output_path}")
-        return
+        if not status["gpu_registration"]:
+            print(f"GPU registration unavailable: {status['gpu_error']}")
 
-    status = fusion_backend_status(max_workers=max_workers)
-    if require_gpu:
-        require_gpu_backend()
-    print(
-        "Fusion backends: "
-        f"registration={status['registration_backend']}; "
-        f"fusion={status['fusion_backend']} "
-        f"({status['fusion_workers']} block workers)"
-    )
-    if not status["gpu_registration"]:
-        print(f"GPU registration unavailable: {status['gpu_error']}")
-
-    tile_fuser = TileFusion(
-        root_path=root_path,
-        channel_to_use=registration_channel,
-        blend_pixels=blend_pixels,
-        downsample_factors=downsample_factors,
-        ssim_window=ssim_window,
-        threshold=registration_threshold,
-        chunk_shape_yx=chunk_shape_yx,
-        fusion_ram_fraction=fusion_ram_fraction,
-        max_workers=max_workers,
-        max_in_flight_writes=max_in_flight_writes,
-        optimization_rel_threshold=optimization_rel_threshold,
-        optimization_abs_threshold=optimization_abs_threshold,
-        max_registration_shift_zyx=max_registration_shift_zyx,
-        roi_selection=None if roi is None else PhysicalRoi.read(roi),
-    )
-    tile_fuser.run()
-    fused_path = tile_fuser.output_dir / (
-        f"{tile_fuser.acquisition_name}_fused.ome.zarr"
-    )
-    max_z_path = tile_fuser.output_dir / (
-        f"{tile_fuser.acquisition_name}_max_z_fused.ome.zarr"
-    )
+        tile_fuser = TileFusion(
+            root_path=root_path,
+            channel_to_use=registration_channel,
+            blend_pixels=blend_pixels,
+            downsample_factors=downsample_factors,
+            ssim_window=ssim_window,
+            threshold=registration_threshold,
+            chunk_shape_yx=chunk_shape_yx,
+            fusion_ram_fraction=fusion_ram_fraction,
+            max_workers=max_workers,
+            max_in_flight_writes=max_in_flight_writes,
+            optimization_rel_threshold=optimization_rel_threshold,
+            optimization_abs_threshold=optimization_abs_threshold,
+            max_registration_shift_zyx=max_registration_shift_zyx,
+            roi_selection=None if roi is None else PhysicalRoi.read(roi),
+            normalize_depth_intensity=normalize_depth_intensity,
+        )
+        tile_fuser.run()
+        output_dir = tile_fuser.output_dir
+        stem = tile_fuser.acquisition_name
+    fused_path = output_dir / f"{stem}_fused.ome.zarr"
+    max_z_path = output_dir / f"{stem}_max_z_fused.ome.zarr"
     regenerate_fused_max_projection(
         fused_path,
         max_z_path,
         max_workers=max_workers,
     )
-    print(f"Created registered fused maximum-Z projection: {max_z_path}")
+    action = "Regenerated" if regenerate_max_z else "Created registered"
+    print(f"{action} fused maximum-Z projection: {max_z_path}")
 
 
-# entry for point for CLI
-def main():
+def main() -> None:
     """Run the registration and fusion command-line application.
-
-    Parameters
-    ----------
-    None
-        This callable has no parameters.
 
     Returns
     -------
     None
-        No value is returned.
+        The Typer application parses arguments and runs the requested fusion.
     """
     app()
 

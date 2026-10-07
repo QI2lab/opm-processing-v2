@@ -14,12 +14,18 @@ def stage_z_level_indices(
     coverslip because the fitted coverslip height varies across XY. Repeated
     visits to the same rounded XY location define depth level 0, 1, ... in
     acquisition order.
+
+    Parameters
+    ----------
+    stage_positions_zxy : Sequence[Sequence[float]] | np.ndarray
+        Acquisition-ordered physical stage positions in micrometers.
+
+    Returns
+    -------
+    np.ndarray
+        Zero-based depth visit index for each position.
     """
     positions = np.asarray(stage_positions_zxy, dtype=np.float64)
-    if positions.ndim != 2 or positions.shape[1] != 3 or positions.shape[0] == 0:
-        raise ValueError("stage positions must have nonempty ZXY shape")
-    if not np.all(np.isfinite(positions)):
-        raise ValueError("stage positions must be finite")
 
     visits: dict[tuple[float, float], int] = {}
     indices = np.empty(positions.shape[0], dtype=np.int64)
@@ -65,12 +71,6 @@ def stage_positions_to_image_coordinates(
         Independent float64 coordinates suitable for tile placement.
     """
     coordinates = np.asarray(positions, dtype=np.float64).copy()
-    if (
-        coordinates.ndim != 2
-        or coordinates.shape[1] not in (2, 3)
-        or coordinates.shape[0] == 0
-    ):
-        raise ValueError("positions must have nonempty shape (n, 2) or (n, 3)")
     if reverse_y:
         coordinates[:, -2] *= -1.0
     if reverse_z and coordinates.shape[1] == 3:

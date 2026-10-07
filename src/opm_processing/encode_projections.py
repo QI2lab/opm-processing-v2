@@ -21,7 +21,18 @@ FRAME_PATTERN = re.compile(r"(.+)_t(\d+)\.tiff?$", re.IGNORECASE)
 
 
 def find_sequences(root: Path) -> list[list[Path]]:
-    """Group exported TIFFs by parent and stem, and sort numerically by timepoint."""
+    """Group exported TIFFs by parent and stem, and sort numerically by timepoint.
+
+    Parameters
+    ----------
+    root : Path
+        Projection frame directory searched recursively for timepoint TIFFs.
+
+    Returns
+    -------
+    list[list[Path]]
+        Numerically ordered timepoint TIFF paths grouped by position and channel.
+    """
     groups = defaultdict(list)
     for path in root.rglob("*"):
         match = FRAME_PATTERN.fullmatch(path.name)
@@ -44,6 +55,16 @@ def image_nv12(frame: np.ndarray) -> tuple[np.ndarray, int, int]:
 
     Neutral chroma preserves grayscale. Black padding gives even dimensions
     and a minimum 128-pixel extent for small test or cropped canvases.
+
+    Parameters
+    ----------
+    frame : np.ndarray
+        Uint8 grayscale or RGB projection image.
+
+    Returns
+    -------
+    tuple[np.ndarray, int, int]
+        Flattened NV12 pixels and padded encoder width and height.
     """
     if frame.dtype != np.uint8 or not (
         frame.ndim == 2 or (frame.ndim == 3 and frame.shape[2] == 3)
@@ -83,7 +104,34 @@ def encode_sequence(
     gop_seconds=2,
     encoder_options=None,
 ):
-    """Encode one ordered sequence and atomically publish a fast-start H.264 MP4."""
+    """Encode one ordered sequence and atomically publish a fast-start H.264 MP4.
+
+    Parameters
+    ----------
+    frames : Sequence[Path]
+        Numerically ordered projection TIFF paths for one position/channel.
+    output : Path
+        Directory or file receiving the generated images and figures.
+    fps
+        Playback frames per second, or None to use saved acquisition timing.
+    bitrate
+        NVENC target bitrate in bits per second.
+    gpu
+        CUDA device index used by the video encoder.
+    codec
+        NVENC output codec, h264 or hevc.
+    rate_control
+        NVENC bitrate control mode, cbr or vbr.
+    gop_seconds
+        Interval between intra frames, in seconds.
+    encoder_options
+        Additional keyword options passed to the NVENC encoder.
+
+    Returns
+    -------
+    Path
+        MP4 destination after successful encoding and atomic publication.
+    """
     import PyNvVideoCodec as nvc
 
     if not frames:
@@ -100,7 +148,7 @@ def encode_sequence(
             )
         fps = Fraction(1000) / Fraction(str(interval))
     rate = Fraction(str(fps)).limit_denominator(1_000_000)
-    if not frames or not 0 < rate <= 120 or bitrate <= 0 or gpu < 0:
+    if not 0 < rate <= 120 or bitrate <= 0 or gpu < 0:
         raise ValueError(
             "Require frames, fps >0..120, a positive bitrate and a nonnegative GPU index."
         )
@@ -217,7 +265,23 @@ def encode_projections(
         str, typer.Option(help="cbr or vbr; both retain the configured bitrate target.")
     ] = "cbr",
 ):
-    """Write one high-quality H.264 MP4 beside each projection TIFF sequence."""
+    """Write one high-quality H.264 MP4 beside each projection TIFF sequence.
+
+    Parameters
+    ----------
+    root_path : Annotated[Path, typer.Argument(help='Acquisition root directory containing the deconvolved/deskewed OME-Zarr store.')]
+        Acquisition or processed-output directory selected by the caller.
+    fps : Annotated[float | None, typer.Option(min=0, max=120, help='Override playback fps; default is the acquired volume rate.')]
+        Playback frames per second, or None to use saved acquisition timing.
+    bitrate : Annotated[int, typer.Option(min=1, help='Video bitrate in bits per second (default: 8 Mbps).')]
+        NVENC target bitrate in bits per second.
+    gpu : Annotated[int, typer.Option(min=0, help='NVENC GPU index.')]
+        CUDA device index used by the video encoder.
+    codec : Annotated[str, typer.Option(help='h264 for broad compatibility, or hevc for newer players.')]
+        NVENC output codec, h264 or hevc.
+    rate_control : Annotated[str, typer.Option(help='cbr or vbr; both retain the configured bitrate target.')]
+        NVENC bitrate control mode, cbr or vbr.
+    """
     from opm_processing.export_projections import find_datasets
 
     dataset = find_datasets(root_path)[0]

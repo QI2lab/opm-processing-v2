@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 from scipy.signal import fftconvolve
 
-from opm_processing.imageprocessing.psf_sampling_experiment import (
+from scripts.psf_sampling_experiment import (
     cartesian_psf,
     sample_skewed,
 )

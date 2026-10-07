@@ -1,7 +1,6 @@
 """Read, write, and convert OPM acquisition data."""
 
 from . import acquisition as acquisition
-from . import metadata as metadata
 from . import position_collection as position_collection
 from .acquisition import (
     AcquisitionMetadata,
@@ -17,7 +16,6 @@ __all__ = [
     "acquisition_stem",
     "acquisition",
     "inspect_acquisition",
-    "metadata",
     "open_acquisition_datastore",
     "position_collection",
 ]

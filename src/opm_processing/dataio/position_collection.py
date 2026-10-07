@@ -21,12 +21,33 @@ from yaozarrs import open_group, v05
 from yaozarrs.write.v05 import Bf2RawBuilder
 
 from opm_processing.dataio.acquisition import inspect_acquisition
-from opm_processing.dataio.metadata import convert_metadata
 from opm_processing.dataio.ngff import (
     round_spatial,
     round_spatial_values,
     round_tczyx_transform,
 )
+
+
+def convert_metadata(obj: Any) -> Any:
+    """Convert NumPy arrays in collection attributes into JSON-compatible lists.
+
+    Parameters
+    ----------
+    obj : Any
+        Attribute value, including nested dictionaries and lists.
+
+    Returns
+    -------
+    Any
+        Value with NumPy arrays converted to lists; other values are preserved.
+    """
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, dict):
+        return {key: convert_metadata(value) for key, value in obj.items()}
+    if isinstance(obj, list):
+        return [convert_metadata(value) for value in obj]
+    return obj
 
 
 @dataclass(frozen=True)
@@ -48,15 +69,10 @@ class PositionCollection:
     def shape(self) -> tuple[int, ...]:
         """Return the logical TPCZYX shape of the collection.
 
-        Parameters
-        ----------
-        None
-            This callable has no parameters.
-
         Returns
         -------
         tuple[int, ...]
-            Result produced by the callable.
+            T, P, C, Z, Y, and X dimensions from the first series.
         """
         t, c, z, y, x = self.arrays[0].shape
         return int(t), len(self.arrays), int(c), int(z), int(y), int(x)
@@ -82,35 +98,35 @@ def create_position_collection(
     Parameters
     ----------
     output_path : str | Path
-        Value supplied for ``output path``.
+        Destination Bf2Raw OME-Zarr directory.
     shape : Sequence[int]
-        Value supplied for ``shape``.
+        Logical collection dimensions in TPCZYX order.
     voxel_size_um : Sequence[float]
-        Value supplied for ``voxel size um``.
+        Physical voxel spacing in ZYX order, in micrometers.
     dtype : np.dtype | str
-        Value supplied for ``dtype``.
+        Pixel dtype stored in each series.
     stage_positions : Sequence[Sequence[float]] | None
-        Value supplied for ``stage positions``.
+        Per-position stage coordinates in the acquisition ordering, or no stage labels.
     channels : Sequence[str] | None
-        Value supplied for ``channels``.
+        Ordered channel names; omitted names become channel-N.
     attributes : dict[str, Any] | None
-        Value supplied for ``attributes``.
+        Additional JSON-compatible root metadata.
     chunks : tuple[int, ...] | str | None
-        Value supplied for ``chunks``.
+        TCZYX chunk dimensions or the TensorStore automatic chunk policy.
     overwrite : bool
-        Value supplied for ``overwrite``.
+        Whether an existing destination may be replaced.
+    multiscale_factors_yx : Sequence[int]
+        YX pyramid reduction factors; level zero is always included.
+    multiscale_downsample : str
+        Pyramid sampling method: stride or block_mean.
+    spatial_offset_um : Sequence[float]
+        Image origin in ZYX order, in micrometers.
 
     Returns
     -------
     PositionCollection
-        Result produced by the callable.
+        Ordered array handles and physical metadata for the collection.
     """
-    if len(shape) != 6:
-        raise ValueError(f"Expected a TPCZYX shape, received {tuple(shape)}")
-    if len(voxel_size_um) != 3:
-        raise ValueError("voxel_size_um must contain z, y, and x spacing")
-    if len(spatial_offset_um) != 3:
-        raise ValueError("spatial_offset_um must contain z, y, and x offsets")
     if multiscale_downsample not in ("stride", "block_mean"):
         raise ValueError('multiscale_downsample must be "stride" or "block_mean"')
 
@@ -123,8 +139,6 @@ def create_position_collection(
     if any(value < 1 for value in factors):
         raise ValueError("multiscale_factors_yx must contain positive integers")
     factors = tuple(value for value in factors if value == 1 or value <= min(y, x))
-    if stage_positions is not None and len(stage_positions) != positions:
-        raise ValueError("stage_positions must contain one entry per position")
     rounded_stage_positions = (
         None
         if stage_positions is None
@@ -243,19 +257,35 @@ def create_variable_position_collection(
 
     Each series is an independently placed TCZYX image. This is used for ROI
     tiles so no series needs to be padded back to the original camera tile.
+
+    Parameters
+    ----------
+    output_path : str | Path
+        Destination Bf2Raw OME-Zarr directory.
+    shapes_tczyx : Sequence[Sequence[int]]
+        Per-tile TCZYX shapes with one timepoint and a common channel count.
+    voxel_size_um : Sequence[float]
+        Physical voxel spacing in ZYX order, in micrometers.
+    spatial_origins_zyx_um : Sequence[Sequence[float]]
+        Per-tile image origins in ZYX order, in micrometers.
+    dtype : np.dtype | str
+        Pixel dtype stored in each series.
+    channels : Sequence[str] | None
+        Ordered channel names; omitted names become channel-N.
+    attributes : dict[str, Any] | None
+        Additional JSON-compatible root metadata.
+    chunks : tuple[int, ...] | str | None
+        TCZYX chunk dimensions or the automatic chunk policy.
+    overwrite : bool
+        Whether an existing destination may be replaced.
+
+    Returns
+    -------
+    PositionCollection
+        Ordered cropped tile handles and their physical origins.
     """
     shapes = tuple(tuple(int(value) for value in shape) for shape in shapes_tczyx)
     origins = tuple(round_spatial_values(origin) for origin in spatial_origins_zyx_um)
-    if not shapes or any(len(shape) != 5 for shape in shapes):
-        raise ValueError("shapes_tczyx must contain nonempty TCZYX shapes")
-    if len(origins) != len(shapes):
-        raise ValueError("spatial_origins_zyx_um must contain one origin per series")
-    if len(voxel_size_um) != 3:
-        raise ValueError("voxel_size_um must contain z, y, and x spacing")
-    if any(shape[0] != 1 for shape in shapes):
-        raise ValueError("Variable ROI series must each contain one timepoint")
-    if len({shape[1] for shape in shapes}) != 1:
-        raise ValueError("Variable ROI series must have a common channel count")
 
     voxel_size = round_spatial_values(voxel_size_um)
     output_dtype = np.dtype(dtype)
@@ -327,13 +357,30 @@ def _build_variable_ome_xml(
     origins_zyx_um: Sequence[Sequence[float]],
     channels: Sequence[str] | None,
 ) -> str:
-    """Build OME-XML for independently shaped and positioned ROI tiles."""
+    """Build OME-XML for independently shaped and positioned ROI tiles.
+
+    Parameters
+    ----------
+    shapes_tczyx : Sequence[Sequence[int]]
+        Per-series dimensions in TCZYX order.
+    dtype : np.dtype
+        Pixel dtype shared by the series.
+    voxel_size_um : Sequence[float]
+        ZYX voxel spacing in micrometers.
+    origins_zyx_um : Sequence[Sequence[float]]
+        Per-series ZYX physical origins in micrometers.
+    channels : Sequence[str] | None
+        Ordered channel names, or generated channel-N labels.
+
+    Returns
+    -------
+    str
+        OME-XML with one image and stage label per cropped tile.
+    """
     channel_count = int(shapes_tczyx[0][1])
     channel_names = list(
         channels or (f"channel-{index}" for index in range(channel_count))
     )
-    if len(channel_names) != channel_count:
-        raise ValueError("channels must contain one name per channel")
     ome_pixel_type = {
         "float32": "float",
         "float64": "double",
@@ -401,25 +448,23 @@ def _build_ome_xml(
     Parameters
     ----------
     shape : tuple[int, int, int, int, int, int]
-        Value supplied for ``shape``.
+        Logical collection dimensions in TPCZYX order.
     dtype : np.dtype
-        Value supplied for ``dtype``.
+        Pixel dtype stored in each series.
     voxel_size_um : Sequence[float]
-        Value supplied for ``voxel size um``.
+        Physical voxel spacing in ZYX order, in micrometers.
     stage_positions : Sequence[Sequence[float]] | None
-        Value supplied for ``stage positions``.
+        Per-position stage coordinates in the acquisition ordering, or no stage labels.
     channels : Sequence[str] | None
-        Value supplied for ``channels``.
+        Ordered channel names; omitted names become channel-N.
 
     Returns
     -------
     str
-        Result produced by the callable.
+        Serialized OME-XML describing every position.
     """
     t, positions, c, z, y, x = shape
     channel_names = list(channels or (f"channel-{index}" for index in range(c)))
-    if len(channel_names) != c:
-        raise ValueError("channels must contain one name per channel")
     ome_pixel_type = {
         "float32": "float",
         "float64": "double",
@@ -486,21 +531,17 @@ def open_position_collection(path: str | Path) -> PositionCollection:
     Parameters
     ----------
     path : str | Path
-        Value supplied for ``path``.
+        OME-Zarr directory to open.
 
     Returns
     -------
     PositionCollection
-        Result produced by the callable.
+        Ordered array handles, pyramid levels, and physical metadata.
     """
     root = open_group(path)
-    if not isinstance(root.ome_metadata(), v05.Bf2Raw):
-        raise ValueError(f"Not a Bio-Formats2Raw collection: {path}")
 
     ome_group = root["OME"]
     series_metadata = ome_group.ome_metadata()
-    if not isinstance(series_metadata, v05.Series):
-        raise ValueError(f"Collection lacks typed OME series metadata: {path}")
     collection_path = Path(path).expanduser().resolve()
     ome = from_xml(
         (collection_path / "OME" / "METADATA.ome.xml").read_text(encoding="utf-8")
@@ -512,27 +553,20 @@ def open_position_collection(path: str | Path) -> PositionCollection:
     for name in series_metadata.series:
         image_group = root[name]
         image_metadata = image_group.ome_metadata()
-        if not isinstance(image_metadata, v05.Image):
-            raise ValueError(f"Series {name} lacks typed OME image metadata")
         datasets = image_metadata.multiscales[0].datasets
         level_arrays = tuple(
             image_group[dataset.path].to_tensorstore() for dataset in datasets
         )
-        if not level_arrays:
-            raise ValueError(f"Series {name} contains no multiscale datasets")
-        level_scales = tuple(
-            int(
-                round(
-                    float(dataset.scale_transform.scale[-1])
-                    / float(datasets[0].scale_transform.scale[-1])
-                )
-            )
-            for dataset in datasets
-        )
         if factors is None:
-            factors = level_scales
-        elif level_scales != factors:
-            raise ValueError("All position series must use the same pyramid factors")
+            factors = tuple(
+                int(
+                    round(
+                        dataset.scale_transform.scale[-1]
+                        / datasets[0].scale_transform.scale[-1]
+                    )
+                )
+                for dataset in datasets
+            )
         arrays.append(level_arrays[0])
         series_levels.append(level_arrays)
         translation = datasets[0].translation_transform
@@ -547,12 +581,7 @@ def open_position_collection(path: str | Path) -> PositionCollection:
             )
         )
     arrays = tuple(arrays)
-    if not arrays:
-        raise ValueError(f"Bf2Raw collection has no image series: {path}")
     attributes = {key: value for key, value in root.attrs.items() if key != "ome"}
-    variable_shapes = any(
-        tuple(array.shape) != tuple(arrays[0].shape) for array in arrays[1:]
-    )
 
     if "opm_v2" in root.attrs:
         acquisition = inspect_acquisition(path, root=root)
@@ -565,8 +594,6 @@ def open_position_collection(path: str | Path) -> PositionCollection:
         tuple(levels[level] for levels in series_levels)
         for level in range(len(series_levels[0]))
     )
-    if len(ome.images) != len(arrays):
-        raise ValueError("OME-XML image count does not match the position series")
     first_pixels = ome.images[0].pixels
     voxel_size_um = (
         float(first_pixels.physical_size_z or 1.0),
@@ -586,8 +613,6 @@ def open_position_collection(path: str | Path) -> PositionCollection:
         for image in ome.images
         if image.stage_label is not None
     )
-    if not variable_shapes and len(stage_positions) not in (0, len(arrays)):
-        raise ValueError("OME-XML stage labels are incomplete")
     return PositionCollection(
         path=collection_path,
         arrays=arrays,
@@ -608,13 +633,13 @@ def open_image_array(path: str | Path, level: str = "0") -> Any:
     Parameters
     ----------
     path : str | Path
-        Value supplied for ``path``.
+        OME-Zarr directory to open.
     level : str
-        Value supplied for ``level``.
+        Dataset path within the image group, usually a pyramid level number.
 
     Returns
     -------
     Any
-        Result produced by the callable.
+        TensorStore handle for the requested image dataset.
     """
     return open_group(path)[level].to_tensorstore()

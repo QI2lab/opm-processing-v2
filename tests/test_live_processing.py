@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -22,7 +23,6 @@ from opm_processing.dataio.live import (
     ZarrTileReadiness,
     iter_live_tiles,
     read_lifecycle_event,
-    resolve_live_sidecars,
 )
 from opm_processing.dataio.position_collection import create_position_collection
 from opm_processing.dataio.position_collection import open_position_collection
@@ -32,10 +32,9 @@ from opm_processing.dataio.processing_state import (
 )
 from opm_processing.imageprocessing.opmtools import orthogonal_deskew
 from opm_processing.process import (
-    _is_empty_tile,
-    _load_provided_illumination,
-    _open_live_acquisition,
-    _validate_empty_tile_options,
+    is_empty_tile,
+    open_live_acquisition,
+    validate_empty_tile_options,
     app,
     process,
 )
@@ -84,7 +83,14 @@ def _manifest_document(data_path: Path, *, timepoints: int = 2) -> dict:
 
 
 def _write_manifest(data_path: Path, *, timepoints: int = 2) -> LiveManifest:
-    sidecars = resolve_live_sidecars(data_path)
+    sidecars = SimpleNamespace(
+        manifest=data_path.with_name(
+            data_path.name.removesuffix(".ome.zarr") + ".manifest.json"
+        ),
+        log=data_path.with_name(
+            data_path.name.removesuffix(".ome.zarr") + ".log.jsonl"
+        ),
+    )
     sidecars.manifest.write_text(
         json.dumps(_manifest_document(data_path, timepoints=timepoints)),
         encoding="utf-8",
@@ -145,14 +151,14 @@ def test_live_acquisition_directory_resolves_manifest_data_path(tmp_path) -> Non
     )
     manifest = _write_manifest(data_path)
 
-    acquisition, resolved_manifest, log_path = _open_live_acquisition(acquisition_dir)
+    acquisition, resolved_manifest, log_path = open_live_acquisition(acquisition_dir)
 
     assert acquisition.path == data_path.resolve()
     assert resolved_manifest == manifest
     assert log_path == acquisition_dir / "sample.log.jsonl"
 
     with pytest.raises(ValueError, match="containing acquisition directory"):
-        _open_live_acquisition(data_path)
+        open_live_acquisition(data_path)
 
 
 @pytest.mark.unit
@@ -274,40 +280,22 @@ def test_lifecycle_reader_ignores_an_incomplete_last_record(tmp_path) -> None:
 
 
 @pytest.mark.unit
-def test_provided_illumination_is_strictly_validated(tmp_path) -> None:
-    """Accept a matching image and reject invalid values without estimation."""
-    path = tmp_path / "illumination.ome.tif"
-    expected = np.ones((2, 4, 5), dtype=np.float32)
-    imwrite(path, expected, metadata={"axes": "CYX"})
-    np.testing.assert_array_equal(
-        _load_provided_illumination(path, expected.shape), expected
-    )
-
-    invalid_path = tmp_path / "invalid.ome.tif"
-    invalid = expected.copy()
-    invalid[0, 0, 0] = 0
-    imwrite(invalid_path, invalid, metadata={"axes": "CYX"})
-    with pytest.raises(ValueError, match="strictly positive"):
-        _load_provided_illumination(invalid_path, expected.shape)
-
-
-@pytest.mark.unit
 def test_empty_tile_detection_uses_global_occupancy() -> None:
     """Use global occupancy to ignore sparse noise and hot pixels."""
     stack = np.zeros((5, 4, 4), dtype=np.float32)
     stack[:, 0, 0] = 10.0
-    assert _is_empty_tile(
+    assert is_empty_tile(
         stack,
         threshold=2.0,
         min_signal_fraction=0.1,
     )
     stack[-1, 0, :4] = 2.0
-    assert not _is_empty_tile(
+    assert not is_empty_tile(
         stack,
         threshold=2.0,
         min_signal_fraction=0.1,
     )
-    assert not _is_empty_tile(
+    assert not is_empty_tile(
         stack,
         threshold=None,
         min_signal_fraction=0.1,
@@ -315,13 +303,13 @@ def test_empty_tile_detection_uses_global_occupancy() -> None:
 
     sparse_artifacts = np.zeros((100, 20, 20), dtype=np.float32)
     sparse_artifacts[:10, :10, :10] = 10.0
-    assert _is_empty_tile(
+    assert is_empty_tile(
         sparse_artifacts,
         threshold=2.0,
         min_signal_fraction=0.05,
     )
     sparse_artifacts[:20, :10, :10] = 10.0
-    assert not _is_empty_tile(
+    assert not is_empty_tile(
         sparse_artifacts,
         threshold=2.0,
         min_signal_fraction=0.05,
@@ -341,7 +329,7 @@ def test_empty_tile_detection_uses_global_occupancy() -> None:
 def test_empty_tile_options_are_validated(threshold, signal_fraction, message) -> None:
     """Reject thresholds and occupancy fractions with undefined behavior."""
     with pytest.raises(ValueError, match=message):
-        _validate_empty_tile_options(threshold, signal_fraction)
+        validate_empty_tile_options(threshold, signal_fraction)
 
 
 @pytest.mark.integration
@@ -386,7 +374,14 @@ def test_live_process_matches_direct_deskew_without_estimating(
     manifest_document = _manifest_document(data_path, timepoints=1)
     manifest_document["index_sizes"] = {"t": 1, "p": 1, "c": 1, "z": 4}
     manifest_document["channels"] = manifest_document["channels"][:1]
-    sidecars = resolve_live_sidecars(data_path)
+    sidecars = SimpleNamespace(
+        manifest=data_path.with_name(
+            data_path.name.removesuffix(".ome.zarr") + ".manifest.json"
+        ),
+        log=data_path.with_name(
+            data_path.name.removesuffix(".ome.zarr") + ".log.jsonl"
+        ),
+    )
     sidecars.manifest.write_text(json.dumps(manifest_document), encoding="utf-8")
     sidecars.log.write_text(
         json.dumps({"event": "completed", "acquisition_id": "synthetic-acquisition"})
@@ -465,7 +460,14 @@ def test_live_deconvolution_builds_each_channel_psf_once(tmp_path, monkeypatch) 
         [30.0, 100.0, 200.0],
         [30.0, 100.0, 202.0],
     ]
-    sidecars = resolve_live_sidecars(data_path)
+    sidecars = SimpleNamespace(
+        manifest=data_path.with_name(
+            data_path.name.removesuffix(".ome.zarr") + ".manifest.json"
+        ),
+        log=data_path.with_name(
+            data_path.name.removesuffix(".ome.zarr") + ".log.jsonl"
+        ),
+    )
     sidecars.manifest.write_text(json.dumps(manifest_document), encoding="utf-8")
     sidecars.log.write_text(
         json.dumps({"event": "completed", "acquisition_id": "synthetic-acquisition"})
@@ -570,7 +572,14 @@ def test_live_empty_channel_skips_deconvolution_and_writes_zero(
 
     manifest_document = _manifest_document(data_path, timepoints=1)
     manifest_document["index_sizes"] = {"t": 1, "p": 1, "c": 2, "z": 4}
-    sidecars = resolve_live_sidecars(data_path)
+    sidecars = SimpleNamespace(
+        manifest=data_path.with_name(
+            data_path.name.removesuffix(".ome.zarr") + ".manifest.json"
+        ),
+        log=data_path.with_name(
+            data_path.name.removesuffix(".ome.zarr") + ".log.jsonl"
+        ),
+    )
     sidecars.manifest.write_text(json.dumps(manifest_document), encoding="utf-8")
     sidecars.log.write_text(
         json.dumps({"event": "completed", "acquisition_id": "synthetic-acquisition"})
@@ -811,7 +820,14 @@ def test_live_processing_resumes_completed_output_tiles(tmp_path, monkeypatch) -
         [30.0, 100.0, 200.0],
         [30.0, 100.0, 202.0],
     ]
-    sidecars = resolve_live_sidecars(data_path)
+    sidecars = SimpleNamespace(
+        manifest=data_path.with_name(
+            data_path.name.removesuffix(".ome.zarr") + ".manifest.json"
+        ),
+        log=data_path.with_name(
+            data_path.name.removesuffix(".ome.zarr") + ".log.jsonl"
+        ),
+    )
     sidecars.manifest.write_text(json.dumps(manifest_document), encoding="utf-8")
     sidecars.log.write_text(
         json.dumps({"event": "completed", "acquisition_id": "synthetic-acquisition"})

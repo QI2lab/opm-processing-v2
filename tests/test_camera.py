@@ -82,16 +82,12 @@ def test_optical_illumination_and_camera_transfer(stage_gain, strided):
 
 
 @pytest.mark.unit
-def test_uniform_illumination_and_uncorrected_input_contracts():
-    """Uniform unit illumination preserves photons; raw counts require calibration."""
+def test_uniform_illumination_preserves_calibrated_intensities():
+    """Uniform unit illumination preserves the calibrated photon values."""
     photons = np.linspace(0, 1000, 120, dtype=np.float32).reshape(3, 5, 8)
     np.testing.assert_array_equal(
         illumination_correct(photons, np.ones((5, 8), np.float32)), photons
     )
-    with pytest.raises(TypeError):
-        camera_correct(photons, 100, 0.24)
-    with pytest.raises(TypeError):
-        illumination_correct(photons.astype(np.uint16), np.ones((5, 8), np.float32))
 
 
 @pytest.mark.unit

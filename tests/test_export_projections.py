@@ -20,7 +20,12 @@ def test_physical_sphere_projections_and_scale():
         indexing="ij",
     )
     sphere = (x * x + y * y + z * z <= 4**2).astype(float)
-    canvas, pixel_um, _ = exporter.make_canvas(sphere, spacing, (0, 1), 1234, 2)
+    images, display_pixel_um, legends = exporter.projection_panels(
+        sphere, spacing, (0, 1)
+    )
+    canvas, pixel_um, _ = exporter.assemble_canvas(
+        *images, display_pixel_um, 1234, 2, legends=legends
+    )
     assert pixel_um == 0.1
     panels = [canvas[:122, :121], canvas[134:258, :121], canvas[:122, 133:257]]
     for panel in panels:

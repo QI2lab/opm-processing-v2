@@ -4,23 +4,14 @@ Deskew qi2lab OPM data.
 This file deskews and creates maximum projections of raw qi2lab OPM data.
 """
 
-import multiprocessing as mp
-import sys
-
-if sys.platform.startswith("linux"):
-    mp.set_start_method("forkserver", force=True)
-elif sys.platform.startswith("win"):
-    mp.set_start_method("spawn", force=True)
-
-import warnings
-
-warnings.filterwarnings("ignore", category=UserWarning)
-warnings.simplefilter("ignore", category=FutureWarning)
-
 import hashlib
 import math
+import multiprocessing as mp
+import sys
 import time
 import traceback
+from collections.abc import Iterable, Iterator, Sequence
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -38,7 +29,6 @@ from opm_processing.dataio.acquisition import (
 from opm_processing.dataio.live import (
     LIVE_POLL_INTERVAL_SECONDS,
     LiveManifest,
-    LiveSidecars,
     ZarrTileReadiness,
     iter_live_tiles,
 )
@@ -56,12 +46,10 @@ from opm_processing.dataio.processing_state import (
 )
 from opm_processing.dataio.roi import (
     PhysicalRoi,
-    intersecting_position_indices,
     world_roi_to_skewed_bounds,
 )
 from opm_processing.imageprocessing.coordinates import (
     stage_z_level_indices,
-    stage_positions_to_image_coordinates,
 )
 from opm_processing.imageprocessing.camera import (
     camera_correct,
@@ -78,11 +66,35 @@ from opm_processing.imageprocessing.opmtools import (
 app = typer.Typer()
 app.pretty_exceptions_enable = False
 
-PROCESS_MAX_Z_FACTORS_YX = (2, 4, 8, 16, 32)
+# Reject cached fields made with a different camera-calibration contract.
+FLATFIELD_SOFTWARE = "opm-processing/basicpy-stage-depth-camera-contract-v10"
 
 
-def _progress_tile_groups(tiles, requested_tiles, completed_tiles, acquisition_order):
-    """Report completed acquisition groups using the recorded outer axis."""
+def progress_tile_groups(
+    tiles: Iterable[tuple[int, int]],
+    requested_tiles: Iterable[tuple[int, int]],
+    completed_tiles: Iterable[tuple[int, int]],
+    acquisition_order: Sequence[str],
+) -> Iterator[tuple[int, tuple[int]]]:
+    """Report acquisition groups and resume-aware progress within each group.
+
+    Parameters
+    ----------
+    tiles : iterable of tuple
+        Pending tile keys in time and position order.
+    requested_tiles : iterable of tuple
+        All tile keys requested for this processing run.
+    completed_tiles : iterable of tuple
+        Tile keys already processed before this run.
+    acquisition_order : sequence of str
+        Acquisition axis order used to select the outer progress tracker.
+
+    Yields
+    ------
+    tuple
+        Time index and a singleton position tuple for each pending tile,
+        while updating the outer and inner progress bars.
+    """
     axis = next((axis for axis in acquisition_order if axis in ("t", "p")), None)
     description, unit = {
         "t": ("time", "timepoint"),
@@ -90,87 +102,80 @@ def _progress_tile_groups(tiles, requested_tiles, completed_tiles, acquisition_o
         None: ("volumes", "volume"),
     }[axis]
 
-    def group_key(tile):
-        return tile[0] if axis == "t" else tile[1] if axis == "p" else tile
-
+    axis_index = {"t": 0, "p": 1, None: None}[axis]
     requested = set(requested_tiles)
-    pending = requested - set(completed_tiles)
-    total_groups = len({group_key(tile) for tile in requested})
-    remaining = {}
-    for tile in pending:
-        key = group_key(tile)
-        remaining[key] = remaining.get(key, 0) + 1
-    with tqdm(
-        total=total_groups,
-        initial=total_groups - len(remaining),
-        desc=description,
-        unit=unit,
-    ) as progress:
+    completed = requested.intersection(completed_tiles)
+    groups = {}
+    for tile in requested:
+        key = tile[axis_index] if axis_index is not None else tile
+        counts = groups.setdefault(key, [0, 0])
+        counts[0] += 1
+        counts[1] += tile in completed
+    with (
+        tqdm(
+            total=len(groups),
+            initial=sum(total == done for total, done in groups.values()),
+            desc=description,
+            unit=unit,
+        ) as progress,
+        ExitStack() as inner_stack,
+    ):
+        inner_progress = None
+        current_group = None
         for time_index, position_index in tiles:
+            tile = (time_index, position_index)
+            key = tile[axis_index] if axis_index is not None else tile
+            if axis is not None and key != current_group:
+                inner_stack.close()
+                current_group = key
+                inner_description, inner_unit = (
+                    ("positions", "position") if axis == "t" else ("time", "timepoint")
+                )
+                inner_progress = inner_stack.enter_context(
+                    tqdm(
+                        total=groups[key][0],
+                        initial=groups[key][1],
+                        desc=inner_description,
+                        unit=inner_unit,
+                        leave=False,
+                    )
+                )
             yield time_index, (position_index,)
             # Resume after the caller has processed and checkpointed this
             # volume. A timepoint may contain several selected positions.
-            tile = (time_index, position_index)
-            if tile in pending:
-                pending.remove(tile)
-                key = group_key(tile)
-                remaining[key] -= 1
-                if remaining[key] == 0:
+            if tile in requested and tile not in completed:
+                completed.add(tile)
+                if inner_progress is not None:
+                    inner_progress.update(1)
+                groups[key][1] += 1
+                if groups[key][1] == groups[key][0]:
                     progress.update(1)
 
 
-def _psf_wavelength_um(channel: str) -> float:
-    """Use the longest wavelength in a single or combined laser channel label."""
-    try:
-        wavelengths_nm = [
-            float(part.strip().lower().removesuffix("nm").strip())
-            for part in str(channel).split("+")
-        ]
-        if not all(math.isfinite(value) and value > 0 for value in wavelengths_nm):
-            raise ValueError("Wavelengths must be finite and positive")
-    except ValueError as error:
-        raise ValueError(
-            f"Cannot determine a PSF wavelength from channel {channel!r}; "
-            "supply --decon-psf-paths for channels without wavelength labels"
-        ) from error
-    return max(wavelengths_nm) / 1000
-
-
-def _resolve_output_directory(root_path: Path, output: Path | None) -> Path:
-    """Return an existing directory for all processing artifacts."""
-    output_dir = (
-        root_path.parent if output is None else Path(output).expanduser().resolve()
-    )
-    if output_dir.exists() and not output_dir.is_dir():
-        raise ValueError(f"Processing output is not a directory: {output_dir}")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    return output_dir
-
-
-def _resolve_flatfield_path(root_path: Path, output_dir: Path) -> Path:
-    """Reuse an existing output- or acquisition-side flatfield when available."""
-    filename = f"{acquisition_stem(root_path)}_flatfield.ome.tif"
-    output_path = output_dir / filename
-    if output_path.exists():
-        return output_path
-    acquisition_path = root_path.parent / filename
-    if acquisition_path.exists():
-        return acquisition_path
-    return output_path
-
-
-def _processed_dtype(save_float32: bool) -> np.dtype:
-    """Return the requested dtype for calibrated processing products."""
-    return np.dtype(np.float32 if save_float32 else np.uint16)
-
-
-def _open_resume_collection(
+def open_resume_collection(
     path: Path,
     expected_shape: tuple[int, int, int, int, int, int],
     expected_dtype: np.dtype,
     expected_multiscale_factors_yx: tuple[int, ...] = (1,),
 ) -> PositionCollection:
-    """Open and validate a processed collection from an interrupted run."""
+    """Open and validate a processed collection from an interrupted run.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        Filesystem path of the artifact to read or write.
+    expected_shape : tuple[int, int, int, int, int, int]
+        Required collection dimensions in TPCZYX order.
+    expected_dtype : numpy.dtype
+        Required dtype of every existing output image array.
+    expected_multiscale_factors_yx : tuple[int, ...]
+        Required absolute YX pyramid factors, including level zero factor 1.
+
+    Returns
+    -------
+    PositionCollection
+        Existing collection after shape, dtype, and pyramid validation.
+    """
     collection = open_position_collection(path)
     if collection.shape != expected_shape:
         raise ValueError(
@@ -193,12 +198,27 @@ def _open_resume_collection(
     return collection
 
 
-def _open_variable_resume_collection(
+def open_variable_resume_collection(
     path: Path,
     expected_shapes: list[tuple[int, ...]],
     expected_dtype: np.dtype,
 ) -> PositionCollection:
-    """Open and validate an interrupted variable-size ROI collection."""
+    """Open and validate an interrupted variable-size ROI collection.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        Filesystem path of the artifact to read or write.
+    expected_shapes : list[tuple[int, ...]]
+        Required TCZYX dimensions for each cropped ROI series, in storage order.
+    expected_dtype : numpy.dtype
+        Required dtype of every existing output image array.
+
+    Returns
+    -------
+    PositionCollection
+        Existing ROI collection after per-series shape and dtype validation.
+    """
     collection = open_position_collection(path)
     actual_shapes = [
         tuple(int(value) for value in array.shape) for array in collection.arrays
@@ -218,7 +238,7 @@ def _open_variable_resume_collection(
     return collection
 
 
-def _initialize_processing_state(
+def initialize_processing_state(
     *,
     output_dir: Path,
     source_path: Path,
@@ -228,7 +248,30 @@ def _initialize_processing_state(
     resume: bool,
     output_preexisting: bool,
 ) -> ProcessingState:
-    """Create or validate the only durable state for one processing run."""
+    """Create or validate the only durable state for one processing run.
+
+    Parameters
+    ----------
+    output_dir : pathlib.Path
+        Directory containing processed images and state.
+    source_path : pathlib.Path
+        Raw acquisition path recorded as the processing source.
+    output_path : pathlib.Path
+        Processed store identified by this checkpoint or processing run.
+    configuration : dict[str, Any]
+        Pixel-affecting processing options used to validate a resumed run.
+    roi_series : tuple[dict[str, Any], ...]
+        Source indices and crop geometry for each variable-size ROI series.
+    resume : bool
+        Reuse compatible output checkpoints; False overwrites this output run.
+    output_preexisting : bool
+        Whether the output store existed before initialization.
+
+    Returns
+    -------
+    ProcessingState
+        Initialized journal with compatible checkpoints, or a fresh output run.
+    """
     state_path = processing_state_path(output_dir, acquisition_stem(source_path))
     if resume and output_preexisting and not state_path.is_file():
         raise ValueError(
@@ -257,23 +300,27 @@ def _initialize_processing_state(
     return state
 
 
-def _require_float32(data: np.ndarray, stage: str) -> np.ndarray:
-    """Enforce the processing contract at a float32 intermediate boundary."""
-    result = np.asarray(data)
-    if result.dtype != np.dtype(np.float32):
-        raise TypeError(f"{stage} must produce float32 data; received {result.dtype}")
-    return result
+def format_processed_output(data: np.ndarray, save_float32: bool) -> np.ndarray:
+    """Convert a completed float32 processing product for persistent storage.
 
+    Parameters
+    ----------
+    data : numpy.ndarray
+        Loaded image values; float32 is required at processing boundaries.
+    save_float32 : bool
+        Preserve float32 intensities; False clips and casts final output to uint16.
 
-def _format_processed_output(data: np.ndarray, save_float32: bool) -> np.ndarray:
-    """Convert a completed float32 processing product for persistent storage."""
-    data = _require_float32(data, "completed processing")
+    Returns
+    -------
+    numpy.ndarray
+        Original float32 data or a uint16 copy clipped to 0 through 65535.
+    """
     if save_float32:
         return data
     return np.clip(data, 0, np.iinfo(np.uint16).max).astype(np.uint16)
 
 
-def _write_checkpointed_roi_channel(
+def write_checkpointed_roi_channel(
     target: Any,
     value: np.ndarray | np.generic,
     state: ProcessingState,
@@ -282,19 +329,59 @@ def _write_checkpointed_roi_channel(
     *,
     is_zero: bool,
 ) -> None:
-    """Finish a cropped channel write before recording it as resumable."""
+    """Finish a cropped channel write before recording it as resumable.
+
+    Parameters
+    ----------
+    target : Any
+        Writable TensorStore selection for one cropped output channel.
+    value : numpy.ndarray or np.generic
+        Channel image or scalar fill value to write before checkpointing.
+    state : ProcessingState
+        Durable processing journal receiving the completed-channel checkpoint.
+    output_path : pathlib.Path
+        Processed store identified by this checkpoint or processing run.
+    channel_key : tuple[int, int, int]
+        Source time, position, and channel indices, in that order.
+    is_zero : bool
+        Record that this channel contains no signal.
+
+    Returns
+    -------
+    None
+        The channel is checkpointed only after its write finishes successfully.
+    """
     target.write(value).result()
     state.complete_channel(output_path, *channel_key, is_zero=is_zero)
 
 
-def _queue_position_pyramid_writes(
+def queue_position_pyramid_writes(
     collection: PositionCollection,
     position: int,
     timepoint: int,
     channel: int,
     level_zero: np.ndarray | np.generic,
 ) -> list[Any]:
-    """Queue one TCZYX selection across every per-position pyramid level."""
+    """Queue one TCZYX selection across every per-position pyramid level.
+
+    Parameters
+    ----------
+    collection : PositionCollection
+        Output position collection containing level-zero and pyramid arrays.
+    position : int
+        Zero-based position index in the image collection.
+    timepoint : int
+        Zero-based time index in the output collection.
+    channel : int
+        Zero-based channel index.
+    level_zero : numpy.ndarray or np.generic
+        ZYX image or scalar fill used to write each YX pyramid level.
+
+    Returns
+    -------
+    list
+        Write futures that the caller must finish before checkpointing the tile.
+    """
     writes = []
     for factor, level_arrays in zip(
         collection.multiscale_factors_yx,
@@ -313,11 +400,25 @@ def _queue_position_pyramid_writes(
     return writes
 
 
-def _validate_empty_tile_options(
+def validate_empty_tile_options(
     threshold: float | None,
     min_signal_fraction: float,
 ) -> tuple[float | None, float]:
-    """Validate options controlling the empty-tile fast path."""
+    """Validate options controlling the empty-tile fast path.
+
+    Parameters
+    ----------
+    threshold : float or None
+        Minimum calibrated intensity counted as signal; None disables empty
+        detection.
+    min_signal_fraction : float
+        Required fraction of volume pixels at or above the signal threshold.
+
+    Returns
+    -------
+    tuple
+        Validated signal threshold and minimum signal fraction.
+    """
     if threshold is not None:
         threshold = float(threshold)
         if not np.isfinite(threshold) or threshold < 0:
@@ -334,50 +435,36 @@ def _validate_empty_tile_options(
     return threshold, min_signal_fraction
 
 
-def _is_empty_tile(
+def is_empty_tile(
     data: np.ndarray,
     threshold: float | None,
     min_signal_fraction: float,
 ) -> bool:
-    """Return whether too little of a calibrated channel volume contains signal."""
+    """Return whether too little of a calibrated channel volume contains signal.
+
+    Parameters
+    ----------
+    data : numpy.ndarray
+        Camera-calibrated channel image or volume, before illumination correction.
+    threshold : float or None
+        Minimum calibrated intensity counted as signal; None disables empty
+        detection.
+    min_signal_fraction : float
+        Required fraction of volume pixels at or above the signal threshold.
+
+    Returns
+    -------
+    bool
+        True when too few pixels meet the threshold; False when detection is
+        disabled.
+    """
     if threshold is None:
         return False
-    image = np.asarray(data)
-    if image.ndim < 2:
-        raise ValueError("Empty-tile detection requires at least YX image axes")
-    signal_fraction = np.count_nonzero(image >= threshold) / image.size
+    signal_fraction = np.count_nonzero(data >= threshold) / data.size
     return bool(signal_fraction < min_signal_fraction)
 
 
-def _read_raw_channel_volume(datastore, time_index: int, position: int, channel: int):
-    """Read one complete raw channel tile from TensorStore or an array-like store."""
-    selection = datastore[time_index, position, channel, :]
-    try:
-        raw = selection.read().result()
-    except (AttributeError, TypeError):
-        raw = np.asarray(selection)
-    return np.squeeze(np.asarray(raw))
-
-
-def _illumination_candidate_order(
-    positions: tuple[int, ...],
-    *,
-    preferred_count: int = 32,
-) -> tuple[int, ...]:
-    """Prioritize evenly distributed positions, then deterministic replacements."""
-    if len(positions) <= preferred_count:
-        return positions
-    primary_indices = np.unique(
-        np.linspace(0, len(positions) - 1, preferred_count, dtype=np.int64)
-    )
-    primary = tuple(positions[int(index)] for index in primary_indices)
-    primary_set = set(primary)
-    return primary + tuple(
-        position for position in positions if position not in primary_set
-    )
-
-
-def _build_illumination_signal_decisions(
+def build_illumination_signal_decisions(
     datastore,
     stage_z_indices: np.ndarray,
     camera_offset: float,
@@ -387,7 +474,32 @@ def _build_illumination_signal_decisions(
     *,
     apply_stage_scan_gain: bool,
 ) -> np.ndarray | None:
-    """Find nonempty illumination candidates without pre-scanning every tile."""
+    """Find nonempty illumination candidates without pre-scanning every tile.
+
+    Parameters
+    ----------
+    datastore : tensorstore.TensorStore
+        Readable raw TensorStore with TPCZYX axes and uint16 camera values.
+    stage_z_indices : numpy.ndarray
+        Depth-level index for each acquisition position.
+    camera_offset : float
+        Camera baseline in ADU, subtracted before applying the conversion.
+    camera_conversion : float
+        Calibrated intensity units per ADU after baseline subtraction.
+    threshold : float or None
+        Minimum calibrated intensity counted as signal; None disables empty
+        detection.
+    min_signal_fraction : float
+        Required fraction of volume pixels at or above the signal threshold.
+    apply_stage_scan_gain : bool
+        Apply the fixed qi2lab detector-X gain during camera calibration.
+
+    Returns
+    -------
+    numpy.ndarray or None
+        TPC tri-state decisions for sampled time-zero candidates, or None when
+        disabled.
+    """
     if threshold is None:
         return None
     decisions = np.full(
@@ -396,15 +508,12 @@ def _build_illumination_signal_decisions(
         dtype=np.int8,
     )
     stage_z_indices = np.asarray(stage_z_indices, dtype=np.int64)
-    if stage_z_indices.shape != (decisions.shape[1],):
-        raise ValueError("stage_z_indices must contain one value per position")
     position_groups = tuple(
         tuple(int(value) for value in np.flatnonzero(stage_z_indices == stage_level))
         for stage_level in range(int(stage_z_indices.max()) + 1)
     )
     target_total = sum(
-        min(32, len(positions)) * decisions.shape[2]
-        for positions in position_groups
+        min(32, len(positions)) * decisions.shape[2] for positions in position_groups
     )
     progress = tqdm(
         total=target_total,
@@ -414,22 +523,28 @@ def _build_illumination_signal_decisions(
     try:
         for stage_level, positions in enumerate(position_groups):
             target_count = min(32, len(positions))
+            candidates = positions
+            if len(positions) > target_count:
+                # Try evenly spaced tiles first, then replace empty candidates.
+                primary_indices = np.unique(
+                    np.linspace(0, len(positions) - 1, target_count, dtype=np.int64)
+                )
+                primary = tuple(positions[int(index)] for index in primary_indices)
+                primary_set = set(primary)
+                candidates = primary + tuple(
+                    position for position in positions if position not in primary_set
+                )
             for channel in range(decisions.shape[2]):
                 nonempty_count = 0
-                for position in _illumination_candidate_order(positions):
-                    raw = _read_raw_channel_volume(
-                        datastore,
-                        0,
-                        position,
-                        channel,
-                    )
+                for position in candidates:
+                    raw = np.squeeze(datastore[0, position, channel, :].read().result())
                     calibrated = camera_correct(
                         raw,
                         camera_offset,
                         camera_conversion,
                         apply_stage_scan_gain=apply_stage_scan_gain,
                     )
-                    is_empty = _is_empty_tile(
+                    is_empty = is_empty_tile(
                         calibrated,
                         threshold,
                         min_signal_fraction,
@@ -445,7 +560,7 @@ def _build_illumination_signal_decisions(
     return decisions
 
 
-def _tile_is_empty(
+def tile_is_empty(
     signal_decisions: np.ndarray | None,
     time_index: int,
     position: int,
@@ -454,79 +569,94 @@ def _tile_is_empty(
     threshold: float | None,
     min_signal_fraction: float,
 ) -> bool:
-    """Reuse or populate a tri-state decision while processing loaded data."""
+    """Reuse or populate a tri-state decision while processing loaded data.
+
+    Parameters
+    ----------
+    signal_decisions : numpy.ndarray or None
+        TPC decision array: -1 unknown, 0 empty, 1 nonempty; None disables caching.
+    time_index : int
+        Zero-based acquisition time index.
+    position : int
+        Zero-based position index in the image collection.
+    channel : int
+        Zero-based channel index.
+    calibrated : numpy.ndarray
+        Camera-corrected channel volume before illumination correction.
+    threshold : float or None
+        Minimum calibrated intensity counted as signal; None disables empty
+        detection.
+    min_signal_fraction : float
+        Required fraction of volume pixels at or above the signal threshold.
+
+    Returns
+    -------
+    bool
+        Cached or measured empty decision; the supplied cache is updated in place.
+    """
     if signal_decisions is not None:
         decision = int(signal_decisions[time_index, position, channel])
         if decision >= 0:
             return decision == 0
-    is_empty = _is_empty_tile(calibrated, threshold, min_signal_fraction)
+    is_empty = is_empty_tile(calibrated, threshold, min_signal_fraction)
     if signal_decisions is not None:
         signal_decisions[time_index, position, channel] = 0 if is_empty else 1
     return is_empty
 
 
-def _known_empty_tile(
-    signal_decisions: np.ndarray | None,
-    time_index: int,
-    position: int,
-    channel: int,
-) -> bool:
-    """Return true only for an empty decision made during candidate selection."""
-    return bool(
-        signal_decisions is not None
-        and int(signal_decisions[time_index, position, channel]) == 0
-    )
-
-
-def _planar_output_labels(opm_mode: str, deconvolve: bool) -> tuple[str, str]:
-    """Return filename and provenance labels for a non-deskewed 2D product."""
-    is_projection_mode = "projection" in str(opm_mode).casefold()
-    filename_label = "projection" if is_projection_mode else "2d"
-    output_kind = filename_label
-    if deconvolve:
-        filename_label = f"decon_{filename_label}"
-        output_kind = f"deconvolved_{output_kind}"
-    return filename_label, output_kind
-
-
-def _flatfield_software_tag() -> str:
-    """Return the estimator identifier stored with reusable flatfields."""
-    return "opm-processing/basicpy-stage-depth-camera-contract-v10"
-
-
-def _stage_z_level_indices(stage_positions_zxy: np.ndarray) -> np.ndarray:
-    """Map each tile to its repeated depth at the same physical stage XY."""
-    return stage_z_level_indices(stage_positions_zxy)
-
-
-def _read_current_flatfield(
+def read_current_flatfield(
     path: Path,
     expected_shape: tuple[int, int, int, int],
 ) -> np.ndarray | None:
-    """Read a flatfield only when it was made by the current estimator."""
-    try:
-        with TiffFile(path) as tif:
-            tag = tif.pages[0].tags.get("Software")
-            if tag is None or tag.value != _flatfield_software_tag():
-                return None
-            flatfields = tif.asarray().astype(np.float32)
-    except (OSError, ValueError):
-        return None
+    """Read a flatfield only when it was made by the current estimator.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        Filesystem path of the artifact to read or write.
+    expected_shape : tuple[int, int, int, int]
+        Required depth, channel, Y, X dimensions.
+
+    Returns
+    -------
+    numpy.ndarray or None
+        Depth-CYX fields, or None when the estimator version or acquisition
+        dimensions differ from this run.
+    """
+    with TiffFile(path) as tif:
+        tag = tif.pages[0].tags.get("Software")
+        if tag is None or tag.value != FLATFIELD_SOFTWARE:
+            return None
+        flatfields = tif.asarray().astype(np.float32)
     if expected_shape[0] == 1 and flatfields.shape == expected_shape[1:]:
         flatfields = flatfields[np.newaxis, ...]
     if flatfields.shape != expected_shape:
         return None
-    if not np.all(np.isfinite(flatfields)) or np.any(flatfields <= 0):
-        return None
     return flatfields
 
 
-def _write_flatfield(
+def write_flatfield(
     path: Path,
     flatfields: np.ndarray,
     pixel_size_um: float,
 ) -> None:
-    """Write reusable physical-stage-Z illumination fields."""
+    """Write reusable physical-stage-Z illumination fields.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        Filesystem path of the artifact to read or write.
+    flatfields : numpy.ndarray
+        Positive float32 illumination fields in depth, channel, Y, X order.
+    pixel_size_um : float
+        Camera pixel pitch in micrometers.
+
+    Returns
+    -------
+    None
+        Fields are written with spatial metadata and the current estimator
+        identifier.
+    """
     with TiffWriter(path, bigtiff=True) as tif:
         metadata = {
             "axes": "ZCYX",
@@ -541,12 +671,12 @@ def _write_flatfield(
             resolution=(1e4 / pixel_size_um, 1e4 / pixel_size_um),
             photometric="minisblack",
             resolutionunit="CENTIMETER",
-            software=_flatfield_software_tag(),
+            software=FLATFIELD_SOFTWARE,
             metadata=metadata,
         )
 
 
-def _load_or_estimate_flatfield(
+def load_or_estimate_flatfield(
     path: Path,
     datastore,
     camera_offset: float,
@@ -559,8 +689,39 @@ def _load_or_estimate_flatfield(
     minimum_signal_fraction: float,
     signal_mask: np.ndarray | None,
 ) -> np.ndarray:
-    """Reuse a current flatfield or replace an obsolete estimator artifact."""
-    stage_z_indices = _stage_z_level_indices(stage_positions_zxy)
+    """Reuse a current flatfield or replace an obsolete estimator artifact.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        Filesystem path of the artifact to read or write.
+    datastore : tensorstore.TensorStore
+        Readable raw TensorStore with TPCZYX axes and uint16 camera values.
+    camera_offset : float
+        Camera baseline in ADU, subtracted before applying the conversion.
+    camera_conversion : float
+        Calibrated intensity units per ADU after baseline subtraction.
+    pixel_size_um : float
+        Camera pixel pitch in micrometers.
+    stage_positions_zxy : numpy.ndarray
+        Physical stage Z, scan-axis X, and lateral Y coordinates in micrometers.
+    apply_stage_scan_gain : bool
+        Apply the fixed qi2lab detector-X gain during camera calibration.
+    signal_threshold : float or None
+        Calibrated signal cutoff for selecting illumination samples; None disables
+        it.
+    minimum_signal_fraction : float
+        Minimum fraction of candidate pixels that must meet the signal cutoff.
+    signal_mask : numpy.ndarray or None
+        TPC mask selecting nonempty estimation tiles; None allows automatic
+        selection.
+
+    Returns
+    -------
+    numpy.ndarray
+        Depth-CYX illumination fields reused from disk or estimated and saved.
+    """
+    stage_z_indices = stage_z_level_indices(stage_positions_zxy)
     expected_shape = (
         int(stage_z_indices.max()) + 1,
         datastore.shape[2],
@@ -568,7 +729,7 @@ def _load_or_estimate_flatfield(
         datastore.shape[-1],
     )
     if path.exists():
-        calibration = _read_current_flatfield(
+        calibration = read_current_flatfield(
             path,
             expected_shape,
         )
@@ -578,7 +739,7 @@ def _load_or_estimate_flatfield(
         print("Existing flatfield uses an obsolete estimator; re-estimating it.")
 
     if signal_threshold is not None and signal_mask is None:
-        signal_mask = _build_illumination_signal_decisions(
+        signal_mask = build_illumination_signal_decisions(
             datastore,
             stage_z_indices,
             camera_offset,
@@ -596,7 +757,7 @@ def _load_or_estimate_flatfield(
         apply_stage_scan_gain,
         None if signal_mask is None else signal_mask == 1,
     )
-    _write_flatfield(
+    write_flatfield(
         path,
         flatfields,
         pixel_size_um,
@@ -604,37 +765,19 @@ def _load_or_estimate_flatfield(
     return flatfields
 
 
-def _load_provided_illumination(
-    path: Path,
-    expected_shape: tuple[int, int, int],
-) -> np.ndarray:
-    """Load a user-supplied CYX illumination image without estimating one."""
-    illumination_path = Path(path).expanduser().resolve()
-    if not illumination_path.is_file():
-        raise ValueError(f"Illumination file does not exist: {illumination_path}")
-    with TiffFile(illumination_path) as tif:
-        axes = tif.series[0].axes.upper()
-        illumination = np.asarray(tif.asarray(), dtype=np.float32)
-    if axes == "YX":
-        illumination = illumination[np.newaxis, ...]
-    elif axes != "CYX":
-        raise ValueError(
-            f"Live illumination must have CYX axes, or YX for one channel; got {axes!r}"
-        )
-    if tuple(illumination.shape) != expected_shape:
-        raise ValueError(
-            f"Live illumination shape {illumination.shape} does not match "
-            f"acquisition CYX shape {expected_shape}"
-        )
-    if not np.all(np.isfinite(illumination)) or np.any(illumination <= 0):
-        raise ValueError(
-            "Live illumination values must be finite and strictly positive"
-        )
-    return illumination
+def file_sha256(path: Path) -> str:
+    """Return a stable SHA-256 digest for a processing input artifact.
 
+    Parameters
+    ----------
+    path : pathlib.Path
+        Filesystem path of the artifact to read or write.
 
-def _file_sha256(path: Path) -> str:
-    """Return a stable SHA-256 digest for a processing input artifact."""
+    Returns
+    -------
+    str
+        Hexadecimal SHA-256 digest of the file contents.
+    """
     digest = hashlib.sha256()
     with Path(path).open("rb") as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
@@ -642,14 +785,26 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _open_live_acquisition(
+def open_live_acquisition(
     root_path: Path,
 ) -> tuple[AcquisitionMetadata, LiveManifest, Path]:
     """Wait for and resolve a live manifest plus its OME-Zarr hierarchy.
 
-    ``root_path`` is the containing acquisition directory. The single
-    top-level live manifest is the sole authority for locating the source
-    OME-Zarr through its ``data_path`` field.
+    Parameters
+    ----------
+    root_path : pathlib.Path
+        Raw acquisition store, or its containing directory for live processing.
+
+    Returns
+    -------
+    tuple
+        Acquisition metadata, its live manifest, and lifecycle log path after
+        metadata appears.
+
+    Notes
+    -----
+    Poll until a single manifest and the required OME-Zarr metadata exist.
+    The manifest's data_path locates the source store.
     """
     requested_path = Path(root_path).expanduser().resolve()
     if requested_path.name.endswith((".zarr", ".ome.zarr")):
@@ -675,18 +830,9 @@ def _open_live_acquisition(
         time.sleep(LIVE_POLL_INTERVAL_SECONDS)
     manifest_path = manifests[0]
     manifest_stem = manifest_path.name.removesuffix(".manifest.json")
-    sidecars = LiveSidecars(
-        manifest=manifest_path,
-        log=manifest_path.with_name(f"{manifest_stem}.log.jsonl"),
-    )
-
-    manifest = LiveManifest.read(sidecars.manifest)
+    log_path = manifest_path.with_name(f"{manifest_stem}.log.jsonl")
+    manifest = LiveManifest.read(manifest_path)
     root_path = manifest.data_path
-    if manifest.data_path != root_path:
-        raise ValueError(
-            "Live manifest data_path does not match the requested acquisition: "
-            f"{manifest.data_path} != {root_path}"
-        )
     required_metadata = [root_path / "zarr.json", root_path / "OME" / "zarr.json"]
     required_metadata.extend(
         metadata_path
@@ -702,54 +848,10 @@ def _open_live_acquisition(
         )
         time.sleep(LIVE_POLL_INTERVAL_SECONDS)
     acquisition = manifest.apply(inspect_acquisition(root_path))
-    return acquisition, manifest, sidecars.log
+    return acquisition, manifest, log_path
 
 
-def _roi_position_indices(
-    roi: PhysicalRoi | None,
-    stage_positions_zyx: np.ndarray,
-    tile_shape_yx: tuple[int, int],
-    pixel_size_yx_um: tuple[float, float],
-    *,
-    reverse_stage_z: bool,
-    opm_angle_deg: float,
-) -> tuple[int, ...] | None:
-    """Select every YX-overlapping position while intentionally ignoring Z."""
-    if roi is None:
-        return None
-    position_count = len(stage_positions_zyx)
-    if roi.position_indices is not None:
-        selected = tuple(
-            index for index in roi.position_indices if index < position_count
-        )
-    else:
-        placements = stage_positions_to_image_coordinates(
-            stage_positions_zyx,
-            reverse_y=True,
-            reverse_z=reverse_stage_z,
-            opm_angle_deg=opm_angle_deg,
-        )
-        height, width = tile_shape_yx
-        pixel_y, pixel_x = pixel_size_yx_um
-        footprints = [
-            {
-                "position_index": index,
-                "bounds_yx_um": [
-                    float(position[-2]),
-                    float(position[-2] + height * pixel_y),
-                    float(position[-1]),
-                    float(position[-1] + width * pixel_x),
-                ],
-            }
-            for index, position in enumerate(placements)
-        ]
-        selected = intersecting_position_indices(roi.bounds_yx_um, footprints)
-    if not selected:
-        raise ValueError("The ROI does not intersect any acquisition positions")
-    return selected
-
-
-def _roi_tile_plans(
+def plan_roi_tiles(
     roi: PhysicalRoi,
     time_indices: tuple[int, ...],
     position_indices: tuple[int, ...],
@@ -763,7 +865,39 @@ def _roi_tile_plans(
     halo_scan: int,
     halo_x: int,
 ) -> tuple[dict[str, Any], ...]:
-    """Plan variable-size cropped ROI tiles without full-tile zero padding."""
+    """Plan variable-size cropped ROI tiles without full-tile zero padding.
+
+    Parameters
+    ----------
+    roi : PhysicalRoi
+        Physical ROI with registered tile footprints and origins.
+    time_indices : tuple[int, ...]
+        Source time indices included in the cropped output.
+    position_indices : tuple[int, ...]
+        Source positions included in the cropped output.
+    deskew_input_shape : tuple[int, int, int]
+        Raw scan, camera-Y, and camera-X dimensions after scan trimming.
+    channel_count : int
+        Number of channels stored in each cropped output series.
+    pixel_size_um : float
+        Camera pixel pitch in micrometers.
+    scan_step_um : float
+        Distance between adjacent acquisition scan planes in micrometers.
+    angle_deg : float
+        Oblique imaging-plane angle in degrees.
+    z_downsample_level : int
+        Integer reduction factor along deskewed Z.
+    halo_scan : int
+        Extra scan planes retained around each ROI for deconvolution support.
+    halo_x : int
+        Extra camera-X pixels retained around each ROI for deconvolution support.
+
+    Returns
+    -------
+    tuple of dict
+        Per-series source indices, scan/X crops, output TCZYX shapes, and physical
+        origins.
+    """
     plans: list[dict[str, Any]] = []
     roi_y0, roi_y1, roi_x0, roi_x1 = roi.bounds_yx_um
     for time_index in time_indices:
@@ -772,11 +906,6 @@ def _roi_tile_plans(
                 time_index,
                 position_index,
             )
-            if registered_origin is None:
-                raise ValueError(
-                    "ROI metadata lacks a registered ZYX origin for time "
-                    f"{time_index}, position {position_index}"
-                )
             skewed = world_roi_to_skewed_bounds(
                 roi.bounds_yx_um,
                 registered_origin[-2:],
@@ -845,6 +974,7 @@ def _roi_tile_plans(
                         crop_y1 - crop_y0,
                         crop_x1 - crop_x0,
                     ],
+                    "skewed_bounds": skewed,
                     "skewed_bounds_sx": [
                         int(skewed.scan_start),
                         int(skewed.scan_stop),
@@ -860,7 +990,7 @@ def _roi_tile_plans(
     return tuple(plans)
 
 
-def _apply_stage_axis_flips(
+def apply_stage_axis_flips(
     stage_positions: np.ndarray,
     axis_flips_xyz: tuple[bool, bool, bool],
 ) -> np.ndarray:
@@ -868,21 +998,19 @@ def _apply_stage_axis_flips(
 
     Parameters
     ----------
-    stage_positions : np.ndarray
-        Value supplied for ``stage positions``.
+    stage_positions : numpy.ndarray
+        Stage coordinates in Z, scan-axis X, and lateral Y order.
     axis_flips_xyz : tuple[bool, bool, bool]
-        Value supplied for ``axis flips xyz``.
+        X, Y, Z flags reflecting coordinates about each selected axis maximum.
 
     Returns
     -------
-    np.ndarray
-        Result produced by the callable.
+    numpy.ndarray
+        Transformed floating-point coordinate copy; the input is unchanged.
     """
-    if len(axis_flips_xyz) != 3:
-        raise ValueError("axis_flips_xyz must contain X, Y, and Z flags")
     transformed = np.asarray(stage_positions, dtype=float).copy()
     for should_flip, column in zip(axis_flips_xyz, (2, 1, 0)):
-        if should_flip and transformed.shape[0] > 0:
+        if should_flip:
             transformed[:, column] = (
                 np.max(transformed[:, column]) - transformed[:, column]
             )
@@ -982,79 +1110,71 @@ def process(
         ),
     ] = None,
 ):
-    """Postprocess qi2lab OPM dataset.
-
-    This code assumes data is generated by opm-v2 GUI and the resulting data is     saved using OPMMirrorHandler. All revelant metadata is read from imaging     files, including stage transformation, camera parameters, and channels.
-
-    Usage: `process "/path/to/qi2lab_acquisition.zarr"`
-
-    See docstring for the various options available.
-
+    """Process an OPM acquisition using its recorded scan and camera calibration.
 
     Parameters
     ----------
-    root_path: Path
-        Path to OPM pymmcoregui zarr file.
-    output: Path or None, default = None
-        Directory for processed artifacts. Defaults to the source directory.
-    live: Path or None, default = None
-        Supplied illumination image and live-processing mode switch.
-    resume: bool, default = False
-        Continue a compatible interrupted output from durable tile checkpoints.
-        Without this flag, existing processed outputs are overwritten.
-    deconvolve: bool, default = False
-        Deconvolve the data using RLGC.
-    decon_scan_upsample: int or None, default = None
-        Select experimental RLGC at acquired scan spacing divided by this
-        integer factor. Requires deconvolution; no scan chunking is supported.
-    save_float32: bool, default = False
-        Save calibrated processing products as float32 instead of uint16.
-    skip_empty_below: float or None, default = None
-        Enable hot-pixel-resistant empty-tile skipping at this camera-calibrated
-        intensity threshold, before illumination correction.
-    skip_empty_min_signal_fraction: float, default = 0.01
-        Minimum fraction of channel-volume pixels that must meet the threshold.
-    max_projection: bool, default = True
-        Create a maximum projection datastore. Disabling this also disables the
-        fused maximum projection, which depends on that datastore.
-    flatfield_correction: bool, default = False
-        Estimate and apply flatfield correction on raw data.
-    create_fused_max_projection: bool, default = True
-        Create stage position fused max Z projection.
-    write_fused_max_projection_tiff: bool, default = False
-        Write fused maxZ  projection to OME-TIFF file.
-    z_downsample_level: int, default = 2
-        Amount to downsample deskewed data in z.
-    time_range: list[int,int], default = None
-        Range of timepoints to reconstruct.
-    pos_range: list[int,int], default = None
-        Range of stage positions to reconstruct.
-    eager_mode: bool, default = False
-        Use stricter iteration cutoff, potentially leading to over-fitting.
-    decon_psf_paths: list[Path] or None, default = None
-        Optional channel-ordered ``.npy`` or image PSFs. When omitted,
-        wavelength-specific theoretical skewed PSFs are generated.
-
+    root_path : pathlib.Path
+        Raw acquisition store, or its containing directory for live processing.
+    deconvolve : bool
+        Apply Richardson–Lucy gradient-consensus deconvolution before saving.
+    save_float32 : bool
+        Preserve float32 intensities; False clips and casts final output to uint16.
+    skip_empty_below : float or None
+        Calibrated signal cutoff for skipping empty channels; None disables
+        skipping.
+    skip_empty_min_signal_fraction : float
+        Minimum fraction of channel-volume pixels required above the cutoff.
+    max_projection : bool
+        Write per-tile maximum-Z images; False also disables their fused mosaic.
+    flatfield_correction : bool
+        Estimate or reuse illumination fields and divide calibrated data by them.
+    create_fused_max_projection : bool
+        Fuse per-tile maximum-Z images using nominal stage placements.
+    write_fused_max_projection_tiff : bool
+        Export the stage-placed maximum projection as OME-TIFF.
+    z_downsample_level : int
+        Integer reduction factor along deskewed Z.
     crop_after_deskew : bool
-        Value supplied for ``crop after deskew``.
-    decon_crop_scan : int
-        Retained deconvolution tile size along the acquisition scan axis.
+        Crop deskewed Y to the region with support across the complete Z range.
+    time_range : tuple[int, int] or None
+        Start-inclusive, stop-exclusive time selection; None processes all times.
+    pos_range : tuple[int, int] or None
+        Start-inclusive, stop-exclusive position selection; None processes all
+        positions.
+    eager_mode : bool
+        Use eager stopping for planar deconvolution; unused for skewed volumes.
+    decon_crop_scan : int or None
+        Retained scan-plane chunk size for 3D deconvolution; None calibrates it
+        automatically.
     decon_gpu_id : int
-        Value supplied for ``decon gpu id``.
+        Zero-based CUDA device index used by the deconvolution solver.
     decon_verbose : int
-        Value supplied for ``decon verbose``.
-    decon_fallback_step_scan : int
-        Scan planes removed from the tile after a GPU allocation failure.
+        Solver diagnostic verbosity, with zero suppressing iteration reports.
+    decon_fallback_step_scan : int or None
+        Scan planes removed from a chunk after GPU allocation failure; None uses the
+        solver default.
     decon_psf_paths : list[Path] or None
-        Optional channel-ordered 2D or 3D PSFs. A 2D acquisition uses the
-        central Z plane of each 3D PSF.
+        Channel-ordered PSF files; None generates theoretical PSFs. Planar
+        processing uses a central Z slice of 3D PSFs.
+    decon_scan_upsample : int or None
+        Experimental integer scan upsampling factor; None uses the standard solver.
+        Requires 3D deconvolution and a full GPU volume.
+    resume : bool
+        Reuse compatible output checkpoints; False overwrites this output run.
+    output : Path or None
+        Output directory to create; None uses the acquisition directory.
+    live : Path or None
+        Supplied CYX illumination TIFF enabling live processing; None processes
+        offline.
 
     Returns
     -------
     None
-        No value is returned.
+        Processed images and durable checkpoints are written to the output
+        directory.
     """
-    skip_empty_below, skip_empty_min_signal_fraction = _validate_empty_tile_options(
+    skip_empty_below, skip_empty_min_signal_fraction = validate_empty_tile_options(
         skip_empty_below,
         skip_empty_min_signal_fraction,
     )
@@ -1078,17 +1198,16 @@ def process(
             )
         if time_range is not None or pos_range is not None:
             raise ValueError("--live does not support time or position subranges")
-        acquisition, live_manifest, live_log_path = _open_live_acquisition(root_path)
+        acquisition, live_manifest, live_log_path = open_live_acquisition(root_path)
         root_path = acquisition.path
         opm_mode = acquisition.mode.casefold()
         if "mirror" not in opm_mode and "stage" not in opm_mode:
             raise ValueError(
                 "--live currently supports mirror- and stage-scan acquisitions only"
             )
-        output_dir = _resolve_output_directory(root_path, output)
         process_skewed(
             root_path=root_path,
-            output_dir=output_dir,
+            output_dir=output,
             acquisition=acquisition,
             deconvolve=deconvolve,
             save_float32=save_float32,
@@ -1123,11 +1242,10 @@ def process(
         f"C={sizes.get('c', 1)}, Z={sizes.get('z', 1)}; "
         f"channels={list(acquisition.channel_names)}"
     )
-    output_dir = _resolve_output_directory(root_path, output)
     print(f"Processing OPM mode: {opm_mode}")
     common = {
         "root_path": root_path,
-        "output_dir": output_dir,
+        "output_dir": output,
         "acquisition": acquisition,
         "deconvolve": deconvolve,
         "save_float32": save_float32,
@@ -1137,16 +1255,16 @@ def process(
         "write_fused_max_projection_tiff": write_fused_max_projection_tiff,
         "time_range": time_range,
         "pos_range": pos_range,
-        "decon_crop_scan": decon_crop_scan,
         "decon_gpu_id": decon_gpu_id,
         "decon_verbose": decon_verbose,
-        "decon_fallback_step_scan": decon_fallback_step_scan,
         "decon_psf_paths": decon_psf_paths,
         "resume": resume,
     }
     if acquisition.is_2d or "projection" in opm_mode:
         if decon_scan_upsample is not None:
-            raise typer.BadParameter("--decon-scan-upsample requires a 3D mirror or stage scan")
+            raise typer.BadParameter(
+                "--decon-scan-upsample requires a 3D mirror or stage scan"
+            )
         process_projection(
             **common,
             eager_deconvolution=eager_mode,
@@ -1154,6 +1272,8 @@ def process(
     elif "mirror" in opm_mode or "stage" in opm_mode:
         process_skewed(
             **common,
+            decon_crop_scan=decon_crop_scan,
+            decon_fallback_step_scan=decon_fallback_step_scan,
             decon_scan_upsample=decon_scan_upsample,
             max_projection=max_projection,
             create_fused_max_projection=create_fused_max_projection,
@@ -1192,91 +1312,81 @@ def process_skewed(
     resume: bool = False,
     decon_scan_upsample: int | None = None,
 ):
-    """Postprocess qi2lab OPM dataset.
-
-    This code assumes data is generated by opm-v2 GUI and the resulting data is     saved using OPMMirrorHandler. All revelant metadata is read from imaging     files, including stage transformation, camera parameters, and channels.
-
-    Usage: `deskew "/path/to/qi2lab_acquisition.zarr"`
-
-    See docstring for the various options available.
-
-    Outputs are in:
-    - Deskewed 3D individual deskewed tiles:         `"/path/to/qi2lab_acquisition_deskewed.ome.zarr"`
-    - Maximum Z projected individual deskewed tiles:         `"/path/to/qi2lab_acquisition_max_z_deskewed.ome.zarr"`
-    - Maximum Z projection fused deskewed tiles:         `"/path/to/qi2lab_acquisition_max_z_fused.ome.zarr"`
+    """Calibrate, optionally deconvolve, and deskew mirror or stage scan tiles.
 
     Parameters
     ----------
-    root_path: Path
-        Path to OPM pymmcoregui zarr file.
-    output_dir: Path or None, default = None
-        Directory for processed artifacts. Defaults to the source directory.
-    illumination_path: Path or None, default = None
-        User-supplied CYX illumination image for live processing.
-    live_manifest: LiveManifest or None, default = None
-        Upfront acquisition plan enabling live tile discovery.
-    live_log_path: Path or None, default = None
-        Append-only acquisition lifecycle log.
-    deconvolve: bool, default = False
-        Deconvolve the data using RLGC.
-    save_float32: bool, default = False
-        Save calibrated processing products as float32 instead of uint16.
-    skip_empty_below: float or None, default = None
-        Enable hot-pixel-resistant empty-tile skipping at this camera-calibrated
-        intensity threshold, before illumination correction.
-    skip_empty_min_signal_fraction: float, default = 0.01
-        Minimum fraction of channel-volume pixels that must meet the threshold.
-    max_projection: bool, default = True
-        Create a maximum projection datastore. Disabling this also disables the
-        fused maximum projection, which depends on that datastore.
-    flatfield_correction: bool, default = True
-        Estimate and apply flatfield correction on raw data.
-    create_fused_max_projection: bool, default = True
-        Create stage position fused max Z projection.
-    write_fused_max_projection_tiff: bool, default = False
-        Write fused maxZ  projection to OME-TIFF file.
-    z_downsample_level: int, default = 2
-        Amount to downsample deskewed data in z.
-    time_range: list[int,int], default = None
-        Range of timepoints to reconstruct.
-    pos_range: list[int,int], default = None
-        Range of stage positions to reconstruct.
-    decon_psf_paths: list[Path] or None, default = None
-        Optional channel-ordered ``.npy`` or image PSFs. When omitted,
-        wavelength-specific theoretical skewed PSFs are generated.
-
+    root_path : pathlib.Path
+        Resolved path to the raw acquisition store.
+    acquisition : AcquisitionMetadata
+        Inspected scan geometry, channels, stage placement, and camera calibration.
+    deconvolve : bool
+        Apply Richardson–Lucy gradient-consensus deconvolution before saving.
+    save_float32 : bool
+        Preserve float32 intensities; False clips and casts final output to uint16.
+    skip_empty_below : float or None
+        Calibrated signal cutoff for skipping empty channels; None disables
+        skipping.
+    skip_empty_min_signal_fraction : float
+        Minimum fraction of channel-volume pixels required above the cutoff.
+    max_projection : bool
+        Write per-tile maximum-Z images; False also disables their fused mosaic.
+    flatfield_correction : bool
+        Estimate or reuse illumination fields and divide calibrated data by them.
+    create_fused_max_projection : bool
+        Fuse per-tile maximum-Z images using nominal stage placements.
+    write_fused_max_projection_tiff : bool
+        Export the stage-placed maximum projection as OME-TIFF.
+    z_downsample_level : int
+        Integer reduction factor along deskewed Z.
     crop_after_deskew : bool
-        Value supplied for ``crop after deskew``.
-    decon_crop_scan : int
-        Retained deconvolution tile size along the acquisition scan axis.
+        Crop deskewed Y to the region with support across the complete Z range.
+    time_range : tuple[int, int] or None
+        Start-inclusive, stop-exclusive time selection; None processes all times.
+    pos_range : tuple[int, int] or None
+        Start-inclusive, stop-exclusive position selection; None processes all
+        positions.
+    decon_crop_scan : int or None
+        Retained scan-plane chunk size for 3D deconvolution; None calibrates it
+        automatically.
     decon_gpu_id : int
-        Value supplied for ``decon gpu id``.
+        Zero-based CUDA device index used by the deconvolution solver.
     decon_verbose : int
-        Value supplied for ``decon verbose``.
-    decon_fallback_step_scan : int
-        Scan planes removed from the tile after a GPU allocation failure.
+        Solver diagnostic verbosity, with zero suppressing iteration reports.
+    decon_fallback_step_scan : int or None
+        Scan planes removed from a chunk after GPU allocation failure; None uses the
+        solver default.
+    decon_psf_paths : list[Path] or None
+        Channel-ordered PSF files; None generates theoretical PSFs. Planar
+        processing uses a central Z slice of 3D PSFs.
+    output_dir : Path or None
+        Directory for processed images and state; None uses the source directory.
+    illumination_path : Path or None
+        Supplied CYX illumination TIFF; None uses the offline flatfield setting.
+    live_manifest : LiveManifest or None
+        Acquisition plan enabling live tile discovery; None processes offline.
+    live_log_path : Path or None
+        Acquisition lifecycle log used to detect live completion.
+    roi_selection : PhysicalRoi or None
+        Registered physical ROI selecting and cropping source tiles; None retains
+        full tiles.
+    resume : bool
+        Reuse compatible output checkpoints; False overwrites this output run.
+    decon_scan_upsample : int or None
+        Experimental integer scan upsampling factor; None uses the standard solver.
+        Requires 3D deconvolution and a full GPU volume.
 
     Returns
     -------
     None
-        No value is returned.
+        Deskewed tiles, optional maximum projections, and checkpoints are written to
+        disk.
     """
-    if acquisition.is_2d:
-        raise ValueError(
-            "A 2D acquisition must use projection processing and cannot be deskewed"
-        )
-    if decon_scan_upsample is not None:
-        if not deconvolve or decon_scan_upsample < 1 or int(decon_scan_upsample) != decon_scan_upsample:
-            raise ValueError("decon_scan_upsample requires deconvolution and a positive integer")
-        if roi_selection is not None or decon_crop_scan is not None or decon_fallback_step_scan is not None:
-            raise ValueError("Experimental undersampled RLGC does not yet support ROI or scan chunking")
     # Fusion consumes the per-position maximum-projection datastore.  Treat
     # --no-max-projection as disabling that dependent output as well instead of
     # trying to open a datastore that was intentionally never created.
-    create_fused_max_projection = bool(
-        max_projection and create_fused_max_projection
-    )
-    skip_empty_below, skip_empty_min_signal_fraction = _validate_empty_tile_options(
+    create_fused_max_projection = bool(max_projection and create_fused_max_projection)
+    skip_empty_below, skip_empty_min_signal_fraction = validate_empty_tile_options(
         skip_empty_below,
         skip_empty_min_signal_fraction,
     )
@@ -1290,12 +1400,16 @@ def process_skewed(
     elif deconvolve:
         from opm_processing.imageprocessing.rlgc_undersampled import rlgc_undersampled
 
-    output_dir = _resolve_output_directory(root_path, output_dir)
+    max_z_factors_yx = (2, 4, 8, 16, 32)
+    output_dir = (
+        root_path.parent
+        if output_dir is None
+        else Path(output_dir).expanduser().resolve()
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     datastore = open_acquisition_datastore(acquisition)
     opm_mode = acquisition.mode
-    if acquisition.scan_axis_step_um is None:
-        raise ValueError("Acquisition metadata lacks a scan-axis step")
     scan_axis_step_um = acquisition.scan_axis_step_um
     reconstruction_step_um = scan_axis_step_um / (decon_scan_upsample or 1)
     if decon_scan_upsample is not None:
@@ -1316,8 +1430,6 @@ def process_skewed(
     camera_conversion = acquisition.camera_conversion
     channels = list(acquisition.channel_names)
     stage_positions_raw = np.asarray(acquisition.stage_positions_zxy, dtype=float)
-    if None in (pixel_size_um, opm_tilt_deg, camera_offset, camera_conversion):
-        raise ValueError("Acquisition metadata lacks required OPM/camera calibration")
     pixel_size_um = float(pixel_size_um)
     opm_tilt_deg = float(opm_tilt_deg)
     camera_offset = float(camera_offset)
@@ -1326,7 +1438,7 @@ def process_skewed(
         "stage" in str(opm_mode).casefold()
         and int(datastore.shape[-1]) == QI2LAB_STAGE_SCAN_DETECTOR_WIDTH
     )
-    output_dtype = _processed_dtype(save_float32)
+    output_dtype = np.dtype(np.float32 if save_float32 else np.uint16)
     psfs: list[np.ndarray] | None = None
     if deconvolve:
         if decon_psf_paths is not None:
@@ -1343,7 +1455,11 @@ def process_skewed(
         else:
             psfs = [
                 generate_skewed_psf(
-                    em_wvl=_psf_wavelength_um(channel),
+                    em_wvl=max(
+                        float(wavelength.strip().lower().removesuffix("nm"))
+                        for wavelength in channel.split("+")
+                    )
+                    / 1000,
                     pixel_size_um=pixel_size_um,
                     scan_axis_step_um=reconstruction_step_um,
                     theta_deg=opm_tilt_deg,
@@ -1352,8 +1468,8 @@ def process_skewed(
                 )
                 for channel in tqdm(channels, desc="PSFs", unit="PSF")
             ]
-    stage_positions = _apply_stage_axis_flips(stage_positions_raw, stage_axis_flips)
-    stage_z_indices = _stage_z_level_indices(stage_positions_raw)
+    stage_positions = apply_stage_axis_flips(stage_positions_raw, stage_axis_flips)
+    stage_z_indices = stage_z_level_indices(stage_positions_raw)
     stage_z_flipped = stage_axis_flips[2]
 
     # Estimate the shape of one deskewed volume.
@@ -1377,30 +1493,11 @@ def process_skewed(
         crop_after_deskew=crop_after_deskew,
     )
 
-    roi_position_indices = _roi_position_indices(
-        roi_selection,
-        stage_positions,
-        (int(deskewed_shape[1]), int(deskewed_shape[2])),
-        (pixel_size_um, pixel_size_um),
-        reverse_stage_z=not stage_z_flipped,
-        opm_angle_deg=opm_tilt_deg,
-    )
-    roi_placements = stage_positions_to_image_coordinates(
-        stage_positions,
-        reverse_y=True,
-        reverse_z=not stage_z_flipped,
-        opm_angle_deg=opm_tilt_deg,
+    roi_position_indices = (
+        None if roi_selection is None else roi_selection.position_indices
     )
     roi_halo_scan = 0 if psfs is None else max(int(psf.shape[0]) // 2 for psf in psfs)
     roi_halo_x = 0 if psfs is None else max(int(psf.shape[-1]) // 2 for psf in psfs)
-
-    if roi_selection is not None and live_manifest is not None:
-        raise ValueError("ROI processing is not supported during live acquisition")
-    if roi_selection is not None and (max_projection or create_fused_max_projection):
-        raise ValueError(
-            "ROI processing writes cropped tiles for full-volume fusion and "
-            "does not create per-position maximum projections"
-        )
 
     if time_range is not None:
         time_shape = time_range[1]
@@ -1429,7 +1526,7 @@ def process_skewed(
             )
             if roi_position_indices is not None and index in roi_position_indices
         )
-        roi_plans = _roi_tile_plans(
+        roi_plans = plan_roi_tiles(
             roi_selection,
             plan_times,
             plan_positions,
@@ -1457,19 +1554,16 @@ def process_skewed(
     ]
     deskewed: np.ndarray | None = None
 
-    flatfield_path = (
-        Path(illumination_path).expanduser().resolve()
-        if illumination_path is not None
-        else _resolve_flatfield_path(root_path, output_dir)
-    )
+    if illumination_path is not None:
+        flatfield_path = Path(illumination_path).expanduser().resolve()
+    else:
+        flatfield_path = output_dir / f"{acquisition_stem(root_path)}_flatfield.ome.tif"
+        source_flatfield = root_path.parent / flatfield_path.name
+        if not flatfield_path.exists() and source_flatfield.exists():
+            flatfield_path = source_flatfield
     provided_flatfields = (
-        _load_provided_illumination(
-            flatfield_path,
-            (
-                int(datastore.shape[2]),
-                int(datastore.shape[-2]),
-                int(datastore.shape[-1]),
-            ),
+        np.asarray(imread(flatfield_path), dtype=np.float32).reshape(
+            datastore.shape[2], datastore.shape[-2], datastore.shape[-1]
         )
         if illumination_path is not None
         else None
@@ -1482,7 +1576,7 @@ def process_skewed(
             or provided_flatfields is not None
             or flatfield_path.exists()
         )
-        else _build_illumination_signal_decisions(
+        else build_illumination_signal_decisions(
             datastore,
             stage_z_indices,
             camera_offset,
@@ -1525,7 +1619,7 @@ def process_skewed(
                 "psf_sha256": (
                     None
                     if decon_psf_paths is None
-                    else tuple(_file_sha256(path) for path in decon_psf_paths)
+                    else tuple(file_sha256(path) for path in decon_psf_paths)
                 ),
             }
         ),
@@ -1569,7 +1663,7 @@ def process_skewed(
         tuple(int(value) for value in plan["shape_tczyx"]) for plan in roi_plans
     ]
     if roi_selection is not None and resume and output_path.exists():
-        output_collection = _open_variable_resume_collection(
+        output_collection = open_variable_resume_collection(
             output_path,
             roi_output_shapes,
             output_dtype,
@@ -1585,7 +1679,7 @@ def process_skewed(
             overwrite=True,
         )
     elif (live_manifest is not None or resume) and output_path.exists():
-        output_collection = _open_resume_collection(
+        output_collection = open_resume_collection(
             output_path,
             output_shape,
             output_dtype,
@@ -1634,13 +1728,13 @@ def process_skewed(
         )
         max_z_output_shape = tuple(int(value) for value in max_z_datastore_shape)
         if (live_manifest is not None or resume) and max_z_output_path.exists():
-            max_z_collection = _open_resume_collection(
+            max_z_collection = open_resume_collection(
                 max_z_output_path,
                 max_z_output_shape,
                 output_dtype,
                 tuple(
                     factor
-                    for factor in (1, *PROCESS_MAX_Z_FACTORS_YX)
+                    for factor in (1, *max_z_factors_yx)
                     if factor <= min(max_z_output_shape[-2:])
                 ),
             )
@@ -1652,7 +1746,7 @@ def process_skewed(
                 stage_positions=stage_positions[:pos_shape],
                 channels=channels,
                 dtype=output_dtype,
-                multiscale_factors_yx=PROCESS_MAX_Z_FACTORS_YX,
+                multiscale_factors_yx=max_z_factors_yx,
                 spatial_offset_um=max_z_offset_um,
                 overwrite=True,
             )
@@ -1662,7 +1756,7 @@ def process_skewed(
         if provided_flatfields is not None:
             flatfields = provided_flatfields[np.newaxis, ...]
         else:
-            flatfields = _load_or_estimate_flatfield(
+            flatfields = load_or_estimate_flatfield(
                 flatfield_path,
                 datastore,
                 camera_offset,
@@ -1686,9 +1780,9 @@ def process_skewed(
         )
 
     processing_configuration["illumination_sha256"] = (
-        _file_sha256(flatfield_path) if flatfield_correction else None
+        file_sha256(flatfield_path) if flatfield_correction else None
     )
-    processing_state = _initialize_processing_state(
+    processing_state = initialize_processing_state(
         output_dir=output_dir,
         source_path=root_path,
         output_path=output_path,
@@ -1711,15 +1805,13 @@ def process_skewed(
             configuration={
                 **processing_configuration,
                 "kind": f"max_z_{output_kind}",
-                "multiscale_factors_yx": PROCESS_MAX_Z_FACTORS_YX,
+                "multiscale_factors_yx": max_z_factors_yx,
             },
             overwrite=not state_resume,
         )
 
     # A tile is checkpointed only after every requested output write resolves.
     if live_manifest is not None:
-        if live_log_path is None:
-            raise ValueError("Live processing requires an acquisition lifecycle log")
         readiness = ZarrTileReadiness(acquisition)
         completed_live_tiles = processing_state.completed_tiles(output_path)
         if max_projection:
@@ -1732,7 +1824,7 @@ def process_skewed(
                 "Resuming live processing with "
                 f"{len(completed_live_tiles)} of {live_tile_count} tiles complete."
             )
-        tile_groups = _progress_tile_groups(
+        tile_groups = progress_tile_groups(
             iter_live_tiles(
                 readiness,
                 live_manifest,
@@ -1780,7 +1872,7 @@ def process_skewed(
         remaining_tiles = (
             tile for tile in requested_tiles if tile not in completed_requested_tiles
         )
-        tile_groups = _progress_tile_groups(
+        tile_groups = progress_tile_groups(
             remaining_tiles,
             requested_tiles,
             completed_requested_tiles,
@@ -1806,28 +1898,7 @@ def process_skewed(
                 if plan_entry is None:
                     continue
                 roi_series_index, roi_plan = plan_entry
-                fallback_origin = (
-                    float(roi_placements[pos_idx, -2]),
-                    float(roi_placements[pos_idx, -1]),
-                )
-                tile_origin = roi_selection.tile_origin_yx_um(
-                    t_idx,
-                    pos_idx,
-                    fallback_origin,
-                )
-                skewed_roi = world_roi_to_skewed_bounds(
-                    roi_selection.bounds_yx_um,
-                    tile_origin,
-                    tuple(int(value) for value in deskew_input_shape),
-                    pixel_size_um=pixel_size_um,
-                    scan_step_um=scan_axis_step_um,
-                    angle_deg=opm_tilt_deg,
-                    crop_y_pixels=int(crop_y),
-                    halo_scan=roi_halo_scan,
-                    halo_x=roi_halo_x,
-                )
-                if skewed_roi is None:
-                    continue
+                skewed_roi = roi_plan["skewed_bounds"]
             wrote_tile = True
             tile_completed_channels = {
                 channel
@@ -1852,7 +1923,10 @@ def process_skewed(
                 leave=False,
             ):
                 channel_key = (int(t_idx), int(pos_idx), int(chan_idx))
-                if _known_empty_tile(signal_mask, t_idx, pos_idx, chan_idx):
+                if (
+                    signal_mask is not None
+                    and signal_mask[t_idx, pos_idx, chan_idx] == 0
+                ):
                     zero_channels.add((int(t_idx), int(pos_idx), int(chan_idx)))
                     zero_value = output_dtype.type(0)
                     if roi_series_index is None:
@@ -1860,7 +1934,7 @@ def process_skewed(
                             ts_store[pos_idx][t_idx, chan_idx].write(zero_value)
                         )
                     else:
-                        _write_checkpointed_roi_channel(
+                        write_checkpointed_roi_channel(
                             ts_store[roi_series_index][0, chan_idx],
                             zero_value,
                             processing_state,
@@ -1870,7 +1944,7 @@ def process_skewed(
                         )
                     if max_projection:
                         ts_max_writes.extend(
-                            _queue_position_pyramid_writes(
+                            queue_position_pyramid_writes(
                                 max_z_collection,
                                 pos_idx,
                                 t_idx,
@@ -1929,7 +2003,7 @@ def process_skewed(
                 )
                 if skewed_roi is not None and scan_axis_reversed:
                     camera_calibrated_data = np.flip(camera_calibrated_data, axis=0)
-                if _tile_is_empty(
+                if tile_is_empty(
                     signal_mask,
                     t_idx,
                     pos_idx,
@@ -1945,7 +2019,7 @@ def process_skewed(
                             ts_store[pos_idx][t_idx, chan_idx].write(zero_value)
                         )
                     else:
-                        _write_checkpointed_roi_channel(
+                        write_checkpointed_roi_channel(
                             ts_store[roi_series_index][0, chan_idx],
                             zero_value,
                             processing_state,
@@ -1955,7 +2029,7 @@ def process_skewed(
                         )
                     if max_projection:
                         ts_max_writes.extend(
-                            _queue_position_pyramid_writes(
+                            queue_position_pyramid_writes(
                                 max_z_collection,
                                 pos_idx,
                                 t_idx,
@@ -2006,10 +2080,6 @@ def process_skewed(
                                 decon_chunk_state.remember_successful_crop
                             ),
                         )
-                    deconvolved_data = _require_float32(
-                        deconvolved_data,
-                        "deconvolution",
-                    )
                     deskewed = orthogonal_deskew(
                         deconvolved_data,
                         theta=opm_tilt_deg,
@@ -2045,8 +2115,6 @@ def process_skewed(
                             downsample_factor=z_downsample_level,
                         )
 
-                deskewed = _require_float32(deskewed, "deskew")
-
                 if roi_plan is not None:
                     crop_y0, crop_y1, crop_x0, crop_x1 = (
                         int(value) for value in roi_plan["deskew_crop_yx"]
@@ -2063,12 +2131,12 @@ def process_skewed(
                     max_z_deskewed = np.max(deskewed, axis=0, keepdims=True)
                     # create future objects for async data writing
                     ts_max_writes.extend(
-                        _queue_position_pyramid_writes(
+                        queue_position_pyramid_writes(
                             max_z_collection,
                             pos_idx,
                             t_idx,
                             chan_idx,
-                            _format_processed_output(
+                            format_processed_output(
                                 max_z_deskewed,
                                 save_float32,
                             ),
@@ -2076,7 +2144,7 @@ def process_skewed(
                     )
 
                 # create future objects for async data writing
-                formatted = _format_processed_output(deskewed, save_float32)
+                formatted = format_processed_output(deskewed, save_float32)
                 if not np.any(formatted):
                     zero_channels.add((int(t_idx), int(pos_idx), int(chan_idx)))
                 if roi_series_index is None:
@@ -2084,7 +2152,7 @@ def process_skewed(
                         ts_store[pos_idx][t_idx, chan_idx].write(formatted)
                     )
                 else:
-                    _write_checkpointed_roi_channel(
+                    write_checkpointed_roi_channel(
                         ts_store[roi_series_index][0, chan_idx],
                         formatted,
                         processing_state,
@@ -2208,79 +2276,72 @@ def process_projection(
     pos_range: tuple[int, int] = None,
     eager_deconvolution: bool = False,
     resume: bool = False,
-    decon_crop_scan: int | None = None,
     decon_gpu_id: int = 0,
     decon_verbose: int = 1,
-    decon_fallback_step_scan: int | None = None,
     decon_psf_paths: list[Path] | None = None,
     output_dir: Path | None = None,
 ):
-    """Postprocess qi2lab OPM dataset.
-
-    This code assumes data is generated by opm-v2 GUI and the resulting data is     saved using OPMMirrorHandler. All revelant metadata is read from imaging     files, including stage transformation, camera parameters, and channels.
-
-    Usage: `process "/path/to/qi2lab_acquisition.zarr"`
-
-    See docstring for the various options available.
-
-    Outputs are in:
-    - Deconvolved individual projection tiles:         `"/path/to/qi2lab_acquisition_decon_projection.ome.zarr"`
-    - Stage position fused projection tiles:         `"/path/to/qi2lab_acquisition_stagefused.ome.zarr"`
+    """Calibrate and optionally deconvolve planar acquisition tiles.
 
     Parameters
     ----------
-    root_path: Path
-        Path to OPM pymmcoregui zarr file.
-    output_dir: Path or None, default = None
-        Directory for processed artifacts. Defaults to the source directory.
-    deconvolve: bool, default = False
-        Deconvolve the data using RLGC.
-    save_float32: bool, default = False
-        Save calibrated processing products as float32 instead of uint16.
-    skip_empty_below: float or None, default = None
-        Enable hot-pixel-resistant empty-tile skipping at this camera-calibrated
-        intensity threshold, before illumination correction.
-    skip_empty_min_signal_fraction: float, default = 0.01
-        Minimum fraction of channel-volume pixels that must meet the threshold.
-    flatfield_correction: bool, default = True
-        Estimate and apply flatfield correction on raw data.
-    write_fused_max_projection_tiff: bool, default = False
-        Write fused maxZ  projection to OME-TIFF file.
-    time_range: list[int,int], default = None
-        Range of timepoints to process.
-    pos_range: list[int,int], default = None
-        Range of stage positions to process.
-    eager_mode: bool, default = False
-        Use stricter iteration cutoff, potentially leading to over-fitting.
-
+    root_path : pathlib.Path
+        Resolved path to the raw acquisition store.
+    acquisition : AcquisitionMetadata
+        Inspected scan geometry, channels, stage placement, and camera calibration.
+    deconvolve : bool
+        Apply Richardson–Lucy gradient-consensus deconvolution before saving.
+    save_float32 : bool
+        Preserve float32 intensities; False clips and casts final output to uint16.
+    skip_empty_below : float or None
+        Calibrated signal cutoff for skipping empty channels; None disables
+        skipping.
+    skip_empty_min_signal_fraction : float
+        Minimum fraction of channel-volume pixels required above the cutoff.
+    flatfield_correction : bool
+        Estimate or reuse illumination fields and divide calibrated data by them.
+    write_fused_max_projection_tiff : bool
+        Export the stage-placed maximum projection as OME-TIFF.
+    time_range : tuple[int, int] or None
+        Start-inclusive, stop-exclusive time selection; None processes all times.
+    pos_range : tuple[int, int] or None
+        Start-inclusive, stop-exclusive position selection; None processes all
+        positions.
     eager_deconvolution : bool
-        Value supplied for ``eager deconvolution``.
+        Use eager stopping in the planar gradient-consensus solver.
     resume : bool
-        Continue a compatible output using durable tile checkpoints.
-    decon_crop_scan : int
-        Retained deconvolution tile size along the acquisition scan axis.
+        Reuse compatible output checkpoints; False overwrites this output run.
     decon_gpu_id : int
-        Value supplied for ``decon gpu id``.
+        Zero-based CUDA device index used by the deconvolution solver.
     decon_verbose : int
-        Value supplied for ``decon verbose``.
-    decon_fallback_step_scan : int
-        Scan planes removed from the tile after a GPU allocation failure.
+        Solver diagnostic verbosity, with zero suppressing iteration reports.
+    decon_psf_paths : list[Path] or None
+        Channel-ordered PSF files; None generates theoretical PSFs. Planar
+        processing uses a central Z slice of 3D PSFs.
+    output_dir : Path or None
+        Directory for processed images and state; None uses the source directory.
 
     Returns
     -------
     None
-        No value is returned.
+        Processed planar tiles, stage-placed mosaics, and checkpoints are written to
+        disk.
     """
     overwrite = not resume
     if deconvolve:
         from opm_processing.imageprocessing.rlgc import rlgc_2d
 
-    skip_empty_below, skip_empty_min_signal_fraction = _validate_empty_tile_options(
+    skip_empty_below, skip_empty_min_signal_fraction = validate_empty_tile_options(
         skip_empty_below,
         skip_empty_min_signal_fraction,
     )
 
-    output_dir = _resolve_output_directory(root_path, output_dir)
+    output_dir = (
+        root_path.parent
+        if output_dir is None
+        else Path(output_dir).expanduser().resolve()
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     datastore = open_acquisition_datastore(acquisition)
     opm_mode = acquisition.mode
@@ -2291,13 +2352,11 @@ def process_projection(
     channels = list(acquisition.channel_names)
     stage_positions_raw = np.asarray(acquisition.stage_positions_zxy, dtype=float)
     stage_axis_flips = acquisition.stage_axis_flips_xyz
-    if None in (pixel_size_um, opm_tilt_deg, camera_offset, camera_conversion):
-        raise ValueError("Acquisition metadata lacks required OPM/camera calibration")
     pixel_size_um = float(pixel_size_um)
     opm_tilt_deg = float(opm_tilt_deg)
     camera_offset = float(camera_offset)
     camera_conversion = float(camera_conversion)
-    output_dtype = _processed_dtype(save_float32)
+    output_dtype = np.dtype(np.float32 if save_float32 else np.uint16)
     psfs: list[np.ndarray] | None = None
     if deconvolve:
         if decon_psf_paths is not None:
@@ -2314,13 +2373,17 @@ def process_projection(
         else:
             psfs = [
                 generate_proj_psf(
-                    em_wvl=_psf_wavelength_um(channel),
+                    em_wvl=max(
+                        float(wavelength.strip().lower().removesuffix("nm"))
+                        for wavelength in channel.split("+")
+                    )
+                    / 1000,
                     pixel_size_um=pixel_size_um,
                 )
                 for channel in tqdm(channels, desc="PSFs", unit="PSF")
             ]
-    stage_positions = _apply_stage_axis_flips(stage_positions_raw, stage_axis_flips)
-    stage_z_indices = _stage_z_level_indices(stage_positions_raw)
+    stage_positions = apply_stage_axis_flips(stage_positions_raw, stage_axis_flips)
+    stage_z_indices = stage_z_level_indices(stage_positions_raw)
     stage_z_flipped = stage_axis_flips[2]
 
     if time_range is not None:
@@ -2335,24 +2398,26 @@ def process_projection(
 
     if datastore.rank == 5:
         datastore = datastore[:, :, :, None, :, :]
-    elif datastore.rank != 6 or datastore.shape[3] != 1:
-        raise ValueError(
-            "Projection acquisitions must have TPCYX shape or a singleton Z axis; "
-            f"got {datastore.shape}"
-        )
 
-    filename_label, output_kind = _planar_output_labels(opm_mode, deconvolve)
+    filename_label = "projection" if "projection" in opm_mode.casefold() else "2d"
+    output_kind = filename_label
+    if deconvolve:
+        output_kind = f"deconvolved_{filename_label}"
+        filename_label = f"decon_{filename_label}"
     output_path = output_dir / Path(
         f"{acquisition_stem(root_path)}_{filename_label}.ome.zarr"
     )
     output_preexisting = output_path.exists()
     fused_output_path: Path | None = None
     signal_mask: np.ndarray | None = None
-    flatfield_path = _resolve_flatfield_path(root_path, output_dir)
+    flatfield_path = output_dir / f"{acquisition_stem(root_path)}_flatfield.ome.tif"
+    source_flatfield = root_path.parent / flatfield_path.name
+    if not flatfield_path.exists() and source_flatfield.exists():
+        flatfield_path = source_flatfield
     signal_mask = (
         None
         if not flatfield_correction or flatfield_path.exists()
-        else _build_illumination_signal_decisions(
+        else build_illumination_signal_decisions(
             datastore,
             stage_z_indices,
             camera_offset,
@@ -2381,13 +2446,13 @@ def process_projection(
                 "psf_sha256": (
                     None
                     if decon_psf_paths is None
-                    else tuple(_file_sha256(path) for path in decon_psf_paths)
+                    else tuple(file_sha256(path) for path in decon_psf_paths)
                 ),
             }
         ),
     }
     if resume and output_path.exists():
-        output_collection = _open_resume_collection(
+        output_collection = open_resume_collection(
             output_path,
             tuple(int(value) for value in datastore.shape),
             output_dtype,
@@ -2405,7 +2470,7 @@ def process_projection(
     ts_store = output_collection.arrays
 
     if flatfield_correction:
-        flatfields = _load_or_estimate_flatfield(
+        flatfields = load_or_estimate_flatfield(
             flatfield_path,
             datastore,
             camera_offset,
@@ -2429,9 +2494,9 @@ def process_projection(
         )
 
     processing_configuration["illumination_sha256"] = (
-        _file_sha256(flatfield_path) if flatfield_correction else None
+        file_sha256(flatfield_path) if flatfield_correction else None
     )
-    processing_state = _initialize_processing_state(
+    processing_state = initialize_processing_state(
         output_dir=output_dir,
         source_path=root_path,
         output_path=output_path,
@@ -2473,7 +2538,7 @@ def process_projection(
     ):
         tile_writes = []
         for chan_idx in tqdm(range(datastore.shape[2]), desc="c", leave=False):
-            if _known_empty_tile(signal_mask, t_idx, pos_idx, chan_idx):
+            if signal_mask is not None and signal_mask[t_idx, pos_idx, chan_idx] == 0:
                 zero_channels.add((int(t_idx), int(pos_idx), int(chan_idx)))
                 tile_writes.append(
                     ts_store[pos_idx][t_idx, chan_idx].write(output_dtype.type(0))
@@ -2488,7 +2553,7 @@ def process_projection(
                 camera_conversion,
             )
 
-            if _tile_is_empty(
+            if tile_is_empty(
                 signal_mask,
                 t_idx,
                 pos_idx,
@@ -2515,14 +2580,10 @@ def process_projection(
                     verbose=decon_verbose,
                     safe_mode=not eager_deconvolution,
                 )
-                deconvolved_data = _require_float32(
-                    deconvolved_data,
-                    "deconvolution",
-                )
             else:
                 deconvolved_data = camera_corrected_data
 
-            formatted = _format_processed_output(
+            formatted = format_processed_output(
                 deconvolved_data,
                 save_float32,
             )
@@ -2625,24 +2686,35 @@ def run_estimate_illuminations(
 ):
     """Run ``estimate_illuminations`` in a subprocess.
 
-    BaSiCPy uses PyTorch on the GPU, so the fit runs in an isolated process to
-    ensure all GPU allocations are released before other processing begins.
-
     Parameters
     ----------
-    datastore: TensorStore
-        TensorStore object containing the data.
-    camera_offset: float
-        Camera offset value.
-    camera_conversion: float
-        Camera conversion value.
-    conn: Pipe
-        Pipe connection to send the result back to the main process.
+    datastore : tensorstore.TensorStore
+        Readable raw TensorStore with TPCZYX axes and uint16 camera values.
+    camera_offset : float
+        Camera baseline in ADU, subtracted before applying the conversion.
+    camera_conversion : float
+        Calibrated intensity units per ADU after baseline subtraction.
+    stage_positions_zxy : numpy.ndarray
+        Physical stage Z, scan-axis X, and lateral Y coordinates in micrometers.
+    apply_stage_scan_gain : bool
+        Apply the fixed qi2lab detector-X gain during camera calibration.
+    signal_mask : numpy.ndarray or None
+        TPC mask selecting nonempty estimation tiles; None allows automatic
+        selection.
+    conn : multiprocessing.connection.Connection
+        Child pipe endpoint sending either fitted fields or an exception to the
+        parent.
 
     Returns
     -------
     None
-        No value is returned.
+        The result or annotated exception is sent through the pipe, which is then
+        closed.
+
+    Notes
+    -----
+    BaSiCPy runs in an isolated process so its GPU allocations are released
+    before reconstruction begins.
     """
     try:
         from opm_processing.cuda import preload_cuda_libraries
@@ -2677,25 +2749,37 @@ def call_estimate_illuminations(
 ):
     """Call ``estimate_illuminations`` in an isolated subprocess.
 
-    BaSiCPy uses PyTorch on the GPU, so the fit runs in an isolated process to
-    ensure all GPU allocations are released before other processing begins.
-
     Parameters
     ----------
-    datastore: TensorStore
-        TensorStore object containing the data.
-    camera_offset: float
-        Camera offset value.
-    camera_conversion: float
-        Camera conversion value.
+    datastore : tensorstore.TensorStore
+        Readable raw TensorStore with TPCZYX axes and uint16 camera values.
+    camera_offset : float
+        Camera baseline in ADU, subtracted before applying the conversion.
+    camera_conversion : float
+        Calibrated intensity units per ADU after baseline subtraction.
+    stage_positions_zxy : numpy.ndarray
+        Physical stage Z, scan-axis X, and lateral Y coordinates in micrometers.
+    apply_stage_scan_gain : bool
+        Apply the fixed qi2lab detector-X gain during camera calibration.
+    signal_mask : numpy.ndarray or None
+        TPC mask selecting nonempty estimation tiles; None allows automatic
+        selection.
 
     Returns
     -------
-    flatfields: np.ndarray
-        Estimated illuminations.
+    numpy.ndarray
+        Estimated depth-CYX fields after the isolated worker exits successfully.
+
+    Notes
+    -----
+    BaSiCPy runs in an isolated process so its GPU allocations are released
+    before reconstruction begins.
     """
-    parent_conn, child_conn = mp.Pipe()
-    p = mp.Process(
+    context = mp.get_context(
+        "forkserver" if sys.platform.startswith("linux") else "spawn"
+    )
+    parent_conn, child_conn = context.Pipe()
+    p = context.Process(
         target=run_estimate_illuminations,
         args=(
             datastore,
@@ -2735,15 +2819,10 @@ def call_estimate_illuminations(
 def main():
     """Run the OPM processing command-line application.
 
-    Parameters
-    ----------
-    None
-        This callable has no parameters.
-
     Returns
     -------
     None
-        No value is returned.
+        The Typer application parses arguments and executes processing.
     """
     app()
 

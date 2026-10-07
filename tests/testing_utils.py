@@ -22,24 +22,7 @@ def masked_correlation(
     truth_percentile: float,
     observation_mask: np.ndarray | None = None,
 ) -> CorrelationMeasurement:
-    """Measure correlation on truth-selected pixels, including lost signal.
-
-    Parameters
-    ----------
-    candidate : np.ndarray
-        Value supplied for ``candidate``.
-    truth : np.ndarray
-        Value supplied for ``truth``.
-    truth_percentile : float
-        Value supplied for ``truth percentile``.
-    observation_mask : np.ndarray or None
-        Acquisition geometry selecting observable voxels, independent of output.
-
-    Returns
-    -------
-    CorrelationMeasurement
-        Result produced by the callable.
-    """
+    """Measure correlation on truth-selected pixels, including lost signal."""
     candidate_array = np.asarray(candidate)
     truth_array = np.asarray(truth)
     if candidate_array.shape != truth_array.shape:
@@ -61,24 +44,7 @@ def shell_line_width_x(
     wall_x: float,
     half_window: int,
 ) -> float:
-    """Measure discrete FWHM of an ellipsoidal shell along its X normal.
-
-    Parameters
-    ----------
-    volume : np.ndarray
-        Value supplied for ``volume``.
-    center_zyx : tuple[float, float, float]
-        Value supplied for ``center zyx``.
-    wall_x : float
-        Value supplied for ``wall x``.
-    half_window : int
-        Value supplied for ``half window``.
-
-    Returns
-    -------
-    float
-        Result produced by the callable.
-    """
+    """Measure discrete FWHM of an ellipsoidal shell along its X normal."""
     z_index = int(round(center_zyx[0]))
     y_index = int(round(center_zyx[1]))
     x_index = int(round(wall_x))

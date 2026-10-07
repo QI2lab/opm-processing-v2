@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from opm_processing.imageprocessing import deconvolve_opm_simulation as experiment
+from scripts import deconvolve_opm_simulation as experiment
 
 
 @pytest.mark.unit

@@ -37,19 +37,76 @@ from opm_processing.imageprocessing.rlgc import (
 
 
 def _convolve_core(image, otf, padded_shape, core):
-    """Convolve a zero-extended object and crop to its original field of view."""
+    """Convolve a zero-extended object and crop to its original field of view.
+
+    Parameters
+    ----------
+    image
+        Nonnegative image samples on the operator input grid.
+    otf
+        Frequency-domain optical transfer function on the padded convolution grid.
+    padded_shape
+        FFT grid dimensions including zero padding.
+    core
+        Slices selecting the original image support from the FFT grid.
+
+    Returns
+    -------
+    cupy.ndarray
+        Convolved image on the original support after zero-padded FFT convolution.
+    """
     padded = cp.zeros(padded_shape, dtype=cp.float32)
     padded[core] = image
     return fft_conv(padded, otf, padded_shape)[core].copy()
 
 
 def _forward(image, otf, padded_shape, core, factor):
-    """Blur on the fine grid before selecting measured scan planes."""
+    """Blur on the fine grid before selecting measured scan planes.
+
+    Parameters
+    ----------
+    image
+        Nonnegative image samples on the operator input grid.
+    otf
+        Frequency-domain optical transfer function on the padded convolution grid.
+    padded_shape
+        FFT grid dimensions including zero padding.
+    core
+        Slices selecting the original image support from the FFT grid.
+    factor
+        Integer spacing between measured scan planes on the fine reconstruction grid.
+
+    Returns
+    -------
+    cupy.ndarray
+        Predicted camera planes at the measured fine-grid scan indices.
+    """
     return _convolve_core(image, otf, padded_shape, core)[::factor].copy()
 
 
 def _adjoint(image, otf_adjoint, padded_shape, core, fine_shape, factor):
-    """Scatter measurements into a zero-filled fine grid and apply C transpose."""
+    """Scatter measurements into a zero-filled fine grid and apply C transpose.
+
+    Parameters
+    ----------
+    image
+        Nonnegative image samples on the operator input grid.
+    otf_adjoint
+        Conjugate optical transfer function for adjoint convolution.
+    padded_shape
+        FFT grid dimensions including zero padding.
+    core
+        Slices selecting the original image support from the FFT grid.
+    fine_shape
+        Endpoint-preserving fine reconstruction dimensions in scan, Y, X order.
+    factor
+        Integer spacing between measured scan planes on the fine reconstruction grid.
+
+    Returns
+    -------
+    cupy.ndarray
+        Adjoint optical backprojection on the endpoint-preserving fine scan grid.
+    """
     scattered = cp.zeros(fine_shape, dtype=cp.float32)
     scattered[::factor] = image
     return _convolve_core(scattered, otf_adjoint, padded_shape, core)
@@ -145,9 +202,33 @@ def rlgc_undersampled(
             observed = cp.asarray(image)
 
             def forward(estimate):
+                """Blur the fine estimate and select only acquired scan planes.
+
+                Parameters
+                ----------
+                estimate
+                    Current fluorescence reconstruction on the fine scan grid.
+
+                Returns
+                -------
+                array or scalar
+                    Predicted measured camera planes from the fine estimate.
+                """
                 return _forward(estimate, otf, padded_shape, core, factor)
 
             def adjoint(values):
+                """Scatter acquired-plane values and apply the adjoint optical convolution.
+
+                Parameters
+                ----------
+                values
+                    Index tuples to sort and deduplicate before JSON persistence.
+
+                Returns
+                -------
+                array or scalar
+                    Backprojected measured-plane values on the fine reconstruction grid.
+                """
                 return _adjoint(
                     values, otf_adjoint, padded_shape, core, fine_shape, factor
                 )

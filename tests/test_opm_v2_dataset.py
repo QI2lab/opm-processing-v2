@@ -87,18 +87,7 @@ def test_singleton_z_stage_mode_writes_2d_name_without_stage_fusion(
 def test_process_runs_end_to_end_on_opm_v2_projection_zarr(
     opm_v2_projection_zarr,
 ):
-    """Verify projection acquisitions process and fuse end to end.
-
-    Parameters
-    ----------
-    opm_v2_projection_zarr : object
-        Value supplied for ``opm v2 projection zarr``.
-
-    Returns
-    -------
-    None
-        No value is returned.
-    """
+    """Verify projection acquisitions process and fuse end to end."""
     fixture = opm_v2_projection_zarr
 
     process(

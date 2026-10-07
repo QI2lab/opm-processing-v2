@@ -8,26 +8,17 @@ import time
 from dataclasses import dataclass, replace
 from itertools import product
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Callable, Iterator
 
 from opm_processing.dataio.acquisition import (
     AcquisitionMetadata,
     ChannelMetadata,
-    acquisition_stem,
 )
 
 LIVE_MANIFEST_SCHEMA = "opm_v2.live_acquisition"
 LIVE_MANIFEST_VERSION = "1.0"
 LIVE_POLL_INTERVAL_SECONDS = 30.0
 _TERMINAL_EVENTS = {"completed", "canceled", "errored"}
-
-
-@dataclass(frozen=True)
-class LiveSidecars:
-    """Paths shared by acquisition control and live processing."""
-
-    manifest: Path
-    log: Path
 
 
 @dataclass(frozen=True)
@@ -55,12 +46,21 @@ class LiveManifest:
 
     @classmethod
     def read(cls, path: str | Path) -> "LiveManifest":
-        """Read and validate one live-acquisition manifest."""
+        """Read the live controller's acquisition plan for the supported schema.
+
+        Parameters
+        ----------
+        path : str | Path
+            Live manifest JSON beside the acquisition store.
+
+        Returns
+        -------
+        LiveManifest
+            Planned dimensions, channels, calibration, and stage positions.
+        """
         manifest_path = Path(path).expanduser().resolve()
         with manifest_path.open(encoding="utf-8") as stream:
             document = json.load(stream)
-        if not isinstance(document, dict):
-            raise ValueError(f"Live manifest must contain a JSON object: {path}")
         if document.get("schema") != LIVE_MANIFEST_SCHEMA:
             raise ValueError(
                 f"Unsupported live manifest schema: {document.get('schema')!r}"
@@ -70,73 +70,40 @@ class LiveManifest:
                 f"Unsupported live manifest version: {document.get('schema_version')!r}"
             )
 
-        acquisition_id = str(document.get("acquisition_id", "")).strip()
-        if not acquisition_id:
-            raise ValueError("Live manifest lacks acquisition_id")
-        raw_data_path = document.get("data_path")
-        if not isinstance(raw_data_path, str) or not raw_data_path.strip():
-            raise ValueError("Live manifest lacks data_path")
+        acquisition_id = document["acquisition_id"]
+        raw_data_path = document["data_path"]
         data_path = Path(raw_data_path).expanduser()
         if not data_path.is_absolute():
             data_path = manifest_path.parent / data_path
         data_path = data_path.resolve()
 
-        sizes_document = document.get("index_sizes")
-        if not isinstance(sizes_document, dict):
-            raise ValueError("Live manifest lacks index_sizes")
+        sizes_document = document["index_sizes"]
         index_sizes = {
             axis: int(sizes_document.get(axis, 1)) for axis in ("t", "p", "c", "z")
         }
-        if any(size < 1 for size in index_sizes.values()):
-            raise ValueError("Live manifest index sizes must all be positive")
 
-        acquisition_order = tuple(
-            str(axis) for axis in document.get("acquisition_order", ())
-        )
-        if set(acquisition_order) != set(index_sizes):
-            raise ValueError(
-                "Live manifest acquisition_order must contain t, p, c, and z once"
-            )
+        acquisition_order = tuple(str(axis) for axis in document["acquisition_order"])
 
-        channel_documents = document.get("channels")
-        if (
-            not isinstance(channel_documents, list)
-            or len(channel_documents) != index_sizes["c"]
-        ):
-            raise ValueError("Live manifest must contain one channel entry per channel")
+        channel_documents = document["channels"]
         channels = []
         for index, channel in enumerate(channel_documents):
-            if not isinstance(channel, dict):
-                raise ValueError("Live manifest channel entries must be objects")
-            name = str(channel.get("name", "")).strip()
-            if not name:
-                raise ValueError(f"Live manifest channel {index} lacks a name")
+            name = channel["name"]
             channels.append(
                 ChannelMetadata(
                     index=index,
                     name=name,
-                    wavelength_nm=_optional_float(channel.get("wavelength_nm")),
-                    exposure_ms=_optional_float(channel.get("exposure_ms")),
-                    laser_power=_optional_float(channel.get("laser_power")),
+                    wavelength_nm=channel.get("wavelength_nm"),
+                    exposure_ms=channel.get("exposure_ms"),
+                    laser_power=channel.get("laser_power"),
                 )
             )
 
-        position_documents = document.get("stage_positions_zxy")
-        if (
-            not isinstance(position_documents, list)
-            or len(position_documents) != index_sizes["p"]
-        ):
-            raise ValueError(
-                "Live manifest must contain one ZXY stage position per position"
-            )
+        position_documents = document["stage_positions_zxy"]
         stage_positions = tuple(
-            _coordinate_triplet(position, "stage position")
-            for position in position_documents
+            tuple(float(value) for value in position) for position in position_documents
         )
 
         orientations_document = document.get("orientations", {})
-        if not isinstance(orientations_document, dict):
-            raise ValueError("Live manifest orientations must be an object")
 
         return cls(
             path=manifest_path,
@@ -147,12 +114,12 @@ class LiveManifest:
             acquisition_order=acquisition_order,
             channels=tuple(channels),
             stage_positions_zxy=stage_positions,
-            scan_axis=_optional_string(document.get("scan_axis")),
-            scan_axis_step_um=_required_float(document, "scan_axis_step_um"),
-            pixel_size_um=_required_float(document, "pixel_size_um"),
-            angle_deg=_required_float(document, "angle_deg"),
-            camera_offset=_required_float(document, "camera_offset"),
-            camera_conversion=_required_float(document, "camera_e_to_adu"),
+            scan_axis=document.get("scan_axis"),
+            scan_axis_step_um=float(document["scan_axis_step_um"]),
+            pixel_size_um=float(document["pixel_size_um"]),
+            angle_deg=float(document["angle_deg"]),
+            camera_offset=float(document["camera_offset"]),
+            camera_conversion=float(document["camera_e_to_adu"]),
             excess_scan_positions=int(document.get("excess_scan_positions", 0)),
             excess_scan_start_positions=int(
                 document.get("excess_scan_start_positions", 0)
@@ -164,19 +131,23 @@ class LiveManifest:
         )
 
     def apply(self, acquisition: AcquisitionMetadata) -> AcquisitionMetadata:
-        """Overlay upfront manifest values onto inspected OME-Zarr metadata."""
+        """Overlay upfront manifest values onto inspected OME-Zarr metadata.
+
+        Parameters
+        ----------
+        acquisition : AcquisitionMetadata
+            Inspected acquisition dimensions, stage geometry, and camera calibration.
+
+        Returns
+        -------
+        AcquisitionMetadata
+            Acquisition description with the live manifest plan and calibration applied.
+        """
         if acquisition.path.resolve() != self.data_path:
             raise ValueError(
                 "Live manifest data_path does not match the requested acquisition: "
                 f"{self.data_path} != {acquisition.path.resolve()}"
             )
-        actual_sizes = acquisition.index_sizes
-        for axis, expected in self.index_sizes.items():
-            if actual_sizes.get(axis, 1) != expected:
-                raise ValueError(
-                    f"Live manifest {axis}={expected} disagrees with OME-Zarr "
-                    f"{axis}={actual_sizes.get(axis, 1)}"
-                )
         return replace(
             acquisition,
             mode=self.mode,
@@ -199,21 +170,23 @@ class LiveManifest:
         )
 
 
-def resolve_live_sidecars(acquisition_path: str | Path) -> LiveSidecars:
-    """Return the single manifest and log associated with an acquisition."""
-    path = Path(acquisition_path).expanduser().resolve()
-    stem = acquisition_stem(path)
-    return LiveSidecars(
-        manifest=path.parent / f"{stem}.manifest.json",
-        log=path.parent / f"{stem}.log.jsonl",
-    )
-
-
 def read_lifecycle_event(path: str | Path, acquisition_id: str) -> str | None:
     """Return the most recent recognized acquisition lifecycle event.
 
     A final unterminated line is ignored because it may be observed while the
     controller is appending it.
+
+    Parameters
+    ----------
+    path : str | Path
+        Controller lifecycle JSONL file beside the acquisition.
+    acquisition_id : str
+        Manifest identity that must match lifecycle log records.
+
+    Returns
+    -------
+    str | None
+        Last complete recognized lifecycle event, or None before any event is logged.
     """
     log_path = Path(path)
     if not log_path.is_file():
@@ -227,12 +200,7 @@ def read_lifecycle_event(path: str | Path, acquisition_id: str) -> str | None:
         stripped = line.strip()
         if not stripped:
             continue
-        try:
-            record = json.loads(stripped)
-        except json.JSONDecodeError as error:
-            raise ValueError(f"Invalid JSONL record in {log_path}") from error
-        if not isinstance(record, dict):
-            raise ValueError(f"Lifecycle records must be JSON objects: {log_path}")
+        record = json.loads(stripped)
         record_id = record.get("acquisition_id")
         if record_id is not None and str(record_id) != acquisition_id:
             raise ValueError(
@@ -249,20 +217,34 @@ class ZarrTileReadiness:
     """Determine complete T/P tiles from raw Zarr v3 chunk keys."""
 
     def __init__(self, acquisition: AcquisitionMetadata) -> None:
-        if acquisition.axes != ("t", "p", "c", "z", "y", "x"):
-            raise ValueError(
-                f"Live deskewing requires logical TPCZYX input; got {acquisition.axes}"
-            )
+        """Read per-position chunk layouts from the acquisition's array paths.
+
+        Parameters
+        ----------
+        acquisition : AcquisitionMetadata
+            Inspected filesystem-backed TCZYX acquisition series.
+        """
         self.acquisition = acquisition
         self._arrays = tuple(
-            _LiveArrayChunks.read(acquisition.path / relative_path)
+            LiveArrayChunks.read(acquisition.path / relative_path)
             for relative_path in acquisition.array_paths
         )
-        if len(self._arrays) != acquisition.index_sizes["p"]:
-            raise ValueError("OME-Zarr array count does not match position count")
 
     def tile_is_ready(self, time_index: int, position_index: int) -> bool:
-        """Return whether every raw chunk for one T/P tile exists."""
+        """Return whether every raw chunk for one T/P tile exists.
+
+        Parameters
+        ----------
+        time_index : int
+            Acquisition timepoint index.
+        position_index : int
+            Acquisition position index.
+
+        Returns
+        -------
+        bool
+            True when every required raw chunk file for the selected tile exists.
+        """
         if not 0 <= time_index < self.acquisition.index_sizes["t"]:
             raise IndexError(f"Time index is out of bounds: {time_index}")
         if not 0 <= position_index < self.acquisition.index_sizes["p"]:
@@ -270,7 +252,13 @@ class ZarrTileReadiness:
         return self._arrays[position_index].tile_is_ready(time_index)
 
     def ready_tiles(self) -> set[tuple[int, int]]:
-        """Return every tile whose complete raw chunk set is present."""
+        """Return every tile whose complete raw chunk set is present.
+
+        Returns
+        -------
+        set[tuple[int, int]]
+            Timepoint/position pairs whose complete raw chunk sets are present.
+        """
         return {
             (time_index, position_index)
             for time_index in range(self.acquisition.index_sizes["t"])
@@ -280,7 +268,9 @@ class ZarrTileReadiness:
 
 
 @dataclass(frozen=True)
-class _LiveArrayChunks:
+class LiveArrayChunks:
+    """Array dimensions and chunk-key layout used to detect completed tiles."""
+
     path: Path
     shape: tuple[int, ...]
     chunk_shape: tuple[int, ...]
@@ -293,29 +283,29 @@ class _LiveArrayChunks:
         path: Path,
         *,
         require_frame_chunks: bool = True,
-    ) -> "_LiveArrayChunks":
+    ) -> "LiveArrayChunks":
+        """Read a position array's dimensions and raw chunk-key layout.
+
+        Parameters
+        ----------
+        path : Path
+            Position array directory containing zarr.json.
+        require_frame_chunks : bool
+            Require separate T/C/Z frame chunks for live raw-data reads.
+
+        Returns
+        -------
+        LiveArrayChunks
+            Layout used to enumerate every chunk needed for a complete tile.
+        """
         metadata_path = path / "zarr.json"
         with metadata_path.open(encoding="utf-8") as stream:
             metadata = json.load(stream)
-        if metadata.get("node_type") != "array" or metadata.get("zarr_format") != 3:
-            raise ValueError(f"Live processing requires a Zarr v3 array: {path}")
-        shape = tuple(int(value) for value in metadata.get("shape", ()))
-        names = tuple(
-            str(value).lower() for value in metadata.get("dimension_names", ())
-        )
-        if shape == () or names != ("t", "c", "z", "y", "x"):
-            raise ValueError(
-                "Live processing requires per-position TCZYX arrays; "
-                f"got dimensions {names} at {path}"
-            )
+        shape = tuple(int(value) for value in metadata["shape"])
         chunk_shape = tuple(
             int(value)
-            for value in metadata.get("chunk_grid", {})
-            .get("configuration", {})
-            .get("chunk_shape", ())
+            for value in metadata["chunk_grid"]["configuration"]["chunk_shape"]
         )
-        if len(chunk_shape) != len(shape):
-            raise ValueError(f"Invalid chunk grid metadata: {path}")
         if require_frame_chunks and chunk_shape[:3] != (1, 1, 1):
             raise ValueError(
                 "Live processing requires one-frame chunks along T, C, and Z; "
@@ -324,24 +314,31 @@ class _LiveArrayChunks:
         if any(
             codec.get("name") == "sharding_indexed"
             for codec in metadata.get("codecs", ())
-            if isinstance(codec, dict)
         ):
             raise ValueError(f"Live processing does not support sharded arrays: {path}")
         encoding_document = metadata.get("chunk_key_encoding", {})
         encoding = str(encoding_document.get("name", "default"))
-        if encoding not in {"default", "v2"}:
-            raise ValueError(f"Unsupported chunk-key encoding {encoding!r}: {path}")
         default_separator = "/" if encoding == "default" else "."
         separator = str(
             encoding_document.get("configuration", {}).get(
                 "separator", default_separator
             )
         )
-        if separator not in {"/", "."}:
-            raise ValueError(f"Unsupported chunk-key separator {separator!r}: {path}")
         return cls(path, shape, chunk_shape, encoding, separator)
 
     def tile_is_ready(self, time_index: int) -> bool:
+        """Return whether all channel, plane, and detector chunks are present.
+
+        Parameters
+        ----------
+        time_index : int
+            Timepoint whose chunk keys are checked.
+
+        Returns
+        -------
+        bool
+            True once every required chunk file exists.
+        """
         chunk_counts = tuple(
             math.ceil(size / chunk)
             for size, chunk in zip(self.shape, self.chunk_shape, strict=True)
@@ -359,6 +356,18 @@ class _LiveArrayChunks:
         )
 
     def _chunk_path(self, coordinates: tuple[int, ...]) -> Path:
+        """Encode one TCZYX chunk coordinate as its on-disk path.
+
+        Parameters
+        ----------
+        coordinates : tuple[int, ...]
+            Chunk-grid indices in TCZYX order.
+
+        Returns
+        -------
+        Path
+            File path for the array's Zarr chunk-key encoding.
+        """
         components = [str(value) for value in coordinates]
         if self.encoding == "default":
             components.insert(0, "c")
@@ -376,7 +385,28 @@ def iter_live_tiles(
     sleeper: Callable[[float], None] = time.sleep,
     completed_tiles: set[tuple[int, int]] | None = None,
 ) -> Iterator[tuple[int, int]]:
-    """Yield newly complete, unprocessed tiles until acquisition termination."""
+    """Yield newly complete, unprocessed tiles until acquisition termination.
+
+    Parameters
+    ----------
+    readiness : ZarrTileReadiness
+        Chunk-readiness reader for the acquisition position arrays.
+    manifest : LiveManifest
+        Upfront live acquisition plan defining the expected timepoints and positions.
+    log_path : str | Path
+        Controller lifecycle JSONL file beside the acquisition store.
+    poll_interval : float
+        Seconds to wait between checks while acquisition is still running.
+    sleeper : Callable[[float], None]
+        Wait function, replaceable by a test clock.
+    completed_tiles : set[tuple[int, int]] | None
+        Durable timepoint/position checkpoints already processed.
+
+    Yields
+    ------
+    tuple[int, int]
+        Newly complete timepoint/position pair not present in the durable checkpoints.
+    """
     expected = {
         (time_index, position_index)
         for time_index in range(manifest.index_sizes["t"])
@@ -407,32 +437,3 @@ def iter_live_tiles(
             f"{poll_interval:g} seconds for another complete tile..."
         )
         sleeper(poll_interval)
-
-
-def _required_float(document: dict[str, Any], key: str) -> float:
-    value = _optional_float(document.get(key))
-    if value is None:
-        raise ValueError(f"Live manifest lacks numeric {key}")
-    return value
-
-
-def _optional_float(value: Any) -> float | None:
-    if value is None or isinstance(value, bool):
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _optional_string(value: Any) -> str | None:
-    if value is None:
-        return None
-    text = str(value).strip().lower()
-    return text or None
-
-
-def _coordinate_triplet(value: Any, label: str) -> tuple[float, float, float]:
-    if not isinstance(value, (list, tuple)) or len(value) != 3:
-        raise ValueError(f"Live manifest {label} must contain three values")
-    return tuple(float(item) for item in value)  # type: ignore[return-value]

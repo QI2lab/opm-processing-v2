@@ -40,7 +40,18 @@ _DISPLAY_OUTPUT_SUFFIXES = {
 
 
 def _processed_output_stem(path: Path) -> str | None:
-    """Return the acquisition stem encoded by a recognized display output."""
+    """Return the acquisition stem encoded by a recognized display output.
+
+    Parameters
+    ----------
+    path : Path
+        Processed output path inspected for a supported display filename suffix.
+
+    Returns
+    -------
+    str | None
+        Acquisition name encoded in the recognized processed filename, or None.
+    """
     for suffixes in _DISPLAY_OUTPUT_SUFFIXES.values():
         for suffix in suffixes:
             if path.name.endswith(suffix):
@@ -49,7 +60,18 @@ def _processed_output_stem(path: Path) -> str | None:
 
 
 def _resolve_display_context(root_path: Path) -> tuple[Path, str]:
-    """Resolve the output directory and acquisition stem for display lookup."""
+    """Resolve the output directory and acquisition stem for display lookup.
+
+    Parameters
+    ----------
+    root_path : Path
+        Acquisition or processed-output directory selected by the caller.
+
+    Returns
+    -------
+    tuple[Path, str]
+        Processed-output directory and the acquisition name used for display lookup.
+    """
     candidate = Path(root_path).expanduser().resolve()
     direct_stem = _processed_output_stem(candidate)
     if direct_stem is not None:
@@ -128,13 +150,13 @@ def _configure_collection_layers(
     Parameters
     ----------
     data_path : Path
-        Value supplied for ``data path``.
+        Processed OME-Zarr store opened by the napari plugin.
     layers : list[Any]
-        Value supplied for ``layers``.
+        Lazy image layers produced by the OME-Zarr reader plugin.
     pos_range : tuple[int, int] | None
-        Value supplied for ``pos range``.
+        Half-open position range to make visible, or None for all positions.
     time_range : tuple[int, int] | None
-        Value supplied for ``time range``.
+        Half-open timepoint range to display, or None for all timepoints.
 
     Returns
     -------
@@ -193,13 +215,13 @@ def display(
     Parameters
     ----------
     root_path : Path
-        Value supplied for ``root path``.
+        Acquisition or processed-output directory selected by the caller.
     to_display : str
-        Value supplied for ``to display``.
+        Processed output kind: full, max-z, fused-full, or fused-max-z.
     time_range : tuple[int, int] | None
-        Value supplied for ``time range``.
+        Half-open timepoint range to display, or None for all timepoints.
     pos_range : tuple[int, int] | None
-        Value supplied for ``pos range``.
+        Half-open position range to make visible, or None for all positions.
     roi_output : pathlib.Path or None
         Output path for the physical-coordinate ROI JSON. When omitted in ROI
         mode, defaults to ``<acquisition>_roi.json`` beside the displayed data.
@@ -289,11 +311,6 @@ def display(
 
 def main() -> None:
     """Run the display command-line application.
-
-    Parameters
-    ----------
-    None
-        This callable has no parameters.
 
     Returns
     -------

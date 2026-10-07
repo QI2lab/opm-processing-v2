@@ -32,7 +32,7 @@ def test_nested_progress_counts_completed_tiles(monkeypatch, outer_axis):
     tiles = [(0, 0), (0, 1), (1, 0), (1, 1)]
     if outer_axis == "p":
         tiles.sort(key=lambda tile: (tile[1], tile[0]))
-    iterator = processing._progress_tile_groups(
+    iterator = processing.progress_tile_groups(
         iter(tiles[1:]), tiles, {tiles[0]}, (outer_axis,)
     )
     next(iterator)

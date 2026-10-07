@@ -22,13 +22,37 @@ PROCESSING_STATE_VERSION = 1
 
 
 def processing_state_path(output_root: Path, acquisition_stem: str) -> Path:
-    """Return the single processing-state path for an acquisition output root."""
+    """Return the single processing-state path for an acquisition output root.
+
+    Parameters
+    ----------
+    output_root : Path
+        Directory containing the acquisition outputs and processing journal.
+    acquisition_stem : str
+        Acquisition name without its OME-Zarr filename suffix.
+
+    Returns
+    -------
+    Path
+        Acquisition processing journal path beside its output artifacts.
+    """
     root = Path(output_root).expanduser().resolve()
     return root / f"{acquisition_stem}.processing.json"
 
 
 def _json_value(value: Any) -> Any:
-    """Return a deterministic JSON-compatible representation."""
+    """Return a deterministic JSON-compatible representation.
+
+    Parameters
+    ----------
+    value : Any
+        Scalar or structured metadata value to convert.
+
+    Returns
+    -------
+    Any
+        Deterministic JSON-compatible values used in the journal and resume fingerprint.
+    """
     if isinstance(value, Path):
         return str(value.expanduser().resolve())
     if isinstance(value, dict):
@@ -43,12 +67,34 @@ def _json_value(value: Any) -> Any:
 
 
 def _tile_records(values: Iterable[tuple[int, ...]]) -> list[list[int]]:
-    """Normalize index tuples for deterministic persistence."""
+    """Normalize index tuples for deterministic persistence.
+
+    Parameters
+    ----------
+    values : Iterable[tuple[int, ...]]
+        Index tuples to sort and deduplicate before JSON persistence.
+
+    Returns
+    -------
+    list[list[int]]
+        Sorted unique index records ready for JSON persistence.
+    """
     return [list(map(int, value)) for value in sorted(set(values))]
 
 
 def _configuration_fingerprint(configuration: dict[str, Any]) -> str:
-    """Hash only output-affecting settings for exact resume validation."""
+    """Hash only output-affecting settings for exact resume validation.
+
+    Parameters
+    ----------
+    configuration : dict[str, Any]
+        Output-affecting settings used to fingerprint resumable processing.
+
+    Returns
+    -------
+    str
+        SHA-256 digest of the canonical output-affecting configuration.
+    """
     encoded = json.dumps(
         _json_value(configuration),
         sort_keys=True,
@@ -66,7 +112,20 @@ class ProcessingState:
 
     @classmethod
     def create(cls, path: Path, source_path: Path) -> "ProcessingState":
-        """Create a new empty state document and persist it immediately."""
+        """Create a new empty state document and persist it immediately.
+
+        Parameters
+        ----------
+        path : Path
+            Processing journal JSON destination.
+        source_path : Path
+            Source acquisition or registered image associated with these outputs.
+
+        Returns
+        -------
+        ProcessingState
+            New empty journal after its first durable save.
+        """
         state_path = Path(path).expanduser().resolve()
         source = Path(source_path).expanduser().resolve()
         state = cls(
@@ -84,41 +143,52 @@ class ProcessingState:
 
     @classmethod
     def read(cls, path: Path) -> "ProcessingState":
-        """Read and strictly validate a current processing-state document."""
+        """Read a processing-state document and require the current schema version.
+
+        Parameters
+        ----------
+        path : Path
+            Processing journal beside the acquisition outputs.
+
+        Returns
+        -------
+        ProcessingState
+            Loaded journal for the supported processing contract.
+        """
         state_path = Path(path).expanduser().resolve()
-        if not state_path.is_file():
-            raise FileNotFoundError(f"Processing state does not exist: {state_path}")
-        try:
-            document = json.loads(state_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as error:
-            raise ValueError(f"Invalid processing-state JSON: {state_path}") from error
-        if not isinstance(document, dict):
-            raise ValueError(f"Processing state must be a JSON object: {state_path}")
+        document = json.loads(state_path.read_text(encoding="utf-8"))
         if document.get("schema") != PROCESSING_STATE_SCHEMA:
             raise ValueError(f"Unsupported processing-state schema: {state_path}")
         if document.get("schema_version") != PROCESSING_STATE_VERSION:
             raise ValueError(f"Unsupported processing-state version: {state_path}")
-        if not isinstance(document.get("source"), dict):
-            raise ValueError(f"Processing state lacks source identity: {state_path}")
-        for section in ("outputs", "registration"):
-            if not isinstance(document.get(section), dict):
-                raise ValueError(
-                    f"Processing-state section {section!r} must be an object: "
-                    f"{state_path}"
-                )
         return cls(path=state_path, document=document)
 
     @classmethod
     def open(
         cls, path: Path, source_path: Path, *, overwrite: bool
     ) -> "ProcessingState":
-        """Create or reopen state while enforcing its acquisition identity."""
+        """Create or reopen state while enforcing its acquisition identity.
+
+        Parameters
+        ----------
+        path : Path
+            Processing journal JSON beside the acquisition output artifacts.
+        source_path : Path
+            Source acquisition or registered image associated with these outputs.
+        overwrite : bool
+            Replace an existing run instead of requiring compatible resume settings.
+
+        Returns
+        -------
+        ProcessingState
+            Compatible journal for the acquisition, or a newly created journal.
+        """
         state_path = Path(path).expanduser().resolve()
         source = Path(source_path).expanduser().resolve()
         if not state_path.exists():
             return cls.create(state_path, source)
         state = cls.read(state_path)
-        recorded_source = Path(str(state.document["source"].get("path", ""))).resolve()
+        recorded_source = Path(state.document["source"]["path"]).resolve()
         if recorded_source != source:
             if overwrite:
                 return cls.create(state_path, source)
@@ -129,7 +199,18 @@ class ProcessingState:
         return state
 
     def _run_key(self, output_path: Path) -> str:
-        """Return a root-relative POSIX key for one output artifact."""
+        """Return a root-relative POSIX key for one output artifact.
+
+        Parameters
+        ----------
+        output_path : Path
+            Processed image artifact recorded in the processing journal.
+
+        Returns
+        -------
+        str
+            Root-relative POSIX path identifying the output artifact in this journal.
+        """
         output = Path(output_path).expanduser().resolve()
         try:
             return output.relative_to(self.path.parent).as_posix()
@@ -146,7 +227,19 @@ class ProcessingState:
         roi_series: Iterable[dict[str, Any]] = (),
         overwrite: bool,
     ) -> None:
-        """Create a run or validate that a resumable run is exactly compatible."""
+        """Create a run or validate that a resumable run is exactly compatible.
+
+        Parameters
+        ----------
+        output_path : Path
+            Processed image artifact recorded in the processing journal.
+        configuration : dict[str, Any]
+            Output-affecting settings used to fingerprint resumable processing.
+        roi_series : Iterable[dict[str, Any]]
+            Source indices and skewed crop geometry for independently cropped ROI tiles.
+        overwrite : bool
+            Replace an existing run instead of requiring compatible resume settings.
+        """
         key = self._run_key(output_path)
         expected = {
             "path": key,
@@ -178,7 +271,18 @@ class ProcessingState:
         self.save()
 
     def run(self, output_path: Path) -> dict[str, Any]:
-        """Return a required run record."""
+        """Return a required run record.
+
+        Parameters
+        ----------
+        output_path : Path
+            Processed image store recorded in this journal.
+
+        Returns
+        -------
+        dict[str, Any]
+            Mutable run metadata and durable completion checkpoints.
+        """
         key = self._run_key(output_path)
         try:
             run = self.document["outputs"][key]
@@ -186,26 +290,57 @@ class ProcessingState:
             raise ValueError(
                 f"Processing state has no run for {output_path}"
             ) from error
-        if not isinstance(run, dict):
-            raise ValueError(f"Invalid processing run for {output_path}")
         return run
 
     def completed_tiles(self, output_path: Path) -> set[tuple[int, int]]:
-        """Return durable completed time/position pairs."""
+        """Return durable completed time/position pairs.
+
+        Parameters
+        ----------
+        output_path : Path
+            Processed image artifact recorded in the processing journal.
+
+        Returns
+        -------
+        set[tuple[int, int]]
+            Timepoint/position pairs whose output writes were checkpointed.
+        """
         return {
             tuple(map(int, item))
             for item in self.run(output_path).get("completed_tiles", ())
         }
 
     def zero_channels(self, output_path: Path) -> set[tuple[int, int, int]]:
-        """Return durable empty time/position/channel decisions."""
+        """Return durable empty time/position/channel decisions.
+
+        Parameters
+        ----------
+        output_path : Path
+            Processed image artifact recorded in the processing journal.
+
+        Returns
+        -------
+        set[tuple[int, int, int]]
+            Timepoint/position/channel triples intentionally written as empty.
+        """
         return {
             tuple(map(int, item))
             for item in self.run(output_path).get("zero_channels", ())
         }
 
     def completed_channels(self, output_path: Path) -> set[tuple[int, int, int]]:
-        """Return durable T/P/C checkpoints; older runs have only tile records."""
+        """Return durable T/P/C checkpoints; older runs have only tile records.
+
+        Parameters
+        ----------
+        output_path : Path
+            Processed image artifact recorded in the processing journal.
+
+        Returns
+        -------
+        set[tuple[int, int, int]]
+            Channel-level durable write checkpoints.
+        """
         return {
             tuple(map(int, item))
             for item in self.run(output_path).get("completed_channels", ())
@@ -220,7 +355,21 @@ class ProcessingState:
         *,
         is_zero: bool = False,
     ) -> None:
-        """Atomically checkpoint a channel after its output write completes."""
+        """Atomically checkpoint a channel after its output write completes.
+
+        Parameters
+        ----------
+        output_path : Path
+            Processed image artifact recorded in the processing journal.
+        time_index : int
+            Acquisition timepoint index.
+        position_index : int
+            Acquisition position index.
+        channel_index : int
+            Acquisition channel index.
+        is_zero : bool
+            Record that the completed channel was intentionally written as zero.
+        """
         run = self.run(output_path)
         key = (int(time_index), int(position_index), int(channel_index))
         completed = self.completed_channels(output_path)
@@ -235,14 +384,21 @@ class ProcessingState:
         self.save()
 
     def roi_series(self, output_path: Path) -> tuple[dict[str, Any], ...]:
-        """Return the required source and crop mapping for variable ROI series."""
+        """Return the required source and crop mapping for variable ROI series.
+
+        Parameters
+        ----------
+        output_path : Path
+            Processed image store recorded in this journal.
+
+        Returns
+        -------
+        tuple[dict[str, Any], ...]
+            Ordered source and crop records, or no records for full tiles.
+        """
         records = self.run(output_path).get("roi_series")
         if records is None:
             return ()
-        if not isinstance(records, list) or any(
-            not isinstance(item, dict) for item in records
-        ):
-            raise ValueError(f"Invalid ROI series mapping for {output_path}")
         return tuple(records)
 
     def complete_tile(
@@ -253,7 +409,19 @@ class ProcessingState:
         *,
         zero_channels: Iterable[int] = (),
     ) -> None:
-        """Atomically record one tile after all of its output writes complete."""
+        """Atomically record one tile after all of its output writes complete.
+
+        Parameters
+        ----------
+        output_path : Path
+            Processed image artifact recorded in the processing journal.
+        time_index : int
+            Acquisition timepoint index.
+        position_index : int
+            Acquisition position index.
+        zero_channels : Iterable[int]
+            Channel indices recorded as empty for the completed tile.
+        """
         run = self.run(output_path)
         completed = {tuple(map(int, item)) for item in run.get("completed_tiles", ())}
         completed.add((int(time_index), int(position_index)))
@@ -273,7 +441,17 @@ class ProcessingState:
         configuration: dict[str, Any],
         pairwise_metrics: dict[str, Any],
     ) -> None:
-        """Persist pairwise registration links for one processed output."""
+        """Persist pairwise registration links for one processed output.
+
+        Parameters
+        ----------
+        output_path : Path
+            Processed image artifact recorded in the processing journal.
+        configuration : dict[str, Any]
+            Output-affecting settings used to fingerprint resumable processing.
+        pairwise_metrics : dict[str, Any]
+            Measured pairwise translations and quality metrics to persist.
+        """
         key = self._run_key(output_path)
         self.run(output_path)
         self.document["registration"][key] = {
@@ -288,10 +466,23 @@ class ProcessingState:
         *,
         configuration: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Return registration state, optionally validating its settings."""
+        """Return registration state, optionally validating its settings.
+
+        Parameters
+        ----------
+        output_path : Path
+            Processed tile store whose registration is requested.
+        configuration : dict[str, Any] | None
+            Expected registration settings, or None to skip fingerprint comparison.
+
+        Returns
+        -------
+        dict[str, Any]
+            Persisted links, registered tile origins, and artifact associations.
+        """
         key = self._run_key(output_path)
         record = self.document["registration"].get(key)
-        if not isinstance(record, dict):
+        if record is None:
             raise ValueError(f"Processing state has no registration for {output_path}")
         if configuration is not None and record.get(
             "configuration_sha256"
@@ -306,7 +497,17 @@ class ProcessingState:
         fused_path: Path,
         tiles: Iterable[dict[str, Any]],
     ) -> None:
-        """Record final registered tile origins and their fused artifact."""
+        """Record final registered tile origins and their fused artifact.
+
+        Parameters
+        ----------
+        output_path : Path
+            Processed image artifact recorded in the processing journal.
+        fused_path : Path
+            Completed fused image associated with the processed tile collection.
+        tiles : Iterable[dict[str, Any]]
+            Final registered tile records including source indices and physical origins.
+        """
         record = self.registration(output_path)
         record["fused_path"] = self._run_key(fused_path)
         record["tiles"] = [_json_value(tile) for tile in tiles]
@@ -318,18 +519,37 @@ class ProcessingState:
         *,
         max_projection_path: Path,
     ) -> None:
-        """Record the max projection derived from a registered fused artifact."""
+        """Record the max projection derived from a registered fused artifact.
+
+        Parameters
+        ----------
+        output_path : Path
+            Processed image artifact recorded in the processing journal.
+        max_projection_path : Path
+            Registered maximum-Z image derived from the fused artifact.
+        """
         record = self.registration(output_path)
         record["max_projection_path"] = self._run_key(max_projection_path)
         self.save()
 
     def registered_output_for_fused(self, fused_path: Path) -> Path:
-        """Return the processed output associated with a registered fusion."""
+        """Return the processed output associated with a registered fusion.
+
+        Parameters
+        ----------
+        fused_path : Path
+            Completed fused image recorded in this journal.
+
+        Returns
+        -------
+        Path
+            Source processed tile collection for the registered fusion.
+        """
         fused_key = self._run_key(fused_path)
         matches = [
             key
             for key, record in self.document["registration"].items()
-            if isinstance(record, dict) and record.get("fused_path") == fused_key
+            if record.get("fused_path") == fused_key
         ]
         if len(matches) != 1:
             raise ValueError(
@@ -339,13 +559,23 @@ class ProcessingState:
         return self.path.parent / matches[0]
 
     def registered_output_for_max_projection(self, path: Path) -> Path:
-        """Return the processed output associated with a registered max-Z image."""
+        """Return the processed output associated with a registered max-Z image.
+
+        Parameters
+        ----------
+        path : Path
+            Registered maximum projection recorded in this journal.
+
+        Returns
+        -------
+        Path
+            Source processed tile collection for the projection.
+        """
         projection_key = self._run_key(path)
         matches = [
             key
             for key, record in self.document["registration"].items()
-            if isinstance(record, dict)
-            and record.get("max_projection_path") == projection_key
+            if record.get("max_projection_path") == projection_key
         ]
         if len(matches) != 1:
             raise ValueError(

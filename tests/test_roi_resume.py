@@ -32,7 +32,7 @@ def test_roi_resumes_at_last_durable_channel(roi_run, monkeypatch, interruption)
     expected = [array.read().result() for array in reference.arrays]
     run.decon_calls.clear()
     real_complete = ProcessingState.complete_channel
-    real_write = run.process._write_checkpointed_roi_channel
+    real_write = run.process.write_checkpointed_roi_channel
     stop_key = (0, 2, 2) if interruption == "after_final_channel" else (0, 2, 0)
 
     def checkpoint(self, path, time, position, channel, **kwargs):
@@ -60,7 +60,7 @@ def test_roi_resumes_at_last_durable_channel(roi_run, monkeypatch, interruption)
 
     if interruption == "during_write":
         monkeypatch.setattr(
-            run.process, "_write_checkpointed_roi_channel", failing_write
+            run.process, "write_checkpointed_roi_channel", failing_write
         )
         expected_error = OSError
     else:
@@ -82,7 +82,7 @@ def test_roi_resumes_at_last_durable_channel(roi_run, monkeypatch, interruption)
     for _, position, channel in saved:
         run.raw.arrays[position][0, channel].write(np.uint16(900)).result()
     monkeypatch.setattr(ProcessingState, "complete_channel", real_complete)
-    monkeypatch.setattr(run.process, "_write_checkpointed_roi_channel", real_write)
+    monkeypatch.setattr(run.process, "write_checkpointed_roi_channel", real_write)
     run.decon_calls.clear()
     roi_command.process_roi(run.source, run.roi_path)
 
@@ -98,21 +98,10 @@ def test_roi_resumes_at_last_durable_channel(roi_run, monkeypatch, interruption)
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("known_empty", (False, True))
-def test_empty_roi_channel_is_checkpointed_and_skipped(
-    roi_run, monkeypatch, known_empty
-):
-    """Both empty-channel paths persist their zero decision before interruption."""
+def test_empty_roi_channel_is_checkpointed_and_skipped(roi_run, monkeypatch):
+    """Persist an empty channel before interruption and preserve it on resume."""
     run = roi_run
     run.raw.arrays[1][0, 0].write(np.uint16(100)).result()
-    if known_empty:
-        monkeypatch.setattr(
-            run.process,
-            "_known_empty_tile",
-            lambda mask, time, position, channel: (
-                (time, position, channel) == (0, 1, 0)
-            ),
-        )
     real_complete = ProcessingState.complete_channel
 
     def stop_after_empty(self, *args, **kwargs):
@@ -140,7 +129,6 @@ def test_empty_roi_channel_is_checkpointed_and_skipped(
 
     run.raw.arrays[1][0, 0].write(np.uint16(900)).result()
     monkeypatch.setattr(ProcessingState, "complete_channel", real_complete)
-    monkeypatch.setattr(run.process, "_known_empty_tile", lambda *args: False)
     run.process.process_skewed(run.source, **options)
     result = open_position_collection(output)
     expected = run.expected_tiles[0].copy()
@@ -264,7 +252,7 @@ def test_recreated_output_does_not_reuse_stale_checkpoints(tmp_path):
     state.complete_tile(output, 0, 1)
     assert not output.exists()
 
-    reopened = process._initialize_processing_state(
+    reopened = process.initialize_processing_state(
         output_dir=tmp_path,
         source_path=source,
         output_path=output,

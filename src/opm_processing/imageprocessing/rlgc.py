@@ -151,7 +151,22 @@ def _linear_fft_pad_width(
     psf_shape: tuple[int, int, int],
     pad_yx: bool = True,
 ) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int]]:
-    """Calculate per-axis linear FFT padding without allocating an image."""
+    """Calculate per-axis linear FFT padding without allocating an image.
+
+    Parameters
+    ----------
+    image_shape : tuple[int, int, int]
+        Input image dimensions in scan, camera-Y, camera-X order.
+    psf_shape : tuple[int, int, int]
+        Point-spread function support dimensions in scan, camera-Y, camera-X order.
+    pad_yx : bool
+        Include reflected detector YX halos in addition to scan-axis padding.
+
+    Returns
+    -------
+    tuple
+        Per-axis reflected boundary and FFT expansion widths.
+    """
     pad_scan = _axis_linear_fft_padding(image_shape[0], psf_shape[0])
     if pad_yx:
         pad_y = _axis_linear_fft_padding(image_shape[1], psf_shape[1])
@@ -162,55 +177,18 @@ def _linear_fft_pad_width(
     return pad_scan, pad_y, pad_x
 
 
-def pad_for_linear_fft(
-    image: np.ndarray,
-    psf_shape: tuple[int, int, int],
-    pad_yx: bool = True,
-) -> tuple[np.ndarray, tuple[tuple[int, int], tuple[int, int], tuple[int, int]]]:
-    """Pad a 3D image for linear FFT convolution with ``ndimage(..., mode="reflect")`` edges.
-
-    Z is always padded by the PSF support. Y/X are padded by the PSF support and
-    expanded to FFT-friendly sizes only when ``pad_yx`` is True.
-
-    Parameters
-    ----------
-    image : numpy.ndarray
-        3D input image in Z, Y, X order.
-    psf_shape : tuple[int, int, int]
-        PSF shape in Z, Y, X order.
-    pad_yx : bool, default=True
-        If True, pad and FFT-expand Y/X. If False, only pad Z.
-
-    Returns
-    -------
-    tuple[numpy.ndarray, tuple[tuple[int, int], tuple[int, int], tuple[int, int]]]
-        Padded image and the per-axis padding widths needed to remove padding
-        after deconvolution.
-    """
-    if image.ndim != 3:
-        raise ValueError(f"Expected 3D input, got shape {image.shape!r}")
-
-    pad_width = _linear_fft_pad_width(
-        tuple(int(size) for size in image.shape),
-        psf_shape,
-        pad_yx=pad_yx,
-    )
-    padded_image = np.pad(image, pad_width, mode="symmetric")
-    return padded_image, pad_width
-
-
 def remove_padding_zyx(
     padded_image: cp.ndarray | np.ndarray,
     pad_width: tuple[tuple[int, int], tuple[int, int], tuple[int, int]],
 ) -> cp.ndarray | np.ndarray:
-    """Remove per-axis padding added by :func:`pad_for_linear_fft`.
+    """Remove reflected boundary and FFT padding from a reconstructed volume.
 
     Parameters
     ----------
     padded_image : cupy.ndarray or numpy.ndarray
         Padded image in Z, Y, X order.
     pad_width : tuple[tuple[int, int], tuple[int, int], tuple[int, int]]
-        Per-axis padding widths returned by :func:`pad_for_linear_fft`.
+        Reflected boundary and FFT padding widths for each axis.
 
     Returns
     -------
@@ -262,7 +240,7 @@ def enforce_symmetric_boundary(
     image : cupy.ndarray
         Padded 3D image in Z, Y, X order. The array is modified in place.
     pad_width : tuple[tuple[int, int], tuple[int, int], tuple[int, int]]
-        Per-axis padding widths returned by :func:`pad_for_linear_fft`.
+        Reflected boundary and FFT padding widths for each axis.
 
     Returns
     -------
@@ -371,34 +349,6 @@ def fft_conv(
     return cp.fft.irfftn(fft_buf, s=shape).astype(cp.float32, copy=False)
 
 
-def _observed_region_mask(
-    shape: tuple[int, int, int],
-    pad_width: tuple[tuple[int, int], tuple[int, int], tuple[int, int]],
-) -> cp.ndarray:
-    """Build a mask that is one in the original image and zero in padding.
-
-    Parameters
-    ----------
-    shape : tuple[int, int, int]
-        Full padded image shape.
-    pad_width : tuple[tuple[int, int], tuple[int, int], tuple[int, int]]
-        Per-axis padding widths returned by :func:`pad_for_linear_fft`.
-
-    Returns
-    -------
-    cupy.ndarray
-        Float32 mask with observed voxels equal to one.
-    """
-    mask = cp.zeros(shape, dtype=cp.float32)
-    slices = []
-    for axis, (pad_before, pad_after) in enumerate(pad_width):
-        start = pad_before
-        stop = shape[axis] - pad_after if pad_after > 0 else None
-        slices.append(slice(start, stop))
-    mask[tuple(slices)] = 1
-    return mask
-
-
 def _observed_region_slices(
     shape: tuple[int, int, int],
     pad_width: tuple[tuple[int, int], tuple[int, int], tuple[int, int]],
@@ -422,38 +372,6 @@ def _observed_region_slices(
         stop = shape[axis] - pad_after if pad_after > 0 else None
         slices.append(slice(pad_before, stop))
     return tuple(slices)
-
-
-def kl_div(p: cp.ndarray, q: cp.ndarray, mask: cp.ndarray | None = None) -> float:
-    """Compute Kullback-Leibler divergence between two distributions.
-
-    Parameters
-    ----------
-    p : cupy.ndarray
-        First distribution (nonnegative).
-    q : cupy.ndarray
-        Second distribution (nonnegative).
-    mask : cupy.ndarray or None, default=None
-        Optional mask selecting the observed image region. Values outside the
-        mask are excluded before normalization.
-
-    Returns
-    -------
-    float
-        Sum over all elements of ``p * (log(p) - log(q))``, with NaNs set to 0.
-    """
-    eps = cp.float32(1e-4)
-    if mask is not None:
-        p = (p + eps) * mask
-        q = (q + eps) * mask
-    else:
-        p = p + eps
-        q = q + eps
-    p = p / cp.sum(p)
-    q = q / cp.sum(q)
-    kldiv = p * (cp.log(p) - cp.log(q))
-    kldiv[cp.isnan(kldiv)] = 0
-    return float(cp.sum(kldiv))
 
 
 def _kl_div_into(
@@ -626,7 +544,22 @@ class RlgcChunkState:
         psf_shapes: list[tuple[int, ...]] | tuple[tuple[int, ...], ...],
         gpu_id: int = 0,
     ) -> int:
-        """Determine the crop only when this state has no stored value."""
+        """Determine the crop only when this state has no stored value.
+
+        Parameters
+        ----------
+        image_shape : tuple[int, int, int]
+            Input image dimensions in scan, camera-Y, camera-X order.
+        psf_shapes : list[tuple[int, ...]] | tuple[tuple[int, ...], ...]
+            Point-spread function dimensions for the processed channels.
+        gpu_id : int
+            CUDA device index used for reconstruction or memory estimation.
+
+        Returns
+        -------
+        int
+            Shared retained scan size selected from the image and channel PSF dimensions.
+        """
         if self.crop_scan is None:
             self.crop_scan = determine_rlgc_crop_scan(
                 image_shape,
@@ -636,7 +569,13 @@ class RlgcChunkState:
         return self.crop_scan
 
     def remember_successful_crop(self, crop_scan: int) -> None:
-        """Retain a successful fallback crop for all later solver calls."""
+        """Retain a successful fallback crop for all later solver calls.
+
+        Parameters
+        ----------
+        crop_scan : int
+            Retained scan-plane count used for chunked deconvolution.
+        """
         self.crop_scan = int(crop_scan)
 
 
@@ -705,6 +644,18 @@ def _split_observed_counts(
     ``observed - result``, preserving the measured data. For fractional data
     this is a weighted-count approximation, not an exact Poisson noise model.
     Integer-only inputs retain the original binomial samples and RNG sequence.
+
+    Parameters
+    ----------
+    observed : cp.ndarray
+        Nonnegative measured photon counts split into independent observations.
+    rng : cp.random.Generator
+        Random generator used for reproducible count splitting.
+
+    Returns
+    -------
+    cupy.ndarray
+        One random float32 count split; subtract it from observed to obtain the other split.
     """
     counts = observed.astype(cp.int64)
     split = rng.binomial(counts, p=0.5).astype(cp.float32)
@@ -1392,6 +1343,24 @@ def rlgc_2d(
         A YX image or singleton-Z ZYX image.
     skewed_psf : numpy.ndarray
         A YX PSF or skewed ZYX PSF. Only its central Z plane is used.
+    gpu_id : int
+        CUDA device index used for reconstruction or memory estimation.
+    safe_mode : bool
+        Roll back consensus iterations when either split likelihood worsens.
+    limit : float
+        Stop when the fraction of voxels receiving consensus updates falls below this value.
+    max_delta : float
+        Stop when the maximum relative reconstruction change falls below this value.
+    rng_seed : int | None
+        Seed for independent count splitting; None uses an unseeded generator.
+    verbose : int
+        Deconvolution diagnostic verbosity.
+    release_memory : bool
+        Clear shared FFT caches and unused GPU allocations on completion.
+    logger : logging.Logger | None
+        Optional logger for iteration diagnostics.
+    log_prefix : str
+        Text prepended to deconvolution diagnostics for this tile or channel.
 
     Returns
     -------
