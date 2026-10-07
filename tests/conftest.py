@@ -15,39 +15,24 @@ from opm_processing.dataio.position_collection import create_position_collection
 from opm_processing.imageprocessing.opmtools import deskew_shape_estimator
 
 
-def pytest_addoption(parser):
-    """Register an explicit opt-in for hardware-dependent performance runs.
+def pytest_collection_modifyitems(items):
+    """Require unit or disk-based integration tests during collection.
 
     Parameters
     ----------
-    parser : pytest.Parser
-        Command-line parser receiving the benchmark switch.
-    """
-    parser.addoption(
-        "--run-benchmarks",
-        action="store_true",
-        help="Run optional speed benchmarks against main",
-    )
-
-
-def pytest_collection_modifyitems(config, items):
-    """Classify correctness tests and skip benchmarks unless requested.
-
-    Parameters
-    ----------
-    config : pytest.Config
-        Parsed command-line options, including benchmark opt-in.
     items : list of pytest.Item
-        Collected tests to classify and optionally mark as skipped.
+        Collected correctness tests to validate.
+
+    Raises
+    ------
+    pytest.UsageError
+        If a test has no unique category, uses a forbidden category, or an
+        integration test has no temporary disk storage in its fixture closure.
     """
     for item in items:
-        if item.get_closest_marker("benchmark") and not config.getoption(
-            "--run-benchmarks"
-        ):
-            item.add_marker(
-                pytest.mark.skip(
-                    reason="Optional speed benchmark: use --run-benchmarks"
-                )
+        if any(item.get_closest_marker(name) for name in ("smoke", "api", "benchmark")):
+            raise pytest.UsageError(
+                f"{item.nodeid}: smoke, API, and benchmark tests are not permitted"
             )
         categories = [
             name for name in ("unit", "integration") if item.get_closest_marker(name)
@@ -55,6 +40,14 @@ def pytest_collection_modifyitems(config, items):
         if len(categories) != 1:
             raise pytest.UsageError(
                 f"{item.nodeid} must have exactly one of unit or integration"
+            )
+        if categories == ["integration"] and not {
+            "tmp_path",
+            "tmp_path_factory",
+        }.intersection(item.fixturenames):
+            raise pytest.UsageError(
+                f"{item.nodeid}: integration tests require simulated input and "
+                "verified output on disk"
             )
 
 

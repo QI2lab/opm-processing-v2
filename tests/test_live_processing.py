@@ -92,7 +92,7 @@ def _write_manifest(data_path: Path, *, timepoints: int = 2) -> LiveManifest:
     return LiveManifest.read(sidecars.manifest)
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 def test_manifest_overlays_metadata_available_before_frame_metadata(tmp_path) -> None:
     """Use the immutable plan when per-frame metadata has not been flushed."""
     data_path = tmp_path / "sample.ome.zarr"
@@ -122,7 +122,7 @@ def test_manifest_overlays_metadata_available_before_frame_metadata(tmp_path) ->
     assert acquisition.channel_names == ("488nm", "561nm")
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 def test_live_acquisition_directory_resolves_manifest_data_path(tmp_path) -> None:
     """Accept the acquisition directory and resolve its manifest OME-Zarr."""
     acquisition_dir = tmp_path / "timestamped_acquisition"
@@ -155,7 +155,7 @@ def test_live_acquisition_directory_resolves_manifest_data_path(tmp_path) -> Non
         _open_live_acquisition(data_path)
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 def test_chunk_presence_marks_only_a_fully_written_tile_ready(tmp_path) -> None:
     """Require every C/Z/Y/X chunk before publishing one T/P tile."""
     data_path = tmp_path / "chunks.ome.zarr"
@@ -188,7 +188,7 @@ def test_chunk_presence_marks_only_a_fully_written_tile_ready(tmp_path) -> None:
     assert readiness.ready_tiles() == {(0, 0)}
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 def test_live_iterator_polls_then_stops_at_completed_log(tmp_path) -> None:
     """Poll only while caught up and stop after all completed tiles are yielded."""
     data_path = tmp_path / "iterator.ome.zarr"
@@ -226,7 +226,7 @@ def test_live_iterator_polls_then_stops_at_completed_log(tmp_path) -> None:
     assert sleeps == [30.0]
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 def test_live_iterator_skips_tiles_completed_before_restart(tmp_path) -> None:
     """Seed iterator state with processed tiles discovered from existing output."""
     data_path = tmp_path / "resume.ome.zarr"
@@ -262,7 +262,7 @@ def test_live_iterator_skips_tiles_completed_before_restart(tmp_path) -> None:
     assert tiles == [(0, 1)]
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 def test_lifecycle_reader_ignores_an_incomplete_last_record(tmp_path) -> None:
     """Do not parse a JSONL record while the controller is appending it."""
     log_path = tmp_path / "sample.log.jsonl"
@@ -273,7 +273,7 @@ def test_lifecycle_reader_ignores_an_incomplete_last_record(tmp_path) -> None:
     assert read_lifecycle_event(log_path, "id") == "started"
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 def test_provided_illumination_is_strictly_validated(tmp_path) -> None:
     """Accept a matching image and reject invalid values without estimation."""
     path = tmp_path / "illumination.ome.tif"

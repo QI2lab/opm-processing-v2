@@ -245,7 +245,7 @@ def test_gpu_hot_pixel_replacement_matches_synthetic_sample(cupy_gpu):
     np.testing.assert_array_equal(corrected, expected)
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 def test_gpu_registration_recovers_known_3d_translation(cupy_gpu):
     """Run cuCIM registration plus CUDA SSIM on a translated sample volume.
 
@@ -295,7 +295,7 @@ def test_gpu_registration_recovers_known_3d_translation(cupy_gpu):
     assert score > unregistered_score
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 def test_rlgc_gpu_deconvolution_improves_synthetic_point_sample(cupy_gpu):
     """End-to-end GPU deconvolution must improve recovery of point emitters.
 
@@ -361,7 +361,7 @@ def test_rlgc_gpu_deconvolution_improves_synthetic_point_sample(cupy_gpu):
     rlgc.clear_rlgc_caches(clear_memory_pool=True)
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 def test_rlgc_preserves_stationary_intensity(cupy_gpu, monkeypatch):
     """A balanced split of an exact constant prediction must have unit update."""
     rlgc = importlib.import_module("opm_processing.imageprocessing.rlgc")
@@ -380,7 +380,7 @@ def test_rlgc_preserves_stationary_intensity(cupy_gpu, monkeypatch):
     np.testing.assert_allclose(restored, observed, rtol=1e-6)
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 @pytest.mark.parametrize("safe_mode", [True, False])
 def test_rlgc_stopping_is_invariant_to_split_labels(cupy_gpu, monkeypatch, safe_mode):
     """Swapping the two halves on alternate iterations cannot change recovery."""
@@ -415,7 +415,7 @@ def test_rlgc_stopping_is_invariant_to_split_labels(cupy_gpu, monkeypatch, safe_
     assert np.mean((actual - truth) ** 2) < np.mean((observed - truth) ** 2)
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 @pytest.mark.parametrize("scan_planes", [1, 5])
 def test_rlgc_preserves_smooth_low_count_background(cupy_gpu, scan_planes):
     """Local stopping must preserve resolved background instead of flat patches."""
@@ -483,7 +483,7 @@ def test_rlgc_integer_split_has_binomial_distribution(cupy_gpu):
     )
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 @pytest.mark.parametrize("seed", [7, 31, 83])
 @pytest.mark.parametrize(
     "read_noise_e", [0.7, 1.0, 1.6], ids=["ultra-quiet", "standard", "fast"]
@@ -553,7 +553,7 @@ def test_rlgc_recovers_dim_emitter_with_camera_noise(cupy_gpu, seed, read_noise_
     assert restored.min() >= 0
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 def test_rlgc_empty_image_remains_empty(cupy_gpu):
     """Data-derived initialization must not introduce signal into an empty image."""
     rlgc = importlib.import_module("opm_processing.imageprocessing.rlgc")
@@ -563,7 +563,7 @@ def test_rlgc_empty_image_remains_empty(cupy_gpu):
     np.testing.assert_array_equal(restored, observed)
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 @pytest.mark.parametrize("singleton_z", [False, True])
 def test_rlgc_2d_recovers_points_using_central_psf(cupy_gpu, singleton_z):
     """Run the real wrapper and solver against independently blurred YX truth."""

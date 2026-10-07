@@ -33,7 +33,7 @@ def test_camera_transfer_dark_saturation_and_rounding(conversion):
     assert not np.shares_memory(actual, raw)
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 @pytest.mark.parametrize("stage_gain,strided", [(False, False), (True, True)])
 def test_optical_illumination_and_camera_transfer(stage_gain, strided):
     """Restore a diffraction emitter with known illumination and detector gain.

@@ -93,6 +93,7 @@ def test_nvenc_round_trip_moving_gaussian(tmp_path):
 @pytest.mark.unit
 def test_rgb_nv12_known_bt709_primaries():
     # Published BT.709 limited-range primary values, each on a full chroma block.
+    """Compare color conversion with published BT.709 primary calibration values."""
     frame = np.repeat(
         np.repeat(
             np.array([[[255, 0, 0], [0, 255, 0], [0, 0, 255]]], dtype=np.uint8),
@@ -111,6 +112,7 @@ def test_rgb_nv12_known_bt709_primaries():
 @pytest.mark.integration
 @pytest.mark.gpu
 def test_nvenc_rgb_calibration_round_trip(tmp_path):
+    """Encode on-disk color calibration objects and verify decoded output colors."""
     pytest.importorskip("PyNvVideoCodec")
     rgb = np.zeros((256, 384, 3), dtype=np.uint8)
     colors = [[200, 30, 40], [20, 180, 40], [40, 30, 210]]

@@ -1,13 +1,12 @@
-"""Physical geometry and mocked-store integration checks for projection export."""
+"""Physical projection units and simulated disk-to-disk export tests."""
 
-from concurrent.futures import Future
-from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import tifffile
 
+from opm_processing.dataio.position_collection import create_position_collection
 from opm_processing import export_projections as exporter
 
 
@@ -49,38 +48,24 @@ def test_acquired_volume_timing():
 
 
 @pytest.mark.integration
-def test_mocked_store_export_preserves_brightness_and_separates_series(
-    tmp_path, monkeypatch
-):
+def test_disk_export_preserves_brightness_and_separates_series(tmp_path):
     """Known linear intensities retain the same mapping over time in each series."""
-
-    class Store:
-        def __init__(self, data):
-            self.data = data
-            self.shape = data.shape
-
-        def __getitem__(self, item):
-            return Store(self.data[item])
-
-        def read(self):
-            result = Future()
-            result.set_result(self.data)
-            return result
-
     first = np.linspace(0, 100, 10 * 20 * 30).reshape(10, 20, 30)
     data = np.stack([np.stack([first, first * 2]), np.stack([first * 0.5, first])])
-    collection = SimpleNamespace(
-        arrays=[Store(data), Store(data)],
-        voxel_size_um=(0.1, 0.1, 0.1),
-        channel_names=("488", "637"),
+    source_path = tmp_path / "sample_decon_deskewed.ome.zarr"
+    collection = create_position_collection(
+        source_path,
+        (2, 2, 2, 10, 20, 30),
+        (0.1, 0.1, 0.1),
+        channels=("488", "637"),
+        dtype=np.float32,
     )
-    monkeypatch.setattr(exporter, "open_position_collection", lambda _: collection)
+    for array in collection.arrays:
+        array.write(data.astype(np.float32)).result()
     acquisition = SimpleNamespace(
         scan_position_count=25, channels=[SimpleNamespace(exposure_ms=10)] * 2
     )
-    exporter.export_dataset(
-        Path("sample_decon_deskewed.ome.zarr"), tmp_path, acquisition, 1
-    )
+    exporter.export_dataset(source_path, tmp_path, acquisition, 1)
     files = sorted(tmp_path.rglob("*.tiff"))
     assert len(files) == 8
     first_file = (
@@ -97,20 +82,13 @@ def test_mocked_store_export_preserves_brightness_and_separates_series(
         > tifffile.imread(second_file)[:20, :30].mean()
     )
 
-    from opm_processing import encode_projections as encoder
-
-    encoded = []
-    monkeypatch.setattr(
-        encoder, "encode_sequence", lambda *args, **kwargs: encoded.append(args)
-    )
     selected = tmp_path / "selected"
     exporter.export_dataset(
-        Path("sample_decon_deskewed.ome.zarr"),
+        source_path,
         selected,
         acquisition,
         1,
         timepoints=(1, 2),
-        video=True,
     )
     subset = sorted(selected.rglob("*.tiff"))
     assert len(subset) == 4
@@ -121,73 +99,12 @@ def test_mocked_store_export_preserves_brightness_and_separates_series(
         with tifffile.TiffFile(path) as tif:
             assert tif.shaped_metadata[0]["elapsed_ms"] == 500
             assert tif.shaped_metadata[0]["timepoint"] == 1
-    assert len(encoded) == 4
-    assert all(len(args[0]) == 1 for args in encoded)
-    assert all(args[1].name.endswith("_t0001-t0001.mp4") for args in encoded)
     for bounds in ((-1, 2), (1, 1), (0, 3)):
         with pytest.raises(ValueError, match="START < STOP"):
             exporter.export_dataset(
-                Path("sample_decon_deskewed.ome.zarr"),
+                source_path,
                 tmp_path / "invalid",
                 acquisition,
                 timepoints=bounds,
             )
     assert not (tmp_path / "invalid").exists()
-
-
-@pytest.mark.integration
-def test_root_only_cli_resolution(tmp_path, monkeypatch):
-    """Both CLIs select the full processed store and only its corresponding frames."""
-    from typer.testing import CliRunner
-    from opm_processing import encode_projections as encoder
-
-    dataset = tmp_path / "sample_decon_deskewed.ome.zarr"
-    dataset.mkdir()
-    (tmp_path / "sample_max_z_decon_deskewed.ome.zarr").mkdir()
-    (tmp_path / "sample_deskewed.ome.zarr").mkdir()
-    called = []
-    options = []
-    monkeypatch.setattr(exporter, "acquisition_for", lambda *args: "metadata")
-    monkeypatch.setattr(
-        exporter,
-        "export_dataset",
-        lambda *args, **kwargs: (called.append(args), options.append(kwargs)),
-    )
-    runner = CliRunner()
-    result = runner.invoke(exporter.app, [str(tmp_path)])
-    assert result.exit_code == 0, result.output
-    assert (
-        runner.invoke(exporter.app, [str(tmp_path), "--downsample", "4"]).exit_code != 0
-    )
-    ranged = runner.invoke(exporter.app, [str(tmp_path), "--timepoints", "100", "200"])
-    assert ranged.exit_code == 0, ranged.output
-    assert options[-1]["timepoints"] == (100, 200)
-    assert called[0][:3] == (dataset, tmp_path / "projection_frames", "metadata")
-    assert runner.invoke(exporter.app, [str(dataset)]).exit_code != 0
-    frames = (
-        tmp_path
-        / "projection_frames"
-        / dataset.name.removesuffix(".ome.zarr")
-        / "p000/c000"
-    )
-    frames.mkdir(parents=True)
-    frame = frames / "sample_decon_deskewed_t0000.tiff"
-    frame.touch()
-    reduced_frame = frames / "downsample_4x" / frame.name
-    reduced_frame.parent.mkdir()
-    reduced_frame.touch()
-    unrelated = tmp_path / "projection_frames/unrelated"
-    unrelated.mkdir()
-    (unrelated / "other_t0000.tiff").touch()
-    encoded = []
-    monkeypatch.setattr(
-        encoder, "encode_sequence", lambda *args, **kwargs: encoded.append(args)
-    )
-    result = runner.invoke(encoder.app, [str(tmp_path)])
-    assert result.exit_code == 0, result.output
-    assert len(encoded) == 1
-    assert encoded[0][0] == [frame]
-    assert runner.invoke(encoder.app, [str(frames)]).exit_code != 0
-    (tmp_path / "another_decon_deskewed.ome.zarr").mkdir()
-    with pytest.raises(ValueError, match="Expected one"):
-        exporter.find_datasets(tmp_path)

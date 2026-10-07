@@ -1,7 +1,6 @@
 """Numerical unit and storage integration tests for tile fusion."""
 
 from types import MethodType, SimpleNamespace
-import inspect
 
 import numpy as np
 import pytest
@@ -14,6 +13,11 @@ from yaozarrs.write.v05 import prepare_image
 
 from opm_processing.fuse import app as fuse_app
 from opm_processing.dataio.processing_state import ProcessingState
+from opm_processing.dataio.position_collection import (
+    create_position_collection,
+    open_image_array,
+    open_position_collection,
+)
 from opm_processing.imageprocessing import maxtilefusion as maxtilefusion_module
 from opm_processing.imageprocessing import tilefusion as tilefusion_module
 from opm_processing.imageprocessing.coordinates import (
@@ -87,7 +91,7 @@ class _ReadArray:
         return _ReadView(self.data[key])
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 def test_max_projection_pyramid_clamps_partial_source_edge_chunks() -> None:
     """Never request factor-rounded source bounds beyond level-zero shape."""
     source = np.arange(1 * 3 * 1 * 17 * 19, dtype=np.uint16).reshape(1, 3, 1, 17, 19)
@@ -135,8 +139,14 @@ def test_stage_z_is_reversed_only_for_lab_placement(angle, reverse_z) -> None:
 def test_max_projection_depth_tiles_share_xy_footprint(tmp_path) -> None:
     """Depth tiles with fixed stage XY must fuse into a single tile footprint."""
     source = np.arange(64, dtype=np.uint16).reshape(1, 1, 1, 8, 8)
+    source_path = tmp_path / "depth_phantom.ome.zarr"
+    collection = create_position_collection(
+        source_path, (1, 2, 1, 1, 8, 8), (0.23, 0.115, 0.115)
+    )
+    for array in collection.arrays:
+        array.write(source).result()
     fusion = MaxTileFusion(
-        ts_dataset=(_ReadArray(source), _ReadArray(source)),
+        ts_dataset=open_position_collection(source_path).arrays,
         tile_positions=((3939.54, -7456.06, 4207.16), (3800.09, -7456.06, 4207.16)),
         output_path=tmp_path / "depth_max_z_fused.ome.zarr",
         pixel_size=(0.23, 0.115, 0.115),
@@ -147,7 +157,8 @@ def test_max_projection_depth_tiles_share_xy_footprint(tmp_path) -> None:
     fusion.run()
 
     np.testing.assert_array_equal(fusion.tile_positions[0], fusion.tile_positions[1])
-    np.testing.assert_array_equal(fusion.fused_ts.read().result(), source)
+    written = open_image_array(tmp_path / "depth_max_z_fused.ome.zarr")
+    np.testing.assert_array_equal(written.read().result(), source)
 
 
 @pytest.mark.unit
@@ -242,8 +253,13 @@ def test_max_projection_fusion_writes_centered_multiscales_and_offsets(
     """Persist every fused max level with rounded physical coordinates."""
     source = np.arange(64, dtype=np.uint16).reshape(1, 1, 1, 8, 8)
     output_path = tmp_path / "max_z_fused.ome.zarr"
+    source_path = tmp_path / "ramp_phantom.ome.zarr"
+    collection = create_position_collection(
+        source_path, (1, 1, 1, 1, 8, 8), (0.34567, 0.1164, 0.1184)
+    )
+    collection.arrays[0].write(source).result()
     fusion = MaxTileFusion(
-        ts_dataset=(_ReadArray(source),),
+        ts_dataset=open_position_collection(source_path).arrays,
         tile_positions=((1.23456, 2.34567, 3.45678),),
         output_path=output_path,
         pixel_size=(0.34567, 0.1164, 0.1184),
@@ -620,14 +636,18 @@ def test_zero_registration_channel_is_excluded_before_patch_reads() -> None:
     assert fusion.pairwise_metrics == {}
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 @pytest.mark.parametrize("limit_y", (None, 50))
-def test_depth_registration_handles_large_xy_drift(limit_y, capsys):
+@pytest.mark.parametrize("depth_overlap", (20, 13))
+def test_depth_registration_handles_large_xy_drift(limit_y, depth_overlap, capsys):
     """Recover a thin-Z overlap with 60-pixel Y drift, or explain rejection."""
     rng = np.random.default_rng(71)
-    truth = gaussian_filter(rng.uniform(0, 1000, (44, 240, 270)), (1, 2, 2))
+    depth_step = 32 - depth_overlap
+    truth = gaussian_filter(
+        rng.uniform(0, 1000, (32 + depth_step, 240, 270)), (1, 2, 2)
+    )
     truth = np.rint(truth).astype(np.uint16)
-    volumes = (truth[:32, 60:240, :200], truth[12:44, :180, 70:270])
+    volumes = (truth[:32, 60:240, :200], truth[depth_step:, :180, 70:270])
     fusion = TileFusion.__new__(TileFusion)
     fusion.downsample_factors = (3, 5, 5)
     fusion.ssim_window = 15
@@ -637,15 +657,13 @@ def test_depth_registration_handles_large_xy_drift(limit_y, capsys):
     fusion.time_dim = 1
     fusion.z_dim, fusion.y_dim, fusion.x_dim = volumes[0].shape
     fusion._pixel_size = (1.0, 1.0, 1.0)
-    fusion._tile_positions = [(0.0, 0.0, 0.0), (12.0, 0.0, 0.0)]
+    fusion._tile_positions = [(0.0, 0.0, 0.0), (float(depth_step), 0.0, 0.0)]
     fusion._tile_shapes = [volumes[0].shape] * 2
     fusion._tiles_by_time = ((0, 1),)
     fusion._tile_time_indices = [0, 0]
     fusion._is_2d = False
     fusion._max_workers = 1
-    fusion.max_registration_shift_zyx = (
-        inspect.signature(TileFusion).parameters["max_registration_shift_zyx"].default
-    )
+    fusion.max_registration_shift_zyx = (20, 100, 100)
     if limit_y is not None:
         fusion.max_registration_shift_zyx = (20, limit_y, 100)
     fusion._debug = False
@@ -682,7 +700,7 @@ def test_separate_fields_do_not_warn_about_registration_connectivity(capsys):
     assert not capsys.readouterr().out
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 @pytest.mark.parametrize(
     ("downsample_method", "is_2d", "padded_shape"),
     (
@@ -835,7 +853,7 @@ def test_multiscale_storage_round_trip_matches_reference(
     assert not any(key.startswith("opm_") for key in reopened.attrs)
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 def test_fused_multiscale_storage_preserves_float32_source_contract(tmp_path):
     """Float32 processed tiles create float32 fused output at every level."""
     fusion = TileFusion.__new__(TileFusion)

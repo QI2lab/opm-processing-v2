@@ -25,7 +25,7 @@ from opm_processing.process import process
 from opm_processing.imageprocessing.opmtools import orthogonal_deskew
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 def test_position_collection_multiscales_round_spatial_metadata(
     tmp_path: Path,
 ) -> None:
@@ -245,7 +245,7 @@ def current_single_position_mirror_timelapse(tmp_path: Path) -> Path:
     return path
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 def test_current_stage_metadata_is_discovered_without_array_open(
     current_opm_v2_stage_scan: Path,
 ) -> None:
@@ -284,7 +284,7 @@ def test_current_stage_metadata_is_discovered_without_array_open(
     assert metadata.scan_axis_reversed is True
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 def test_current_stage_collection_opens_as_virtual_tpczyx(
     current_opm_v2_stage_scan: Path,
 ) -> None:
@@ -314,7 +314,7 @@ def test_current_stage_collection_opens_as_virtual_tpczyx(
             np.testing.assert_array_equal(actual, expected)
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 def test_single_position_root_image_opens_as_virtual_tpczyx(
     current_single_position_mirror_timelapse: Path,
 ) -> None:

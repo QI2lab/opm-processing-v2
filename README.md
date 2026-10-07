@@ -83,6 +83,34 @@ Register, fuse, and create the registered multiscale max-Z image:
 uv run fuse "/path/to/acquisition-or-output-directory"
 ```
 
+Registration search limits are inferred separately for each overlapping tile
+pair from stage spacing, processed tile dimensions, voxel spacing, scan angle,
+and registration downsampling. Depth overlaps allow the oblique-plane footprint
+displacement along Y; corrections must retain at least half the pair's overlap.
+Downsampling and the SSIM window adapt to the available overlap. Links still
+need to pass `--registration-threshold` (default 0.7). Use
+`--max-registration-shift-zyx Z Y X` to override the automatic limits, and
+`--registration-channel` to select the channel with suitable tissue signal.
+Global optimization weights each measured axis by its effective registration
+sampling and evaluates residuals in those sampling units. It rejects inconsistent
+cycle edges one at a time, refitting after each rejection, while retaining the
+links that anchor connected tile groups. Connectivity warnings use the links
+retained by optimization.
+Depth-layer brightness is normalized from registered overlaps at the same
+stage XY. Each depth shares one gain per timepoint and channel across all its
+XY tiles; brightness differences between XY fields are retained. The first
+depth anchors the intensity scale. Gains are recorded in
+`<stem>_depth_intensity_gains.json`. Use `--no-normalize-depth-intensity` to
+preserve the deskewed tiles' intensity scales. Raw and deskewed arrays are
+never modified by fusion normalization.
+
+Enable or disable depth normalization explicitly when running fusion:
+
+```bash
+uv run fuse "/path/to/acquisition" --normalize-depth-intensity
+uv run fuse "/path/to/acquisition" --no-normalize-depth-intensity
+```
+
 Draw and save a rectangular ROI from that registered max-Z image, then process
 and fuse the selected raw-data region:
 
@@ -249,6 +277,11 @@ MP4s are lossy presentation copies; keep TIFFs and OME-Zarr data for analysis.
 Re-running replaces matching MP4s only after encoding and muxing succeed.
 
 ## Tests
+
+Tests are either unit tests of isolated numerical or state behavior, or
+integration tests using simulated objects with real disk inputs and verified
+disk outputs. Smoke tests, API/argument-forwarding tests, and benchmark-only
+tests are excluded. GPU is a hardware requirement marker, not a test category.
 
 ```bash
 uv sync --group dev

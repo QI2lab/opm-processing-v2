@@ -63,7 +63,7 @@ def physical_sphere():
     return prepare_sphere()
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 @pytest.mark.parametrize("scan_step, max_error", [(0.2, 0.05), (0.8, 0.12)])
 def test_skewed_sphere_deskews_to_cartesian_microscope(
     physical_sphere, scan_step, max_error

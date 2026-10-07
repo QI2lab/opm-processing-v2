@@ -169,7 +169,7 @@ def _chunked_deskew(
     )
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 def test_chunked_deskew_matches_direct_deskew_without_deconvolution(
     chunked_deskew_sample,
     chunked_deskew_config,
@@ -241,7 +241,7 @@ def test_deskew_preserves_fractional_photon_density(scan_step) -> None:
     np.testing.assert_array_equal(output[..., 5:], 0)
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 @pytest.mark.gpu
 def test_chunked_deskew_with_gpu_deconvolution_improves_ground_truth(
     chunked_deskew_sample,
@@ -344,7 +344,7 @@ def test_deskew_x_ramp_and_z_averaging(factor):
     )
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 def test_default_chunking_calibrates_and_retains_detector_ramp():
     """A mocked long scan crosses the default split and retains known photons."""
     from unittest.mock import MagicMock

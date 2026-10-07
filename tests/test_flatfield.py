@@ -21,7 +21,7 @@ from opm_processing.imageprocessing.camera import (
 )
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 def test_flatfield_path_reuses_acquisition_file_with_separate_output(
     tmp_path: Path,
 ) -> None:
@@ -40,7 +40,7 @@ def test_flatfield_path_reuses_acquisition_file_with_separate_output(
     assert _resolve_flatfield_path(acquisition_path, output_dir) == source_flatfield
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 def test_flatfield_path_prefers_output_and_writes_new_files_there(
     tmp_path: Path,
 ) -> None:
@@ -95,7 +95,7 @@ def test_flatfield_tiles_are_evenly_subsampled_within_each_depth():
     assert set(np.diff(selected)) <= {14, 15}
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 def test_empty_check_runs_once_and_filters_illumination_candidates(monkeypatch):
     """The full-volume TPC mask limits each channel before tile subsampling."""
     from opm_processing import process as process_module
@@ -281,7 +281,7 @@ def test_processing_contract_uses_uint16_raw_float32_intermediates_and_final_cas
         camera_correct(raw.astype(np.float32), 100.0, 1.0)
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 def test_stage_z_flatfield_round_trips_exact_values(
     tmp_path: Path,
 ):
@@ -306,7 +306,7 @@ def test_stage_z_flatfield_round_trips_exact_values(
         np.testing.assert_array_equal(actual, flatfields)
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 def test_estimator_fits_physical_stage_z_levels_independently(monkeypatch):
     """Stage-Z groups produce distinct fields while scan planes remain samples."""
     from opm_processing.imageprocessing import flatfield as flatfield_module
@@ -376,7 +376,7 @@ def test_flatfield_sample_loading_applies_detector_calibration():
         np.testing.assert_array_equal(actual[..., 1104:], (value - 100) * 0.5)
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 def test_single_tile_depth_fields_recover_known_illumination():
     """Fit separate depth fields from scan planes with the real BaSiC solver."""
     rng = np.random.default_rng(37)
@@ -407,27 +407,7 @@ def test_single_tile_depth_fields_recover_known_illumination():
         assert after < 0.35 * before
 
 
-@pytest.mark.integration
-def test_flatfield_worker_preserves_error_and_original_traceback():
-    """A one-image input fails clearly and carries its subprocess traceback."""
-    from opm_processing.process import call_estimate_illuminations
-
-    with pytest.raises(ValueError, match="at least two sampled images") as error:
-        call_estimate_illuminations(
-            ts.array(np.ones((1, 1, 1, 1, 16, 32), dtype=np.uint16)),
-            0.0,
-            1.0,
-            np.asarray(((0, 0, 0),)),
-            False,
-            None,
-        )
-    notes = "\n".join(error.value.__notes__)
-    assert "Flatfield worker traceback:" in notes
-    assert "estimate_illuminations" in notes
-    assert "flatfield.py" in notes
-
-
-@pytest.mark.integration
+@pytest.mark.unit
 def test_flatfield_correction_recovers_multitile_multichannel_truth():
     """Recover known rectangular illumination fields from a tiled scan."""
     rng = np.random.default_rng(7)

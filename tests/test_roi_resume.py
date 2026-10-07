@@ -184,6 +184,10 @@ def test_roi_resume_rejects_changed_tile_mapping_and_settings(roi_run):
     roi_command.process_roi(run.source, run.roi_path)
     state_path = run.output_dir / "sample.processing.json"
     saved_state = state_path.read_bytes()
+    output_path = run.output_dir / "sample_decon_deskewed.ome.zarr"
+    saved_pixels = [
+        array.read().result() for array in open_position_collection(output_path).arrays
+    ]
     shifted = replace(
         run.roi,
         tile_footprints=tuple(
@@ -195,6 +199,11 @@ def test_roi_resume_rejects_changed_tile_mapping_and_settings(roi_run):
     with pytest.raises(ValueError, match="incompatible"):
         roi_command.process_roi(run.source, run.roi_path)
     assert state_path.read_bytes() == saved_state
+
+    for array, expected in zip(
+        open_position_collection(output_path).arrays, saved_pixels
+    ):
+        np.testing.assert_array_equal(array.read().result(), expected)
 
     run.roi.write(run.roi_path)
     with pytest.raises(ValueError, match="incompatible"):
@@ -243,7 +252,7 @@ def test_roi_cli_resumes_by_default(roi_run, flag, expected):
         assert not np.array_equal(after, before)
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 def test_recreated_output_does_not_reuse_stale_checkpoints(tmp_path):
     """An absent output store cannot be skipped using surviving JSON checkpoints."""
     process = importlib.import_module("opm_processing.process")

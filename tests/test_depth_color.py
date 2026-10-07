@@ -1,7 +1,5 @@
-"""Depth-color unit checks and mocked-store export integration."""
+"""Depth-color units and simulated point-object disk-to-disk export."""
 
-from concurrent.futures import Future
-from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -13,11 +11,13 @@ from opm_processing.imageprocessing.depth_color import (
     depth_palette,
     depth_legends,
 )
+from opm_processing.dataio.position_collection import create_position_collection
 from opm_processing import export_projections as exporter
 
 
 @pytest.mark.unit
 def test_anisotropic_point_source_depth_and_brightness():
+    """Locate a simulated point source in physical depth without changing brightness."""
     spacing = (0.4, 0.2, 0.1)
     shape = (21, 31, 41)
     center = (6, 19, 28)
@@ -38,6 +38,7 @@ def test_anisotropic_point_source_depth_and_brightness():
 
 @pytest.mark.unit
 def test_raw_maximum_precedes_display_clipping():
+    """Select the physical intensity maximum before applying display contrast."""
     volume = np.array([[[100]], [[200]]], dtype=float)
     np.testing.assert_array_equal(
         depth_projection(volume, 0, (0, 50))[0, 0], depth_palette(2)[1]
@@ -49,32 +50,25 @@ def test_raw_maximum_precedes_display_clipping():
 
 
 @pytest.mark.integration
-def test_color_tiff_export_from_mocked_store(tmp_path, monkeypatch):
-    class Store:
-        def __init__(self, data):
-            self.data, self.shape = data, data.shape
-
-        def __getitem__(self, item):
-            return Store(self.data[item])
-
-        def read(self):
-            future = Future()
-            future.set_result(self.data)
-            return future
-
+def test_color_tiff_export_from_disk(tmp_path):
+    """Export simulated point objects from OME-Zarr to verified RGB TIFF pixels."""
     data = np.zeros((4, 1, 21, 31, 41), dtype=np.float32)
     data[:, 0, 6, 19, 28] = 100
     data[1:, 0, 12, 10, 20] = 50
-    collection = SimpleNamespace(
-        arrays=[Store(data)], voxel_size_um=(0.4, 0.2, 0.1), channel_names=["488"]
+    source_path = tmp_path / "sample_decon_deskewed.ome.zarr"
+    collection = create_position_collection(
+        source_path,
+        (4, 1, 1, 21, 31, 41),
+        (0.4, 0.2, 0.1),
+        channels=("488",),
+        dtype=np.float32,
     )
-    monkeypatch.setattr(exporter, "open_position_collection", lambda _: collection)
+    for array in collection.arrays:
+        array.write(data).result()
     acquisition = SimpleNamespace(
         scan_position_count=21, channels=[SimpleNamespace(exposure_ms=5)]
     )
-    exporter.export_dataset(
-        Path("sample_decon_deskewed.ome.zarr"), tmp_path, acquisition, depth_color=True
-    )
+    exporter.export_dataset(source_path, tmp_path, acquisition, depth_color=True)
     files = list(tmp_path.rglob("*.tiff"))
     assert len(files) == 4
     for path in files:
@@ -92,7 +86,7 @@ def test_color_tiff_export_from_mocked_store(tmp_path, monkeypatch):
 
     serial = tmp_path / "serial"
     exporter.export_dataset(
-        Path("sample_decon_deskewed.ome.zarr"),
+        source_path,
         serial,
         acquisition,
         depth_color=True,
@@ -107,6 +101,7 @@ def test_color_tiff_export_from_mocked_store(tmp_path, monkeypatch):
 
 @pytest.mark.unit
 def test_timepoint_workers_overlap_and_propagate_failure():
+    """Verify concurrent work and propagation of the original worker exception."""
     from threading import Barrier, Lock
 
     barrier = Barrier(3, timeout=5)

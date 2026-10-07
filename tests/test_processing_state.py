@@ -15,7 +15,7 @@ from opm_processing.dataio.processing_state import (
 )
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 @pytest.mark.parametrize(
     ("save_float32", "dtype"),
     ((False, "uint16"), (True, "float32")),
@@ -104,7 +104,7 @@ def test_processing_state_round_trip_has_exact_durable_ground_truth(
     assert reopened.registered_output_for_max_projection(maximum) == output
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 @pytest.mark.parametrize(
     ("mutation", "message"),
     (
@@ -131,7 +131,7 @@ def test_processing_state_rejects_noncurrent_contract(
         ProcessingState.read(path)
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 def test_processing_state_resume_requires_exact_run_configuration(tmp_path) -> None:
     """Allow resume only when every output-affecting setting is unchanged."""
     source = tmp_path / "sample.ome.zarr"
@@ -159,7 +159,7 @@ def test_processing_state_resume_requires_exact_run_configuration(tmp_path) -> N
     assert path.read_bytes() == saved
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 def test_overwriting_one_run_preserves_siblings_and_invalidates_only_its_registration(
     tmp_path,
 ) -> None:
@@ -200,7 +200,7 @@ def test_overwriting_one_run_preserves_siblings_and_invalidates_only_its_registr
         state.registration(deconvolved)
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 def test_failed_channel_checkpoint_keeps_previous_durable_state(tmp_path, monkeypatch):
     """Failure to replace the JSON must leave the preceding checkpoint readable."""
     output = tmp_path / "sample_deskewed.ome.zarr"

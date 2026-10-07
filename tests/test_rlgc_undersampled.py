@@ -24,7 +24,12 @@ import numpy as np
 import pytest
 from scipy import signal
 from typer.testing import CliRunner
-from tests.undersampled_test_support import mock_acquisition, mock_processing_store
+from tests.undersampled_test_support import (
+    simulated_acquisition_metadata,
+    write_simulated_acquisition,
+)
+from opm_processing.dataio.position_collection import open_position_collection
+from opm_processing.dataio.processing_state import ProcessingState
 
 
 def _physical_coordinates(shape, scan_step=0.2, offset=(0, 0, 0)):
@@ -132,7 +137,7 @@ def _nrmse(actual, expected):
     return float(np.linalg.norm(actual - expected) / np.linalg.norm(expected))
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 @pytest.mark.gpu
 @pytest.mark.parametrize("factor", [3, 4])
 @pytest.mark.parametrize("poisson", [False, True], ids=["noise_free", "photon_noise"])
@@ -216,7 +221,7 @@ def test_physical_full_and_undersampled_rl(
     assert max(errors) < 0.12
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 @pytest.mark.gpu
 def test_physical_gradient_consensus(cupy_gpu, optical_psf, specimen):
     """Exercise the reused GC loop with photon noise and unmeasured planes."""
@@ -302,9 +307,9 @@ def test_reject_invalid_sampling_factor(cupy_gpu, factor):
 @pytest.mark.gpu
 @pytest.mark.parametrize("mode", ["mirror", "stage"])
 def test_combined_channel_cli_reconstructs_physical_specimen(
-    cupy_gpu, monkeypatch, mode
+    cupy_gpu, monkeypatch, mode, tmp_path
 ):
-    """Recover a known 637 nm specimen through the CLI with a mocked file store."""
+    """Reconstruct physical beads from camera data on disk to deskewed data on disk."""
     process = importlib.import_module("opm_processing.process")
     solver = importlib.import_module("opm_processing.imageprocessing.rlgc_undersampled")
     truth, beads = _make_specimen((49, 65, 49), 0.4)
@@ -316,8 +321,11 @@ def test_combined_channel_cli_reconstructs_physical_specimen(
     if mode == "stage":
         raw = raw[::-1].copy()
     raw = raw[None, None, None]
-    metadata = mock_acquisition(mode, raw.shape)
-    output, collections, state = mock_processing_store(monkeypatch, metadata, raw)
+    metadata = simulated_acquisition_metadata(
+        tmp_path / "both_lasers.ome.zarr", mode, raw.shape
+    )
+    write_simulated_acquisition(metadata, raw)
+    output = tmp_path
     generated_parameters = []
 
     def physical_psf(**kwargs):
@@ -370,12 +378,13 @@ def test_combined_channel_cli_reconstructs_physical_specimen(
     assert 0.9 < metrics["flux_ratio"] < 1.1
 
     processed_path = output / "both_lasers_decon_deskewed.ome.zarr"
-    collection = collections[processed_path]
+    collection = open_position_collection(processed_path)
+    state = ProcessingState.read(output / "both_lasers.processing.json")
     actual = collection.arrays[0][0, 0].read().result()
     assert np.isfinite(actual).all() and actual.min() >= 0
     assert collection.voxel_size_um == (0.115, 0.115, 0.115)
     np.testing.assert_array_equal(
-        collection.stage_positions, metadata.stage_positions_zxy
+        collection.stage_positions_zxy, metadata.stage_positions_zxy
     )
     assert state.completed_tiles(processed_path) == {(0, 0)}
     assert state.run(processed_path)["reconstruction"] == {

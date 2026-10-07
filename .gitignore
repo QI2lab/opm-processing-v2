@@ -117,6 +117,11 @@ tests/test_symlink.py
 src/cucim-cu12/
 src/cucim
 /diagnostics/
+# Temporary diagnostic runs and generated stitching reports
+/.tmp/
+/stitching_*_diagnostic.json
+/stitching_diagnostic_*.json
+/stitching_*_comparison.png
 AUDIT_REFACTOR_WORKFLOW.md
 /figures/
 /.agents/

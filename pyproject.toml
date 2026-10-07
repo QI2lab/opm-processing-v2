@@ -131,9 +131,8 @@ minversion = "7.0"
 testpaths = ["tests"]
 addopts = "-p no:zarr"
 markers = [
-    "benchmark: optional performance measurements; enable with --run-benchmarks",
     "unit: isolated numerical or decision behavior with an independent expected result",
-    "integration: multiple processing components, real storage, or complete GPU solver execution",
+    "integration: simulated image objects processed from real disk inputs to verified disk outputs",
     "gpu: correctness tests that execute CUDA code on a real NVIDIA GPU",
 ]
 filterwarnings = [

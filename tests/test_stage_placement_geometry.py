@@ -3,7 +3,10 @@
 import numpy as np
 import pytest
 
-from opm_processing.dataio.position_collection import open_position_collection
+from opm_processing.dataio.position_collection import (
+    open_image_array,
+    open_position_collection,
+)
 from opm_processing.imageprocessing.tilefusion import TileFusion
 from opm_processing.process import process
 from tests.conftest import _opm_v2_frame_metadata, _write_opm_v2_zarr
@@ -132,3 +135,10 @@ def test_physical_stage_z_translation_preserves_registered_xy(tmp_path, angle, m
     fusion.run()
     np.testing.assert_allclose(fusion.global_offsets, 0.0, atol=1.0)
     assert len(fusion.pairwise_metrics) >= 2
+    written = open_image_array(tmp_path / "physical_stage_fused.ome.zarr")
+    fused = written[0, 0].read().result()
+    peak = np.asarray(np.unravel_index(np.argmax(fused), fused.shape))
+    physical_peak = peak * pixel_um + fusion.offset_um
+    np.testing.assert_allclose(
+        (physical_peak - placed_peaks[0]) / pixel_um, 0.0, atol=2.0
+    )
