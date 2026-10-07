@@ -276,6 +276,21 @@ are required. PyNvVideoCodec is installed by `uv sync` on Windows/Linux.
 MP4s are lossy presentation copies; keep TIFFs and OME-Zarr data for analysis.
 Re-running replaces matching MP4s only after encoding and muxing succeed.
 
+## Simulation and figure scripts
+
+Non-core simulations, experiments, and figure generators live in `scripts/`.
+Run them as modules from the repository root so their package imports resolve:
+
+```bash
+uv run python -m scripts.opm_simulation --output diagnostics/meridian_sphere
+uv run --with matplotlib python -m scripts.plot_opm_simulation diagnostics/meridian_sphere/scan_0.2um
+```
+
+Each script's opening docstring describes its inputs, calculations, and outputs.
+The [sphere simulation workflow](docs/meridian_sphere_simulation.md) and
+[publication figure workflow](docs/opm_publication_figure.md) show the full commands.
+These repository scripts are separate from the installed processing commands.
+
 ## Tests
 
 Tests are either unit tests of isolated numerical or state behavior, or

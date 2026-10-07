@@ -55,7 +55,7 @@ Exports are PDF, editable-text SVG and 600-dpi PNG under
 as `geometry_check.json`.
 
 ```powershell
-uv run --no-sync --with matplotlib python -m opm_processing.imageprocessing.plot_orthogonal_interpolation --output diagnostics/orthogonal_interpolation_labeled
+uv run --no-sync --with matplotlib python -m scripts.plot_orthogonal_interpolation --output diagnostics/orthogonal_interpolation_labeled
 ```
 
 Spatial axes are labeled in ?m; the numerical example uses illustrative p = 1 ?m and ?s = 3 ?m. The bottom key identifies camera planes and their pixels, orthogonal projection paths, other lab-grid points, and target P. Scan displacement s is explicitly labeled along lab Y.
