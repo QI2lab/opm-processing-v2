@@ -83,6 +83,9 @@ Register, fuse, and create the registered multiscale max-Z image:
 uv run fuse "/path/to/acquisition-or-output-directory"
 ```
 
+Directory fusion prefers `*_decon_deskewed.ome.zarr` when available and prints
+the selected input. Pass a processed store directly to select it explicitly.
+
 Registration search limits are inferred separately for each overlapping tile
 pair from stage spacing, processed tile dimensions, voxel spacing, scan angle,
 and registration downsampling. Depth overlaps allow the oblique-plane footprint
@@ -101,8 +104,9 @@ stage XY. Each depth shares one gain per timepoint and channel across all its
 XY tiles; brightness differences between XY fields are retained. The first
 depth anchors the intensity scale. Gains are recorded in
 `<stem>_depth_intensity_gains.json`. Use `--no-normalize-depth-intensity` to
-preserve the deskewed tiles' intensity scales. Raw and deskewed arrays are
-never modified by fusion normalization.
+omit fitted depth gains. Fusion also accounts for partially filled deskew Z
+bins using their metadata-derived interpolation coverage. Raw and deskewed
+arrays are never modified by fusion normalization.
 
 Enable or disable depth normalization explicitly when running fusion:
 

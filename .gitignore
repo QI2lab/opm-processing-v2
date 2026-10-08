@@ -127,3 +127,8 @@ AUDIT_REFACTOR_WORKFLOW.md
 /.agents/
 
 uv.lock
+docs/deconvolution_optimization_audit.md
+docs/fusion_optimization.md
+docs/undersampled_rl_experiment.md
+docs/fusion_optimization.md
+docs/undersampled_rl_experiment.md
