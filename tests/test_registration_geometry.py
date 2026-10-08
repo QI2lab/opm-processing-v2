@@ -7,7 +7,10 @@ from scipy.ndimage import gaussian_filter
 
 from opm_processing.imageprocessing.tilefusion import (
     TileFusion,
+    _aligned_registration_views,
     _infer_registration_limits,
+    _ssim,
+    xp,
 )
 
 
@@ -112,6 +115,9 @@ def test_inferred_depth_limits_recover_or_reject_measured_drift(drift):
     truth = np.rint(truth).astype(np.uint16)
     volumes = (truth[:64, drift:], truth[51:, :512])
     fusion = TileFusion.__new__(TileFusion)
+    fusion._tile_support_zy = [
+        np.ones(volume.shape[:2], np.float32) for volume in volumes
+    ]
     fusion.downsample_factors = (3, 2, 2)
     fusion.ssim_window = 15
     fusion.threshold = 0.7
@@ -145,3 +151,84 @@ def test_inferred_depth_limits_recover_or_reject_measured_drift(drift):
         )
     else:
         assert fusion.pairwise_metrics == {}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("offsets", ((0.5, -1.3), (0.5, -1.3, 2.4), (1, -2, 3)))
+def test_aligned_registration_views_preserve_fractional_translation(offsets):
+    """Recover an analytic intensity ramp without rounding shifts or scoring padding.
+
+    Parameters
+    ----------
+    offsets : tuple of float
+        Applied moving-image correction in two or three array dimensions.
+    """
+    shape = (11, 13, 17)[-len(offsets) :]
+    coordinates = np.indices(shape, dtype=np.float32)
+    slopes = np.arange(1, len(offsets) + 1, dtype=np.float32)
+    fixed = 100 + np.einsum("i,i...->...", slopes, coordinates)
+    moving = fixed + np.dot(slopes, offsets)
+    reference, aligned = _aligned_registration_views(
+        xp.asarray(fixed), xp.asarray(moving), offsets
+    )
+    # For a linear field, interpolation recovers the exact continuous object.
+    assert reference.shape == tuple(
+        length - int(np.ceil(abs(offset))) for length, offset in zip(shape, offsets)
+    )
+    assert bool(xp.allclose(reference, aligned, atol=2e-5, rtol=0))
+
+
+@pytest.mark.unit
+def test_similarity_scores_common_geometric_support_and_rejects_unrelated_signal():
+    """Exclude opposing wedge padding while retaining an independent mismatch check."""
+    rng = np.random.default_rng(38)
+    truth = rng.uniform(0, 1000, (21, 45, 37)).astype(np.float32)
+    truth[:, 23:26, 17:20] = 0  # Supported dark specimen pixels remain eligible.
+    z, y, _x = np.indices(truth.shape)
+    fixed_support = y >= z
+    moving_support = y < 45 - z
+    common = xp.asarray(fixed_support & moving_support)
+    fixed = xp.asarray(truth * fixed_support)
+    moving = xp.asarray(truth * moving_support)
+    assert _ssim(fixed, moving, 7) < 0.7
+    assert _ssim(fixed, moving, 7, valid_mask=common) == pytest.approx(1, abs=1e-6)
+    unrelated = xp.asarray(rng.uniform(0, 1000, truth.shape).astype(np.float32))
+    assert _ssim(fixed, unrelated, 7, valid_mask=common) < 0.7
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("unrelated", (False, True))
+def test_thin_depth_registration_scores_only_common_planes(unrelated):
+    """Use matched XY samples when geometric gaps prevent a 3D SSIM window.
+
+    Parameters
+    ----------
+    unrelated : bool
+        Replace the second observed field with independent signal to check
+        that projecting common planes does not manufacture a good match.
+    """
+    rng = np.random.default_rng(83)
+    truth = gaussian_filter(rng.uniform(0, 1000, (5, 45, 37)), (0, 1, 1))
+    support = np.zeros(truth.shape, bool)
+    support[[0, 2, 4], 4:-4, 4:-4] = True
+    fixed = xp.asarray(truth.astype(np.float32))
+    moving = xp.asarray(
+        gaussian_filter(rng.uniform(0, 1000, truth.shape), (0, 1, 1)).astype(np.float32)
+        if unrelated
+        else truth.astype(np.float32)
+    )
+    masks = (xp.asarray(support), xp.asarray(support))
+    assert not np.isfinite(_ssim(fixed, moving, 3, valid_mask=masks[0]))
+    measured_shift, score = TileFusion.register_and_score(
+        fixed,
+        moving,
+        3,
+        max_shift=(0, 2, 2),
+        registration_axis=0,
+        support_masks=masks,
+    )
+    if unrelated:
+        assert score < 0.7
+    else:
+        np.testing.assert_allclose(measured_shift, 0, atol=0.1)
+        assert score == pytest.approx(1, abs=1e-6)

@@ -5,8 +5,146 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import tensorstore as ts
+from scipy.ndimage import gaussian_filter1d
+from typer.testing import CliRunner
 
 from opm_processing.imageprocessing.tilefusion import TileFusion, _fit_depth_gains
+from opm_processing.fuse import app as fuse_app
+
+
+@pytest.mark.integration
+def test_directory_fusion_uses_deconvolved_tiles_and_preserves_partial_z_bins(tmp_path):
+    """Fuse known depth overlaps through disk while replacing a plain-data fusion.
+
+    Parameters
+    ----------
+    tmp_path
+        Directory for the simulated camera acquisition, both processed inputs,
+        processing journal, fused volume and maximum projection.
+
+    Notes
+    -----
+    A narrow fluorescent line on a constant background has independently known
+    intensity. The deeper acquisition has Beer–Lambert attenuation of one half.
+    Simulated deconvolved tiles retain the line; plain tiles contain its Gaussian
+    optical blur. Exact stage placements are persisted as measured registration
+    state to isolate fusion and input selection from feature registration.
+    Partially filled Z bins must retain the same calibrated intensity as full
+    bins across the overlap. Both fusion passes use real reads and writes.
+    """
+    from dataclasses import replace
+
+    from opm_processing.dataio.position_collection import (
+        create_position_collection,
+        open_image_array,
+        open_position_collection,
+    )
+    from opm_processing.dataio.processing_state import ProcessingState
+    from opm_processing.process import process
+    from tests.undersampled_test_support import (
+        simulated_acquisition_metadata,
+        write_simulated_acquisition,
+    )
+
+    shape = (1, 2, 1, 64, 64, 32)
+    depth_step_um = 24.0
+    attenuation_per_um = np.log(2) / depth_step_um
+    specimen = np.full(shape[-3:], 100.0)
+    specimen[..., 10] += 500
+    raw = np.stack(
+        [
+            np.rint(specimen * np.exp(-attenuation_per_um * path)).astype(np.uint16)
+            for path in (0, depth_step_um)
+        ]
+    )[None, :, None]
+    metadata = replace(
+        simulated_acquisition_metadata(tmp_path / "coverage.ome.zarr", "mirror", shape),
+        array_paths=("0/0", "1/0"),
+        stage_positions_zxy=((0, 0, 0), (-depth_step_um, 0, 0)),
+        scan_axis_step_um=1.0,
+        pixel_size_um=1.0,
+        camera_offset=0.0,
+        camera_conversion=1.0,
+    )
+    write_simulated_acquisition(metadata, raw)
+    process(
+        metadata.path,
+        flatfield_correction=False,
+        max_projection=False,
+        create_fused_max_projection=False,
+        z_downsample_level=2,
+        save_float32=True,
+    )
+    plain_path = tmp_path / "coverage_deskewed.ome.zarr"
+    decon_path = tmp_path / "coverage_decon_deskewed.ome.zarr"
+    plain = open_position_collection(plain_path)
+    decon = create_position_collection(
+        decon_path,
+        plain.shape,
+        plain.voxel_size_um,
+        dtype=np.float32,
+        stage_positions=plain.stage_positions_zxy,
+        channels=plain.channel_names,
+        chunks=(1, 1, 4, 32, 32),
+    )
+    state = ProcessingState.read(tmp_path / "coverage.processing.json")
+    state.initialize_run(
+        decon_path, configuration={"simulated_deconvolution": True}, overwrite=True
+    )
+    for position, (source, destination) in enumerate(zip(plain.arrays, decon.arrays)):
+        photons = source.read().result()
+        destination.write(photons).result()
+        source.write(gaussian_filter1d(photons, 1, axis=-1)).result()
+        state.complete_tile(decon_path, 0, position)
+
+    for path in (plain_path, decon_path):
+        fusion = TileFusion(path, max_registration_shift_zyx=(1, 1, 1), max_workers=1)
+        fusion.processing_state.save_registration(
+            path,
+            configuration=fusion._registration_cache_settings(),
+            pairwise_metrics={"0,1": [0, 0, 0, 1.0]},
+        )
+        if path == plain_path:
+            fusion.run()
+            written = open_image_array(tmp_path / "coverage_fused.ome.zarr")
+            expected = 2 * gaussian_filter1d(specimen[0, 0], 1)
+            np.testing.assert_allclose(
+                written[0, 0, 12:16, 56:60, :32].read().result(),
+                np.broadcast_to(expected, (4, 4, 32)),
+                rtol=1e-6,
+            )
+
+    result = CliRunner().invoke(
+        fuse_app,
+        [
+            str(tmp_path),
+            "--max-registration-shift-zyx",
+            "1",
+            "1",
+            "1",
+            "--max-workers",
+            "1",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    written = open_image_array(tmp_path / "coverage_fused.ome.zarr")
+    np.testing.assert_allclose(
+        written[0, 0, 12:16, 56:60, :32].read().result(),
+        np.broadcast_to(2 * specimen[0, 0], (4, 4, 32)),
+        rtol=1e-6,
+    )
+    maximum = open_image_array(tmp_path / "coverage_max_z_fused.ome.zarr")
+    np.testing.assert_allclose(
+        maximum[0, 0, 0, 56:60, :32].read().result(),
+        np.broadcast_to(2 * specimen[0, 0], (4, 32)),
+        rtol=1e-6,
+    )
+    state = ProcessingState.read(state.path)
+    assert (
+        state.registered_output_for_fused(tmp_path / "coverage_fused.ome.zarr")
+        == decon_path
+    )
+    assert state.registration(plain_path)["pairwise_metrics"] == {"0,1": [0, 0, 0, 1.0]}
 
 
 @pytest.mark.integration
@@ -210,4 +348,12 @@ def test_scaled_uint16_output_clips_and_float32_preserves_range():
     unscaled = fusion._cast_fusion_values(fusion._scale_depth_source(0, source))
     assert unscaled is source
     np.testing.assert_array_equal(unscaled.ravel(), (40000, 1000))
+    np.testing.assert_array_equal(source.ravel(), (40000, 1000))
+    coverage = np.asarray([[0.5]], np.float32)
+    corrected = fusion._scale_depth_source(0, source, coverage_zy=coverage)
+    np.testing.assert_array_equal(corrected.ravel(), (80000, 2000))
+    np.testing.assert_array_equal(source.ravel(), (40000, 1000))
+    fusion._depth_intensity_gains[:] = (2, 0.5)
+    corrected = fusion._scale_depth_source(0, source, coverage_zy=coverage)
+    np.testing.assert_array_equal(corrected.ravel(), (160000, 1000))
     np.testing.assert_array_equal(source.ravel(), (40000, 1000))

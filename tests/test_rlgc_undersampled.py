@@ -24,27 +24,13 @@ import numpy as np
 import pytest
 from scipy import signal
 from typer.testing import CliRunner
+from tests.physics_point_sources import fluorescent_specimen, skewed_coordinates
 from tests.undersampled_test_support import (
     simulated_acquisition_metadata,
     write_simulated_acquisition,
 )
 from opm_processing.dataio.position_collection import open_position_collection
 from opm_processing.dataio.processing_state import ProcessingState
-
-
-def _physical_coordinates(shape, scan_step=0.2, offset=(0, 0, 0)):
-    """Map centered acquisition indices to laboratory XYZ in microns."""
-    scan, row, col = np.meshgrid(
-        *[np.arange(n) - (n - 1) / 2 + d for n, d in zip(shape, offset)],
-        indexing="ij",
-        sparse=True,
-    )
-    angle = np.deg2rad(30)
-    return (
-        col * 0.115,
-        scan * scan_step + row * 0.115 * np.cos(angle),
-        row * 0.115 * np.sin(angle),
-    )
 
 
 @pytest.fixture(scope="module")
@@ -85,37 +71,7 @@ def _optical_psf(wavelength, scan_step):
 @pytest.fixture(scope="module")
 def specimen():
     """Integrate bead volumes and a tilted filament over skew-grid voxels."""
-    return _make_specimen((73, 65, 49), 0.2)
-
-
-def _make_specimen(shape, scan_step):
-    """Integrate a specimen defined in microns on the requested oblique grid."""
-    truth = np.zeros(shape, dtype=np.float64)
-    # (X,Y,Z) centers in um; different Y phases include missing scan planes.
-    beads = [(-1.25, -3.1, -0.55), (1.0, 2.7, 0.65), (0.6, -0.65, -0.65)]
-    start = np.array([-0.9, -1.6, 0.45])
-    end = np.array([0.65, 1.7, -0.15])
-    direction = end - start
-    offsets = (-1 / 3, 0.0, 1 / 3)
-    for ds in offsets:
-        for dy in offsets:
-            for dx in offsets:
-                xyz = _physical_coordinates(
-                    shape, scan_step=scan_step, offset=(ds, dy, dx)
-                )
-                for center in beads:
-                    distance2 = sum((coord - c) ** 2 for coord, c in zip(xyz, center))
-                    truth += 10000 * (distance2 <= 0.19**2) / 27
-                projection = sum(
-                    (coord - s) * d for coord, s, d in zip(xyz, start, direction)
-                )
-                projection = np.clip(projection / np.dot(direction, direction), 0, 1)
-                distance2 = sum(
-                    (coord - (s + projection * d)) ** 2
-                    for coord, s, d in zip(xyz, start, direction)
-                )
-                truth += 5000 * (distance2 <= 0.11**2) / 27
-    return truth.astype(np.float32), beads
+    return fluorescent_specimen((73, 65, 49), 0.2)
 
 
 def _blur(truth, psf):
@@ -186,7 +142,7 @@ def test_physical_full_and_undersampled_rl(
     }
     # Feature localization is checked in physical coordinates, so swapping
     # scan/camera Y, changing origin, or a wrong shear cannot pass on MSE alone.
-    xyz = _physical_coordinates(truth.shape)
+    xyz = skewed_coordinates(truth.shape)
     errors = []
     for bead in beads:
         region = sum((coord - c) ** 2 for coord, c in zip(xyz, bead)) < 0.6**2
@@ -312,7 +268,7 @@ def test_combined_channel_cli_reconstructs_physical_specimen(
     """Reconstruct physical beads from camera data on disk to deskewed data on disk."""
     process = importlib.import_module("opm_processing.process")
     solver = importlib.import_module("opm_processing.imageprocessing.rlgc_undersampled")
-    truth, beads = _make_specimen((49, 65, 49), 0.4)
+    truth, beads = fluorescent_specimen((49, 65, 49), 0.4)
     known_psf = _optical_psf(0.637, 0.4)
     expectation = _blur(truth, known_psf)
     photons = np.random.default_rng(637).poisson(expectation)[::2]

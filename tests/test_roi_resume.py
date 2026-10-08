@@ -265,44 +265,85 @@ def test_recreated_output_does_not_reuse_stale_checkpoints(tmp_path):
 
 
 @pytest.mark.integration
-def test_roi_command_fuses_selected_tiles_and_projects_pixels(roi_run, monkeypatch):
-    """Run ROI processing, fusion, and projection through real persisted arrays."""
-    from opm_processing.imageprocessing import tilefusion
-    from opm_processing.imageprocessing.maxtilefusion import (
-        regenerate_fused_max_projection,
-    )
-    from opm_processing.dataio.position_collection import open_image_array
+def test_roi_command_fuses_selected_tiles_and_projects_pixels(tmp_path):
+    """Recover a known line through real ROI processing, fusion and projection.
 
-    run = roi_run
-    monkeypatch.setattr(tilefusion, "inspect_acquisition", lambda path: run.metadata)
-    monkeypatch.setattr(
-        roi_command,
-        "TileFusion",
-        lambda **kwargs: tilefusion.TileFusion(
-            **kwargs,
-            blend_pixels=(0, 0, 0),
-            max_workers=1,
-            multiscale_factors=(2,),
-            chunk_shape_yx=(8, 8),
+    Parameters
+    ----------
+    tmp_path
+        Directory for the simulated acquisition, physical ROI and saved images.
+
+    Notes
+    -----
+    Two colocated views contain the same fluorescent line on a constant
+    background in three spectral channels. Full deskew gain is independently
+    known to be two. Fusion must preserve that gain even at half-filled Z bins.
+    No metadata, reconstruction, registration or storage boundary is mocked.
+    """
+    from opm_processing.dataio.acquisition import ChannelMetadata
+    from opm_processing.dataio.position_collection import open_image_array
+    from opm_processing.dataio.roi import PhysicalRoi
+    from tests.undersampled_test_support import (
+        simulated_acquisition_metadata,
+        write_simulated_acquisition,
+    )
+
+    shape = (1, 2, 3, 64, 64, 32)
+    specimen = np.full(shape[-3:], 100.0)
+    specimen[..., 10] += 500
+    spectral_gains = np.arange(1, 4)
+    raw = np.broadcast_to(
+        specimen[None, None, None] * spectral_gains[None, None, :, None, None, None],
+        shape,
+    ).astype(np.uint16)
+    metadata = replace(
+        simulated_acquisition_metadata(tmp_path / "sample.ome.zarr", "mirror", shape),
+        channels=tuple(
+            ChannelMetadata(index, f"{wavelength}nm", wavelength, 10, None)
+            for index, wavelength in enumerate((488, 561, 637))
+        ),
+        array_paths=("0/0", "1/0"),
+        stage_positions_zxy=((0, 0, 0), (0, 0, 0)),
+        scan_axis_step_um=1.0,
+        pixel_size_um=1.0,
+        camera_offset=0.0,
+        camera_conversion=1.0,
+    )
+    write_simulated_acquisition(metadata, raw)
+    roi = PhysicalRoi(
+        bounds_yx_um=(56.0, 60.0, 4.0, 20.0),
+        source_path=tmp_path / "sample_max_z_fused.ome.zarr",
+        grid_origin_yx_um=(0.0, 0.0),
+        pixel_size_yx_um=(1.0, 1.0),
+        position_indices=(0, 1),
+        tile_footprints=tuple(
+            {
+                "time_index": 0,
+                "position_index": position,
+                "origin_zyx_um": [0.0, 0.0, 0.0],
+                "bounds_yx_um": [0.0, 120.0, 0.0, 32.0],
+            }
+            for position in (0, 1)
         ),
     )
-    # The synthetic tiles are exactly co-located. Registration is a separate
-    # GPU integration test; this fixture supplies that known displacement.
-    monkeypatch.setattr(
-        tilefusion.TileFusion,
-        "register_and_score",
-        staticmethod(lambda *args, **kwargs: ((0.0, 0.0, 0.0), 1.0)),
+    roi_path = roi.write(tmp_path / "sample_roi.json")
+    roi_command.process_roi(
+        metadata.path,
+        roi_path,
+        deconvolve=False,
+        flatfield_correction=False,
+        save_float32=True,
     )
-    monkeypatch.setattr(
-        roi_command, "regenerate_fused_max_projection", regenerate_fused_max_projection
-    )
-    roi_command.process_roi(run.source)
-    fused = open_image_array(run.output_dir / "sample_fused.ome.zarr").read().result()
+    output_dir = tmp_path / "sample_roi"
+    fused = open_image_array(output_dir / "sample_fused.ome.zarr").read().result()
     projected = (
-        open_image_array(run.output_dir / "sample_max_z_fused.ome.zarr").read().result()
+        open_image_array(output_dir / "sample_max_z_fused.ome.zarr").read().result()
     )
     expected = np.zeros_like(fused)
-    mean = (run.expected_tiles[0].astype(np.float32) + run.expected_tiles[1]) / 2
-    expected[..., :3, :18, :10] = mean.astype(np.uint16)
-    np.testing.assert_array_equal(fused, expected)
-    np.testing.assert_array_equal(projected, expected.max(axis=2, keepdims=True))
+    expected[0, :, :16, :4, :16] = (
+        2 * spectral_gains[:, None, None, None] * specimen[0, 0, 4:20]
+    )
+    np.testing.assert_allclose(fused, expected, rtol=1e-6)
+    np.testing.assert_allclose(
+        projected, expected.max(axis=2, keepdims=True), rtol=1e-6
+    )

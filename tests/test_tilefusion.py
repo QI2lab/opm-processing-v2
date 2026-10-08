@@ -95,8 +95,9 @@ class _ReadArray:
 @pytest.mark.parametrize("dtype", (np.uint16, np.float32))
 @pytest.mark.parametrize("strided", (False, True))
 @pytest.mark.parametrize("shared", (False, True))
+@pytest.mark.parametrize("partial", (False, True))
 def test_weighted_fusion_rows_preserve_masks_offsets_and_output_range(
-    dtype, strided, shared
+    dtype, strided, shared, partial
 ):
     """Compare strided weighted pixels with independent separable-weight truth.
 
@@ -108,6 +109,8 @@ def test_weighted_fusion_rows_preserve_masks_offsets_and_output_range(
         Use cropped strided views, or contiguous blocks with explicit crop offsets.
     shared : bool
         Share one denominator across complete channels, or handle missing channels.
+    partial : bool
+        Include a half-filled interpolation bin with known geometric coverage.
     """
     first = np.arange(3 * 4 * 5 * 10, dtype=np.float32).reshape(3, 4, 5, 10)
     first[0, 1, 1, 1] = 0
@@ -126,13 +129,18 @@ def test_weighted_fusion_rows_preserve_masks_offsets_and_output_range(
         else (np.asarray((True, True, False)), np.asarray((True, False, True)))
     )
     support = np.asarray(((True, False, True), (False, True, True)))
+    if partial:
+        support = support.astype(np.float32)
+        support[0, 0] = 0.5
+        for pixels in source_views:
+            pixels[:, 0, 0] *= np.float32(0.5)
     z_weights = np.asarray((0.5, 1), np.float32)
     y_weights = np.asarray((1, 0.25, 0.5), np.float32)
     x_weights = np.asarray((1, 0.5, 0.25, 1), np.float32)
     spatial_weights = (z_weights[:, None, None] * y_weights[None, :, None]) * x_weights[
         None, None, :
     ]
-    spatial_weights *= support[..., None]
+    spatial_weights *= (support > 0)[..., None]
     accumulated = np.zeros((3, 4, 7, 10), np.float32)
     weights = np.zeros((1 if shared else 3, *accumulated.shape[1:]), np.float32)
     expected_sum = np.zeros_like(accumulated)
@@ -160,7 +168,7 @@ def test_weighted_fusion_rows_preserve_masks_offsets_and_output_range(
         contribution = spatial_weights[None] * channels[:, None, None, None]
         corrected = pixels if gains is None else pixels * gains[:, None, None, None]
         expected_sum[selection] += corrected * contribution
-        expected_weight[selection] += contribution
+        expected_weight[selection] += contribution * support[None, ..., None]
     np.testing.assert_array_equal(accumulated, expected_sum)
     np.testing.assert_array_equal(
         weights, expected_weight[:1] if shared else expected_weight
@@ -779,6 +787,9 @@ def test_depth_registration_handles_large_xy_drift(limit_y, depth_overlap, capsy
     truth = np.rint(truth).astype(np.uint16)
     volumes = (truth[:32, 60:240, :200], truth[depth_step:, :180, 70:270])
     fusion = TileFusion.__new__(TileFusion)
+    fusion._tile_support_zy = [
+        np.ones(volume.shape[:2], np.float32) for volume in volumes
+    ]
     fusion.downsample_factors = (3, 5, 5)
     fusion.ssim_window = 15
     fusion.threshold = 0.7

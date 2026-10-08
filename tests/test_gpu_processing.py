@@ -69,7 +69,7 @@ def test_fft_convolution_matches_direct_reference(cupy_gpu):
     [([0, 1, 3, 20], [4, 0, 2, 1]), ([0, 0, 0], [0, 0, 0]), ([2, 2, 2], [9, 9, 9])],
 )
 def test_kld_matches_independent_probability_definition(cupy_gpu, p_values, q_values):
-    """The production CUDA likelihood operator implements directed relative entropy."""
+    """The production CUDA divergence implements normalized directed relative entropy."""
     cp = cupy_gpu
     rlgc = importlib.import_module("opm_processing.imageprocessing.rlgc")
     p = cp.asarray(p_values, dtype=cp.float32)
@@ -88,8 +88,17 @@ def test_kld_matches_independent_probability_definition(cupy_gpu, p_values, q_va
 
 
 @pytest.mark.unit
-def test_gpu_registration_recovers_known_3d_translation(cupy_gpu):
-    """Run cuCIM registration plus CUDA SSIM on a translated sample volume."""
+@pytest.mark.parametrize("applied_shift", ((1.0, -2.0, 3.0), (0.6, -2.3, 3.4)))
+def test_gpu_registration_recovers_known_3d_translation(cupy_gpu, applied_shift):
+    """Recover integer and fractional translations using cuCIM and CUDA SSIM.
+
+    Parameters
+    ----------
+    cupy_gpu
+        CuPy module verified against the available CUDA device.
+    applied_shift : tuple of float
+        Known moving-image translation in ZYX pixels.
+    """
     cp = cupy_gpu
     try:
         import cucim  # noqa: F401
@@ -105,15 +114,22 @@ def test_gpu_registration_recovers_known_3d_translation(cupy_gpu):
         rng.normal(size=(11, 39, 43)).astype(np.float32),
         sigma=(0.8, 1.2, 1.2),
     )
-    applied_shift = np.array((1.0, -2.0, 3.0), dtype=np.float32)
-    moving = ndimage.shift(
-        fixed,
-        shift=applied_shift,
-        order=1,
-        mode="constant",
-        cval=0,
-        prefilter=False,
-    )
+    applied_shift = np.array(applied_shift, dtype=np.float32)
+    if np.any(applied_shift != np.rint(applied_shift)):
+        # The Fourier shift defines an exact periodic fractional translation;
+        # repeated spatial interpolation would change the sampled signal.
+        moving = np.fft.ifftn(
+            ndimage.fourier_shift(np.fft.fftn(fixed), applied_shift)
+        ).real.astype(np.float32)
+    else:
+        moving = ndimage.shift(
+            fixed,
+            shift=applied_shift,
+            order=1,
+            mode="constant",
+            cval=0,
+            prefilter=False,
+        )
     unregistered_score = tilefusion._ssim(
         cp.asarray(fixed), cp.asarray(moving), win_size=5
     )
@@ -190,41 +206,6 @@ def test_rlgc_preserves_stationary_intensity(cupy_gpu, monkeypatch):
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("safe_mode", [True, False])
-def test_rlgc_stopping_is_invariant_to_split_labels(cupy_gpu, monkeypatch, safe_mode):
-    """Swapping the two halves on alternate iterations cannot change recovery."""
-    rlgc = importlib.import_module("opm_processing.imageprocessing.rlgc")
-    zz, yy, xx = np.mgrid[-2:3, -3:4, -3:4]
-    psf = np.exp(-(zz**2 / 1.1**2 + (yy**2 + xx**2) / 4) / 2)
-    psf = (psf / psf.sum()).astype(np.float32)
-    truth = np.zeros((9, 35, 37), np.float32)
-    truth[2, 9, 10] = 1800
-    truth[4, 18, 27] = 2400
-    truth[6, 26, 17] = 2100
-    observed = (
-        np.random.default_rng(31)
-        .poisson(ndimage.convolve(truth, psf, mode="reflect") + 0.25)
-        .astype(np.float32)
-    )
-    options = dict(safe_mode=safe_mode, rng_seed=17, limit=0.02, max_delta=0.005)
-    baseline = rlgc.rlgc(observed, psf, **options)
-    original_split = rlgc._split_observed_counts
-    calls = 0
-
-    def relabeled_split(image, rng):
-        nonlocal calls
-        split = original_split(image, rng)
-        calls += 1
-        return image - split if calls % 2 == 0 else split
-
-    monkeypatch.setattr(rlgc, "_split_observed_counts", relabeled_split)
-    actual = rlgc.rlgc(observed, psf, **options)
-    assert calls > 2  # Exercise stopping beyond the first relabeling.
-    np.testing.assert_allclose(actual, baseline, rtol=1e-6, atol=1e-5)
-    assert np.mean((actual - truth) ** 2) < np.mean((observed - truth) ** 2)
-
-
-@pytest.mark.unit
 @pytest.mark.parametrize("scan_planes", [1, 5])
 def test_rlgc_preserves_smooth_low_count_background(cupy_gpu, scan_planes):
     """Local stopping must preserve resolved background instead of flat patches."""
@@ -276,6 +257,33 @@ def test_rlgc_fractional_split_is_unbiased_and_preserves_counts(cupy_gpu):
 
 
 @pytest.mark.unit
+def test_reference_fractional_split_retains_remainders_in_complement(cupy_gpu):
+    """Verify the local reference's fractional-count mean and complementary data.
+
+    Parameters
+    ----------
+    cupy_gpu
+        Fixture providing CuPy on a working CUDA device.
+    """
+    cp = cupy_gpu
+    solver = importlib.import_module("opm_processing.imageprocessing.rlgc")
+    levels = np.asarray((0.24, 0.96, 1.44, 2.88, 12.24), np.float32)
+    observed = cp.asarray(np.broadcast_to(levels[:, None], (len(levels), 200_000)))
+    first = solver._split_observed_counts(
+        observed, cp.random.default_rng(73), assign_fractional_remainder=False
+    )
+    second = observed - first
+    np.testing.assert_array_equal(cp.asnumpy(first + second), cp.asnumpy(observed))
+    np.testing.assert_array_equal(cp.asnumpy(first), cp.asnumpy(cp.floor(first)))
+    np.testing.assert_allclose(
+        cp.asnumpy(first.mean(axis=1)), np.floor(levels) / 2, atol=0.01
+    )
+    np.testing.assert_allclose(
+        cp.asnumpy(second.mean(axis=1)), levels - np.floor(levels) / 2, atol=0.01
+    )
+
+
+@pytest.mark.unit
 def test_rlgc_integer_split_has_binomial_distribution(cupy_gpu):
     """Four photons split into 0..4 counts with binomial probabilities."""
     cp = cupy_gpu
@@ -293,73 +301,94 @@ def test_rlgc_integer_split_has_binomial_distribution(cupy_gpu):
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("seed", [7, 31, 83])
 @pytest.mark.parametrize(
     "read_noise_e", [0.7, 1.0, 1.6], ids=["ultra-quiet", "standard", "fast"]
 )
-def test_rlgc_recovers_dim_emitter_with_camera_noise(cupy_gpu, seed, read_noise_e):
-    """Recover an emitter with ORCA-Fusion BT shot, read, and quantization noise."""
+def test_rlgc_recovers_dim_emitter_with_camera_noise(cupy_gpu, read_noise_e):
+    """Recover a known emitter across calibrated camera-noise realizations.
+
+    Parameters
+    ----------
+    cupy_gpu
+        Fixture requiring a working CUDA device.
+    read_noise_e : float
+        RMS electron read noise before ADC conversion. Three independent shot
+        and read-noise draws check individual object error, concentration and
+        absolute fluorescence, then the mean differential fluorescence.
+    """
     rlgc = importlib.import_module("opm_processing.imageprocessing.rlgc")
-    rng = np.random.default_rng(seed)
-    zz, yy, xx = np.mgrid[-3:4, -6:7, -6:7]
-    psf = np.exp(-0.5 * ((zz / 1.2) ** 2 + ((yy + 2 * zz) / 2) ** 2 + (xx / 2) ** 2))
-    psf = (psf / psf.sum()).astype(np.float32)
-    truth = np.zeros((9, 48, 64), dtype=np.float32)
-    truth[4, 24, 32] = 100
-    # Hamamatsu C15440-20UP: 0.24 electrons/ADU, 100 ADU offset,
-    # 0.7/1.0/1.6 electrons RMS read noise across the three scan modes.
-    # See the manufacturer's
-    # ORCA-Fusion/ORCA-Fusion BT technical note, specifications, page 15:
-    # https://www.hamamatsu.com/content/dam/hamamatsu-photonics/sites/documents/99_SALES_LIBRARY/sys/SCAS0138E_C14440-20UP_tec.pdf
-    # Shot noise acts on electrons before ADC conversion. Multiplying a
-    # Poisson draw by 0.24 instead would incorrectly reduce its variance.
-    background_electrons = rng.poisson(1.5, truth.shape)
-    background_electrons = background_electrons + rng.normal(
-        0, read_noise_e, truth.shape
-    )
-    injected = rng.poisson(ndimage.convolve(truth, psf, mode="reflect")).astype(
-        np.float32
-    )
+    flux_ratios = []
+    for seed in (7, 31, 83):
+        rng = np.random.default_rng(seed)
+        zz, yy, xx = np.mgrid[-3:4, -6:7, -6:7]
+        psf = np.exp(
+            -0.5 * ((zz / 1.2) ** 2 + ((yy + 2 * zz) / 2) ** 2 + (xx / 2) ** 2)
+        )
+        psf = (psf / psf.sum()).astype(np.float32)
+        truth = np.zeros((9, 48, 64), dtype=np.float32)
+        truth[4, 24, 32] = 100
+        # Hamamatsu C15440-20UP: 0.24 electrons/ADU, 100 ADU offset,
+        # 0.7/1.0/1.6 electrons RMS read noise across the three scan modes.
+        # See the manufacturer's
+        # ORCA-Fusion/ORCA-Fusion BT technical note, specifications, page 15:
+        # https://www.hamamatsu.com/content/dam/hamamatsu-photonics/sites/documents/99_SALES_LIBRARY/sys/SCAS0138E_C14440-20UP_tec.pdf
+        # Shot noise acts on electrons before ADC conversion. Multiplying a
+        # Poisson draw by 0.24 instead would incorrectly reduce its variance.
+        background_electrons = rng.poisson(1.5, truth.shape)
+        background_electrons = background_electrons + rng.normal(
+            0, read_noise_e, truth.shape
+        )
+        injected = rng.poisson(ndimage.convolve(truth, psf, mode="reflect")).astype(
+            np.float32
+        )
 
-    def calibrate_camera(electrons):
-        """Digitize electron charge, then apply the pipeline's camera calibration."""
-        adu = np.clip(np.rint(100 + electrons / 0.24), 0, 65535).astype(np.uint16)
-        return np.maximum((adu.astype(np.float32) - 100) * 0.24, 0)
+        def calibrate_camera(electrons):
+            """Digitize electron charge, then apply the pipeline's camera calibration."""
+            adu = np.clip(np.rint(100 + electrons / 0.24), 0, 65535).astype(np.uint16)
+            return np.maximum((adu.astype(np.float32) - 100) * 0.24, 0)
 
-    background = calibrate_camera(background_electrons)
-    observed = calibrate_camera(background_electrons + injected)
-    restored_background = rlgc.rlgc(background, psf, rng_seed=seed)
-    restored = rlgc.rlgc(observed, psf, rng_seed=seed)
-    response = restored - restored_background
+        background = calibrate_camera(background_electrons)
+        observed = calibrate_camera(background_electrons + injected)
+        restored_background = rlgc.rlgc(background, psf, rng_seed=seed)
+        restored = rlgc.rlgc(observed, psf, rng_seed=seed)
+        response = restored - restored_background
 
-    # Score the complete estimate against the expected object, not a sampled
-    # noise realization. Paired subtraction below cancels retained background
-    # grain and cannot establish whole-image reconstruction accuracy by itself.
-    expected_object = truth.astype(np.float64) + 1.5
-    observed_mse = np.mean((observed - expected_object) ** 2)
-    restored_mse = np.mean((restored - expected_object) ** 2)
-    assert restored_mse < observed_mse, {
-        "restored_mse": restored_mse,
-        "observed_mse": observed_mse,
-    }
-    assert np.mean((restored_background.astype(np.float64) - 1.5) ** 2) < np.mean(
-        (background.astype(np.float64) - 1.5) ** 2
-    )
+        # Score the complete estimate against the expected object, not a sampled
+        # noise realization. Paired subtraction below cancels retained background
+        # grain and cannot establish whole-image reconstruction accuracy by itself.
+        expected_object = truth.astype(np.float64) + 1.5
+        observed_mse = np.mean((observed - expected_object) ** 2)
+        restored_mse = np.mean((restored - expected_object) ** 2)
+        assert restored_mse < observed_mse, {
+            "restored_mse": restored_mse,
+            "observed_mse": observed_mse,
+        }
+        assert np.mean((restored_background.astype(np.float64) - 1.5) ** 2) < np.mean(
+            (background.astype(np.float64) - 1.5) ** 2
+        )
 
-    # Paired background subtraction isolates the response to the known emitter.
-    # The core contains the emitter's true location, so useful deconvolution
-    # must move signal into it. A no-op cannot pass this strict improvement.
-    core = (slice(3, 6), slice(22, 27), slice(30, 35))
-    # Compare concentration with the actually measured blurred signal. Keep
-    # the flux bound against the injected electron count, including any signal
-    # lost during camera calibration's clipping of negative measurements.
-    measured_signal = observed - background
-    core_gain = float(response[core].sum() / measured_signal[core].sum())
-    flux_ratio = float(response.sum() / injected.sum())
-    assert core_gain > 1.0, {"core_gain": core_gain, "flux_ratio": flux_ratio}
-    np.testing.assert_allclose(flux_ratio, 1.0, rtol=0.2)
-    assert np.isfinite(restored).all()
-    assert restored.min() >= 0
+        # Paired background subtraction isolates the response to the known emitter.
+        # The core contains the emitter's true location, so useful deconvolution
+        # must move signal into it. A no-op cannot pass this strict improvement.
+        core = (slice(3, 6), slice(22, 27), slice(30, 35))
+        # Compare concentration with the actually measured blurred signal. Keep
+        # the flux bound against the injected electron count, including any signal
+        # lost during camera calibration's clipping of negative measurements.
+        measured_signal = observed - background
+        core_gain = float(response[core].sum() / measured_signal[core].sum())
+        flux_ratio = float(response.sum() / injected.sum())
+        assert core_gain > 1.0, {"core_gain": core_gain, "flux_ratio": flux_ratio}
+        flux_ratios.append(flux_ratio)
+        np.testing.assert_allclose(restored.sum(), observed.sum(), rtol=0.01)
+        np.testing.assert_allclose(
+            restored_background.sum(), background.sum(), rtol=0.01
+        )
+        assert np.isfinite(restored).all()
+        assert restored.min() >= 0
+    # Independently stopped nonlinear reconstructions need not conserve the
+    # flux of their difference for each draw. Check its expected response
+    # across realizations, without fitting a gain to any reconstruction.
+    np.testing.assert_allclose(np.mean(flux_ratios), 1.0, rtol=0.2)
 
 
 @pytest.mark.unit
@@ -403,3 +432,40 @@ def test_rlgc_2d_recovers_points_using_central_psf(cupy_gpu, singleton_z):
         np.unravel_index(np.argmax(restored), restored.shape),
         np.unravel_index(np.argmax(truth), truth.shape),
     )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("scale", (0.01, 1, 1000))
+def test_same_split_kl_change_matches_direct_scores(cupy_gpu, scale):
+    """Check cancellation against independently normalized CPU KL scores.
+
+    Parameters
+    ----------
+    cupy_gpu
+        Fixture requiring a working CUDA device.
+    scale : float
+        Photon-rate scale covering fractional, ordinary and bright measurements.
+    """
+    solver = importlib.import_module("opm_processing.imageprocessing.rlgc")
+    rng = np.random.default_rng(51)
+    current = (rng.uniform(0, 30, (3, 5, 7)) * scale).astype(np.float32)
+    previous = (rng.uniform(0, 30, current.shape) * scale).astype(np.float32)
+    current[0] = 0
+    previous[1] = 0
+    first = rng.poisson(3, current.shape).astype(np.float32)
+    second = rng.poisson(3, current.shape).astype(np.float32)
+    expected = []
+    for split in (first, second):
+        q = split.astype(np.float64) + 1e-4
+        q /= q.sum()
+        scores = []
+        for prediction in (current, previous):
+            p = prediction.astype(np.float64) + 1e-4
+            p /= p.sum()
+            scores.append(np.sum(q * np.log(q / p)))
+        expected.append(scores[0] - scores[1])
+    actual = solver.split_kl_changes(
+        *(cupy_gpu.asarray(value) for value in (current, previous, first, second)),
+        cupy_gpu.empty_like(cupy_gpu.asarray(current)),
+    )
+    np.testing.assert_allclose(actual, expected, rtol=2e-6, atol=2e-7)

@@ -36,7 +36,8 @@ class ReconstructionTestConfig:
     minimum_line_width_samples: int = 4
     line_profile_half_window: int = 5
     blend_pixels_zyx: tuple[int, int, int] = (1, 4, 4)
-    registration_downsample_zyx: tuple[int, int, int] = (3, 1, 1)
+    # Preserve the resolved Z structure of these tiny deconvolved overlaps.
+    registration_downsample_zyx: tuple[int, int, int] = (1, 1, 1)
     maximum_registration_shift_zyx: tuple[int, int, int] = (2, 2, 4)
     decon_scan_chunk_size: int = 6
 
@@ -396,7 +397,8 @@ def _assert_tiled_reconstruction(
                     fused_line_widths.append(width)
     assert len(fused_line_widths) >= config.minimum_line_width_samples
     fused_width = np.mean(fused_line_widths)
-    assert abs(fused_width - deskewed_width) <= 1.0
+    # Fusion now consumes the deconvolved tiles; preserve their resolution.
+    assert abs(fused_width - deconvolved_width) <= 1.0
 
 
 @pytest.mark.integration
