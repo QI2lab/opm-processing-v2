@@ -35,6 +35,7 @@ classifiers = [
 dependencies = [
     "basicpy @ git+https://github.com/QI2lab/BaSiCPy.git@main",
     "cmap",
+    "imagecodecs",
     "napari[all]",
     "napari-ome-zarr>=0.9.0",
     "napari-plugin-engine",
@@ -110,6 +111,7 @@ convert-timelapse = "opm_processing.dataio.convert_timelapse_data:app"
 display = "opm_processing.display:main"
 export-projections = "opm_processing.export_projections:main"
 encode-projections = "opm_processing.encode_projections:main"
+export-ome-tiff = "opm_processing.export_ome_tiff:main"
 fuse = "opm_processing.fuse:main"
 
 # [project.entry-points."some.group"]

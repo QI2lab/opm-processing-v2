@@ -155,6 +155,39 @@ uv run display --help
 uv run process-ROI --help
 ```
 
+## Export fused OME-TIFF images
+
+Export the highest-resolution fused volume and its fused maximum-Z projection:
+
+```powershell
+uv run export-ome-tiff "F:\testing\20261005\20261005_191232_balmer_tissue_stage"
+```
+
+The command reads level zero of `<stem>_fused.ome.zarr` and
+`<stem>_max_z_fused.ome.zarr`, writing `<stem>_fused.ome.tif` and
+`<stem>_max_z_fused.ome.tif` beside them. It preserves all timepoints, channels,
+pixel values, and the original dtype. Both files always use BigTIFF and
+`tifffile` with `compression='zlib', compressionargs={'level': 8}, predictor=True`.
+Tiles are streamed with bounded memory; the volume is never loaded in full.
+
+OME metadata records TCZYX dimensions, physical voxel sizes in micrometers,
+and registered plane positions, including the projection's recorded center Z.
+Available channel names, colors, wavelengths, exposures, acquisition date,
+timing, instrument metadata, and OME annotations are retained from the source
+acquisition or registered processed store. NGFF metadata, acquisition settings,
+source OME-XML, and the processing journal are embedded as OME map annotations.
+Keep the processing sidecar and source acquisition accessible to include their
+metadata. A standalone fused pair exports the metadata available in its stores.
+
+Pass the full fused store directly when a directory contains several datasets.
+Use `--output` to choose another destination, `--workers` to change the number
+of compression workers (default four), and `--overwrite` to replace existing
+exports:
+
+```powershell
+uv run export-ome-tiff "/path/to/sample_fused.ome.zarr" --output "/path/to/tiffs"
+```
+
 ## Export timepoint projection images
 
 Both commands take the acquisition root directory only. They automatically select

@@ -1,6 +1,6 @@
 # Fusion optimization
 
-Fusion now uses fewer intermediate arrays while preserving the saved pixels,
+The 2026-10-07 optimization uses fewer intermediate arrays while preserving the saved pixels,
 feather profiles, geometric support masks, missing-channel handling, depth gains,
 chunk layouts, worker counts, and bounded asynchronous writes.
 
@@ -105,3 +105,107 @@ Final validation: **237 tests passed** with `OPM_REQUIRE_GPU=1`, strict markers,
 and the pytest cache disabled. Ruff lint and formatting checks passed across
 `src/opm_processing`, `scripts`, and `tests`; `git diff --check` also passed.
 Temporary benchmark snapshots and generated stores were removed.
+
+## Input selection, Z coverage and registration support, 2026-10-08
+
+The reported directory command selected `balmer_tissue_stage_deskewed.ome.zarr`
+even though the deconvolved volume existed. Its processing journal confirmed
+that source. Directory selection now prefers deconvolved data within each
+processed kind, with deskewed volumes ahead of planar images. The CLI prints
+the selected store. An explicit processed-store path retains its selection.
+
+Deskew averages laboratory Z samples into the saved Z bin. At the interpolation
+boundary, some samples are invalid and contribute zero. A two-sample bin with
+one valid sample therefore contains half of the complete-bin response. Treating
+every nonzero support row as complete gave that dim bin full fusion weight.
+A simulated disk-to-disk case reproduced a 10 percent dark seam despite exact
+alignment and exactly recovered Beer–Lambert depth gains.
+
+Fusion now derives the fraction of valid samples from the existing constant-input
+deskew calculation and known full response `2 * pixel_size / scan_step`. Round
+the resulting valid-sample count before dividing by the Z averaging factor, so
+complete bins retain exactly unit coverage. This uses scan geometry rather than
+image brightness. Supported zero-valued specimen pixels retain their weights.
+
+For an overlap, source values already include their coverage. Accumulate their
+original feathered signal and multiply the feather denominator by coverage.
+Exclusive regions normalize nonzero coverage directly. Registration patches and
+depth-gain measurements use the same geometric normalization; the registration
+fingerprint invalidates measurements made with the previous convention.
+Depth gains remain one value per depth/channel/time, shared across XY fields.
+Source stores and deskew arithmetic remain unchanged.
+
+Registration also treated the rectangular intersection of tile bounds as valid
+specimen throughout. Adjacent Y fields have opposing deskew wedges: padding in
+one patch can coincide with real signal in the other. This lowered SSIM despite
+correct measured shifts. On channel 2, four links from tiles 45–48 to tiles
+52–55 scored 0.50–0.67 when padding was included, versus 0.92–0.96 when only
+fully supported SSIM windows were scored. Fractional phase-correlation shifts
+were also rounded before scoring, losing precision on deconvolved features.
+
+Use the metadata-derived deskew support for each patch, reduced with a minimum
+over the same sampling blocks as its image. Exclude incomplete blocks, including
+the padded final X block. Align both the image and its support at the measured
+fractional shift, trim wholly unsupported edge planes, and score windows wholly
+inside the common support. Integer shifts retain their array-view fast path.
+The channel, correction limits, phase-correlation search and 0.7 acceptance
+threshold remain the same. No link is accepted solely to connect components.
+The registration fingerprint invalidates previously scored measurements.
+
+Replacing a fused artifact with a different processed source also transfers its
+journal association and invalidates the earlier maximum projection. Pairwise
+measurements for the previous source remain available. This prevents the shared
+output filenames from being associated with both plain and deconvolved inputs.
+
+The regression writes a known fluorescent line and background to a simulated
+camera acquisition, applies known attenuation `exp(-log(2) * depth / 24 um)`,
+and runs real processing and fusion reads/writes. Simulated processed inputs
+contain either the line or its Gaussian optical blur. Exact registered stage
+placements isolate fusion from feature-registration uncertainty. Reopened fused
+and maximum-projection pixels recover the deconvolved object through the Z
+overlap to float32 precision. Numerical cases also cover half-filled bins with
+strided crops, missing channels and both output dtypes.
+
+Nine warmed, alternating CPU trials on two fully covered three-channel
+32 × 512 × 512 uint16 sources compare the corrected accumulation/normalization
+with the optimized implementation immediately before this fix. Saved pixels are
+identical. Median time is 0.08963 versus 0.08980 seconds without depth gains,
+and 0.07786 versus 0.07685 seconds with gains. These differences (−0.2 and
++1.3 percent) do not indicate loss of the earlier fusion optimization. Allocations
+and resets are excluded; no new disk-throughput claim is made.
+
+The actual deconvolved acquisition now has one connected component containing
+all 56 tiles on channel 2 with ZYX limits 20/250/100 and SSIM threshold 0.7.
+Registration accepted 119 measured links; global optimization retained 118,
+including all four adjacent-row links connecting the previously isolated group.
+Their retained SSIM scores are 0.917, 0.934, 0.939 and 0.954.
+
+Numerical regressions independently check fractional translation of an analytic
+intensity ramp, SSIM exclusion of opposing wedge padding, supported dark pixels,
+and rejection of unrelated signal. CUDA registration checks use integer shifts
+and exact periodic fractional shifts. The ROI regression also runs real
+disk-to-disk reconstruction, registration, fusion and maximum projection on a
+known three-channel line object, without mocked processing boundaries.
+
+The read-only acquisition check, fusion previews and test reports are saved in ignored
+`diagnostics/fusion_20261008/`. The acquisition's existing fused outputs have
+not been overwritten by these diagnostics.
+
+Validation: 203 non-GPU-marked tests and both CUDA registration cases passed.
+Ruff lint and formatting checks passed for all 72 source, script and test files;
+`git diff --check` passed. Temporary scripts, snapshots and generated test stores
+were removed after verification.
+
+
+### Deconvolution pipeline validation
+
+The revised deconvolution recovers finer features in the simulated tiled
+workflow. Tiny overlaps now use full Z registration sampling in that physics
+integration, and fused resolution is compared with its deconvolved source.
+Some thin depth overlaps contain common observed voxels but no complete 3D SSIM
+window. When an aligned depth overlap is no thicker than the configured window
+plus two planes, scoring may compare XY means over the same common valid
+planes. This preserves geometric support and uses the existing threshold and
+search bounds. Unit checks retain a known match and reject independent signal;
+the disk-to-disk workflows check connected graphs, absolute coordinates,
+object correlation and retained resolution. Fusion execution is unchanged.
