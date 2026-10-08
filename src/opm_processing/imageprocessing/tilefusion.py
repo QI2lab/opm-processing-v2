@@ -468,7 +468,7 @@ class _RegistrationDeviceBuffers:
 def _accumulate_tile_block(
     fused: np.ndarray,
     weight: np.ndarray,
-    sub: np.ndarray,
+    source: np.ndarray,
     channel_present: np.ndarray,
     valid_zy: np.ndarray,
     z_weights: np.ndarray,
@@ -477,17 +477,23 @@ def _accumulate_tile_block(
     z_off: int,
     y_off: int,
     x_off: int,
+    source_z: int = 0,
+    source_y: int = 0,
+    source_x: int = 0,
+    channel_gains: np.ndarray | None = None,
 ) -> None:
-    """Accumulate a weighted sub-volume into fused and weight buffers (in-place).
+    """Accumulate supported channel rows without copying source sub-volumes.
 
     Parameters
     ----------
     fused : numpy.ndarray
         Float32 accumulation buffer of shape (C, dz, Y, X) for the current block.
     weight : numpy.ndarray
-        Float32 weight accumulation buffer of shape (C, dz, Y, X).
-    sub : numpy.ndarray
-        Tile slab of shape (C, sub_dz, Y_tile, X_tile) to blend.
+        Float32 weight accumulation buffer of shape (C, dz, Y, X), or
+        (1, dz, Y, X) when every contributing tile contains all channels.
+    source : numpy.ndarray
+        Source CZYX block. The feather-profile lengths select the crop extent;
+        source offsets locate that crop without making a strided sub-volume.
     channel_present : numpy.ndarray
         Boolean vector identifying channels that contain signal in this tile.
     valid_zy : numpy.ndarray
@@ -497,67 +503,110 @@ def _accumulate_tile_block(
     z_weights, y_weights, x_weights : numpy.ndarray
         Separable float32 feather profiles for the tile sub-volume.
     z_off : int
-        Offset of `sub` z=0 within `fused` block coordinates.
+        Z origin of the weighted crop within the accumulation buffers.
     y_off : int
-        Offset of `sub` y=0 within fused global Y coordinates.
+        Y origin of the weighted crop within the accumulation buffers.
     x_off : int
-        Offset of `sub` x=0 within fused global X coordinates.
+        X origin of the weighted crop within the accumulation buffers.
+    source_z, source_y, source_x : int
+        Crop origin inside the source block, defaulting to its first voxel.
+    channel_gains : numpy.ndarray | None
+        Float32 intensity correction per channel for this acquisition depth,
+        or None for unit gains. Correction precedes feathering without allocating
+        a scaled source block.
 
     Returns
     -------
     None
         Operates in-place on `fused` and `weight`.
+
+    Notes
+    -----
+    Uncorrected uint16 sources retain Numba's double-precision multiply/add
+    intermediates before storing into float32 accumulation. Casting them first
+    can move normalized pixels across an integer truncation boundary.
     """
     c_dim, _, _, _ = fused.shape
-    _, sub_dz, y_sub, x_sub = sub.shape
+    sub_dz, y_sub, x_sub = len(z_weights), len(y_weights), len(x_weights)
     total = sub_dz * y_sub
 
-    for idx in range(total):
-        dz_i = idx // y_sub
-        y_i = idx % y_sub
-        gz = z_off + dz_i
-        gy = y_off + y_i
-        if not valid_zy[dz_i, y_i]:
+    for c in range(c_dim):
+        if not channel_present[c]:
             continue
-        zy_weight = z_weights[dz_i] * y_weights[y_i]
-        for x_i in range(x_sub):
-            gx = x_off + x_i
-            w_val = zy_weight * x_weights[x_i]
-            for c in range(c_dim):
-                if not channel_present[c]:
-                    continue
-                weight[c, gz, gy, gx] += w_val
-                fused[c, gz, gy, gx] += sub[c, dz_i, y_i, x_i] * w_val
+        weight_channel = 0 if weight.shape[0] == 1 else c
+        gain = np.float32(1) if channel_gains is None else channel_gains[c]
+        for idx in range(total):
+            dz_i = idx // y_sub
+            y_i = idx % y_sub
+            if not valid_zy[dz_i, y_i]:
+                continue
+            gz = z_off + dz_i
+            gy = y_off + y_i
+            zy_weight = z_weights[dz_i] * y_weights[y_i]
+            for x_i in range(x_sub):
+                gx = x_off + x_i
+                w_val = zy_weight * x_weights[x_i]
+                if weight.shape[0] != 1 or c == 0:
+                    weight[weight_channel, gz, gy, gx] += w_val
+                if channel_gains is None:
+                    fused[c, gz, gy, gx] += (
+                        source[c, source_z + dz_i, source_y + y_i, source_x + x_i]
+                        * w_val
+                    )
+                else:
+                    value = (
+                        np.float32(
+                            source[c, source_z + dz_i, source_y + y_i, source_x + x_i]
+                        )
+                        * gain
+                    )
+                    fused[c, gz, gy, gx] += value * w_val
 
 
-@njit(nogil=True)
-def _normalize_block(fused: np.ndarray, weight: np.ndarray) -> None:
-    """Normalize fused by weight in-place.
+@njit(nogil=True, error_model="numpy")
+def _normalize_block(
+    fused: np.ndarray,
+    weight: np.ndarray,
+    output: np.ndarray,
+    z_off: int = 0,
+    y_off: int = 0,
+    x_off: int = 0,
+) -> None:
+    """Normalize and cast channel rows directly into the output block.
 
     Parameters
     ----------
     fused : numpy.ndarray
         Float32 accumulation buffer of shape (C, dz, Y, X).
     weight : numpy.ndarray
-        Float32 weight buffer of shape (C, dz, Y, X).
+        Float32 weight buffer of shape (C, dz, Y, X), or a single shared
+        channel when all contributing tiles contain every channel.
+    output : numpy.ndarray
+        Destination CZYX block with float32 or uint16 dtype. Uint16 values clip
+        to [0, 65535] and truncate; float32 values retain their range.
+        Unsupported pixels become zero.
+    z_off, y_off, x_off : int
+        Origin of the normalized region in the destination block.
 
     Returns
     -------
     None
-        Operates in-place on `fused`.
+        Writes into `output`, which may alias `fused` for in-place normalization.
     """
     c_dim, dz, y_dim, x_dim = fused.shape
     total = dz * y_dim
 
-    for idx in range(total):
-        z_i = idx // y_dim
-        y_i = idx % y_dim
-        for c in range(c_dim):
-            base_w = weight[c, z_i, y_i]
-            base_f = fused[c, z_i, y_i]
+    for c in range(c_dim):
+        weight_channel = 0 if weight.shape[0] == 1 else c
+        for idx in range(total):
+            z_i = idx // y_dim
+            y_i = idx % y_dim
             for x_i in range(x_dim):
-                w_val = base_w[x_i]
-                base_f[x_i] = base_f[x_i] / w_val if w_val > 0 else 0.0
+                w_val = weight[weight_channel, z_i, y_i, x_i]
+                value = fused[c, z_i, y_i, x_i] / w_val if w_val > 0 else np.float32(0)
+                if output.itemsize == 2:
+                    value = min(max(value, np.float32(0)), np.float32(65535))
+                output[c, z_off + z_i, y_off + y_i, x_off + x_i] = value
 
 
 def _partition_fusion_block(
@@ -2870,7 +2919,9 @@ class TileFusion:
             "channels": records,
         }
 
-    def _scale_depth_source(self, tile: int, source: np.ndarray) -> np.ndarray:
+    def _scale_depth_source(
+        self, tile: int, source: np.ndarray, channel: int | None = None
+    ) -> np.ndarray:
         """Apply the depth gains to a fusion source block.
 
         Parameters
@@ -2878,7 +2929,9 @@ class TileFusion:
         tile : int
             Source tile index.
         source : numpy.ndarray
-            Source intensities in CZYX order.
+            Source intensities in CZYX order, or ZYX for one selected channel.
+        channel : int | None
+            Selected channel index for a ZYX source, or None for all channels.
 
         Returns
         -------
@@ -2887,9 +2940,14 @@ class TileFusion:
             The input array is never modified.
         """
         gains = getattr(self, "_depth_intensity_gains", None)
-        if gains is None or np.all(gains[tile] == 1):
+        if gains is None:
             return source
-        return source.astype(np.float32, copy=False) * gains[tile, :, None, None, None]
+        gain = gains[tile] if channel is None else gains[tile, channel]
+        if np.all(gain == 1):
+            return source
+        if channel is None:
+            gain = gain[:, None, None, None]
+        return source.astype(np.float32, copy=False) * gain
 
     def _cast_fusion_values(self, source: np.ndarray) -> np.ndarray:
         """Convert fusion intensities to the configured output dtype.
@@ -3368,8 +3426,9 @@ class TileFusion:
         """Render one independent output block without writing it.
 
         Each contributing tile is read at most once. Exclusive regions are copied
-        into the integer output, while only regions with multiple contributors use
-        float32 feather accumulation.
+        directly into the output. Overlaps use float32 feather accumulation and
+        normalize without crop, clipping, or cast buffers. Float32 output reuses
+        the accumulation buffer; uint16 normalization writes directly into output.
 
         Parameters
         ----------
@@ -3430,7 +3489,8 @@ class TileFusion:
                 slice(tx0 - ox, tx1 - ox),
                 dtype=None,
             )
-            source_blocks[p] = ((tz0, ty0, tx0), self._scale_depth_source(p, source))
+            source_blocks[p] = ((tz0, ty0, tx0), source)
+        depth_gains = getattr(self, "_depth_intensity_gains", None)
 
         output = np.zeros(
             (int(self.channels), z1 - z0, y1 - y0, x1 - x0),
@@ -3450,12 +3510,15 @@ class TileFusion:
                 p, _ = region_contributors[0]
                 (sz0, sy0, sx0), source = source_blocks[p]
                 output[output_selection] = self._cast_fusion_values(
-                    source[
-                        :,
-                        rz0 - sz0 : rz1 - sz0,
-                        ry0 - sy0 : ry1 - sy0,
-                        rx0 - sx0 : rx1 - sx0,
-                    ]
+                    self._scale_depth_source(
+                        p,
+                        source[
+                            :,
+                            rz0 - sz0 : rz1 - sz0,
+                            ry0 - sy0 : ry1 - sy0,
+                            rx0 - sx0 : rx1 - sx0,
+                        ],
+                    )
                 )
                 direct_regions += 1
                 continue
@@ -3469,17 +3532,25 @@ class TileFusion:
                 ),
                 dtype=np.float32,
             )
-            weight = np.zeros(fused.shape, dtype=np.float32)
-            for p, (oz, oy, ox) in region_contributors:
-                (sz0, sy0, sx0), source = source_blocks[p]
-                sub = np.ascontiguousarray(
-                    source[
-                        :,
-                        rz0 - sz0 : rz1 - sz0,
-                        ry0 - sy0 : ry1 - sy0,
-                        rx0 - sx0 : rx1 - sx0,
-                    ]
+            channel_flags = [
+                np.asarray(
+                    [
+                        self._channel_has_signal(p, channel_index)
+                        for channel_index in range(int(self.channels))
+                    ],
+                    dtype=np.bool_,
                 )
+                for p, _offset in region_contributors
+            ]
+            shared_weights = all(np.all(present) for present in channel_flags)
+            weight = np.zeros(
+                (1 if shared_weights else int(self.channels), *fused.shape[1:]),
+                dtype=np.float32,
+            )
+            for (p, (oz, oy, ox)), present in zip(
+                region_contributors, channel_flags, strict=True
+            ):
+                (sz0, sy0, sx0), source = source_blocks[p]
                 local_z = slice(rz0 - oz, rz1 - oz)
                 local_y = slice(ry0 - oy, ry1 - oy)
                 local_x = slice(rx0 - ox, rx1 - ox)
@@ -3499,35 +3570,38 @@ class TileFusion:
                 _accumulate_tile_block(
                     fused,
                     weight,
-                    sub,
-                    np.asarray(
-                        [
-                            self._channel_has_signal(p, channel_index)
-                            for channel_index in range(int(self.channels))
-                        ],
-                        dtype=np.bool_,
-                    ),
-                    np.ascontiguousarray(tile_support[local_z, local_y]),
+                    source,
+                    present,
+                    tile_support[local_z, local_y],
                     z_profile[local_z],
                     y_profile[local_y],
                     x_profile[local_x],
                     0,
                     0,
                     0,
+                    rz0 - sz0,
+                    ry0 - sy0,
+                    rx0 - sx0,
+                    (
+                        None
+                        if depth_gains is None or np.all(depth_gains[p] == 1)
+                        else depth_gains[p]
+                    ),
                 )
 
-            _normalize_block(fused, weight)
-            output_dtype = getattr(self, "output_dtype", np.dtype(np.uint16))
-            region_output = (
-                fused.astype(np.float32, copy=False)
-                if output_dtype == np.dtype(np.float32)
-                else np.clip(fused, 0, np.iinfo(np.uint16).max).astype(np.uint16)
-            )
+            region_output = output[output_selection]
+            if output.dtype == np.dtype(np.float32):
+                _normalize_block(fused, weight, fused)
+                region_output[:] = fused
+            else:
+                _normalize_block(fused, weight, output, rz0 - z0, ry0 - y0, rx0 - x0)
             for channel_index in range(int(self.channels)):
                 active_tiles = [
                     tile_index
-                    for tile_index, _offset in region_contributors
-                    if self._channel_has_signal(tile_index, channel_index)
+                    for (tile_index, _offset), present in zip(
+                        region_contributors, channel_flags, strict=True
+                    )
+                    if present[channel_index]
                 ]
                 if not active_tiles:
                     region_output[channel_index] = 0
@@ -3537,14 +3611,17 @@ class TileFusion:
                 tile_index = active_tiles[0]
                 (sz0, sy0, sx0), source = source_blocks[tile_index]
                 region_output[channel_index] = self._cast_fusion_values(
-                    source[
+                    self._scale_depth_source(
+                        tile_index,
+                        source[
+                            channel_index,
+                            rz0 - sz0 : rz1 - sz0,
+                            ry0 - sy0 : ry1 - sy0,
+                            rx0 - sx0 : rx1 - sx0,
+                        ],
                         channel_index,
-                        rz0 - sz0 : rz1 - sz0,
-                        ry0 - sy0 : ry1 - sy0,
-                        rx0 - sx0 : rx1 - sx0,
-                    ]
+                    )
                 )
-            output[output_selection] = region_output
             blended_regions += 1
 
         selection = (

@@ -6,6 +6,8 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
 
 import numpy as np
+import psutil
+import tensorstore as ts
 from tqdm import tqdm
 
 from yaozarrs import open_group, v05
@@ -319,7 +321,7 @@ class MaxTileFusion:
         reverse_stage_z: bool = True,
         opm_angle_deg: float | None = None,
     ):
-        """Initialize a maximum-projection tile fusion operation.
+        """Initialize maximum-projection fusion with a bounded source chunk cache.
 
         Parameters
         ----------
@@ -363,7 +365,25 @@ class MaxTileFusion:
         self.pad_y = pad_yx[0]
         self.pad_x = pad_yx[1]
 
-        self.ts_dataset = tuple(ts_dataset)
+        source_context = ts.Context(
+            {
+                "cache_pool": {
+                    "total_bytes_limit": min(
+                        4 * 1024**3,
+                        max(1, int(psutil.virtual_memory().available * 0.1)),
+                    ),
+                },
+            }
+        )
+        source_futures = [
+            ts.open(
+                array.spec(retain_context=False),
+                context=source_context,
+                recheck_cached_data=False,
+            )
+            for array in ts_dataset
+        ]
+        self.ts_dataset = tuple(future.result() for future in source_futures)
 
         self.reverse_stage_y = bool(reverse_stage_y)
         self.reverse_stage_z = bool(reverse_stage_z)
@@ -456,13 +476,14 @@ class MaxTileFusion:
 
         Parameters
         ----------
-        blend_pixels : int
-            Fraction of the tile edge used for blending, by default 0.2.
+        blend_pixels : tuple[int, int] | None
+            Feather widths along Y and X in pixels. None uses the configured
+            widths; each width is capped at half the corresponding tile extent.
 
         Returns
         -------
-        weight_mask: ndarray
-            A (h, w) weight array for blending.
+        numpy.ndarray
+            Float32 YX feather weights with a positive floor at exterior edges.
         """
         h, w = self.tile_shape
         if blend_pixels is None:
@@ -638,6 +659,9 @@ class MaxTileFusion:
         Only chunks intersecting a tile are materialized. This keeps peak RAM
         proportional to ``channels * chunk_size**2`` rather than to the full
         mosaic canvas, which may include large empty gaps between stage positions.
+        Each tile crop owns its float32 buffer, which is weighted
+        in-place. The accumulation buffer is reused for normalization and output
+        rounding; uncovered pixels retain their initial zero value.
 
         Returns
         -------
@@ -756,23 +780,24 @@ class MaxTileFusion:
                         tile_y_start:tile_y_end,
                         tile_x_start:tile_x_end,
                     ]
-                    accumulation[:, output_y, output_x] += tile_data * weights
-                    weight_sum[:, output_y, output_x] += (
-                        channel_present[:, None, None] * weights
-                    )
+                    np.multiply(tile_data, weights, out=tile_data)
+                    accumulation[:, output_y, output_x] += tile_data
+                    for channel_index in range(self.channels):
+                        if channel_present[channel_index]:
+                            weight_sum[channel_index, output_y, output_x] += weights
 
-                fused = np.divide(
+                np.divide(
                     accumulation,
                     weight_sum,
-                    out=np.zeros_like(accumulation),
+                    out=accumulation,
                     where=weight_sum > 0,
                 )
                 if self.output_dtype == np.dtype(np.float32):
-                    fused_output = fused
+                    fused_output = accumulation
                 else:
-                    fused_output = np.rint(
-                        np.clip(fused, 0, np.iinfo(np.uint16).max)
-                    ).astype(np.uint16)
+                    np.clip(accumulation, 0, np.iinfo(np.uint16).max, out=accumulation)
+                    np.rint(accumulation, out=accumulation)
+                    fused_output = accumulation.astype(np.uint16)
                 self.fused_ts[
                     output_time,
                     :,

@@ -92,6 +92,136 @@ class _ReadArray:
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("dtype", (np.uint16, np.float32))
+@pytest.mark.parametrize("strided", (False, True))
+@pytest.mark.parametrize("shared", (False, True))
+def test_weighted_fusion_rows_preserve_masks_offsets_and_output_range(
+    dtype, strided, shared
+):
+    """Compare strided weighted pixels with independent separable-weight truth.
+
+    Parameters
+    ----------
+    dtype : numpy.dtype
+        Destination type, retaining float32 values or clipping uint16 values.
+    strided : bool
+        Use cropped strided views, or contiguous blocks with explicit crop offsets.
+    shared : bool
+        Share one denominator across complete channels, or handle missing channels.
+    """
+    first = np.arange(3 * 4 * 5 * 10, dtype=np.float32).reshape(3, 4, 5, 10)
+    first[0, 1, 1, 1] = 0
+    first[0, 1, 1, 3] = -20
+    first[1, 1, 1, 1] = 90000
+    second = first * np.float32(0.5) + np.float32(10)
+    attenuation_per_um = np.asarray((0.025, 0.05, 0.075), np.float32)
+    optical_path_um = np.float32(8)
+    second *= np.exp(-attenuation_per_um * optical_path_um)[:, None, None, None]
+    depth_gains = (None, np.exp(attenuation_per_um * optical_path_um))
+    crop = np.s_[:, 1:3, 1:4, 1:9:2] if strided else np.s_[:, 1:3, 1:4, 1:5]
+    source_views = (first[crop], second[crop])
+    present = (
+        (np.ones(3, bool), np.ones(3, bool))
+        if shared
+        else (np.asarray((True, True, False)), np.asarray((True, False, True)))
+    )
+    support = np.asarray(((True, False, True), (False, True, True)))
+    z_weights = np.asarray((0.5, 1), np.float32)
+    y_weights = np.asarray((1, 0.25, 0.5), np.float32)
+    x_weights = np.asarray((1, 0.5, 0.25, 1), np.float32)
+    spatial_weights = (z_weights[:, None, None] * y_weights[None, :, None]) * x_weights[
+        None, None, :
+    ]
+    spatial_weights *= support[..., None]
+    accumulated = np.zeros((3, 4, 7, 10), np.float32)
+    weights = np.zeros((1 if shared else 3, *accumulated.shape[1:]), np.float32)
+    expected_sum = np.zeros_like(accumulated)
+    expected_weight = np.zeros_like(accumulated)
+    selection = np.s_[:, 1:3, 2:5, 3:7]
+    source_origin = (0, 0, 0) if strided else (1, 1, 1)
+    for source, pixels, channels, gains in zip(
+        (first, second), source_views, present, depth_gains, strict=True
+    ):
+        tilefusion_module._accumulate_tile_block(
+            accumulated,
+            weights,
+            pixels if strided else source,
+            channels,
+            support,
+            z_weights,
+            y_weights,
+            x_weights,
+            1,
+            2,
+            3,
+            *source_origin,
+            gains,
+        )
+        contribution = spatial_weights[None] * channels[:, None, None, None]
+        corrected = pixels if gains is None else pixels * gains[:, None, None, None]
+        expected_sum[selection] += corrected * contribution
+        expected_weight[selection] += contribution
+    np.testing.assert_array_equal(accumulated, expected_sum)
+    np.testing.assert_array_equal(
+        weights, expected_weight[:1] if shared else expected_weight
+    )
+    expected = np.divide(
+        expected_sum,
+        expected_weight,
+        out=np.zeros_like(expected_sum),
+        where=expected_weight > 0,
+    )
+    if dtype == np.uint16:
+        expected = np.clip(expected, 0, 65535).astype(np.uint16)
+    destination = np.full((3, 4, 7, 12), 173, dtype=dtype)
+    if strided:
+        tilefusion_module._normalize_block(accumulated, weights, destination[..., 1:11])
+    else:
+        tilefusion_module._normalize_block(accumulated, weights, destination, 0, 0, 1)
+    np.testing.assert_array_equal(destination[..., 1:11], expected)
+    np.testing.assert_array_equal(destination[..., (0, 11)], 173)
+    np.testing.assert_array_equal(accumulated, expected_sum)
+
+
+@pytest.mark.unit
+def test_uint16_weighted_fusion_preserves_integer_boundary_rounding() -> None:
+    """Retain mixed-precision accumulation before truncating camera pixels."""
+    profile = np.linspace(0.1, 1, 128, dtype=np.float32)
+    accumulated = np.zeros((1, 1, 1, 1), np.float32)
+    weights = np.zeros_like(accumulated)
+    expected_sum = np.float32(0)
+    expected_weight = np.float32(0)
+    for photon_count, x_weight in ((272, profile[73]), (2690, profile[9])):
+        source = np.full(accumulated.shape, photon_count, np.uint16)
+        tilefusion_module._accumulate_tile_block(
+            accumulated,
+            weights,
+            source,
+            np.ones(1, bool),
+            np.ones((1, 1), bool),
+            np.asarray((0.1,), np.float32),
+            np.asarray((profile[24],), np.float32),
+            np.asarray((x_weight,), np.float32),
+            0,
+            0,
+            0,
+        )
+        feather = np.float32(np.float32(0.1) * profile[24]) * x_weight
+        expected_sum = np.float32(
+            np.float64(expected_sum) + np.float64(photon_count) * np.float64(feather)
+        )
+        expected_weight = np.float32(expected_weight + feather)
+        np.testing.assert_array_equal(source, photon_count)
+    np.testing.assert_array_equal(accumulated, expected_sum)
+    np.testing.assert_array_equal(weights, expected_weight)
+    expected = np.float32(expected_sum / expected_weight)
+    assert expected < 779
+    output = np.zeros(accumulated.shape, np.uint16)
+    tilefusion_module._normalize_block(accumulated, weights, output)
+    np.testing.assert_array_equal(output, 778)
+
+
+@pytest.mark.unit
 def test_max_projection_pyramid_clamps_partial_source_edge_chunks() -> None:
     """Never request factor-rounded source bounds beyond level-zero shape."""
     source = np.arange(1 * 3 * 1 * 17 * 19, dtype=np.uint16).reshape(1, 3, 1, 17, 19)
