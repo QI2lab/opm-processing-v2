@@ -19,7 +19,7 @@ def _interpolate_psf_plane(x_grid, y_grid, values, x_coords, y_coords):
     y_grid : object
         Cartesian Y coordinates of the sampled optical PSF plane.
     values : object
-        Index tuples to sort and deduplicate before JSON persistence.
+        Optical intensities in Cartesian Y, X order.
     x_coords : object
         Requested skewed X sampling coordinates.
     y_coords : object
@@ -153,9 +153,13 @@ def get_skewed_coords(sizes, dc, ds, theta, scan_direction="lateral"):
 
 
 def create_psf_silicone_100x(
-    dxy: float, dz: float, nxy: float, nz: float, em_wvl: float, pz: float
+    dxy: float, dz: float, nxy: int, nz: int, em_wvl: float, pz: float
 ) -> np.ndarray:
-    """Create OPM PSF in coverslip coordinates.
+    """Evaluate the vectorial emission model with the existing lateral mask.
+
+    The Gaussian mask has sigma 10 Cartesian grid pixels. This preserves the
+    established model; it does not introduce a measured light-sheet profile.
+    The masked result is normalized by the deconvolution solver.
 
     Parameters
     ----------
@@ -184,24 +188,8 @@ def create_psf_silicone_100x(
         "tg": 170,  # microns, coverslip thickness
         "ns": 1.38,  # specimen refractive index
         "ti0": 300,
-        #'nxy': nxy,
-        #'dxy': dxy,
-        #'wvl': em_wvl,
-        #'pz': pz
     }
-    # ex_lens = {**silicone_lens, 'NA': ex_NA}
     em_lens = {**silicone_lens, "NA": 1.35}
-
-    # # The psf model to use
-    # # can be any of {'vectorial', 'scalar', or 'microscpsf'}
-    # func = 'vectorial'
-
-    # # the main function
-    # _, _, tot_psf = psfm._core.tot_psf(nx=nxy, nz=nz, dxy=dxy, dz=dz,
-    #                                     pz = pz, x_offset=0, z_offset=0,
-    #                                     ex_wvl = ex_wvl, em_wvl = em_wvl,
-    #                                     ex_params=ex_lens, em_params=em_lens,
-    #                                     psf_func=func)
 
     lim = (nz - 1) * dz / 2
     zv = np.linspace(-lim + pz, lim + pz, nz)
@@ -226,7 +214,9 @@ def create_psf_silicone_100x(
 def generate_proj_psf(
     em_wvl: float, pixel_size_um: float = 0.115, pz: float = 15.0, plot=False
 ):
-    """Generate a normalized projection point-spread function.
+    """Generate a central optical-plane kernel with the existing lateral mask.
+
+    The solver normalizes the kernel after masking.
 
     Parameters
     ----------
@@ -235,14 +225,14 @@ def generate_proj_psf(
     pixel_size_um
         Camera-plane pixel size in micrometers.
     pz
-        Objective working distance in micrometers.
+        Emitter depth above the coverslip in micrometers.
     plot
         Retained for API compatibility; plotting is not performed.
 
     Returns
     -------
     numpy.ndarray
-        Normalized central PSF plane in ZYX order with a singleton Z dimension.
+        Masked central PSF plane in ZYX order with a singleton Z dimension.
     """
     silicone_lens = {
         "ni0": 1.4,  # immersion medium RI design value
@@ -252,7 +242,6 @@ def generate_proj_psf(
         "ns": 1.38,  # specimen refractive index
         "ti0": 300,
     }
-    # ex_lens = {**silicone_lens, 'NA': ex_NA}
     em_lens = {**silicone_lens, "NA": 1.35}
 
     psf = psfm.vectorial_psf_centered(
@@ -341,10 +330,11 @@ def generate_skewed_psf(
     dxy = 0.5 * np.min([dx, dy])
     dz = 0.5 * dz
 
+    # Only the target coordinate extent is needed for interpolation.
     nxy = np.max(
         [
-            int(2 * ((x.max() - x.min()) // dxy) + 1),
-            int(2 * ((y.max() - y.min()) // dxy) + 1),
+            2 * int(np.ceil(np.max(np.abs(x)) / dxy)) + 1,
+            2 * int(np.ceil(np.max(np.abs(y)) / dxy)) + 1,
         ]
     )
     nz = z.size

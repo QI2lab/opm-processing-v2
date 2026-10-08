@@ -175,6 +175,7 @@ def register_and_fuse(
             roi_selection=None if roi is None else PhysicalRoi.read(roi),
             normalize_depth_intensity=normalize_depth_intensity,
         )
+        print(f"Fusion input: {tile_fuser.data}")
         tile_fuser.run()
         output_dir = tile_fuser.output_dir
         stem = tile_fuser.acquisition_name

@@ -1614,6 +1614,7 @@ def process_skewed(
             None
             if not deconvolve
             else {
+                "model_revision": "opm-physical-rlgc-20261008",
                 "crop_scan": decon_crop_scan,
                 "fallback_step_scan": decon_fallback_step_scan,
                 "psf_sha256": (
@@ -2442,6 +2443,7 @@ def process_projection(
             None
             if not deconvolve
             else {
+                "model_revision": "opm-physical-rlgc-20261008",
                 "eager": bool(eager_deconvolution),
                 "psf_sha256": (
                     None

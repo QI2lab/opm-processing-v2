@@ -499,6 +499,10 @@ class ProcessingState:
     ) -> None:
         """Record final registered tile origins and their fused artifact.
 
+        Replacing a fused artifact transfers its ownership to this processed
+        source and invalidates the previous maximum projection. Other sources
+        retain their pairwise registration measurements.
+
         Parameters
         ----------
         output_path : Path
@@ -509,7 +513,13 @@ class ProcessingState:
             Final registered tile records including source indices and physical origins.
         """
         record = self.registration(output_path)
-        record["fused_path"] = self._run_key(fused_path)
+        fused_key = self._run_key(fused_path)
+        for previous in self.document["registration"].values():
+            if previous.get("fused_path") == fused_key:
+                previous.pop("max_projection_path", None)
+                if previous is not record:
+                    previous.pop("fused_path")
+        record["fused_path"] = fused_key
         record["tiles"] = [_json_value(tile) for tile in tiles]
         self.save()
 
