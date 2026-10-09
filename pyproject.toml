@@ -159,6 +159,7 @@ addopts = "-p no:zarr"
 markers = [
     "unit: isolated numerical or decision behavior with an independent expected result",
     "integration: simulated image objects processed from real disk inputs to verified disk outputs",
+    "cpu: correctness tests using CPU execution, suitable for GitHub-hosted runners",
     "gpu: correctness tests that execute CUDA code on a real NVIDIA GPU",
 ]
 filterwarnings = [

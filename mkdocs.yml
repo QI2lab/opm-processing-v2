@@ -73,11 +73,6 @@ validation:
     anchors: warn
     unrecognized_links: warn
 
-# This local, ignored working audit references a sibling checkout and generated
-# reports. Published development pages describe validation and retained evidence.
-exclude_docs: |
-  deconvolution_optimization_audit.md
-
 nav:
   - Home: index.md
   - Getting started:
@@ -120,10 +115,3 @@ nav:
       - Contributing: development/contributing.md
       - Running tests: development/testing.md
       - Building documentation: development/documentation.md
-      - Deskew optimization: deskew_optimization.md
-      - Fusion optimization: fusion_optimization.md
-      - Experiments:
-          - Undersampled reconstruction: undersampled_rl_experiment.md
-          - Fine-grid PSF sampling: psf_sampling_experiment.md
-          - Withdrawn tilt changes: deskew_psf_alignment.md
-          - NVENC dataset comparison: nvenc_sample001_comparison.md
