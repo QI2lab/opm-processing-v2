@@ -131,12 +131,14 @@ Projection figures use shared intensity scales and include the projection of
 the absolute volumetric error, rather than differences between independent
 maximum projections.
 
-The 23 unit/integration cases cover exact tube geometry and empty interior,
+The original 23 numerical cases covered exact tube geometry and empty interior,
 pixel-area quadrature, Poisson/read-noise moments, the two convolution routes,
 physical sphere centering, deskew/reference agreement at two scan steps, and
-the existing fine-grid PSF sampling-convergence checks. Arrays stay in memory
-during tests. These validate this stationary forward model; they do not explain
-motion or the residual tilt in the live acquisition.
+fine-grid PSF sampling-convergence checks. Current in-memory simulation checks
+are unit tests. Integration tests must exercise simulated data from disk input
+to verified disk output, as described in the [testing guide](development/testing.md).
+These checks validate the specified stationary forward model; they do not
+explain motion or residual tilt in a live acquisition.
 
 ## GC after the complete camera simulation
 

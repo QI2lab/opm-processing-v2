@@ -1,6 +1,6 @@
 # Fine-grid Cartesian PSF sampling experiment
 
-[`scripts/psf_sampling_experiment.py`](../scripts/psf_sampling_experiment.py) is separate from production PSF generation and
+[`scripts/psf_sampling_experiment.py`](https://github.com/qi2lab/opm-processing-v2/blob/perf/numba-deskew-corrections/scripts/psf_sampling_experiment.py) is separate from production PSF generation and
 orthogonal deskew. Neither production file is modified, and the CLI does not
 select this experiment.
 

@@ -85,6 +85,12 @@ url = "https://pypi.nvidia.com"
 default-groups = ["gpu"]
 
 [dependency-groups]
+docs = [
+    "mkdocs>=1.6,<2",
+    "mkdocs-material>=9.6,<10",
+    "mkdocstrings[python]>=0.30,<1",
+    "pymdown-extensions>=10,<11",
+]
 # Keep the GPU extra selected during ordinary sync/run on CUDA workstations.
 gpu = ["opm-processing-v2[gpu]; sys_platform == 'win32' or sys_platform == 'linux'"]
 dev = [
@@ -99,6 +105,7 @@ dev = [
 [project.urls]
 homepage = "https://github.com/qi2lab/opm-processing-v2"
 repository = "https://github.com/qi2lab/opm-processing-v2"
+documentation = "https://qi2lab.github.io/opm-processing-v2/"
 
 # Entry points
 # https://peps.python.org/pep-0621/#entry-points

@@ -24,7 +24,7 @@ complete read/process/write path; fixtures alone cannot prove those properties.
 
 Use the user-designated deconvolution reference as the measured baseline:
 the local `expansion-processing/src/expansion_processing/rlgc.py`, pinned in
-[the audit](../docs/deconvolution_optimization_audit.md). The former OPM loop
+[the processing methods](https://github.com/qi2lab/opm-processing-v2/blob/perf/numba-deskew-corrections/docs/methods/deconvolution.md). The former OPM loop
 is not an interchangeable reference; it differed in initialization, boundaries,
 fractional splitting, and stopping. Define the permitted OPM adaptations before
 accepting an optimization as reference-equivalent.

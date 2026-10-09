@@ -99,6 +99,7 @@ ENV/
 
 # mkdocs documentation
 /site
+/.venv-docs/
 
 # mypy
 .mypy_cache/
