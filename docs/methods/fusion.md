@@ -55,5 +55,4 @@ Fusion uses threaded blocks and Numba CPU kernels with bounded memory and queued
 writes. Full-volume integer output clips and truncates; maximum-projection
 fusion retains its rounding convention.
 
-The [optimization record](../fusion_optimization.md) contains measured cases and
-their limits. Use the [fusion guide](../guides/fusion.md) for practical settings.
+Use the [fusion guide](../guides/fusion.md) for practical settings.

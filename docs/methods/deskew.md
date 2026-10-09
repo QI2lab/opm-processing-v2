@@ -50,10 +50,7 @@ full averaging divisor; its geometric coverage is accounted for during fusion.
 The default output casts clipped values to uint16. `--save-float32` preserves
 fractional intensity. Changing output dtype does not change the geometric model.
 
-## Execution and evidence
+## Execution
 
 CPU kernels parallelize independent detector or output rows. Coordinates retain
-float64 precision, with float32 interpolation weights and intensities. The
-[deskew optimization record](../deskew_optimization.md) contains dated comparison
-results. The [withdrawn tilt investigation](../deskew_psf_alignment.md) documents
-changes that were reverted and the limits of the earlier simulation.
+float64 precision, with float32 interpolation weights and intensities.

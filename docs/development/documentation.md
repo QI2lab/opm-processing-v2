@@ -35,13 +35,11 @@ source with inspection disabled, so it does not run processing or initialize CUD
 | Guide | A practical task, required inputs, steps, and resulting outputs |
 | Method | Geometry, numerical conventions, assumptions, and validation scope |
 | Python reference | Selected functions rendered from source docstrings |
-| Experiment or benchmark | Status, baseline, conditions, results, and limitations |
 
 Use relative links between documentation pages. Link source files through their
 repository URLs. Add every published page to navigation and check the strict
-build after moving files. Existing experiment paths are retained so repository
-links continue to work. Local working audits and generated reports are excluded
-from the published site.
+build after moving files. Keep audit notes, experiment reports, and performance
+measurements under ignored `diagnostics/`, outside the published documentation.
 
 ## CI and publication
 

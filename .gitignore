@@ -117,22 +117,16 @@ src/opm_processing/test_flatfield.py
 tests/test_symlink.py
 src/cucim-cu12/
 src/cucim
+# Local audit notes, experiment reports, and diagnostic outputs
 /diagnostics/
+/AUDIT_*.md
+/docs/*_audit.md
 # Temporary diagnostic runs and generated stitching reports
 /.tmp/
 /stitching_*_diagnostic.json
 /stitching_diagnostic_*.json
 /stitching_*_comparison.png
-AUDIT_REFACTOR_WORKFLOW.md
 /figures/
 /.agents/
 
-uv.lock
-docs/deconvolution_optimization_audit.md
-docs/fusion_optimization.md
-docs/undersampled_rl_experiment.md
-docs/fusion_optimization.md
-docs/undersampled_rl_experiment.md
-docs/fusion_optimization.md
-docs/undersampled_rl_experiment.md
 uv.lock

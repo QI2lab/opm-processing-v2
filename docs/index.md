@@ -25,6 +25,5 @@ RLGC deconvolution, deskewing, tile registration, fusion, and image export.
 | Run a simulated acquisition | [Simulation examples](examples/index.md) |
 | Contribute changes or run tests | [Development](development/contributing.md) |
 
-The Python reference is collected from source docstrings. Experimental
-reconstruction methods and dated performance measurements are listed under
-Development, with their validation scope and limitations.
+The Python reference is collected from source docstrings. Development pages
+describe contributing, running tests, and building documentation.

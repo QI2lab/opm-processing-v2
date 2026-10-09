@@ -47,5 +47,5 @@ and projection. When output is stored separately, pass that output directory
 to subsequent commands.
 
 The [process reference](../reference/cli/process.md) lists options. Experimental
-scan upsampling is documented separately in the
-[undersampled reconstruction experiment](../undersampled_rl_experiment.md).
+scan upsampling and its limitations are described in the
+[deconvolution methods](../methods/deconvolution.md#sub-sampled-acquisitions).

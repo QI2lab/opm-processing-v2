@@ -37,7 +37,7 @@ KLD is a stopping statistic. Physical acceptance checks specimen recovery,
 fluorescence, localization, and two-point profiles against known ground truth.
 See [test requirements](../development/testing.md).
 
-The recorded audit baseline is the local
+The RLGC reference implementation is
 `expansion-processing/src/expansion_processing/rlgc.py` at revision
 `098b8155f27bfbebf84ebaefc0a1114a64f3c287`, with SHA-256
 `96d3f2ffef3b6f52cf46fcc2c9fe2ad70e29dddc8f60ed61066dfb96dd70a5ec`.
@@ -54,15 +54,10 @@ zero-valued measurements. This operator has its own sensitivity correction and
 finite-volume boundary condition.
 
 The experimental path requires a full GPU volume and currently supports neither
-scan chunking nor ROI processing. Its validation scope and boundary differences
-are described in [undersampled reconstruction](../undersampled_rl_experiment.md).
-Fully sampled and sub-sampled data must be assessed against the same physical
+scan chunking nor ROI processing. For an acquired scan spacing of 0.8 micrometers,
+`N=4` reconstructs at 0.2 micrometers; PSF generation and deskewing use that finer
+spacing. An acquisition with M scan planes produces `(M - 1) * N + 1`
+reconstruction planes, preserving the first and last acquired positions.
+Supplied PSFs must be sampled at the finer spacing. Fully sampled and
+sub-sampled data must be assessed against the same physical
 object and resolution measurements.
-
-## Experiments
-
-The [fine-grid PSF experiment](../psf_sampling_experiment.md) is separate from
-production PSF generation. Lookup-table count splitting and PSF edge tapering
-remain experiments in the audit scripts; the default solver uses its existing
-sampler and optical PSF. Distribution checks alone cannot establish equivalent
-object recovery or two-point resolution.

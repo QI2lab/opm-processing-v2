@@ -32,8 +32,8 @@ git diff --check
 Tests must be numerical unit tests or simulated disk-to-disk integration tests.
 Use the [testing guide](testing.md) for CUDA selection and physical acceptance.
 Run performance measurements outside pytest and record the conditions and
-comparison baseline. Deskew, fusion, and deconvolution optimizations must retain
-their stated geometry and numerical behavior.
+comparison baseline in ignored `diagnostics/`. Deskew, fusion, and deconvolution
+optimizations must retain their stated geometry and numerical behavior.
 
 Prek runs Ruff linting and formatting, spelling, project metadata validation,
 and GitHub Actions validation. The same hooks run on pushes and pull requests.
@@ -43,6 +43,7 @@ required here. Automatic fixes use Ruff's safe fixes.
 ## Documentation
 
 Update command references when options change and method pages when numerical
-behavior changes. Mark experimental and withdrawn work explicitly. Keep the
-README focused on installation and a first workflow; put explanations in the
-site. See [building documentation](documentation.md).
+behavior changes. Keep audit notes and experiment reports in ignored
+`diagnostics/`. Keep the README focused on installation and a first workflow;
+put user and developer guides in the site. See
+[building documentation](documentation.md).
