@@ -99,6 +99,7 @@ ENV/
 
 # mkdocs documentation
 /site
+/.venv-docs/
 
 # mypy
 .mypy_cache/
@@ -116,10 +117,16 @@ src/opm_processing/test_flatfield.py
 tests/test_symlink.py
 src/cucim-cu12/
 src/cucim
+# Local audit notes, experiment reports, and diagnostic outputs
 /diagnostics/
-AUDIT_REFACTOR_WORKFLOW.md
+/AUDIT_*.md
+/docs/*_audit.md
+# Temporary diagnostic runs and generated stitching reports
+/.tmp/
+/stitching_*_diagnostic.json
+/stitching_diagnostic_*.json
+/stitching_*_comparison.png
 /figures/
 /.agents/
-/scripts/
 
 uv.lock

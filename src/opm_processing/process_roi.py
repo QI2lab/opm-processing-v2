@@ -9,7 +9,6 @@ from typing import Annotated
 import typer
 
 from opm_processing.dataio.acquisition import (
-    AcquisitionMetadata,
     acquisition_stem,
     inspect_acquisition,
 )
@@ -17,60 +16,14 @@ from opm_processing.dataio.processing_state import (
     ProcessingState,
     processing_state_path,
 )
-from opm_processing.dataio.roi import (
-    PhysicalRoi,
-    validate_registered_max_projection,
-)
-from opm_processing.imageprocessing.tilefusion import TileFusion
+from opm_processing.dataio.roi import PhysicalRoi
 from opm_processing.imageprocessing.maxtilefusion import (
     regenerate_fused_max_projection,
 )
+from opm_processing.imageprocessing.tilefusion import TileFusion
 from opm_processing.process import process_skewed
 
-
 app = typer.Typer(pretty_exceptions_enable=False)
-
-
-def _resolve_roi_context(root_path: Path) -> tuple[AcquisitionMetadata, Path]:
-    """Locate raw data while retaining the directory used for ROI defaults."""
-    candidate = Path(root_path).expanduser().resolve()
-    try:
-        acquisition = inspect_acquisition(candidate)
-    except ValueError as acquisition_error:
-        if not candidate.is_dir() or any(
-            (candidate / marker).is_file() for marker in ("zarr.json", ".zattrs")
-        ):
-            raise
-        state_paths = sorted(candidate.glob("*.processing.json"))
-        if not state_paths:
-            raise ValueError(
-                f"Cannot locate a raw acquisition in {candidate}, and no "
-                "*.processing.json records its source. Pass the raw acquisition "
-                "path as the first argument and the ROI JSON as the second."
-            ) from acquisition_error
-        if len(state_paths) != 1:
-            matches = ", ".join(path.name for path in state_paths)
-            raise ValueError(
-                f"Expected one processing-state file in {candidate}, found "
-                f"{len(state_paths)}: {matches}. Pass the raw acquisition path "
-                "and ROI JSON explicitly to select an acquisition."
-            ) from acquisition_error
-        state = ProcessingState.read(state_paths[0])
-        recorded_source = state.document["source"].get("path")
-        if not isinstance(recorded_source, str) or not recorded_source.strip():
-            raise ValueError(
-                f"Processing state lacks a source acquisition path: {state.path}"
-            )
-        source_path = Path(recorded_source).expanduser().resolve()
-        if not source_path.is_dir():
-            raise FileNotFoundError(
-                f"Raw acquisition recorded in {state.path} is unavailable: "
-                f"{source_path}. Mount its drive or pass the current raw "
-                "acquisition path and ROI JSON explicitly."
-            )
-        acquisition = inspect_acquisition(source_path)
-        return acquisition, candidate
-    return acquisition, acquisition.path.parent
 
 
 @app.command()
@@ -127,8 +80,59 @@ def process_roi(
         ),
     ] = None,
 ) -> None:
-    """Process a napari-selected world-space ROI and fuse it when needed."""
-    acquisition, context_dir = _resolve_roi_context(root_path)
+    """Process a napari-selected world-space ROI and fuse its cropped tiles.
+
+    Parameters
+    ----------
+    root_path : pathlib.Path
+        Raw acquisition path or directory containing its processing state.
+    roi_json : pathlib.Path or None
+        ROI exported by display; None uses the input directory's default ROI.
+    deconvolve : bool
+        Deconvolve the selected raw regions before deskewing.
+    flatfield_correction : bool
+        Estimate or reuse illumination fields for camera-calibrated images.
+    save_float32 : bool
+        Save float32 intensities; False clips final output to uint16.
+    z_downsample_level : int
+        Integer reduction factor along deskewed Z.
+    crop_after_deskew : bool
+        General deskew crop option, which must be False for physical ROI crops.
+    decon_crop_scan : int or None
+        Retained scan planes per deconvolution chunk; None selects automatically.
+    decon_gpu_id : int
+        Zero-based CUDA device used for deconvolution.
+    decon_verbose : int
+        Deconvolution diagnostic verbosity.
+    decon_psf_paths : list[pathlib.Path] or None
+        Channel-ordered PSF files; None generates theoretical PSFs.
+    registration_channel : int
+        Channel used to align cropped tiles during fusion.
+    resume : bool
+        Continue completed tile and channel checkpoints; False overwrites output.
+    output : pathlib.Path or None
+        Output directory; None uses <acquisition>_roi beside the input.
+
+    Returns
+    -------
+    None
+        Cropped tiles and checkpoints are saved, with fused outputs when the ROI
+        spans multiple positions.
+    """
+    requested_path = Path(root_path).expanduser().resolve()
+    state_paths = tuple(requested_path.glob("*.processing.json"))
+    if state_paths:
+        if len(state_paths) != 1:
+            raise ValueError(
+                "Pass the raw acquisition path and ROI JSON explicitly when "
+                "the input directory contains multiple processing-state files."
+            )
+        state = ProcessingState.read(state_paths[0])
+        acquisition = inspect_acquisition(Path(state.document["source"]["path"]))
+        context_dir = requested_path
+    else:
+        acquisition = inspect_acquisition(requested_path)
+        context_dir = acquisition.path.parent
     if acquisition.is_2d:
         raise ValueError(
             "process-ROI currently targets skewed 3D acquisitions; use process "
@@ -146,7 +150,6 @@ def process_roi(
         else Path(roi_json).expanduser().resolve()
     )
     roi = PhysicalRoi.read(resolved_roi_json)
-    validate_registered_max_projection(roi.source_path)
     output_dir = (
         Path(output).expanduser().resolve()
         if output is not None
@@ -177,8 +180,6 @@ def process_roi(
     processed_path = output_dir / f"{stem}_{label}.ome.zarr"
     state = ProcessingState.read(processing_state_path(output_dir, stem))
     tile_records = state.roi_series(processed_path)
-    if not tile_records:
-        raise RuntimeError("ROI processing did not record any cropped tiles")
     selected_positions = tuple(
         dict.fromkeys(int(record["position_index"]) for record in tile_records)
     )
@@ -204,7 +205,13 @@ def process_roi(
 
 
 def main() -> None:
-    """Run the ROI-processing command-line application."""
+    """Run the ROI-processing command-line application.
+
+    Returns
+    -------
+    None
+        The Typer application parses arguments and processes the requested ROI.
+    """
     app()
 
 

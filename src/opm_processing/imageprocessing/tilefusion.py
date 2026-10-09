@@ -21,10 +21,13 @@ Notes
   use GPU; fusion is performed on CPU using Numba kernels.
 """
 
+from __future__ import annotations
+
 import gc
+import itertools
+import json
 import math
 from collections import deque
-from collections.abc import Sequence
 from concurrent.futures import (
     FIRST_COMPLETED,
     Future,
@@ -32,7 +35,7 @@ from concurrent.futures import (
     wait,
 )
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import psutil
@@ -57,12 +60,16 @@ from opm_processing.dataio.processing_state import (
     ProcessingState,
     processing_state_path,
 )
-from opm_processing.dataio.roi import PhysicalRoi, intersecting_position_indices
 from opm_processing.imageprocessing.coordinates import (
     stage_positions_to_image_coordinates,
+    stage_z_level_indices,
 )
 from opm_processing.imageprocessing.opmtools import orthogonal_deskew
 
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from opm_processing.dataio.roi import PhysicalRoi
 
 # -----------------------------------------------------------------------------
 # Optional GPU stack (safe globals)
@@ -77,6 +84,8 @@ match_histograms: Any
 block_reduce: Any
 phase_cross_correlation: Any
 sobel_filter: Any
+shift_filter: Any
+minimum_filter: Any
 
 _ssim_cpu: Any | None = None
 
@@ -89,7 +98,11 @@ try:
     from cucim.skimage.exposure import match_histograms as _mh  # type: ignore
     from cucim.skimage.measure import block_reduce as _br  # type: ignore
     from cucim.skimage.metrics import structural_similarity as _ssim_gpu  # type: ignore
-    from cucim.skimage.registration import phase_cross_correlation as _pcc  # type: ignore
+    from cucim.skimage.registration import (
+        phase_cross_correlation as _pcc,  # type: ignore
+    )
+    from cupyx.scipy.ndimage import minimum_filter as _minimum_filter  # type: ignore
+    from cupyx.scipy.ndimage import shift as _shift  # type: ignore
     from cupyx.scipy.ndimage import sobel as _sobel  # type: ignore
 
     cp = _cp
@@ -98,27 +111,39 @@ try:
     block_reduce = _br
     phase_cross_correlation = _pcc
     sobel_filter = _sobel
+    shift_filter = _shift
+    minimum_filter = _minimum_filter
     ssim_cuda = _ssim_gpu
     USING_GPU = True
-except Exception as error:  # noqa: BLE001
+except Exception as error:
     # GPU stack unavailable; fall back to CPU.
     GPU_IMPORT_ERROR = error
+    from scipy.ndimage import minimum_filter as _minimum_filter  # type: ignore
+    from scipy.ndimage import shift as _shift  # type: ignore
+    from scipy.ndimage import sobel as _sobel  # type: ignore
     from skimage.exposure import match_histograms as _mh  # type: ignore
     from skimage.measure import block_reduce as _br  # type: ignore
     from skimage.metrics import structural_similarity as _cpu_ssim  # type: ignore
     from skimage.registration import phase_cross_correlation as _pcc  # type: ignore
-    from scipy.ndimage import sobel as _sobel  # type: ignore
 
     match_histograms = _mh
     block_reduce = _br
     phase_cross_correlation = _pcc
     sobel_filter = _sobel
+    shift_filter = _shift
+    minimum_filter = _minimum_filter
     _ssim_cpu = _cpu_ssim
     USING_GPU = False
 
 
 def _default_fusion_workers() -> int:
-    """Use up to eight physical cores to preserve deep, aligned I/O blocks."""
+    """Use up to eight physical cores to preserve deep, aligned I/O blocks.
+
+    Returns
+    -------
+    int
+        Concurrent fusion worker count bounded by available resources.
+    """
     physical = psutil.cpu_count(logical=False)
     if physical is not None:
         return max(1, min(8, int(physical)))
@@ -129,7 +154,18 @@ def _default_fusion_workers() -> int:
 def fusion_backend_status(
     max_workers: int | None = None,
 ) -> dict[str, str | bool | int | None]:
-    """Return observable registration and fusion backend information."""
+    """Return observable registration and fusion backend information.
+
+    Parameters
+    ----------
+    max_workers : int | None
+        Concurrent fusion workers, or None for the available-memory default.
+
+    Returns
+    -------
+    dict
+        Active registration and fusion backends, worker count, and any CUDA import error.
+    """
     workers = _default_fusion_workers() if max_workers is None else int(max_workers)
     return {
         "gpu_registration": USING_GPU,
@@ -156,37 +192,28 @@ def require_gpu_backend() -> None:
 
 _PROCESSED_SUFFIXES = (
     "_decon_deskewed.ome.zarr",
-    "_decon_projection.ome.zarr",
-    "_decon_2d.ome.zarr",
-    "_decon_deskewed.zarr",
-    "_decon_projection.zarr",
-    "_decon_2d.zarr",
     "_deskewed.ome.zarr",
+    "_decon_projection.ome.zarr",
     "_projection.ome.zarr",
+    "_decon_2d.ome.zarr",
     "_2d.ome.zarr",
-    "_deskewed.zarr",
-    "_projection.zarr",
-    "_2d.zarr",
 )
-_PROCESSED_PREFERENCE = {
-    "_deskewed.ome.zarr": 0,
-    "_projection.ome.zarr": 1,
-    "_2d.ome.zarr": 2,
-    "_deskewed.zarr": 3,
-    "_projection.zarr": 4,
-    "_2d.zarr": 5,
-    "_decon_deskewed.ome.zarr": 6,
-    "_decon_projection.ome.zarr": 7,
-    "_decon_2d.ome.zarr": 8,
-    "_decon_deskewed.zarr": 9,
-    "_decon_projection.zarr": 10,
-    "_decon_2d.zarr": 11,
-}
 
 
 def _processed_store_identity(path: Path) -> tuple[str, str] | None:
-    """Return the acquisition stem and processed suffix for a full tile store."""
-    for suffix in _PROCESSED_SUFFIXES:
+    """Return the acquisition stem and processed suffix for a full tile store.
+
+    Parameters
+    ----------
+    path : Path
+        Candidate processed tile collection directory.
+
+    Returns
+    -------
+    tuple[str, str] | None
+        Acquisition name and supported processed suffix, or None for other stores.
+    """
+    for suffix in sorted(_PROCESSED_SUFFIXES, key=len, reverse=True):
         if path.name.endswith(suffix):
             stem = path.name[: -len(suffix)]
             if stem.endswith("_max_z"):
@@ -201,11 +228,21 @@ def resolve_fusion_input(
     """Locate fusion-ready processed data from a source or output directory.
 
     Returns the output directory, processed collection, acquisition stem, and
-    source acquisition path when the latter can be resolved locally.
+    source acquisition path when the latter can be resolved locally. Prefer
+    deskewed volumes over planar outputs and deconvolved data within each kind.
+    An explicit processed-store path selects that store directly.
+
+    Parameters
+    ----------
+    path : str | Path
+        Acquisition, processed tile store, or directory containing processed outputs.
+
+    Returns
+    -------
+    tuple[Path, Path, str, Path | None]
+        Output directory, tile collection, acquisition name, and locally resolved raw source.
     """
     candidate = Path(path).expanduser().resolve()
-    if not candidate.is_dir():
-        raise ValueError(f"Fusion input is not a directory: {candidate}")
 
     direct_identity = _processed_store_identity(candidate)
     search_dir = candidate.parent if direct_identity is not None else candidate
@@ -230,7 +267,7 @@ def resolve_fusion_input(
             )
         data_path, stem, _ = min(
             matches,
-            key=lambda match: _PROCESSED_PREFERENCE[match[2]],
+            key=lambda match: _PROCESSED_SUFFIXES.index(match[2]),
         )
         return search_dir, data_path, stem, None
 
@@ -238,9 +275,7 @@ def resolve_fusion_input(
     output_dir = source_path.parent
     stem = acquisition_stem(source_path)
     checked = []
-    for suffix, _priority in sorted(
-        _PROCESSED_PREFERENCE.items(), key=lambda item: item[1]
-    ):
+    for suffix in _PROCESSED_SUFFIXES:
         processed_path = output_dir / f"{stem}{suffix}"
         checked.append(processed_path)
         if processed_path.is_dir():
@@ -251,7 +286,7 @@ def resolve_fusion_input(
     )
 
 
-def _ssim(arr1: Any, arr2: Any, win_size: int) -> float:
+def _ssim(arr1: Any, arr2: Any, win_size: int, valid_mask: Any | None = None) -> float:
     """Compute SSIM, routing to GPU kernel if available, else CPU skimage.
 
     Parameters
@@ -262,36 +297,42 @@ def _ssim(arr1: Any, arr2: Any, win_size: int) -> float:
         Comparison image/volume (same shape as `arr1`).
     win_size : int
         SSIM window size.
+    valid_mask : array-like or None
+        Geometric intersection of the aligned tile supports. Score only windows
+        whose samples are all supported; None scores the complete overlap.
 
     Returns
     -------
     score : float
-        Structural similarity index in [-1, 1] (typically [0, 1] for images).
+        Structural similarity index in [-1, 1], or negative infinity when no
+        complete supported window is available.
     """
-    if USING_GPU and ssim_cuda is not None:
-        data_range = float(xp.ptp(arr1))
-        if data_range == 0.0:
-            data_range = 1.0
-        return float(
-            ssim_cuda(
-                arr1,
-                arr2,
-                win_size=win_size,
-                data_range=data_range,
-            )
-        )
-
-    if _ssim_cpu is None:
-        raise RuntimeError("CPU SSIM backend is unavailable.")
-
-    arr1_np = np.asarray(arr1)
-    arr2_np = np.asarray(arr2)
-
-    data_range = float(np.ptp(arr1_np))
+    if valid_mask is not None:
+        eligible = minimum_filter(valid_mask, size=win_size, mode="constant", cval=0)
+        if not bool(xp.any(eligible)):
+            return -math.inf
+    data_range = float(xp.ptp(arr1 if valid_mask is None else arr1[valid_mask]))
     if data_range == 0.0:
         data_range = 1.0
-
-    return float(_ssim_cpu(arr1_np, arr2_np, win_size=win_size, data_range=data_range))
+    if USING_GPU and ssim_cuda is not None:
+        result = ssim_cuda(
+            arr1,
+            arr2,
+            win_size=win_size,
+            data_range=data_range,
+            full=valid_mask is not None,
+        )
+    else:
+        if _ssim_cpu is None:
+            raise RuntimeError("CPU SSIM backend is unavailable.")
+        result = _ssim_cpu(
+            np.asarray(arr1),
+            np.asarray(arr2),
+            win_size=win_size,
+            data_range=data_range,
+            full=valid_mask is not None,
+        )
+    return float(result if valid_mask is None else xp.mean(result[1][eligible]))
 
 
 def _aligned_registration_views(
@@ -299,18 +340,49 @@ def _aligned_registration_views(
     moving: Any,
     shift: Sequence[float],
 ) -> tuple[Any, Any]:
-    """Return corresponding valid views after an integer moving-image shift."""
-    if fixed.shape != moving.shape:
-        raise ValueError("registration patches must have matching shapes")
-    if fixed.ndim != len(shift):
-        raise ValueError("registration shift rank must match the patch rank")
+    """Align the moving patch at the measured shift and exclude padding.
+
+    Parameters
+    ----------
+    fixed : Any
+        Reference overlap patch used for pairwise registration.
+    moving : Any
+        Neighbor overlap patch to align with the reference.
+    shift : Sequence[float]
+        Translation applied to the moving patch, in array-axis order. Fractional
+        shifts use linear interpolation; integer shifts return array views.
+
+    Returns
+    -------
+    tuple
+        Matching patches clipped to samples supported by both input arrays.
+
+    Raises
+    ------
+    ValueError
+        If the translation leaves no overlapping samples on an array axis.
+    """
+    offsets = tuple(float(value) for value in shift)
+    if any(
+        abs(offset) >= length
+        for length, offset in zip(fixed.shape, offsets, strict=False)
+    ):
+        raise ValueError("registration shift leaves no overlapping samples")
+    if any(not offset.is_integer() for offset in offsets):
+        aligned = shift_filter(moving, offsets, order=1, prefilter=False)
+        slices = tuple(
+            slice(
+                math.ceil(max(0, offset)),
+                math.floor(min(length, length + offset)),
+            )
+            for length, offset in zip(fixed.shape, offsets, strict=False)
+        )
+        return fixed[slices], aligned[slices]
 
     fixed_slices: list[slice] = []
     moving_slices: list[slice] = []
-    for length, offset_float in zip(fixed.shape, shift):
-        offset = int(np.rint(float(offset_float)))
-        if abs(offset) >= int(length):
-            raise ValueError("registration shift leaves no overlapping samples")
+    for length, offset_float in zip(fixed.shape, offsets, strict=False):
+        offset = int(offset_float)
         if offset >= 0:
             fixed_slices.append(slice(offset, int(length)))
             moving_slices.append(slice(0, int(length) - offset))
@@ -326,10 +398,23 @@ def _bounded_phase_correlation_peak(
     moving: Any,
     max_shift: Sequence[float],
 ) -> Any:
-    """Return the strongest phase-correlation peak inside physical shift limits."""
+    """Return the strongest phase-correlation peak inside physical shift limits.
+
+    Parameters
+    ----------
+    fixed : Any
+        Reference overlap patch used for pairwise registration.
+    moving : Any
+        Neighbor overlap patch to align with the reference.
+    max_shift : Sequence[float]
+        Maximum absolute registration correction along each sampled axis.
+
+    Returns
+    -------
+    np.ndarray
+        Best integer phase-correlation correction within the per-axis search limits.
+    """
     limits = xp.asarray(max_shift, dtype=xp.float32)
-    if limits.shape != (fixed.ndim,):
-        raise ValueError("maximum shift rank must match registration patch rank")
 
     frequency_product = xp.fft.fftn(fixed) * xp.fft.fftn(moving).conj()
     magnitude = xp.abs(frequency_product)
@@ -339,7 +424,9 @@ def _bounded_phase_correlation_peak(
 
     valid_peak = xp.ones(cross_correlation.shape, dtype=xp.bool_)
     signed_coordinates: list[Any] = []
-    for axis, (length, limit) in enumerate(zip(cross_correlation.shape, limits)):
+    for axis, (length, limit) in enumerate(
+        zip(cross_correlation.shape, limits, strict=False)
+    ):
         coordinates = xp.arange(length)
         signed = xp.where(
             coordinates > length // 2,
@@ -365,11 +452,32 @@ class _RegistrationDeviceBuffers:
     """Grow-only reusable CuPy staging buffers for a registration pair."""
 
     def __init__(self, cupy_module: Any) -> None:
+        """Create reusable GPU registration transfer buffers.
+
+        Parameters
+        ----------
+        cupy_module : Any
+            Initialized CuPy module used for allocation and asynchronous host transfers.
+        """
         self._cupy = cupy_module
         self._buffers: list[Any | None] = [None, None]
         self._dtypes: list[np.dtype[Any] | None] = [None, None]
 
     def _stage_one(self, index: int, host: np.ndarray) -> Any:
+        """Copy an overlap patch into one reusable GPU staging buffer.
+
+        Parameters
+        ----------
+        index : int
+            Tile or registration-link index used by this calculation.
+        host : np.ndarray
+            Host overlap patch copied into the staging buffer.
+
+        Returns
+        -------
+        Any
+            Device overlap array populated by the host transfer.
+        """
         contiguous = np.ascontiguousarray(host)
         dtype = contiguous.dtype
         required = int(contiguous.size)
@@ -387,7 +495,20 @@ class _RegistrationDeviceBuffers:
         return view
 
     def stage(self, fixed: np.ndarray, moving: np.ndarray) -> tuple[Any, Any]:
-        """Copy a host pair into reusable device allocations."""
+        """Copy a host pair into reusable device allocations.
+
+        Parameters
+        ----------
+        fixed : np.ndarray
+            Reference overlap patch used for pairwise registration.
+        moving : np.ndarray
+            Neighbor overlap patch to align with the reference.
+
+        Returns
+        -------
+        tuple
+            Reusable device arrays populated with the fixed and moving overlap patches.
+        """
         return self._stage_one(0, fixed), self._stage_one(1, moving)
 
 
@@ -395,7 +516,7 @@ class _RegistrationDeviceBuffers:
 def _accumulate_tile_block(
     fused: np.ndarray,
     weight: np.ndarray,
-    sub: np.ndarray,
+    source: np.ndarray,
     channel_present: np.ndarray,
     valid_zy: np.ndarray,
     z_weights: np.ndarray,
@@ -404,87 +525,139 @@ def _accumulate_tile_block(
     z_off: int,
     y_off: int,
     x_off: int,
+    source_z: int = 0,
+    source_y: int = 0,
+    source_x: int = 0,
+    channel_gains: np.ndarray | None = None,
 ) -> None:
-    """Accumulate a weighted sub-volume into fused and weight buffers (in-place).
+    """Accumulate supported channel rows without copying source sub-volumes.
 
     Parameters
     ----------
     fused : numpy.ndarray
         Float32 accumulation buffer of shape (C, dz, Y, X) for the current block.
     weight : numpy.ndarray
-        Float32 weight accumulation buffer of shape (C, dz, Y, X).
-    sub : numpy.ndarray
-        Tile slab of shape (C, sub_dz, Y_tile, X_tile) to blend.
+        Float32 weight accumulation buffer of shape (C, dz, Y, X), or
+        (1, dz, Y, X) when every contributing tile contains all channels.
+    source : numpy.ndarray
+        Source CZYX block. The feather-profile lengths select the crop extent;
+        source offsets locate that crop without making a strided sub-volume.
     channel_present : numpy.ndarray
         Boolean vector identifying channels that contain signal in this tile.
     valid_zy : numpy.ndarray
-        Metadata-derived deskew support for the slab, with shape
-        (sub_dz, Y_tile). Unsupported rows contribute neither signal nor weight;
-        pixel intensity is never used to infer support.
+        Metadata-derived fraction of valid interpolation samples per ZY bin,
+        with shape (sub_dz, Y_tile). Boolean masks represent complete bins.
+        Sources already contain this coverage factor, so only the denominator
+        receives it. Unsupported rows contribute neither signal nor weight;
+        pixel intensity is never used to infer coverage.
     z_weights, y_weights, x_weights : numpy.ndarray
         Separable float32 feather profiles for the tile sub-volume.
     z_off : int
-        Offset of `sub` z=0 within `fused` block coordinates.
+        Z origin of the weighted crop within the accumulation buffers.
     y_off : int
-        Offset of `sub` y=0 within fused global Y coordinates.
+        Y origin of the weighted crop within the accumulation buffers.
     x_off : int
-        Offset of `sub` x=0 within fused global X coordinates.
+        X origin of the weighted crop within the accumulation buffers.
+    source_z, source_y, source_x : int
+        Crop origin inside the source block, defaulting to its first voxel.
+    channel_gains : numpy.ndarray | None
+        Float32 intensity correction per channel for this acquisition depth,
+        or None for unit gains. Correction precedes feathering without allocating
+        a scaled source block.
 
     Returns
     -------
     None
         Operates in-place on `fused` and `weight`.
+
+    Notes
+    -----
+    Uncorrected uint16 sources retain Numba's double-precision multiply/add
+    intermediates before storing into float32 accumulation. Casting them first
+    can move normalized pixels across an integer truncation boundary.
     """
     c_dim, _, _, _ = fused.shape
-    _, sub_dz, y_sub, x_sub = sub.shape
+    sub_dz, y_sub, x_sub = len(z_weights), len(y_weights), len(x_weights)
     total = sub_dz * y_sub
 
-    for idx in range(total):
-        dz_i = idx // y_sub
-        y_i = idx % y_sub
-        gz = z_off + dz_i
-        gy = y_off + y_i
-        if not valid_zy[dz_i, y_i]:
+    for c in range(c_dim):
+        if not channel_present[c]:
             continue
-        zy_weight = z_weights[dz_i] * y_weights[y_i]
-        for x_i in range(x_sub):
-            gx = x_off + x_i
-            w_val = zy_weight * x_weights[x_i]
-            for c in range(c_dim):
-                if not channel_present[c]:
-                    continue
-                weight[c, gz, gy, gx] += w_val
-                fused[c, gz, gy, gx] += sub[c, dz_i, y_i, x_i] * w_val
+        weight_channel = 0 if weight.shape[0] == 1 else c
+        gain = np.float32(1) if channel_gains is None else channel_gains[c]
+        for idx in range(total):
+            dz_i = idx // y_sub
+            y_i = idx % y_sub
+            coverage = np.float32(valid_zy[dz_i, y_i])
+            if coverage == 0:
+                continue
+            gz = z_off + dz_i
+            gy = y_off + y_i
+            zy_weight = z_weights[dz_i] * y_weights[y_i]
+            for x_i in range(x_sub):
+                gx = x_off + x_i
+                w_val = zy_weight * x_weights[x_i]
+                if weight.shape[0] != 1 or c == 0:
+                    weight[weight_channel, gz, gy, gx] += w_val * coverage
+                if channel_gains is None:
+                    fused[c, gz, gy, gx] += (
+                        source[c, source_z + dz_i, source_y + y_i, source_x + x_i]
+                        * w_val
+                    )
+                else:
+                    value = (
+                        np.float32(
+                            source[c, source_z + dz_i, source_y + y_i, source_x + x_i]
+                        )
+                        * gain
+                    )
+                    fused[c, gz, gy, gx] += value * w_val
 
 
-@njit(nogil=True)
-def _normalize_block(fused: np.ndarray, weight: np.ndarray) -> None:
-    """Normalize fused by weight in-place.
+@njit(nogil=True, error_model="numpy")
+def _normalize_block(
+    fused: np.ndarray,
+    weight: np.ndarray,
+    output: np.ndarray,
+    z_off: int = 0,
+    y_off: int = 0,
+    x_off: int = 0,
+) -> None:
+    """Normalize and cast channel rows directly into the output block.
 
     Parameters
     ----------
     fused : numpy.ndarray
         Float32 accumulation buffer of shape (C, dz, Y, X).
     weight : numpy.ndarray
-        Float32 weight buffer of shape (C, dz, Y, X).
+        Float32 weight buffer of shape (C, dz, Y, X), or a single shared
+        channel when all contributing tiles contain every channel.
+    output : numpy.ndarray
+        Destination CZYX block with float32 or uint16 dtype. Uint16 values clip
+        to [0, 65535] and truncate; float32 values retain their range.
+        Unsupported pixels become zero.
+    z_off, y_off, x_off : int
+        Origin of the normalized region in the destination block.
 
     Returns
     -------
     None
-        Operates in-place on `fused`.
+        Writes into `output`, which may alias `fused` for in-place normalization.
     """
     c_dim, dz, y_dim, x_dim = fused.shape
     total = dz * y_dim
 
-    for idx in range(total):
-        z_i = idx // y_dim
-        y_i = idx % y_dim
-        for c in range(c_dim):
-            base_w = weight[c, z_i, y_i]
-            base_f = fused[c, z_i, y_i]
+    for c in range(c_dim):
+        weight_channel = 0 if weight.shape[0] == 1 else c
+        for idx in range(total):
+            z_i = idx // y_dim
+            y_i = idx % y_dim
             for x_i in range(x_dim):
-                w_val = base_w[x_i]
-                base_f[x_i] = base_f[x_i] / w_val if w_val > 0 else 0.0
+                w_val = weight[weight_channel, z_i, y_i, x_i]
+                value = fused[c, z_i, y_i, x_i] / w_val if w_val > 0 else np.float32(0)
+                if output.itemsize == 2:
+                    value = min(max(value, np.float32(0)), np.float32(65535))
+                output[c, z_off + z_i, y_off + y_i, x_off + x_i] = value
 
 
 def _partition_fusion_block(
@@ -502,6 +675,20 @@ def _partition_fusion_block(
     This preserves the block-oriented memory bound while exposing exclusive tile
     interiors for direct copying. Adjacent X regions with identical contributors
     are merged to avoid unnecessary TensorStore reads and writes.
+
+    Parameters
+    ----------
+    bounds : tuple[int, int, int, int, int, int]
+        Half-open spatial block bounds in ZYX order.
+    contributors : Sequence[tuple[int, tuple[int, int, int]]]
+        Tile indices and integer canvas ZYX origins intersecting the output block.
+    tile_shapes : Sequence[tuple[int, int, int]] | tuple[int, int, int]
+        Per-tile spatial dimensions in ZYX order.
+
+    Returns
+    -------
+    list
+        Spatial sub-blocks paired with the tiles contributing to each sub-block.
     """
     z0, z1, y0, y1, x0, x1 = bounds
     common_shape = (
@@ -512,6 +699,18 @@ def _partition_fusion_block(
     )
 
     def shape_for(tile_index: int) -> tuple[int, int, int]:
+        """Read the source spatial dimensions for one contributing tile.
+
+        Parameters
+        ----------
+        tile_index : int
+            Index into the selected processed tile collection.
+
+        Returns
+        -------
+        tuple[int, int, int]
+            Tile dimensions in ZYX order.
+        """
         if common_shape is not None:
             return common_shape
         return tuple(int(value) for value in tile_shapes[tile_index])
@@ -534,9 +733,9 @@ def _partition_fusion_block(
             list[tuple[int, tuple[int, int, int]]],
         ]
     ] = []
-    for rz0, rz1 in zip(z_cuts, z_cuts[1:]):
-        for ry0, ry1 in zip(y_cuts, y_cuts[1:]):
-            for rx0, rx1 in zip(x_cuts, x_cuts[1:]):
+    for rz0, rz1 in itertools.pairwise(z_cuts):
+        for ry0, ry1 in itertools.pairwise(y_cuts):
+            for rx0, rx1 in itertools.pairwise(x_cuts):
                 region_contributors = [
                     (p, offset)
                     for p, offset in contributors
@@ -570,16 +769,23 @@ def _registration_tile_shapes(
     tile_shape_zyx: Sequence[int] | Sequence[Sequence[int]],
     tile_count: int,
 ) -> np.ndarray:
-    """Normalize one common shape or one ZYX shape per registration tile."""
+    """Normalize one common shape or one ZYX shape per registration tile.
+
+    Parameters
+    ----------
+    tile_shape_zyx : Sequence[int] | Sequence[Sequence[int]]
+        Shared or per-tile spatial dimensions in ZYX order.
+    tile_count : int
+        Number of tiles represented by the shape array.
+
+    Returns
+    -------
+    np.ndarray
+        ZYX dimensions broadcast to one spatial shape per tile.
+    """
     shapes = np.asarray(tile_shape_zyx, dtype=np.float64)
     if shapes.shape == (3,):
         shapes = np.broadcast_to(shapes, (tile_count, 3))
-    elif shapes.shape != (tile_count, 3):
-        raise ValueError(
-            "tile_shape_zyx must have shape (3,) or (positions, 3)"
-        )
-    if np.any(shapes <= 0):
-        raise ValueError("tile_shape_zyx values must be positive")
     return shapes
 
 
@@ -616,10 +822,6 @@ def _select_nearest_registration_pairs(
     """
     positions = np.asarray(positions_zyx, dtype=np.float64)
     pixel_size = np.asarray(pixel_size_zyx, dtype=np.float64)
-    if positions.ndim != 2 or positions.shape[1] != 3:
-        raise ValueError("positions_zyx must have shape (positions, 3)")
-    if pixel_size.shape != (3,):
-        raise ValueError("pixel_size_zyx must have length 3")
     tile_shapes = _registration_tile_shapes(tile_shape_zyx, len(positions))
 
     physical_shapes = tile_shapes * pixel_size
@@ -646,12 +848,38 @@ def _select_nearest_registration_pairs(
     parent = list(range(len(positions)))
 
     def find(index: int) -> int:
+        """Find a tile component representative with path compression.
+
+        Parameters
+        ----------
+        index : int
+            Tile or registration-link index used by this calculation.
+
+        Returns
+        -------
+        int
+            Representative tile index of the connected component.
+        """
         while parent[index] != index:
             parent[index] = parent[parent[index]]
             index = parent[index]
         return index
 
     def union(left: int, right: int) -> bool:
+        """Merge the connected components containing two tiles.
+
+        Parameters
+        ----------
+        left : int
+            First tile index whose connected component is merged.
+        right : int
+            Second tile index whose connected component is merged.
+
+        Returns
+        -------
+        bool
+            Updates the component parents in place.
+        """
         left_root = find(left)
         right_root = find(right)
         if left_root == right_root:
@@ -678,9 +906,23 @@ def _select_nearest_registration_pairs(
         local_parent = {node: node for node in component_nodes}
 
         def local_find(index: int) -> int:
-            while local_parent[index] != index:
-                local_parent[index] = local_parent[local_parent[index]]
-                index = local_parent[index]
+            """Find a tile representative within the current overlap component.
+
+            This disjoint-set helper is consumed before the component loop advances.
+
+            Parameters
+            ----------
+            index : int
+                Tile or registration-link index used by this calculation.
+
+            Returns
+            -------
+            int
+                Representative tile index within the overlap component.
+            """
+            while local_parent[index] != index:  # noqa: B023
+                local_parent[index] = local_parent[local_parent[index]]  # noqa: B023
+                index = local_parent[index]  # noqa: B023
             return index
 
         merges_needed = len(component_nodes) - 1
@@ -707,6 +949,199 @@ def _select_nearest_registration_pairs(
     return selected
 
 
+def _fit_depth_gains(
+    level_count: int, measurements: Sequence[tuple[int, int, float]]
+) -> np.ndarray:
+    """Fit multiplicative depth gains from registered overlap measurements.
+
+    Parameters
+    ----------
+    level_count : int
+        Number of acquisition depth levels, including unmeasured levels.
+    measurements : sequence of tuple[int, int, float]
+        Fixed depth, moving depth, and log intensity ratio for each patch.
+        Repeated measurements are reduced to their median for each depth pair.
+
+    Returns
+    -------
+    numpy.ndarray
+        One gain per depth. The first depth in each connected component has
+        unit gain; unmeasured depths also retain unit gain.
+    """
+    grouped = {}
+    for left, right, log_ratio in measurements:
+        if left > right:
+            left, right, log_ratio = right, left, -log_ratio
+        grouped.setdefault((left, right), []).append(log_ratio)
+    links = [
+        {
+            "i": left,
+            "j": right,
+            "t": np.asarray((np.median(values), 0, 0)),
+            "w": math.sqrt(len(values)),
+        }
+        for (left, right), values in grouped.items()
+    ]
+    adjacency = [set() for _ in range(level_count)]
+    for left, right in grouped:
+        adjacency[left].add(right)
+        adjacency[right].add(left)
+    anchors = []
+    visited = set()
+    for level in range(level_count):
+        if level in visited:
+            continue
+        anchors.append(level)
+        frontier = [level]
+        visited.add(level)
+        while frontier:
+            unseen = adjacency[frontier.pop()] - visited
+            visited.update(unseen)
+            frontier.extend(unseen)
+    shifts = TileFusion._solve_global(links, level_count, anchors)
+    return np.exp(shifts[:, 0])
+
+
+def _registration_sampling(
+    overlap_shape: Sequence[int],
+    downsample_factors: Sequence[int],
+    ssim_window: int,
+    is_2d: bool,
+) -> tuple[int, ...]:
+    """Choose downsampling that retains enough samples for overlap scoring.
+
+    Parameters
+    ----------
+    overlap_shape : sequence of int
+        Overlap dimensions in ZYX order.
+    downsample_factors : sequence of int
+        Requested downsampling along ZYX.
+    ssim_window : int
+        Requested structural similarity window width.
+    is_2d : bool
+        Whether scoring excludes the singleton Z axis.
+
+    Returns
+    -------
+    tuple of int
+        Effective ZYX downsampling factors for this overlap.
+    """
+    active_shape = overlap_shape[1:] if is_2d else overlap_shape
+    window = min(ssim_window, min(active_shape))
+    window -= 1 - window % 2
+    return tuple(
+        max(1, min(factor, length // max(3, window)))
+        for factor, length in zip(downsample_factors, overlap_shape, strict=False)
+    )
+
+
+def _infer_registration_limits(
+    positions_zyx: Sequence[Sequence[float]],
+    tile_shapes_zyx: Sequence[Sequence[int]],
+    pixel_size_zyx: Sequence[float],
+    downsample_factors: Sequence[int],
+    angle_deg: float | None,
+    *,
+    is_2d: bool = False,
+) -> dict[tuple[int, int], tuple[int, int, int]]:
+    """Infer search envelopes from physical overlaps and OPM scan geometry.
+
+    Stage-placement uncertainty is budgeted at ten percent of the smallest
+    face overlap on each tiled axis, with two registration sampling bins as
+    a floor. Untiled axes use ten percent of their tile extent. Depth pairs
+    additionally allow the oblique-plane footprint displacement dz*cot(theta)
+    along image Y. This is a search allowance, not a shear of tile origins.
+    Each pair retains at least half its overlap along every active axis.
+
+    Parameters
+    ----------
+    positions_zyx : sequence of sequence of float
+        Nominal tile origins in physical ZYX coordinates.
+    tile_shapes_zyx : sequence of sequence of int
+        Tile dimensions in ZYX pixels.
+    pixel_size_zyx : sequence of float
+        Physical voxel spacing in the same units as the origins.
+    downsample_factors : sequence of int
+        Requested ZYX registration downsampling factors.
+    angle_deg : float or None
+        Oblique scan angle in degrees, or None when unavailable.
+    is_2d : bool, default = False
+        Whether tiles represent planar images.
+
+    Returns
+    -------
+    dict
+        Overlapping tile pairs mapped to maximum ZYX corrections in pixels.
+    """
+    positions = np.asarray(positions_zyx, dtype=np.float64)
+    if len(positions) == 0:
+        return {}
+    shapes = _registration_tile_shapes(tile_shapes_zyx, len(positions))
+    spacing = np.asarray(pixel_size_zyx, dtype=np.float64)
+    sampling = np.asarray(downsample_factors, dtype=np.int64)
+    if sampling.shape != (3,) or np.any(sampling < 1):
+        raise ValueError("downsample_factors must contain three positive values")
+    pairs = _select_registration_pairs(positions, shapes, spacing, is_2d=is_2d)
+    nearest_pairs = set(
+        _select_nearest_registration_pairs(
+            positions,
+            shapes,
+            spacing,
+            is_2d=is_2d,
+        )
+    )
+    overlaps = {}
+    face_overlaps: list[list[float]] = [[], [], []]
+    for left, right in pairs:
+        delta = np.abs(positions[right] - positions[left]) / spacing
+        overlap = (
+            np.minimum(
+                positions[left] + shapes[left] * spacing,
+                positions[right] + shapes[right] * spacing,
+            )
+            - np.maximum(positions[left], positions[right])
+        ) / spacing
+        if is_2d:
+            delta[0] = 0
+            overlap[0] = 1
+        overlaps[left, right] = overlap
+        # The dominant normalized separation identifies the tile face. Do
+        # not let a small diagonal intersection set another axis's budget.
+        axis = int(np.argmax(delta / np.minimum(shapes[left], shapes[right])))
+        if (left, right) in nearest_pairs and delta[axis] > 0:
+            face_overlaps[axis].append(float(overlap[axis]))
+    extent = np.min(shapes, axis=0)
+    base = np.maximum(
+        2 * sampling,
+        np.ceil(
+            0.1
+            * np.asarray(
+                [
+                    min(values) if values else extent[axis]
+                    for axis, values in enumerate(face_overlaps)
+                ]
+            )
+        ),
+    )
+    cotangent = (
+        1.0 / math.tan(math.radians(angle_deg))
+        if angle_deg is not None and 0 < angle_deg < 90 and not is_2d
+        else 0.0
+    )
+    limits = {}
+    for pair, overlap in overlaps.items():
+        left, right = pair
+        budget = base.copy()
+        budget[1] += (
+            abs(positions[right, 0] - positions[left, 0]) * cotangent / spacing[1]
+        )
+        budget = np.minimum(np.ceil(budget), np.floor(overlap / 2))
+        if is_2d:
+            budget[0] = 0
+        limits[pair] = tuple(int(value) for value in budget)
+    return limits
+
+
 def _select_registration_pairs(
     positions_zyx: Sequence[Sequence[float]],
     tile_shape_zyx: Sequence[int] | Sequence[Sequence[int]],
@@ -714,13 +1149,26 @@ def _select_registration_pairs(
     *,
     is_2d: bool = False,
 ) -> list[tuple[int, int]]:
-    """Return every pair whose physical tile bounding boxes overlap."""
+    """Return every pair whose physical tile bounding boxes overlap.
+
+    Parameters
+    ----------
+    positions_zyx : Sequence[Sequence[float]]
+        Physical tile origins in ZYX order, in micrometers.
+    tile_shape_zyx : Sequence[int] | Sequence[Sequence[int]]
+        Shared or per-tile spatial dimensions in ZYX order.
+    pixel_size_zyx : Sequence[float]
+        Physical voxel spacing in ZYX order, in micrometers.
+    is_2d : bool
+        Use projection-plane geometry rather than volumetric overlap.
+
+    Returns
+    -------
+    list[tuple[int, int]]
+        Neighbor tile pairs selected from stage geometry and physical overlap.
+    """
     positions = np.asarray(positions_zyx, dtype=np.float64)
     pixel_size = np.asarray(pixel_size_zyx, dtype=np.float64)
-    if positions.ndim != 2 or positions.shape[1] != 3:
-        raise ValueError("positions_zyx must have shape (positions, 3)")
-    if pixel_size.shape != (3,):
-        raise ValueError("pixel_size_zyx must have length 3")
     tile_shapes = _registration_tile_shapes(tile_shape_zyx, len(positions))
 
     physical_shapes = tile_shapes * pixel_size
@@ -814,10 +1262,11 @@ class TileFusion:
         chunk_shape_yx: tuple[int, int] = (1024, 1024),
         optimization_rel_threshold: float = 0.5,
         optimization_abs_threshold: float = 1.5,
-        max_registration_shift_zyx: tuple[int, int, int] = (20, 100, 100),
+        max_registration_shift_zyx: tuple[int, int, int] | None = None,
         reverse_stage_y: bool = True,
         reverse_stage_z: bool | None = None,
         roi_selection: PhysicalRoi | None = None,
+        normalize_depth_intensity: bool = True,
     ) -> None:
         """Initialize registration and fusion for a processed acquisition.
 
@@ -855,9 +1304,11 @@ class TileFusion:
         optimization_rel_threshold
             Relative residual threshold for registration outliers.
         optimization_abs_threshold
-            Absolute residual threshold for registration outliers.
+            Absolute residual threshold in effective registration sampling bins.
         max_registration_shift_zyx
-            Maximum accepted registration correction in ZYX voxels.
+            Maximum accepted registration correction in ZYX voxels. None
+            infers a separate limit for each pair from stage spacing, tile
+            overlap, voxel size, scan angle, and registration sampling.
         reverse_stage_y
             Whether to reverse stage-derived image-Y placement. Tile pixel
             arrays are not modified.
@@ -869,6 +1320,9 @@ class TileFusion:
         roi_selection
             Optional physical YX crop. Tile selection ignores Z so every stage-Z
             level intersecting the rectangle is retained.
+        normalize_depth_intensity
+            Match depth-layer intensities using image-registered overlaps at
+            the same stage XY. All XY tiles at one depth share the same gain.
 
         Returns
         -------
@@ -906,10 +1360,7 @@ class TileFusion:
             processing_state_path(self.output_dir, self.acquisition_name)
         )
         self.processing_state.run(self.data)
-        recorded_source = self.processing_state.document["source"].get("path")
-        if not isinstance(recorded_source, str) or not recorded_source:
-            raise ValueError("Processing state lacks a source acquisition path")
-        state_source_path = Path(recorded_source).expanduser().resolve()
+        state_source_path = Path(self.processing_state.document["source"]["path"])
         if source_path is not None and source_path != state_source_path:
             raise ValueError(
                 "Processing state source does not match the fusion acquisition"
@@ -925,21 +1376,9 @@ class TileFusion:
             for array in collection.arrays
         ]
         self.position_arrays = tuple(future.result() for future in source_open_futures)
-        input_dtypes = {
-            np.dtype(array.dtype.numpy_dtype) for array in self.position_arrays
-        }
-        if len(input_dtypes) != 1:
-            raise ValueError("All fusion input tiles must use the same dtype")
-        self.output_dtype = input_dtypes.pop()
-        if self.output_dtype not in (np.dtype(np.uint16), np.dtype(np.float32)):
-            raise ValueError(
-                f"Fusion input must be uint16 or float32; received {self.output_dtype}"
-            )
-        try:
-            input_chunks = self.position_arrays[0].chunk_layout.read_chunk.shape
-            self._input_chunk_zyx = tuple(int(value) for value in input_chunks[-3:])
-        except (AttributeError, TypeError):
-            self._input_chunk_zyx = tuple(int(value) for value in collection.shape[-3:])
+        self.output_dtype = np.dtype(self.position_arrays[0].dtype.numpy_dtype)
+        input_chunks = self.position_arrays[0].chunk_layout.read_chunk.shape
+        self._input_chunk_zyx = tuple(int(value) for value in input_chunks[-3:])
         roi_series = self.processing_state.roi_series(self.data)
         self._variable_roi_tiles = bool(roi_series)
         self.reverse_stage_y = bool(reverse_stage_y)
@@ -950,10 +1389,6 @@ class TileFusion:
         self.roi_selection = roi_selection
         if self._variable_roi_tiles:
             records = roi_series
-            if len(records) != len(self.position_arrays):
-                raise ValueError(
-                    "ROI state must contain one source record per image series"
-                )
             time_count = max(int(record["time_index"]) for record in records) + 1
             self._tile_positions = []
             self._tile_shapes = []
@@ -961,64 +1396,27 @@ class TileFusion:
             self._tile_source_position_indices = []
             self._roi_tile_records = tuple(records)
             tiles_by_time: list[list[int]] = [[] for _ in range(time_count)]
-            channel_counts: set[int] = set()
             for tile_index, (record, array, origin) in enumerate(
                 zip(
                     records,
                     self.position_arrays,
                     collection.spatial_origins_zyx_um,
+                    strict=False,
                 )
             ):
-                try:
-                    time_index = int(record["time_index"])
-                    position_index = int(record["position_index"])
-                except (KeyError, TypeError, ValueError) as error:
-                    raise ValueError(
-                        f"Invalid variable ROI tile record {tile_index}"
-                    ) from error
-                if len(origin) != 3 or not 0 <= time_index < time_count:
-                    raise ValueError(
-                        f"Invalid origin or time index for ROI tile {tile_index}"
-                    )
-                recorded_origin = record.get("origin_zyx_um")
-                if recorded_origin is not None:
-                    try:
-                        initial_origin = tuple(float(value) for value in recorded_origin)
-                    except (TypeError, ValueError) as error:
-                        raise ValueError(
-                            f"Invalid cropped origin for ROI tile {tile_index}"
-                        ) from error
-                    if len(initial_origin) != 3 or not np.allclose(
-                        initial_origin,
-                        origin,
-                        rtol=0.0,
-                        atol=1e-6,
-                    ):
-                        raise ValueError(
-                            "ROI processing state and OME-NGFF metadata disagree "
-                            f"on the cropped origin for tile {tile_index}"
-                        )
-                else:
-                    initial_origin = tuple(float(value) for value in origin)
+                time_index = int(record["time_index"])
+                position_index = int(record["position_index"])
+                initial_origin = tuple(float(value) for value in origin)
                 array_shape = tuple(int(value) for value in array.shape)
-                if len(array_shape) != 5 or array_shape[0] != 1:
-                    raise ValueError(
-                        "Each variable ROI tile must have TCZYX shape with T=1"
-                    )
                 self._tile_positions.append(initial_origin)
                 self._tile_shapes.append(array_shape[-3:])
                 self._tile_time_indices.append(time_index)
                 self._tile_source_position_indices.append(position_index)
                 tiles_by_time[time_index].append(tile_index)
-                channel_counts.add(array_shape[1])
-            if len(channel_counts) != 1:
-                raise ValueError("All variable ROI tiles must have the same channels")
-            if not any(tiles_by_time):
-                raise ValueError("Variable ROI collection contains no tiles")
             self._tiles_by_time = tuple(tuple(group) for group in tiles_by_time)
             self.time_dim = time_count
             self.position_dim = max(len(group) for group in tiles_by_time)
-            self.channels = channel_counts.pop()
+            self.channels = int(self.position_arrays[0].shape[1])
             self.z_dim = max(shape[0] for shape in self._tile_shapes)
             self.y_dim = max(shape[1] for shape in self._tile_shapes)
             self.x_dim = max(shape[2] for shape in self._tile_shapes)
@@ -1031,8 +1429,6 @@ class TileFusion:
             self._reuse_registered_roi_placements = False
         else:
             collection_shape = collection.shape
-            if len(collection.stage_positions_zxy) != collection_shape[1]:
-                raise ValueError("Processed OME-XML lacks one stage label per position")
             stage_positions = [
                 position
                 for _ in range(collection_shape[0])
@@ -1049,64 +1445,20 @@ class TileFusion:
             ]
             selected_positions: tuple[int, ...] = tuple(range(collection_shape[1]))
             if roi_selection is not None:
-                if roi_selection.position_indices is not None:
-                    selected_positions = tuple(
-                        index
-                        for index in roi_selection.position_indices
-                        if index < collection_shape[1]
-                    )
-                else:
-                    footprints = [
-                        {
-                            "position_index": index,
-                            "bounds_yx_um": [
-                                float(position[-2]),
-                                float(
-                                    position[-2]
-                                    + collection_shape[-2] * self._pixel_size[-2]
-                                ),
-                                float(position[-1]),
-                                float(
-                                    position[-1]
-                                    + collection_shape[-1] * self._pixel_size[-1]
-                                ),
-                            ],
-                        }
-                        for index, position in enumerate(
-                            self._tile_positions[: collection_shape[1]]
-                        )
-                    ]
-                    selected_positions = intersecting_position_indices(
-                        roi_selection.bounds_yx_um,
-                        footprints,
-                    )
+                selected_positions = roi_selection.position_indices
                 if not selected_positions:
                     raise ValueError(
                         "The ROI does not intersect any processed positions"
                     )
-                original_position_count = int(collection_shape[1])
                 self.position_arrays = tuple(
                     self.position_arrays[index] for index in selected_positions
                 )
-                base_positions = self._tile_positions[:original_position_count]
-                nominal_positions = [
-                    base_positions[index]
-                    for _ in range(int(collection_shape[0]))
-                    for index in selected_positions
-                ]
-                registered_positions = [
+                self._tile_positions = [
                     roi_selection.registered_tile_origin_zyx_um(time_index, index)
                     for time_index in range(int(collection_shape[0]))
                     for index in selected_positions
                 ]
-                self._reuse_registered_roi_placements = all(
-                    position is not None for position in registered_positions
-                )
-                self._tile_positions = (
-                    [tuple(position) for position in registered_positions]
-                    if self._reuse_registered_roi_placements
-                    else nominal_positions
-                )
+                self._reuse_registered_roi_placements = True
             else:
                 self._reuse_registered_roi_placements = False
             self._source_position_indices = selected_positions
@@ -1158,6 +1510,11 @@ class TileFusion:
         self._debug = bool(debug)
         self._blend_pixels = tuple(int(x) for x in blend_pixels)
         self.channel_to_use = int(channel_to_use)
+        self.normalize_depth_intensity = bool(normalize_depth_intensity)
+        self._depth_intensity_gains = np.ones(
+            (len(self._tile_positions), int(self.channels)), dtype=np.float32
+        )
+        self._depth_intensity_report = None
 
         if multiscale_downsample not in ("stride", "block_mean"):
             raise ValueError('multiscale_downsample must be "stride" or "block_mean".')
@@ -1175,6 +1532,39 @@ class TileFusion:
         self.chunk_y, self.chunk_x = (int(value) for value in chunk_shape_yx)
         self.optimization_rel_threshold = float(optimization_rel_threshold)
         self.optimization_abs_threshold = float(optimization_abs_threshold)
+        self._automatic_registration_limits = max_registration_shift_zyx is None
+        self._pair_registration_limits = {}
+        self._is_2d = all(shape[0] == 1 for shape in self._tile_shapes)
+        if self._automatic_registration_limits:
+            for tile_indices in self._tiles_by_time:
+                local_limits = _infer_registration_limits(
+                    [self._tile_positions[index] for index in tile_indices],
+                    [self._tile_shapes[index] for index in tile_indices],
+                    self._pixel_size,
+                    self.downsample_factors,
+                    self.acquisition.angle_deg,
+                    is_2d=self._is_2d,
+                )
+                self._pair_registration_limits.update(
+                    {
+                        (tile_indices[left], tile_indices[right]): limits
+                        for (left, right), limits in local_limits.items()
+                    }
+                )
+            max_registration_shift_zyx = tuple(
+                max(
+                    (
+                        limits[axis]
+                        for limits in self._pair_registration_limits.values()
+                    ),
+                    default=0,
+                )
+                for axis in range(3)
+            )
+            print(
+                "Automatic registration limits: per-pair geometry; "
+                f"maximum ZYX corrections {max_registration_shift_zyx} pixels."
+            )
         if len(max_registration_shift_zyx) != 3 or any(
             value < 0 for value in max_registration_shift_zyx
         ):
@@ -1184,7 +1574,6 @@ class TileFusion:
         self.max_registration_shift_zyx = tuple(
             int(value) for value in max_registration_shift_zyx
         )
-        self._is_2d = all(shape[0] == 1 for shape in self._tile_shapes)
         if self._variable_roi_tiles:
             self._tile_support_zy = self._build_variable_roi_support_masks()
         else:
@@ -1222,11 +1611,6 @@ class TileFusion:
     def debug(self) -> bool:
         """Get the debug flag.
 
-        Parameters
-        ----------
-        None
-            This callable has no parameters.
-
         Returns
         -------
         debug : bool
@@ -1250,18 +1634,20 @@ class TileFusion:
         self._debug = bool(flag)
 
     def _build_deskew_support_mask(self) -> np.ndarray:
-        """Generate exact deskew support from metadata without reading pixels."""
+        """Generate deskew interpolation coverage without reading image pixels.
+
+        Returns
+        -------
+        np.ndarray
+            Float32 ZY fractions of valid samples in each averaged Z bin.
+            Zero denotes padding; one denotes complete interpolation coverage.
+        """
         if self._is_2d:
             # Projection processing does not deskew or pad its image plane.
-            return np.ones((1, int(self.y_dim)), dtype=bool)
+            return np.ones((1, int(self.y_dim)), dtype=np.float32)
         raw_sizes = self.acquisition.index_sizes
-        try:
-            raw_scan_count = int(raw_sizes["z"])
-            raw_camera_y = int(raw_sizes["y"])
-        except KeyError as error:
-            raise ValueError(
-                "Acquisition metadata must contain raw Z and Y dimensions"
-            ) from error
+        raw_scan_count = int(raw_sizes["z"])
+        raw_camera_y = int(raw_sizes["y"])
         scan_count = (
             raw_scan_count
             - int(
@@ -1270,120 +1656,79 @@ class TileFusion:
             )
             - int(self.acquisition.excess_scan_end_positions)
         )
-        if scan_count < 2 or raw_camera_y < 2:
-            raise ValueError("Acquisition geometry cannot produce a deskew mask")
 
-        try:
-            angle_deg = float(self.acquisition.angle_deg)
-            scan_step_um = float(self.acquisition.scan_axis_step_um)
-            raw_pixel_size_um = float(self.acquisition.pixel_size_um)
-        except (TypeError, ValueError) as error:
-            raise ValueError(
-                "Acquisition metadata lacks the deskew geometry parameters"
-            ) from error
+        angle_deg = float(self.acquisition.angle_deg)
+        scan_step_um = float(self.acquisition.scan_axis_step_um)
+        raw_pixel_size_um = float(self.acquisition.pixel_size_um)
         reconstruction = self.processing_state.run(self.data).get("reconstruction")
         if reconstruction is not None:
             scan_count, raw_camera_y, _ = map(int, reconstruction["shape_syx"])
             scan_step_um = float(reconstruction["scan_axis_step_um"])
-        z_downsample = int(round(float(self._pixel_size[0]) / raw_pixel_size_um))
-        if z_downsample < 1:
-            raise ValueError("Deskew Z downsampling must be positive")
+        z_downsample = round(float(self._pixel_size[0]) / raw_pixel_size_um)
 
-        support = (
-            orthogonal_deskew(
+        support = orthogonal_deskew(
+            np.full(
+                (scan_count, raw_camera_y, 1),
+                1024.0,
+                dtype=np.float32,
+            ),
+            theta=angle_deg,
+            distance=scan_step_um,
+            pixel_size=raw_pixel_size_um,
+            divisible_by=1,
+            downsample_factor=z_downsample,
+        )[..., 0]
+        full_response = 2048 * raw_pixel_size_um / scan_step_um
+        support *= np.float32(z_downsample / full_response)
+        np.rint(support, out=support)
+        support /= np.float32(z_downsample)
+        padded_support = np.zeros(
+            (int(self.z_dim), int(self.y_dim)),
+            dtype=np.float32,
+        )
+        padded_support[:, : support.shape[1]] = support
+        return padded_support
+
+    def _build_variable_roi_support_masks(self) -> list[np.ndarray]:
+        """Build cropped interpolation coverage for every variable ROI tile.
+
+        Returns
+        -------
+        list[np.ndarray]
+            Float32 ZY fractions of valid samples in each averaged Z bin,
+            ordered by cropped tile series.
+        """
+        angle_deg = float(self.acquisition.angle_deg)
+        scan_step_um = float(self.acquisition.scan_axis_step_um)
+        raw_pixel_size_um = float(self.acquisition.pixel_size_um)
+        z_downsample = round(float(self._pixel_size[0]) / raw_pixel_size_um)
+
+        masks: list[np.ndarray] = []
+        for record in self._roi_tile_records:
+            scan_count, camera_y, _camera_x = map(int, record["skewed_shape_syx"])
+            crop_y0, crop_y1, _crop_x0, _crop_x1 = map(int, record["deskew_crop_yx"])
+            support = orthogonal_deskew(
                 np.full(
-                    (scan_count, raw_camera_y, 1),
+                    (scan_count, camera_y, 1),
                     1024.0,
                     dtype=np.float32,
                 ),
                 theta=angle_deg,
                 distance=scan_step_um,
                 pixel_size=raw_pixel_size_um,
-                divisible_by=1,
+                divisible_by=4,
                 downsample_factor=z_downsample,
             )[..., 0]
-            != 0
-        )
-        if self._is_2d:
-            support = np.any(support, axis=0, keepdims=True)
-        if int(support.shape[0]) != int(self.z_dim):
-            raise ValueError(
-                "Metadata-derived deskew support Z does not match processed data: "
-                f"{support.shape[0]} != {self.z_dim}"
-            )
-        if int(support.shape[1]) > int(self.y_dim):
-            raise ValueError(
-                "Metadata-derived deskew support Y exceeds processed data: "
-                f"{support.shape[1]} > {self.y_dim}"
-            )
-        padded_support = np.zeros(
-            (int(self.z_dim), int(self.y_dim)),
-            dtype=bool,
-        )
-        padded_support[:, : support.shape[1]] = support
-        return padded_support
-
-    def _build_variable_roi_support_masks(self) -> list[np.ndarray]:
-        """Build the cropped deskew-validity mask for every variable ROI tile."""
-        try:
-            angle_deg = float(self.acquisition.angle_deg)
-            scan_step_um = float(self.acquisition.scan_axis_step_um)
-            raw_pixel_size_um = float(self.acquisition.pixel_size_um)
-        except (TypeError, ValueError) as error:
-            raise ValueError(
-                "Acquisition metadata lacks the deskew geometry parameters"
-            ) from error
-        z_downsample = int(round(float(self._pixel_size[0]) / raw_pixel_size_um))
-        if z_downsample < 1:
-            raise ValueError("Deskew Z downsampling must be positive")
-
-        masks: list[np.ndarray] = []
-        for tile_index, (record, tile_shape) in enumerate(
-            zip(self._roi_tile_records, self._tile_shapes)
-        ):
-            try:
-                scan_count, camera_y, _camera_x = (
-                    int(value) for value in record["skewed_shape_syx"]
-                )
-                crop_y0, crop_y1, _crop_x0, _crop_x1 = (
-                    int(value) for value in record["deskew_crop_yx"]
-                )
-            except (KeyError, TypeError, ValueError) as error:
-                raise ValueError(
-                    f"ROI tile {tile_index} lacks crop geometry metadata"
-                ) from error
-            support = (
-                orthogonal_deskew(
-                    np.full(
-                        (scan_count, camera_y, 1),
-                        1024.0,
-                        dtype=np.float32,
-                    ),
-                    theta=angle_deg,
-                    distance=scan_step_um,
-                    pixel_size=raw_pixel_size_um,
-                    divisible_by=4,
-                    downsample_factor=z_downsample,
-                )[..., 0]
-                != 0
-            )
+            full_response = 2048 * raw_pixel_size_um / scan_step_um
+            support *= np.float32(z_downsample / full_response)
+            np.rint(support, out=support)
+            support /= np.float32(z_downsample)
             support = support[:, crop_y0:crop_y1]
-            expected_shape = (int(tile_shape[0]), int(tile_shape[1]))
-            if tuple(support.shape) != expected_shape:
-                raise ValueError(
-                    f"ROI tile {tile_index} support shape {support.shape} does not "
-                    f"match tile ZY shape {expected_shape}"
-                )
             masks.append(np.ascontiguousarray(support))
         return masks
 
     def _update_profiles(self) -> None:
         """Recompute 1D feather profiles from blend_pixels and current data shape.
-
-        Parameters
-        ----------
-        None
-            This callable has no parameters.
 
         Returns
         -------
@@ -1398,7 +1743,13 @@ class TileFusion:
     def _load_zero_channel_metadata(self) -> None:
         """Load completed and zero-channel decisions from processing state."""
         completed = self.processing_state.completed_tiles(self.data)
-        expected = set(zip(self._tile_time_indices, self._tile_source_position_indices))
+        expected = set(
+            zip(
+                self._tile_time_indices,
+                self._tile_source_position_indices,
+                strict=False,
+            )
+        )
         missing = expected - completed
         if missing:
             raise ValueError(
@@ -1407,7 +1758,11 @@ class TileFusion:
             )
         zero_keys = self.processing_state.zero_channels(self.data)
         for tile_index, (time_index, position_index) in enumerate(
-            zip(self._tile_time_indices, self._tile_source_position_indices)
+            zip(
+                self._tile_time_indices,
+                self._tile_source_position_indices,
+                strict=False,
+            )
         ):
             for channel_index in range(int(self.channels)):
                 key = (int(time_index), int(position_index), channel_index)
@@ -1421,7 +1776,20 @@ class TileFusion:
             )
 
     def _channel_has_signal(self, tile_index: int, channel_index: int) -> bool:
-        """Return processing's durable tile/channel signal decision."""
+        """Return processing's durable tile/channel signal decision.
+
+        Parameters
+        ----------
+        tile_index : int
+            Index into the selected processed tile collection.
+        channel_index : int
+            Acquisition channel index.
+
+        Returns
+        -------
+        bool
+            True unless this tile/channel was checkpointed as empty during processing.
+        """
         return self._tile_channel_nonzero[(tile_index, channel_index)]
 
     @staticmethod
@@ -1441,17 +1809,9 @@ class TileFusion:
             Float32 array of shape (length,). Values are in (0, 1] with
             pixel-centered ramped edges; for very small `length` (<= 2) or
             `blend` <= 0, returns ones.
-
-        Raises
-        ------
-        ValueError
-            If `length` <= 0.
         """
         length = int(length)
         blend = int(blend)
-
-        if length <= 0:
-            raise ValueError(f"length must be > 0, got {length}")
 
         if length <= 2 or blend <= 0:
             return np.ones(length, dtype=np.float32)
@@ -1506,32 +1866,14 @@ class TileFusion:
             Float32 array in channel-first form:
             - 3D: (Z, Y, X) for int channel, or (C, Z, Y, X) for slice channels.
             - 2D: normalized to (C, 1, Y, X).
-
-        Raises
-        ------
-        ValueError
-            If `tile_idx` is negative or read rank is unexpected.
-        IndexError
-            If `tile_idx` maps to a timepoint >= time_dim.
         """
-        if tile_idx < 0:
-            raise ValueError(f"tile_idx must be >= 0, got {tile_idx}")
         if getattr(self, "_variable_roi_tiles", False):
-            if tile_idx >= len(self.position_arrays):
-                raise IndexError(
-                    f"tile_idx={tile_idx} exceeds {len(self.position_arrays)} ROI tiles"
-                )
             t_idx = 0
             pos_idx = tile_idx
         else:
             n_pos = int(self.position_dim)
             t_idx = tile_idx // n_pos
             pos_idx = tile_idx % n_pos
-            if t_idx >= int(self.time_dim):
-                raise IndexError(
-                    f"tile_idx={tile_idx} maps to t_idx={t_idx}, "
-                    f"but time_dim={self.time_dim}"
-                )
 
         if self._is_2d:
             arr = (
@@ -1539,14 +1881,7 @@ class TileFusion:
                 .read()
                 .result()
             )
-            if arr.ndim == 2:
-                arr = arr[None, None, :, :]
-            elif arr.ndim == 3:
-                arr = arr[:, None, :, :]
-            else:
-                raise ValueError(
-                    f"Unexpected 2D tile ndim={arr.ndim}, shape={arr.shape}"
-                )
+            arr = arr.reshape((-1, 1, *arr.shape[-2:]))
             return arr if dtype is None else arr.astype(dtype, copy=False)
 
         arr = (
@@ -1562,14 +1897,38 @@ class TileFusion:
         channel_index: int,
         bounds_zyx: tuple[tuple[int, int], tuple[int, int], tuple[int, int]],
     ) -> np.ndarray:
-        """Read one overlap through TensorStore's shared native chunk cache."""
-        return self._read_tile_volume(
+        """Read one overlap through TensorStore's shared native chunk cache.
+
+        Parameters
+        ----------
+        tile_idx : int
+            Index into the selected processed tile collection.
+        channel_index : int
+            Acquisition channel index.
+        bounds_zyx : tuple[tuple[int, int], tuple[int, int], tuple[int, int]]
+            Half-open tile-local registration bounds in ZYX pixels.
+
+        Returns
+        -------
+        np.ndarray
+            Tile-local ZYX overlap patch with incomplete Z bins normalized by
+            their metadata-derived interpolation coverage.
+        """
+        patch = self._read_tile_volume(
             tile_idx,
             channel_index,
             slice(*bounds_zyx[0]),
             slice(*bounds_zyx[1]),
             slice(*bounds_zyx[2]),
             dtype=None,
+        )
+        return self._scale_depth_source(
+            tile_idx,
+            patch,
+            channel_index,
+            self._tile_support_zy[tile_idx][
+                slice(*bounds_zyx[0]), slice(*bounds_zyx[1])
+            ],
         )
 
     @staticmethod
@@ -1580,14 +1939,16 @@ class TileFusion:
         max_shift: Sequence[float] | None = None,
         allow_bounded_peak: bool = True,
         registration_axis: int | None = None,
+        support_masks: tuple[Any, Any] | None = None,
     ) -> tuple[tuple[float, float, float], float]:
         """Register `g2` to `g1` and compute an SSIM score.
 
         Steps:
         1) histogram-match g2 -> g1
         2) phase cross-correlation to estimate subpixel shift
-        3) shift g2 by that estimate
-        4) compute SSIM between g1 and shifted g2
+        3) align g2 at that fractional estimate, excluding interpolation padding
+        4) compute SSIM on common geometric support; thin depth overlaps
+           without a complete 3D window use XY means of common valid planes
 
         Parameters
         ----------
@@ -1596,7 +1957,8 @@ class TileFusion:
         g2 : array-like
             Moving patch (same shape as g1).
         win_size : int
-            SSIM window size.
+            Maximum SSIM window size. Thin aligned overlaps use the largest
+            odd window that fits, with at least three voxels per axis.
         max_shift : sequence[float] or None
             Maximum permitted shift in downsampled patch coordinates. The
             upstream fully disambiguated result is used when it lies inside
@@ -1609,6 +1971,10 @@ class TileFusion:
             Axis normal to the physical tile boundary. When provided, an
             edge-based phase-correlation candidate is scored alongside the
             intensity candidate to suppress periodic crop-boundary bias.
+        support_masks : tuple of array-like or None, default=None
+            Fixed and moving geometric support masks at registration sampling.
+            Exclude padding and partially supported downsampling blocks from SSIM
+            windows. None treats both patches as fully supported.
 
         Returns
         -------
@@ -1624,25 +1990,46 @@ class TileFusion:
         """
         arr1 = xp.asarray(g1, dtype=xp.float32)
         arr2 = xp.asarray(g2, dtype=xp.float32)
+        masks = (
+            None
+            if support_masks is None
+            else tuple(xp.asarray(mask, dtype=xp.float32) for mask in support_masks)
+        )
 
         while arr1.ndim > 2 and arr1.shape[0] == 1:
             arr1 = arr1[0]
             arr2 = arr2[0]
+            if masks is not None:
+                masks = tuple(mask[0] for mask in masks)
 
         arr2 = match_histograms(arr2, arr1)
         disambiguate = True
         if max_shift is not None:
             limits = xp.asarray(max_shift, dtype=xp.float32)
-            if limits.shape != (arr1.ndim,):
-                raise ValueError(
-                    "maximum shift rank must match registration patch rank"
-                )
             disambiguate = not all(
                 2.0 * float(limit) < float(length)
-                for limit, length in zip(max_shift, arr1.shape)
+                for limit, length in zip(max_shift, arr1.shape, strict=False)
             )
 
         def correlate(fixed: Any, moving: Any) -> Any:
+            """Calculate phase correlation with the selected CPU or CUDA backend.
+
+            Parameters
+            ----------
+            fixed : Any
+                Reference overlap patch used for pairwise registration.
+            moving : Any
+                Neighbor overlap patch to align with the reference.
+
+            Returns
+            -------
+            Any
+                Measured phase-correlation shift in registration pixels.
+            """
+            # CPU disambiguation can move identical, textureless crops to an
+            # equivalent correlation peak. Their measured correction is zero.
+            if not USING_GPU and np.array_equal(fixed, moving):
+                return np.zeros(fixed.ndim, dtype=np.float32)
             shift, _, _ = phase_cross_correlation(
                 fixed,
                 moving,
@@ -1669,21 +2056,94 @@ class TileFusion:
             return result
 
         def score_shift(candidate: Any) -> float:
+            """Evaluate overlap similarity for a candidate registration correction.
+
+            Parameters
+            ----------
+            candidate : Any
+                Candidate ZYX registration correction in pixels.
+
+            Returns
+            -------
+            float
+                Structural similarity of the translated overlapping patches.
+            """
             try:
                 fixed_view, moving_view = _aligned_registration_views(
                     arr1,
                     arr2,
                     candidate,
                 )
-                if min(fixed_view.shape) < win_size:
-                    return -math.inf
-                return _ssim(fixed_view, moving_view, win_size=win_size)
+                valid_mask = None
+                if masks is not None:
+                    fixed_mask, moving_mask = _aligned_registration_views(
+                        *masks, candidate
+                    )
+                    tolerance = 4 * xp.finfo(xp.float32).eps
+                    valid_mask = (fixed_mask >= 1 - tolerance) & (
+                        moving_mask >= 1 - tolerance
+                    )
+                    # Remove completely unsupported edge planes before selecting
+                    # the SSIM window; thin depth overlaps often have one.
+                    bounds = []
+                    for axis in range(valid_mask.ndim):
+                        other_axes = tuple(
+                            index for index in range(valid_mask.ndim) if index != axis
+                        )
+                        supported = xp.flatnonzero(xp.any(valid_mask, axis=other_axes))
+                        if supported.size == 0:
+                            return -math.inf
+                        bounds.append(slice(int(supported[0]), int(supported[-1]) + 1))
+                    bounds = tuple(bounds)
+                    fixed_view = fixed_view[bounds]
+                    moving_view = moving_view[bounds]
+                    valid_mask = valid_mask[bounds]
+                # Stage-depth overlaps can be thinner than the configured
+                # window even without downsampling. Score the valid aligned
+                # support with the largest odd window that fits it.
+                effective_window = min(win_size, min(fixed_view.shape))
+                effective_window -= 1 - effective_window % 2
+                score = -math.inf
+                if effective_window >= 3:
+                    score = _ssim(
+                        fixed_view,
+                        moving_view,
+                        win_size=effective_window,
+                        valid_mask=valid_mask,
+                    )
+                # A thin depth overlap can have many common voxels but no
+                # complete 3D SSIM window. Compare XY means of the same valid
+                # planes instead, preserving geometric support in both views.
+                if (
+                    not math.isfinite(score)
+                    and fixed_view.ndim == 3
+                    and registration_axis == 0
+                    and fixed_view.shape[0] <= win_size + 2
+                ):
+                    weights = (
+                        xp.ones_like(fixed_view) if valid_mask is None else valid_mask
+                    )
+                    count = xp.sum(weights, axis=0)
+                    fixed_view = xp.sum(fixed_view * weights, axis=0) / xp.maximum(
+                        count, 1
+                    )
+                    moving_view = xp.sum(moving_view * weights, axis=0) / xp.maximum(
+                        count, 1
+                    )
+                    window = min(win_size, min(fixed_view.shape))
+                    window -= 1 - window % 2
+                    if window >= 3:
+                        score = _ssim(
+                            fixed_view,
+                            moving_view,
+                            win_size=window,
+                            valid_mask=count > 0,
+                        )
+                return score
             except ValueError:
                 return -math.inf
 
         shift_apply = correlate(arr1, arr2)
-        if max_shift is not None and limits.shape != shift_apply.shape:
-            raise ValueError("maximum shift rank must match registration patch rank")
         if (
             max_shift is not None
             and allow_bounded_peak
@@ -1773,6 +2233,7 @@ class TileFusion:
         th = self.threshold if threshold is None else float(threshold)
 
         self.pairwise_metrics.clear()
+
         def overlap_bounds_1d(
             offset: int,
             fixed_length: int,
@@ -1881,9 +2342,7 @@ class TileFusion:
                     paired_bounds = [
                         overlap_bounds_1d(offset, int(length_i), int(length_j))
                         for offset, length_i, length_j in zip(
-                            (dz, dy, dx),
-                            shape_i,
-                            shape_j,
+                            (dz, dy, dx), shape_i, shape_j, strict=False
                         )
                     ]
                     bounds_i = [bounds[0] for bounds in paired_bounds]
@@ -1891,10 +2350,14 @@ class TileFusion:
                     if any(hi <= lo for lo, hi in bounds_i):
                         continue
                     overlap_shape = tuple(hi - lo for lo, hi in bounds_i)
-                    df_zyx_eff = [
-                        max(1, min(factor, length))
-                        for factor, length in zip(df_zyx_base, overlap_shape)
-                    ]
+                    active_shape = overlap_shape[1:] if self._is_2d else overlap_shape
+                    if min(active_shape) < 3:
+                        continue
+                    df_zyx_eff = list(
+                        _registration_sampling(
+                            overlap_shape, df_zyx_base, sw, self._is_2d
+                        )
+                    )
                     thin_z_overlap = (
                         not self._is_2d and overlap_shape[0] // df_zyx_base[0] < sw
                     )
@@ -1959,24 +2422,28 @@ class TileFusion:
                 pending_read_bytes = 0
 
                 def fill_read_ahead() -> None:
+                    """Schedule overlap reads until the bounded prefetch queue is full.
+
+                    The queue is consumed completely before the timepoint loop advances.
+                    """
                     nonlocal deferred_spec, pending_read_bytes
-                    while len(pending_reads) < read_ahead_pairs:
+                    while len(pending_reads) < read_ahead_pairs:  # noqa: B023
                         if deferred_spec is not None:
                             spec = deferred_spec
                             deferred_spec = None
                         else:
                             try:
-                                spec = next(spec_iterator)
+                                spec = next(spec_iterator)  # noqa: B023
                             except StopIteration:
                                 return
                         _, _, i, j, bounds_i, bounds_j, _, _, _, pair_bytes = spec
                         if (
-                            pending_reads
-                            and pending_read_bytes + pair_bytes > read_ahead_budget
+                            pending_reads  # noqa: B023
+                            and pending_read_bytes + pair_bytes > read_ahead_budget  # noqa: B023
                         ):
                             deferred_spec = spec
                             return
-                        pending_reads.append(
+                        pending_reads.append(  # noqa: B023
                             (
                                 spec,
                                 executor.submit(
@@ -2013,8 +2480,8 @@ class TileFusion:
                         j_pos,
                         i,
                         j,
-                        _,
-                        _,
+                        bounds_i,
+                        bounds_j,
                         df_zyx_eff,
                         thin_z_overlap,
                         registration_axis,
@@ -2047,8 +2514,29 @@ class TileFusion:
                         block_size=reduce_block,
                         func=xp.mean,
                     )
+                    support_masks = []
+                    for tile, bounds in ((i, bounds_i), (j, bounds_j)):
+                        support = (
+                            self._tile_support_zy[tile][
+                                slice(*bounds[0]), slice(*bounds[1])
+                            ]
+                            > 0
+                        )
+                        support = block_reduce(
+                            xp.asarray(support),
+                            block_size=df_zyx_eff[:2],
+                            func=xp.min,
+                        )
+                        if self._is_2d:
+                            support = support[0]
+                        support = xp.broadcast_to(support[..., None], g1.shape).copy()
+                        if (bounds[2][1] - bounds[2][0]) % df_zyx_eff[2]:
+                            support[..., -1] = False
+                        support_masks.append(support)
 
-                    max_shift = self.max_registration_shift_zyx
+                    max_shift = getattr(self, "_pair_registration_limits", {}).get(
+                        (i, j), self.max_registration_shift_zyx
+                    )
                     if self._is_2d:
                         max_shift_ds = (
                             max_shift[1] / df_zyx_eff[1],
@@ -2057,7 +2545,9 @@ class TileFusion:
                     else:
                         max_shift_ds = tuple(
                             limit / factor
-                            for limit, factor in zip(max_shift, df_zyx_eff)
+                            for limit, factor in zip(
+                                max_shift, df_zyx_eff, strict=False
+                            )
                         )
                     shift_ds, score = self.register_and_score(
                         g1,
@@ -2066,6 +2556,7 @@ class TileFusion:
                         max_shift=max_shift_ds,
                         allow_bounded_peak=not thin_z_overlap,
                         registration_axis=registration_axis,
+                        support_masks=tuple(support_masks),
                     )
                     progress.update()
                     shift_ds_array = np.asarray(shift_ds, dtype=np.float64)
@@ -2112,13 +2603,12 @@ class TileFusion:
                 progress.close()
                 if rejected_shifts:
                     largest = tuple(
-                        int(value)
-                        for value in np.max(np.abs(rejected_shifts), axis=0)
+                        int(value) for value in np.max(np.abs(rejected_shifts), axis=0)
                     )
                     print(
                         f"Registration warning: {len(rejected_shifts)} pairs at "
                         f"time index {t} exceeded the ZYX shift limits "
-                        f"{self.max_registration_shift_zyx} pixels; largest "
+                        f"(maximum envelope {self.max_registration_shift_zyx} pixels); largest "
                         f"measured absolute corrections were {largest}. "
                         "Check --max-registration-shift-zyx if tiles remain misaligned."
                     )
@@ -2180,7 +2670,7 @@ class TileFusion:
                 i = int(link["i"])
                 j = int(link["j"])
                 t = float(link["t"][axis])
-                w = float(link["w"])
+                w = float(link["w"]) / float(link.get("sampling", (1, 1, 1))[axis])
                 a[row, j] = w
                 a[row, i] = -w
                 b[row] = w * t
@@ -2204,8 +2694,8 @@ class TileFusion:
         rel_thresh: float,
         abs_thresh: float,
         iterative: bool,
-    ) -> np.ndarray:
-        """Perform robust two-round (optionally iterative) optimization.
+    ) -> tuple[np.ndarray, list[dict[str, Any]]]:
+        """Reject inconsistent cycle edges without disconnecting registered tiles.
 
         Parameters
         ----------
@@ -2218,14 +2708,14 @@ class TileFusion:
         rel_thresh : float
             Relative threshold multiplier against median residual.
         abs_thresh : float
-            Absolute residual threshold (voxels).
+            Absolute residual threshold in effective registration sampling bins.
         iterative : bool
             If True, repeats outlier rejection until convergence.
 
         Returns
         -------
-        shifts : numpy.ndarray
-            Array of shape (n_tiles, 3) containing optimized shifts.
+        tuple
+            Optimized shifts and the registration links retained by the solve.
         """
         shifts = self._solve_global(links, n_tiles, fixed_indices)
 
@@ -2235,18 +2725,21 @@ class TileFusion:
             Parameters
             ----------
             ls : list[dict[str, Any]]
-                Value supplied for ``ls``.
+                Pairwise links containing tile indices, translations, and sampling.
             sh : np.ndarray
-                Value supplied for ``sh``.
+                Current per-tile ZYX corrections in pixels.
 
             Returns
             -------
             np.ndarray
-                Result produced by the callable.
+                Per-link residual lengths in registration sampling units.
             """
             return np.array(
                 [
-                    np.linalg.norm(sh[link["j"]] - sh[link["i"]] - link["t"])
+                    np.linalg.norm(
+                        (sh[link["j"]] - sh[link["i"]] - link["t"])
+                        / np.asarray(link.get("sampling", (1, 1, 1)))
+                    )
                     for link in ls
                 ],
                 dtype=np.float64,
@@ -2255,26 +2748,72 @@ class TileFusion:
         work = links.copy()
         res = residuals(work, shifts)
         if len(res) == 0:
-            return shifts
+            return shifts, work
         cutoff = max(abs_thresh, rel_thresh * float(np.median(res)))
         outliers = set(np.where(res > cutoff)[0])
 
-        if iterative:
-            while outliers:
-                for index in sorted(outliers, reverse=True):
-                    work.pop(index)
-                shifts = self._solve_global(work, n_tiles, fixed_indices)
+        def can_remove(index: int) -> bool:
+            # A bridge is the sole measured placement between its two groups.
+            # Reject only redundant cycle edges, keeping every group anchored.
+            """Check whether rejecting one registration link preserves connectivity.
+
+            Parameters
+            ----------
+            index : int
+                Tile or registration-link index used by this calculation.
+
+            Returns
+            -------
+            bool
+                True when removing the link preserves its tile component.
+            """
+            adjacency = [set() for _ in range(n_tiles)]
+            for edge_index, link in enumerate(work):
+                if edge_index != index:
+                    adjacency[link["i"]].add(link["j"])
+                    adjacency[link["j"]].add(link["i"])
+            target = work[index]["j"]
+            visited = {work[index]["i"]}
+            frontier = list(visited)
+            while frontier:
+                node = frontier.pop()
+                if node == target:
+                    return True
+                unseen = adjacency[node] - visited
+                visited.update(unseen)
+                frontier.extend(unseen)
+            return False
+
+        while outliers:
+            removable = next(
+                (
+                    index
+                    for index in sorted(
+                        outliers, key=lambda index: res[index], reverse=True
+                    )
+                    if can_remove(index)
+                ),
+                None,
+            )
+            if removable is None:
+                break
+            work.pop(removable)
+            # Refit after every rejection. Bulk removal can discard all
+            # parallel depth links whose residuals came from the same cycle.
+            shifts = self._solve_global(work, n_tiles, fixed_indices)
+            if iterative:
                 res = residuals(work, shifts)
-                if len(res) == 0:
-                    break
                 cutoff = max(abs_thresh, rel_thresh * float(np.median(res)))
                 outliers = set(np.where(res > cutoff)[0])
-        else:
-            for index in sorted(outliers, reverse=True):
-                work.pop(index)
-            shifts = self._solve_global(work, n_tiles, fixed_indices)
+            else:
+                res = np.delete(res, removable)
+                outliers = {
+                    index - (index > removable)
+                    for index in outliers
+                    if index != removable
+                }
 
-        return shifts
+        return shifts, work
 
     def optimize_shifts(
         self,
@@ -2294,7 +2833,7 @@ class TileFusion:
         rel_thresh : float, default=0.5
             Relative outlier cutoff (multiplier of median residual).
         abs_thresh : float, default=1.5
-            Absolute outlier cutoff (voxels).
+            Absolute outlier cutoff in effective registration sampling bins.
 
         Returns
         -------
@@ -2310,8 +2849,40 @@ class TileFusion:
         n_tiles_total = len(self._tile_positions)
 
         self.global_offsets = np.zeros((n_tiles_total, 3), dtype=np.float64)
+        self.optimized_pairwise_metrics = {}
         if not self.pairwise_metrics:
             return
+
+        def pair_sampling(i: int, j: int) -> tuple[int, int, int]:
+            """Read effective registration sampling for a tile pair.
+
+            Parameters
+            ----------
+            i
+                First tile index in the registration pair.
+            j
+                Second tile index in the registration pair.
+
+            Returns
+            -------
+            array or scalar
+                Effective per-axis sampling of the registration pair.
+            """
+            if not hasattr(self, "_tile_shapes"):
+                return (1, 1, 1)
+            offset = np.rint(
+                (np.asarray(self._tile_positions[j]) - self._tile_positions[i])
+                / self._pixel_size
+            ).astype(int)
+            overlap = tuple(
+                min(length_i, delta + length_j) - max(0, delta)
+                for delta, length_i, length_j in zip(
+                    offset, self._tile_shapes[i], self._tile_shapes[j], strict=False
+                )
+            )
+            return _registration_sampling(
+                overlap, self.downsample_factors, self.ssim_window, self._is_2d
+            )
 
         links_all: list[dict[str, Any]] = [
             {
@@ -2319,6 +2890,7 @@ class TileFusion:
                 "j": int(j),
                 "t": np.array(v[:3], dtype=np.float64),
                 "w": float(np.sqrt(v[3])),
+                "sampling": pair_sampling(i, j),
             }
             for (i, j), v in self.pairwise_metrics.items()
         ]
@@ -2349,6 +2921,7 @@ class TileFusion:
                             "j": global_to_local[j],
                             "t": link["t"],
                             "w": link["w"],
+                            "sampling": link["sampling"],
                         }
                     )
 
@@ -2376,8 +2949,9 @@ class TileFusion:
                     frontier.extend(unseen)
             if mode == "ONE_ROUND":
                 d_opt = self._solve_global(local_links, n_pos, fixed)
+                retained_links = local_links
             else:
-                d_opt = self._two_round_opt(
+                d_opt, retained_links = self._two_round_opt(
                     local_links,
                     n_pos,
                     fixed,
@@ -2387,19 +2961,255 @@ class TileFusion:
                 )
 
             self.global_offsets[list(tile_indices), :] = d_opt
+            for link in retained_links:
+                pair = (tile_indices[link["i"]], tile_indices[link["j"]])
+                self.optimized_pairwise_metrics[pair] = self.pairwise_metrics[pair]
+
+    def estimate_depth_intensity_gains(self) -> None:
+        """Estimate channel gains shared by all XY tiles at each depth.
+
+        Sample registered overlaps only between distinct depths acquired at
+        the same XY stage position. Fit robust log intensity ratios separately
+        for each channel and time point, anchoring the first connected depth.
+        Store gains and provenance for fusion without modifying source tiles.
+        Planar acquisitions and acquisitions with one depth retain unit gains.
+
+        Returns
+        -------
+        None
+            Gains and provenance are stored on this instance.
+        """
+        raw_positions = np.asarray(self.acquisition.stage_positions_zxy)
+        source_levels = stage_z_level_indices(raw_positions)
+        levels = source_levels[np.asarray(self._tile_source_position_indices)]
+        level_count = int(source_levels.max()) + 1
+        if self._is_2d or level_count < 2:
+            return
+        observations = {}
+        depth_links = [
+            (i, j, value)
+            for (i, j), value in getattr(self, "optimized_pairwise_metrics", {}).items()
+            if levels[i] != levels[j]
+            and np.allclose(
+                raw_positions[self._tile_source_position_indices[i], 1:],
+                raw_positions[self._tile_source_position_indices[j], 1:],
+                atol=0.001,
+                rtol=0,
+            )
+            and not np.isclose(
+                raw_positions[self._tile_source_position_indices[i], 0],
+                raw_positions[self._tile_source_position_indices[j], 0],
+                atol=0.001,
+                rtol=0,
+            )
+        ]
+        for i, j, value in tqdm(
+            depth_links, desc="match depth intensities", unit="pair"
+        ):
+            # Pairwise image alignment identifies corresponding specimen pixels.
+            # Use it before applying the optimized global placements.
+            offset = np.rint(
+                (np.asarray(self._tile_positions[j]) - self._tile_positions[i])
+                / self._pixel_size
+            ).astype(int) + np.asarray(value[:3], dtype=int)
+            bounds = [
+                (max(0, delta), min(length_i, delta + length_j))
+                for delta, length_i, length_j in zip(
+                    offset, self._tile_shapes[i], self._tile_shapes[j], strict=False
+                )
+            ]
+            if any(hi - lo < 4 for lo, hi in bounds):
+                continue
+            for fraction in (0.2, 0.5, 0.8):
+                patch_bounds = []
+                for axis, (lo, hi) in enumerate(bounds):
+                    length = min(hi - lo, 32 if axis == 0 else 256)
+                    if axis > 0:
+                        length -= length % 4
+                    start = lo + round(fraction * (hi - lo - length))
+                    patch_bounds.append((start, start + length))
+                moving_bounds = [
+                    (lo - delta, hi - delta)
+                    for (lo, hi), delta in zip(patch_bounds, offset, strict=False)
+                ]
+                fixed_slices = tuple(slice(lo, hi) for lo, hi in patch_bounds)
+                moving_slices = tuple(slice(lo, hi) for lo, hi in moving_bounds)
+                fixed = self._read_tile_volume(i, slice(None), *fixed_slices)
+                moving = self._read_tile_volume(j, slice(None), *moving_slices)
+                fixed_coverage = self._tile_support_zy[i][fixed_slices[:2]]
+                moving_coverage = self._tile_support_zy[j][moving_slices[:2]]
+                np.divide(
+                    fixed,
+                    fixed_coverage[None, :, :, None],
+                    out=fixed,
+                    where=fixed_coverage[None, :, :, None] > 0,
+                )
+                np.divide(
+                    moving,
+                    moving_coverage[None, :, :, None],
+                    out=moving,
+                    where=moving_coverage[None, :, :, None] > 0,
+                )
+                support = (fixed_coverage > 0) & (moving_coverage > 0)
+                channels, depth, height, width = fixed.shape
+                fixed = fixed.reshape(
+                    channels, depth, height // 4, 4, width // 4, 4
+                ).mean(axis=(3, 5))
+                moving = moving.reshape(
+                    channels, depth, height // 4, 4, width // 4, 4
+                ).mean(axis=(3, 5))
+                support = support.reshape(depth, height // 4, 4).all(axis=2)[:, :, None]
+                for channel in range(int(self.channels)):
+                    if not self._channel_has_signal(
+                        i, channel
+                    ) or not self._channel_has_signal(j, channel):
+                        continue
+                    a, b = fixed[channel], moving[channel]
+                    valid = (
+                        support & np.isfinite(a) & np.isfinite(b) & (a > 0) & (b > 0)
+                    )
+                    if np.count_nonzero(valid) < 64:
+                        continue
+                    signal = a + b
+                    valid &= signal >= np.median(signal[valid])
+                    log_ratio = float(np.median(np.log(a[valid]) - np.log(b[valid])))
+                    if math.isfinite(log_ratio):
+                        key = (int(self._tile_time_indices[i]), channel)
+                        observations.setdefault(key, []).append(
+                            (int(levels[i]), int(levels[j]), log_ratio)
+                        )
+        records = []
+        for (time, channel), measurements in sorted(observations.items()):
+            gains = _fit_depth_gains(level_count, measurements)
+            for tile, (tile_time, level) in enumerate(
+                zip(self._tile_time_indices, levels, strict=False)
+            ):
+                if tile_time == time:
+                    self._depth_intensity_gains[tile, channel] = gains[level]
+            records.append(
+                {
+                    "time_index": time,
+                    "channel_index": channel,
+                    "depth_gains": gains.tolist(),
+                    "overlap_samples": len(measurements),
+                }
+            )
+            print(
+                f"Depth intensity gains t={time}, c={channel}: {np.round(gains, 3).tolist()}"
+            )
+        self._depth_intensity_report = {
+            "enabled": True,
+            "method": "same-XY-registered-overlaps-robust-depth-log-gains-v1",
+            "anchor": "first depth in each connected depth component",
+            "tile_depth_indices": levels.tolist(),
+            "channels": records,
+        }
+
+    def _scale_depth_source(
+        self,
+        tile: int,
+        source: np.ndarray,
+        channel: int | None = None,
+        coverage_zy: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Apply depth gains and normalize incomplete interpolation bins.
+
+        Parameters
+        ----------
+        tile : int
+            Source tile index.
+        source : numpy.ndarray
+            Source intensities in CZYX order, or ZYX for one selected channel.
+        channel : int | None
+            Selected channel index for a ZYX source, or None for all channels.
+        coverage_zy : numpy.ndarray | None
+            Valid-sample fractions for the selected ZY rows, or None when
+            geometric normalization is performed by weighted accumulation.
+            Divide partially filled bins by their nonzero coverage. Padding
+            stays unchanged, and fully covered sources retain the fast path.
+
+        Returns
+        -------
+        numpy.ndarray
+            Float32 corrected intensities, or the original block when gains
+            are unit and bins are complete. The input array is never modified.
+        """
+        scaled = source
+        gains = getattr(self, "_depth_intensity_gains", None)
+        if gains is not None:
+            gain = gains[tile] if channel is None else gains[tile, channel]
+            if not np.all(gain == 1):
+                if channel is None:
+                    gain = gain[:, None, None, None]
+                scaled = source.astype(np.float32, copy=False) * gain
+        if coverage_zy is not None and np.any((coverage_zy > 0) & (coverage_zy < 1)):
+            if scaled is source:
+                scaled = source.astype(np.float32, copy=True)
+            coverage = coverage_zy[:, :, None]
+            if channel is None:
+                coverage = coverage[None]
+            np.divide(scaled, coverage, out=scaled, where=coverage > 0)
+        return scaled
+
+    def _cast_fusion_values(self, source: np.ndarray) -> np.ndarray:
+        """Convert fusion intensities to the configured output dtype.
+
+        Parameters
+        ----------
+        source : numpy.ndarray
+            Intensities to write to a fused output block.
+
+        Returns
+        -------
+        numpy.ndarray
+            Float32 intensities or uint16 intensities clipped to its range.
+            Returns the original array when its dtype already matches the output.
+            The input array is never modified.
+        """
+        dtype = getattr(self, "output_dtype", np.dtype(np.uint16))
+        if source.dtype == dtype:
+            return source
+        if dtype == np.dtype(np.float32):
+            return source.astype(np.float32, copy=False)
+        return np.clip(source, 0, np.iinfo(np.uint16).max).astype(np.uint16, copy=False)
 
     def report_registration_connectivity(self) -> None:
-        """Report overlapping tiles left in separate registration components."""
+        """Report overlapping tiles left in separate registration components.
+
+        Inspect the links retained by global optimization independently for
+        each time point and warn when overlapping tiles remain disconnected.
+
+        Returns
+        -------
+        None
+            Connectivity diagnostics are printed without changing placements.
+        """
         for time_index, tile_indices in enumerate(self._tiles_by_time):
             parent = {index: index for index in tile_indices}
 
             def find(index: int) -> int:
-                while parent[index] != index:
-                    parent[index] = parent[parent[index]]
-                    index = parent[index]
+                """Find a tile component representative with path compression.
+
+                This disjoint-set helper is consumed before the component loop advances.
+
+                Parameters
+                ----------
+                index : int
+                    Tile or registration-link index used by this calculation.
+
+                Returns
+                -------
+                int
+                    Representative tile index of the connected component.
+                """
+                while parent[index] != index:  # noqa: B023
+                    parent[index] = parent[parent[index]]  # noqa: B023
+                    index = parent[index]  # noqa: B023
                 return index
 
-            for left, right in self.pairwise_metrics:
+            for left, right in getattr(
+                self, "optimized_pairwise_metrics", self.pairwise_metrics
+            ):
                 if left in parent and right in parent:
                     parent[find(right)] = find(left)
             overlapping = _select_registration_pairs(
@@ -2414,7 +3224,9 @@ class TileFusion:
                 if find(tile_indices[left]) != find(tile_indices[right])
             ]
             if disconnected:
-                components = len({find(index) for pair in disconnected for index in pair})
+                components = len(
+                    {find(index) for pair in disconnected for index in pair}
+                )
                 print(
                     f"Registration warning: overlapping tiles at time index "
                     f"{time_index} remain in {components} disconnected components. "
@@ -2440,9 +3252,7 @@ class TileFusion:
             self.data,
             configuration=self._registration_cache_settings(),
         )
-        raw_metrics = data.get("pairwise_metrics")
-        if not isinstance(raw_metrics, dict):
-            raise ValueError("Processing state contains invalid registration metrics")
+        raw_metrics = data["pairwise_metrics"]
 
         metrics = {}
         invalid_count = self._count_invalid_pairwise_metrics(raw_metrics)
@@ -2469,23 +3279,41 @@ class TileFusion:
         self.pairwise_metrics = metrics
 
     def _registration_cache_settings(self) -> dict[str, Any]:
-        """Return every setting that can change pairwise registration."""
+        """Return every setting that can change pairwise registration.
+
+        Returns
+        -------
+        dict
+            Output-affecting registration settings fingerprinted in the processing journal.
+        """
         return {
             "channel_index": self.channel_to_use,
             "stage_y_reversed": self.reverse_stage_y,
             "stage_z_reversed_to_lab": self.reverse_stage_z,
             "stage_z_to_image_y": "none-orthogonal-stage-placement-v3",
+            "deskew_coverage": "normalize-valid-z-bin-samples-v1",
             "pair_selection": "all-thick-overlaps-nearest-thin-z-overlaps-v2",
             "acceptance": "threshold-only-no-forced-bridges-v2",
             "overlap_roi": "full-physical-overlap-main-v1",
-            "downsample": ("upstream-block-reduce-with-adaptive-z-ssim-support-v1"),
+            "downsample": ("upstream-block-reduce-with-adaptive-zyx-ssim-support-v2"),
             "phase_registration": (
                 "thin-z-full-reject-out-of-range-thick-bounded-peak-v7"
             ),
-            "score": ("upstream-cucim-ssim-valid-aligned-overlap-boundary-edge-v3"),
+            "score": ("fractional-alignment-cucim-ssim-geometric-support-windows-v6"),
             "downsample_factors_zyx": list(self.downsample_factors),
             "ssim_window": self.ssim_window,
             "max_registration_shift_zyx": list(self.max_registration_shift_zyx),
+            "shift_limits_policy": (
+                "stage-overlap-oblique-footprint-per-pair-v1"
+                if getattr(self, "_automatic_registration_limits", False)
+                else "explicit"
+            ),
+            "pair_shift_limits": {
+                f"{left},{right}": list(limits)
+                for (left, right), limits in getattr(
+                    self, "_pair_registration_limits", {}
+                ).items()
+            },
             "threshold": self.threshold,
             "roi_bounds_yx_um": (
                 None
@@ -2505,7 +3333,18 @@ class TileFusion:
 
     @staticmethod
     def _count_invalid_pairwise_metrics(data: object) -> int:
-        """Count malformed or nonfinite pairwise registration records."""
+        """Count malformed or nonfinite pairwise registration records.
+
+        Parameters
+        ----------
+        data : object
+            Saved pairwise registration metrics being checked for finite translations.
+
+        Returns
+        -------
+        int
+            Number of saved links containing invalid or nonfinite registration measurements.
+        """
         if not isinstance(data, dict):
             return 1
 
@@ -2529,11 +3368,6 @@ class TileFusion:
     def _compute_fused_image_space(self) -> None:
         """Compute a global fused space spanning all timepoints.
 
-        Parameters
-        ----------
-        None
-            This callable has no parameters.
-
         Returns
         -------
         None
@@ -2548,15 +3382,21 @@ class TileFusion:
 
         max_z = max(
             float(position[0]) + int(shape[0]) * dz_um
-            for position, shape in zip(self._tile_positions, self._tile_shapes)
+            for position, shape in zip(
+                self._tile_positions, self._tile_shapes, strict=False
+            )
         )
         max_y = max(
             float(position[1]) + int(shape[1]) * dy_um
-            for position, shape in zip(self._tile_positions, self._tile_shapes)
+            for position, shape in zip(
+                self._tile_positions, self._tile_shapes, strict=False
+            )
         )
         max_x = max(
             float(position[2]) + int(shape[2]) * dx_um
-            for position, shape in zip(self._tile_positions, self._tile_shapes)
+            for position, shape in zip(
+                self._tile_positions, self._tile_shapes, strict=False
+            )
         )
         if getattr(self, "roi_selection", None) is not None:
             roi_y0, roi_y1, roi_x0, roi_x1 = self.roi_selection.bounds_yx_um
@@ -2573,19 +3413,11 @@ class TileFusion:
     def _pad_to_multiscale_multiple(self) -> None:
         """Minimally pad the fused shape for integer multiscale levels.
 
-        Parameters
-        ----------
-        None
-            This callable has no parameters.
-
         Returns
         -------
         None
             Sets `self.padded_shape` as (Z, Y, X).
         """
-        if self.unpadded_shape is None:
-            raise RuntimeError("unpadded_shape not computed.")
-
         sz, sy, sx = self.unpadded_shape
         alignment = math.lcm(1, *(int(value) for value in self.multiscale_factors))
         z_alignment = 1 if self._is_2d else alignment
@@ -2606,7 +3438,7 @@ class TileFusion:
         Parameters
         ----------
         output_path : str | Path
-            Value supplied for ``output path``.
+            Destination fused OME-Zarr image directory.
         z_slices_per_write : int or None
             Z depth rendered per scale-0 block. By default, this matches the
             input Zarr chunk depth so source chunks are not decompressed again
@@ -2615,13 +3447,8 @@ class TileFusion:
         Returns
         -------
         tuple[ts.TensorStore, list[int]]
-            Result produced by the callable.
+            Level-zero output handle and YX pyramid reduction factors.
         """
-        if self.padded_shape is None:
-            raise RuntimeError("padded_shape not computed.")
-        if self.offset_um is None:
-            raise RuntimeError("offset_um not computed.")
-
         factors = (1, *self.multiscale_factors)
         dz, dy, dx = round_spatial_values(self._pixel_size)
         offset_z, offset_y, offset_x = round_spatial_values(self.offset_um)
@@ -2714,7 +3541,18 @@ class TileFusion:
         return self._multiscale_arrays["0"], write_block_shape
 
     def _fusion_z_step(self, z_size: int) -> int:
-        """Choose an input-aware Z depth that still permits aligned Y/X blocks."""
+        """Choose an input-aware Z depth that still permits aligned Y/X blocks.
+
+        Parameters
+        ----------
+        z_size : int
+            Output Z extent available to the fusion slab.
+
+        Returns
+        -------
+        int
+            Z slab size fitting the memory budget and requested output extent.
+        """
         output_chunk_z = max(1, int(self._output_chunk_z))
         target_z = min(
             int(z_size),
@@ -2748,16 +3586,16 @@ class TileFusion:
         Parameters
         ----------
         z_depth : int
-            Value supplied for ``z depth``.
+            Number of Z planes held in each accumulator.
         y_size : int
-            Value supplied for ``y size``.
+            Full output extent along Y, in pixels.
         x_size : int
-            Value supplied for ``x size``.
+            Full output extent along X, in pixels.
 
         Returns
         -------
         tuple[int, int]
-            Result produced by the callable.
+            YX block dimensions that fit the per-worker memory budget.
         """
         available = int(psutil.virtual_memory().available)
         budget = max(1, int(available * self.fusion_ram_fraction))
@@ -2798,9 +3636,25 @@ class TileFusion:
     ) -> tuple[Any, np.ndarray, int, int]:
         """Render one independent output block without writing it.
 
-        Each contributing tile is read at most once. Exclusive regions are copied
-        into the integer output, while only regions with multiple contributors use
-        float32 feather accumulation.
+        Each contributing tile is read at most once. Exclusive regions apply
+        depth gains and interpolation coverage before copying into the output.
+        Overlaps use float32 feather accumulation and
+        normalize without crop, clipping, or cast buffers. Float32 output reuses
+        the accumulation buffer; uint16 normalization writes directly into output.
+
+        Parameters
+        ----------
+        t : int
+            Output timepoint index.
+        bounds : tuple[int, int, int, int, int, int]
+            Half-open spatial block bounds in ZYX order.
+        contributors : Sequence[tuple[int, tuple[int, int, int]]]
+            Tile indices and integer canvas ZYX origins intersecting the output block.
+
+        Returns
+        -------
+        tuple
+            Destination selection, rendered pixels, direct-copy region count, and blended region count.
         """
         z0, z1, y0, y1, x0, x1 = bounds
         common_shape = (int(self.z_dim), int(self.y_dim), int(self.x_dim))
@@ -2810,6 +3664,9 @@ class TileFusion:
             [common_shape] * len(self._tile_positions),
         )
         regions = _partition_fusion_block(bounds, contributors, tile_shapes)
+        tile_supports = getattr(self, "_tile_support_zy", None)
+        if tile_supports is None:
+            tile_supports = [self._deskew_support_zy] * len(tile_shapes)
 
         if len(regions) == 1 and len(regions[0][1]) == 1:
             region, region_contributors = regions[0]
@@ -2822,6 +3679,15 @@ class TileFusion:
                 slice(ry0 - oy, ry1 - oy),
                 slice(rx0 - ox, rx1 - ox),
                 dtype=getattr(self, "output_dtype", np.dtype(np.uint16)),
+            )
+            direct = self._cast_fusion_values(
+                self._scale_depth_source(
+                    p,
+                    direct,
+                    coverage_zy=tile_supports[p][
+                        rz0 - oz : rz1 - oz, ry0 - oy : ry1 - oy
+                    ],
+                )
             )
             selection = (
                 t,
@@ -2847,6 +3713,7 @@ class TileFusion:
                 dtype=None,
             )
             source_blocks[p] = ((tz0, ty0, tx0), source)
+        depth_gains = getattr(self, "_depth_intensity_gains", None)
 
         output = np.zeros(
             (int(self.channels), z1 - z0, y1 - y0, x1 - x0),
@@ -2863,14 +3730,22 @@ class TileFusion:
                 slice(rx0 - x0, rx1 - x0),
             )
             if len(region_contributors) == 1:
-                p, _ = region_contributors[0]
+                p, (oz, oy, _ox) = region_contributors[0]
                 (sz0, sy0, sx0), source = source_blocks[p]
-                output[output_selection] = source[
-                    :,
-                    rz0 - sz0 : rz1 - sz0,
-                    ry0 - sy0 : ry1 - sy0,
-                    rx0 - sx0 : rx1 - sx0,
-                ]
+                output[output_selection] = self._cast_fusion_values(
+                    self._scale_depth_source(
+                        p,
+                        source[
+                            :,
+                            rz0 - sz0 : rz1 - sz0,
+                            ry0 - sy0 : ry1 - sy0,
+                            rx0 - sx0 : rx1 - sx0,
+                        ],
+                        coverage_zy=tile_supports[p][
+                            rz0 - oz : rz1 - oz, ry0 - oy : ry1 - oy
+                        ],
+                    )
+                )
                 direct_regions += 1
                 continue
 
@@ -2883,26 +3758,29 @@ class TileFusion:
                 ),
                 dtype=np.float32,
             )
-            weight = np.zeros(fused.shape, dtype=np.float32)
-            for p, (oz, oy, ox) in region_contributors:
-                (sz0, sy0, sx0), source = source_blocks[p]
-                sub = np.ascontiguousarray(
-                    source[
-                        :,
-                        rz0 - sz0 : rz1 - sz0,
-                        ry0 - sy0 : ry1 - sy0,
-                        rx0 - sx0 : rx1 - sx0,
-                    ]
+            channel_flags = [
+                np.asarray(
+                    [
+                        self._channel_has_signal(p, channel_index)
+                        for channel_index in range(int(self.channels))
+                    ],
+                    dtype=np.bool_,
                 )
+                for p, _offset in region_contributors
+            ]
+            shared_weights = all(np.all(present) for present in channel_flags)
+            weight = np.zeros(
+                (1 if shared_weights else int(self.channels), *fused.shape[1:]),
+                dtype=np.float32,
+            )
+            for (p, (oz, oy, ox)), present in zip(
+                region_contributors, channel_flags, strict=True
+            ):
+                (sz0, sy0, sx0), source = source_blocks[p]
                 local_z = slice(rz0 - oz, rz1 - oz)
                 local_y = slice(ry0 - oy, ry1 - oy)
                 local_x = slice(rx0 - ox, rx1 - ox)
-                tile_supports = getattr(self, "_tile_support_zy", None)
-                tile_support = (
-                    self._deskew_support_zy
-                    if tile_supports is None
-                    else tile_supports[p]
-                )
+                tile_support = tile_supports[p]
                 tile_profiles = getattr(self, "_tile_profiles", None)
                 if tile_profiles is None:
                     z_profile = self.z_profile
@@ -2913,35 +3791,38 @@ class TileFusion:
                 _accumulate_tile_block(
                     fused,
                     weight,
-                    sub,
-                    np.asarray(
-                        [
-                            self._channel_has_signal(p, channel_index)
-                            for channel_index in range(int(self.channels))
-                        ],
-                        dtype=np.bool_,
-                    ),
-                    np.ascontiguousarray(tile_support[local_z, local_y]),
+                    source,
+                    present,
+                    tile_support[local_z, local_y],
                     z_profile[local_z],
                     y_profile[local_y],
                     x_profile[local_x],
                     0,
                     0,
                     0,
+                    rz0 - sz0,
+                    ry0 - sy0,
+                    rx0 - sx0,
+                    (
+                        None
+                        if depth_gains is None or np.all(depth_gains[p] == 1)
+                        else depth_gains[p]
+                    ),
                 )
 
-            _normalize_block(fused, weight)
-            output_dtype = getattr(self, "output_dtype", np.dtype(np.uint16))
-            region_output = (
-                fused.astype(np.float32, copy=False)
-                if output_dtype == np.dtype(np.float32)
-                else np.clip(fused, 0, np.iinfo(np.uint16).max).astype(np.uint16)
-            )
+            region_output = output[output_selection]
+            if output.dtype == np.dtype(np.float32):
+                _normalize_block(fused, weight, fused)
+                region_output[:] = fused
+            else:
+                _normalize_block(fused, weight, output, rz0 - z0, ry0 - y0, rx0 - x0)
             for channel_index in range(int(self.channels)):
                 active_tiles = [
                     tile_index
-                    for tile_index, _offset in region_contributors
-                    if self._channel_has_signal(tile_index, channel_index)
+                    for (tile_index, _offset), present in zip(
+                        region_contributors, channel_flags, strict=True
+                    )
+                    if present[channel_index]
                 ]
                 if not active_tiles:
                     region_output[channel_index] = 0
@@ -2949,14 +3830,25 @@ class TileFusion:
                 if len(active_tiles) != 1:
                     continue
                 tile_index = active_tiles[0]
+                oz, oy, _ox = next(
+                    offset for p, offset in region_contributors if p == tile_index
+                )
                 (sz0, sy0, sx0), source = source_blocks[tile_index]
-                region_output[channel_index] = source[
-                    channel_index,
-                    rz0 - sz0 : rz1 - sz0,
-                    ry0 - sy0 : ry1 - sy0,
-                    rx0 - sx0 : rx1 - sx0,
-                ]
-            output[output_selection] = region_output
+                region_output[channel_index] = self._cast_fusion_values(
+                    self._scale_depth_source(
+                        tile_index,
+                        source[
+                            channel_index,
+                            rz0 - sz0 : rz1 - sz0,
+                            ry0 - sy0 : ry1 - sy0,
+                            rx0 - sx0 : rx1 - sx0,
+                        ],
+                        channel_index,
+                        tile_supports[tile_index][
+                            rz0 - oz : rz1 - oz, ry0 - oy : ry1 - oy
+                        ],
+                    )
+                )
             blended_regions += 1
 
         selection = (
@@ -2970,11 +3862,6 @@ class TileFusion:
 
     def _fuse_by_blocks(self) -> None:
         """Fuse all timepoints into the global fused store using bounded block writes.
-
-        Parameters
-        ----------
-        None
-            This callable has no parameters.
 
         Returns
         -------
@@ -3026,7 +3913,15 @@ class TileFusion:
         empty_blocks = 0
 
         def queue_write(selection: Any, value: np.ndarray) -> None:
-            """Issue one bounded asynchronous output write."""
+            """Issue one bounded asynchronous output write.
+
+            Parameters
+            ----------
+            selection : Any
+                Destination TensorStore region for an asynchronous write.
+            value : np.ndarray
+                Rendered output block retained until its asynchronous write completes.
+            """
             pending_writes.append(self.fused_ts[selection].write(value))
             if len(pending_writes) >= self.max_in_flight_writes:
                 pending_writes.popleft().result()
@@ -3056,7 +3951,13 @@ class TileFusion:
         pending_renders: set[Future[Any]] = set()
 
         def collect_rendered(done: set[Future[Any]]) -> None:
-            """Queue completed block writes and update observable statistics."""
+            """Queue completed block writes and update observable statistics.
+
+            Parameters
+            ----------
+            done : set[Future[Any]]
+                Completed futures whose results are collected and checked.
+            """
             nonlocal direct_regions, blended_regions
             for future in done:
                 selection, value, direct_count, blended_count = future.result()
@@ -3146,11 +4047,6 @@ class TileFusion:
     def _write_multiscales(self) -> None:
         """Downsample successive scales in parallel, storage-aligned blocks.
 
-        Parameters
-        ----------
-        None
-            This callable has no parameters.
-
         Returns
         -------
         None
@@ -3203,22 +4099,44 @@ class TileFusion:
                 x0: int,
                 x1: int,
             ) -> None:
-                """Read, downsample, and write one output-aligned block."""
+                """Read, downsample, and write one output-aligned block.
+
+                All workers finish before the multiscale level loop advances.
+
+                Parameters
+                ----------
+                t : int
+                    Output timepoint index.
+                c : int
+                    Output channel index.
+                z0 : int
+                    Inclusive Z bound of the output block.
+                z1 : int
+                    Exclusive Z bound of the output block.
+                y0 : int
+                    Inclusive Y bound of the output block.
+                y1 : int
+                    Exclusive Y bound of the output block.
+                x0 : int
+                    Inclusive X bound of the output block.
+                x1 : int
+                    Exclusive X bound of the output block.
+                """
                 slab = (
-                    inp[
+                    inp[  # noqa: B023
                         t,
                         c,
                         slice(
-                            z0 * z_factor,
-                            min(int(inp.shape[2]), z1 * z_factor),
+                            z0 * z_factor,  # noqa: B023
+                            min(int(inp.shape[2]), z1 * z_factor),  # noqa: B023
                         ),
                         slice(
-                            y0 * relative_factor,
-                            min(int(inp.shape[3]), y1 * relative_factor),
+                            y0 * relative_factor,  # noqa: B023
+                            min(int(inp.shape[3]), y1 * relative_factor),  # noqa: B023
                         ),
                         slice(
-                            x0 * relative_factor,
-                            min(int(inp.shape[4]), x1 * relative_factor),
+                            x0 * relative_factor,  # noqa: B023
+                            min(int(inp.shape[4]), x1 * relative_factor),  # noqa: B023
                         ),
                     ]
                     .read()
@@ -3226,18 +4144,18 @@ class TileFusion:
                 )
                 if self.multiscale_downsample == "stride":
                     down = slab[
-                        ::z_factor,
-                        ::relative_factor,
-                        ::relative_factor,
+                        ::z_factor,  # noqa: B023
+                        ::relative_factor,  # noqa: B023
+                        ::relative_factor,  # noqa: B023
                     ]
                 else:
                     arr = xp.asarray(slab)
                     down_arr = block_reduce(
                         arr,
                         block_size=(
-                            z_factor,
-                            relative_factor,
-                            relative_factor,
+                            z_factor,  # noqa: B023
+                            relative_factor,  # noqa: B023
+                            relative_factor,  # noqa: B023
                         ),
                         func=xp.mean,
                     )
@@ -3246,7 +4164,7 @@ class TileFusion:
                         if USING_GPU and cp is not None
                         else np.asarray(down_arr)
                     )
-                out[
+                out[  # noqa: B023
                     t,
                     c,
                     slice(z0, z1),
@@ -3263,10 +4181,18 @@ class TileFusion:
             pending: set[Future[Any]] = set()
 
             def collect_completed(done: set[Future[Any]]) -> None:
-                """Propagate worker failures and advance the transient bar."""
+                """Propagate worker failures and advance the transient bar.
+
+                All workers finish before the multiscale level loop advances.
+
+                Parameters
+                ----------
+                done : set[Future[Any]]
+                    Completed futures whose results are collected and checked.
+                """
                 for future in done:
                     future.result()
-                    chunk_bar.update()
+                    chunk_bar.update()  # noqa: B023
 
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 for t in range(int(self.time_dim)):
@@ -3310,11 +4236,6 @@ class TileFusion:
 
     def run(self) -> None:
         """Execute the full registration + fusion pipeline.
-
-        Parameters
-        ----------
-        None
-            This callable has no parameters.
 
         Returns
         -------
@@ -3360,18 +4281,20 @@ class TileFusion:
             )
             self.report_registration_connectivity()
 
+        if self.normalize_depth_intensity:
+            self.estimate_depth_intensity_gains()
+
         gc.collect()
         if USING_GPU and cp is not None:
             cp.get_default_memory_pool().free_all_blocks()
             cp.get_default_pinned_memory_pool().free_all_blocks()
 
-        if self.global_offsets is None:
-            raise RuntimeError("global_offsets was not computed.")
-
         if not reuse_registered:
             self._tile_positions = [
                 tuple(np.array(pos) + off * np.array(self._pixel_size))
-                for pos, off in zip(self._tile_positions, self.global_offsets)
+                for pos, off in zip(
+                    self._tile_positions, self.global_offsets, strict=False
+                )
             ]
 
         self._compute_fused_image_space()
@@ -3381,6 +4304,12 @@ class TileFusion:
         self.fused_ts, self.write_block_shape = self._prepare_fused_image(omezarr)
         self._fuse_by_blocks()
         self._write_multiscales()
+        report_path = (
+            self.output_dir / f"{self.acquisition_name}_depth_intensity_gains.json"
+        )
+        report_path.write_text(
+            json.dumps(self._depth_intensity_report or {"enabled": False}, indent=2)
+        )
         if not reuse_registered:
             self.processing_state.complete_registration(
                 self.data,

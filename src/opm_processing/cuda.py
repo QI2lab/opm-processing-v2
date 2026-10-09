@@ -7,7 +7,6 @@ import sysconfig
 import warnings
 from pathlib import Path
 
-
 _CUDA_LIBRARIES = (
     ("cuda_runtime", ("libcudart.so.12",)),
     ("cuda_nvrtc", ("libnvrtc.so.12",)),
@@ -35,11 +34,6 @@ def suppress_spurious_cupy_cuda_path_warning() -> None:
     directories. Its Windows initialization currently warns whenever that root
     is absent even though ``cuda-pathfinder`` loads those component wheels.
     Only suppress that exact warning when both required wheel layouts exist.
-
-    Parameters
-    ----------
-    None
-        This callable has no parameters.
 
     Returns
     -------
@@ -77,41 +71,12 @@ def suppress_spurious_cupy_cuda_path_warning() -> None:
         os.environ["PYTHONWARNINGS"] = ",".join(filters)
 
 
-def _nvidia_library_roots() -> tuple[Path, ...]:
-    """Return possible roots for NVIDIA runtime wheels in this environment.
-
-    Parameters
-    ----------
-    None
-        This callable has no parameters.
-
-    Returns
-    -------
-    tuple[Path, ...]
-        Result produced by the callable.
-    """
-    candidates = (
-        Path(sysconfig.get_path("purelib")) / "nvidia",
-        Path(sys.prefix)
-        / "lib"
-        / f"python{sys.version_info.major}.{sys.version_info.minor}"
-        / "site-packages"
-        / "nvidia",
-    )
-    return tuple(dict.fromkeys(candidates))
-
-
 def preload_cuda_libraries() -> None:
     """Load CUDA wheel libraries globally before importing GPU frameworks.
 
     Linux NVIDIA wheels keep shared libraries in package-specific ``lib``
     directories that are not always visible to the dynamic linker. Missing
     libraries are ignored so CPU-only environments continue to import normally.
-
-    Parameters
-    ----------
-    None
-        This callable has no parameters.
 
     Returns
     -------
@@ -124,7 +89,18 @@ def preload_cuda_libraries() -> None:
         return
     _CUDA_PRELOAD_ATTEMPTED = True
 
-    roots = _nvidia_library_roots()
+    roots = tuple(
+        dict.fromkeys(
+            (
+                Path(sysconfig.get_path("purelib")) / "nvidia",
+                Path(sys.prefix)
+                / "lib"
+                / f"python{sys.version_info.major}.{sys.version_info.minor}"
+                / "site-packages"
+                / "nvidia",
+            )
+        )
+    )
     for package, library_names in _CUDA_LIBRARIES:
         for library_name in library_names:
             library_path = next(

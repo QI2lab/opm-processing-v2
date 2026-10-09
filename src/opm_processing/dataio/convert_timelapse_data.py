@@ -18,26 +18,9 @@ from opm_processing.dataio.acquisition import (
     inspect_acquisition,
     open_acquisition_datastore,
 )
+from opm_processing.imageprocessing.camera import camera_correct
 
 app = typer.Typer()
-
-
-def _with_suffix(path: Path, suffix: str) -> Path:
-    """Return a path with the requested suffix.
-
-    Parameters
-    ----------
-    path : Path
-        Value supplied for ``path``.
-    suffix : str
-        Value supplied for ``suffix``.
-
-    Returns
-    -------
-    Path
-        Result produced by the callable.
-    """
-    return path if path.suffix == suffix else path.with_suffix(suffix)
 
 
 def save_raw_with_yaml(data_array: np.ndarray, output_path: Path) -> None:
@@ -46,16 +29,16 @@ def save_raw_with_yaml(data_array: np.ndarray, output_path: Path) -> None:
     Parameters
     ----------
     data_array : np.ndarray
-        Value supplied for ``data array``.
+        Uint16 data in the axis order required by the selected export.
     output_path : Path
-        Value supplied for ``output path``.
+        Destination file; the writer applies the RAW or TIFF suffix.
 
     Returns
     -------
     None
         No value is returned.
     """
-    output_path = _with_suffix(Path(output_path), ".raw")
+    output_path = Path(output_path).with_suffix(".raw")
     yml_path = output_path.with_suffix(".yaml")
     np.asarray(data_array, dtype=np.uint16).tofile(output_path)
     meta = {
@@ -67,57 +50,6 @@ def save_raw_with_yaml(data_array: np.ndarray, output_path: Path) -> None:
     }
     with yml_path.open("w") as stream:
         yaml.safe_dump(meta, stream, sort_keys=False)
-
-
-def _camera_correct(
-    data_array: np.ndarray,
-    *,
-    camera_offset: float,
-    camera_conversion: float,
-) -> np.ndarray:
-    """Apply offset and gain correction while clipping to uint16 limits.
-
-    Parameters
-    ----------
-    data_array : np.ndarray
-        Value supplied for ``data array``.
-    camera_offset : float
-        Value supplied for ``camera offset``.
-    camera_conversion : float
-        Value supplied for ``camera conversion``.
-
-    Returns
-    -------
-    np.ndarray
-        Result produced by the callable.
-    """
-    corrected = (data_array.astype(np.float32) - camera_offset) * camera_conversion
-    return np.clip(corrected, 0, np.iinfo(np.uint16).max)
-
-
-def _tiff_metadata(axes: str, pixel_size_um: float) -> dict[str, object]:
-    """Build physical-size metadata for an OME-TIFF image.
-
-    Parameters
-    ----------
-    axes : str
-        Value supplied for ``axes``.
-    pixel_size_um : float
-        Value supplied for ``pixel size um``.
-
-    Returns
-    -------
-    dict[str, object]
-        Result produced by the callable.
-    """
-    return {
-        "axes": axes,
-        "SignificantBits": np.iinfo(np.uint16).bits,
-        "PhysicalSizeX": pixel_size_um,
-        "PhysicalSizeXUnit": "µm",
-        "PhysicalSizeY": pixel_size_um,
-        "PhysicalSizeYUnit": "µm",
-    }
 
 
 def save_time_projection(
@@ -133,66 +65,27 @@ def save_time_projection(
     Parameters
     ----------
     data_array : np.ndarray
-        Value supplied for ``data array``.
+        Uint16 data in the axis order required by the selected export.
     pixel_size_um : float
-        Value supplied for ``pixel size um``.
+        Detector pixel spacing in micrometers.
     output_path : Path
-        Value supplied for ``output path``.
+        Destination file; the writer applies the RAW or TIFF suffix.
     camera_offset : float
-        Value supplied for ``camera offset``.
+        Electronic camera background in ADU.
     camera_conversion : float
-        Value supplied for ``camera conversion``.
+        Calibrated intensity per ADU.
 
     Returns
     -------
     None
         No value is returned.
     """
-    output_path = _with_suffix(Path(output_path), ".tiff")
-    projection = _camera_correct(
-        data_array,
-        camera_offset=camera_offset,
-        camera_conversion=camera_conversion,
-    ).mean(axis=0, dtype=np.float32)
-    _write_tiff(projection.astype(np.uint16), "YX", pixel_size_um, output_path)
-
-
-def _write_tiff(
-    data_array: np.ndarray,
-    axes: str,
-    pixel_size_um: float,
-    output_path: Path,
-) -> None:
-    """Write an array as a compressed OME-TIFF image.
-
-    Parameters
-    ----------
-    data_array : np.ndarray
-        Value supplied for ``data array``.
-    axes : str
-        Value supplied for ``axes``.
-    pixel_size_um : float
-        Value supplied for ``pixel size um``.
-    output_path : Path
-        Value supplied for ``output path``.
-
-    Returns
-    -------
-    None
-        No value is returned.
-    """
-    output_path = _with_suffix(Path(output_path), ".tiff")
-    resolution = 1e4 / pixel_size_um
-    with TiffWriter(output_path, bigtiff=True) as tif:
-        tif.write(
-            data_array,
-            resolution=(resolution, resolution),
-            compression="zlib",
-            predictor=True,
-            photometric="minisblack",
-            resolutionunit="CENTIMETER",
-            metadata=_tiff_metadata(axes, pixel_size_um),
-        )
+    output_path = Path(output_path).with_suffix(".tiff")
+    calibrated = camera_correct(data_array, camera_offset, camera_conversion)
+    projection = np.clip(calibrated, 0, np.iinfo(np.uint16).max).mean(
+        axis=0, dtype=np.float32
+    )
+    save_as_tiff(projection.astype(np.uint16), pixel_size_um, output_path, axes="YX")
 
 
 def save_as_tiff(
@@ -207,23 +100,41 @@ def save_as_tiff(
     Parameters
     ----------
     data_array : np.ndarray
-        Value supplied for ``data array``.
+        Uint16 data in the axis order required by the selected export.
     pixel_size_um : float
-        Value supplied for ``pixel size um``.
+        Detector pixel spacing in micrometers.
     output_path : Path
-        Value supplied for ``output path``.
+        Destination file; the writer applies the RAW or TIFF suffix.
     axes : str
-        Value supplied for ``axes``.
+        TIFF axis labels matching the data dimensions.
 
     Returns
     -------
     None
         No value is returned.
     """
-    _write_tiff(data_array, axes, pixel_size_um, output_path)
+    output_path = Path(output_path).with_suffix(".tiff")
+    resolution = 1e4 / pixel_size_um
+    with TiffWriter(output_path, bigtiff=True) as tif:
+        tif.write(
+            data_array,
+            resolution=(resolution, resolution),
+            compression="zlib",
+            predictor=True,
+            photometric="minisblack",
+            resolutionunit="CENTIMETER",
+            metadata={
+                "axes": axes,
+                "SignificantBits": np.iinfo(np.uint16).bits,
+                "PhysicalSizeX": pixel_size_um,
+                "PhysicalSizeXUnit": "µm",
+                "PhysicalSizeY": pixel_size_um,
+                "PhysicalSizeYUnit": "µm",
+            },
+        )
 
 
-def _selection_bounds(
+def selection_bounds(
     requested: tuple[int, int] | None,
     length: int,
     name: str,
@@ -233,16 +144,16 @@ def _selection_bounds(
     Parameters
     ----------
     requested : tuple[int, int] | None
-        Value supplied for ``requested``.
+        Half-open index range, or None for the entire axis.
     length : int
-        Value supplied for ``length``.
+        Available samples along the selected axis.
     name : str
-        Value supplied for ``name``.
+        Option name used in an invalid-range error.
 
     Returns
     -------
     tuple[int, int]
-        Result produced by the callable.
+        Validated start and exclusive stop indices.
     """
     if requested is None:
         return 0, length
@@ -271,52 +182,48 @@ def convert_timelapse(
     Parameters
     ----------
     zarr_dir : Path
-        Value supplied for ``zarr dir``.
+        Acquisition store or its containing directory.
     output_dir : Path | None
-        Value supplied for ``output dir``.
+        Destination directory, defaulting to converted_files beside the store.
     time_range : tuple[int, int] | None
-        Value supplied for ``time range``.
+        Half-open timepoint range, or all timepoints.
     stage_range : tuple[int, int] | None
-        Value supplied for ``stage range``.
+        Half-open position range, or all positions.
     scan_range : tuple[int, int] | None
-        Value supplied for ``scan range``.
+        Half-open scan-plane range, or all planes.
     fov_x_range : tuple[int, int] | None
-        Value supplied for ``fov x range``.
+        Half-open camera-column range, or the full detector width.
     create_raw : bool
-        Value supplied for ``create raw``.
+        Write each selected timelapse as RAW with a YAML shape sidecar.
     create_time_projection : bool
-        Value supplied for ``create time projection``.
+        Write the calibrated mean over time for each selected channel.
     create_tiff : bool
-        Value supplied for ``create tiff``.
+        Write selected uncalibrated timelapses as OME-TIFF.
     camera_offset : float | None
-        Value supplied for ``camera offset``.
+        Electronic camera background in ADU.
     camera_conversion : float | None
-        Value supplied for ``camera conversion``.
+        Calibrated intensity per ADU.
 
     Returns
     -------
     list[Path]
-        Result produced by the callable.
+        Written RAW, YAML, and TIFF paths in export order.
     """
     zarr_dir = Path(zarr_dir)
     acquisition = inspect_acquisition(zarr_dir)
     zarr_dir = acquisition.path
     datastore = open_acquisition_datastore(acquisition)
-    if datastore.rank != 6:
-        raise ValueError(f"Expected TPCZYX rank 6, got shape {datastore.shape}")
 
-    if acquisition.pixel_size_um is None:
-        raise ValueError("Acquisition metadata lacks pixel size")
     pixel_size_um = acquisition.pixel_size_um
     if camera_offset is None:
         camera_offset = acquisition.camera_offset
     if camera_conversion is None:
         camera_conversion = acquisition.camera_conversion
 
-    t0, t1 = _selection_bounds(time_range, datastore.shape[0], "time_range")
-    p0, p1 = _selection_bounds(stage_range, datastore.shape[1], "stage_range")
-    z0, z1 = _selection_bounds(scan_range, datastore.shape[3], "scan_range")
-    x0, x1 = _selection_bounds(fov_x_range, datastore.shape[5], "fov_x_range")
+    t0, t1 = selection_bounds(time_range, datastore.shape[0], "time_range")
+    p0, p1 = selection_bounds(stage_range, datastore.shape[1], "stage_range")
+    z0, z1 = selection_bounds(scan_range, datastore.shape[3], "scan_range")
+    x0, x1 = selection_bounds(fov_x_range, datastore.shape[5], "fov_x_range")
     destination = (
         Path(output_dir) if output_dir else zarr_dir.parent / "converted_files"
     )
@@ -389,27 +296,27 @@ def main(
     Parameters
     ----------
     zarr_dir : Path
-        Value supplied for ``zarr dir``.
+        Acquisition store or its containing directory.
     output_dir : Path | None
-        Value supplied for ``output dir``.
+        Destination directory, defaulting to converted_files beside the store.
     time_range : tuple[int, int] | None
-        Value supplied for ``time range``.
+        Half-open timepoint range, or all timepoints.
     stage_range : tuple[int, int] | None
-        Value supplied for ``stage range``.
+        Half-open position range, or all positions.
     scan_range : tuple[int, int] | None
-        Value supplied for ``scan range``.
+        Half-open scan-plane range, or all planes.
     fov_x_range : tuple[int, int] | None
-        Value supplied for ``fov x range``.
+        Half-open camera-column range, or the full detector width.
     create_raw : bool
-        Value supplied for ``create raw``.
+        Write each selected timelapse as RAW with a YAML shape sidecar.
     create_time_projection : bool
-        Value supplied for ``create time projection``.
+        Write the calibrated mean over time for each selected channel.
     create_tiff : bool
-        Value supplied for ``create tiff``.
+        Write selected uncalibrated timelapses as OME-TIFF.
     camera_offset : float | None
-        Value supplied for ``camera offset``.
+        Electronic camera background in ADU.
     camera_conversion : float | None
-        Value supplied for ``camera conversion``.
+        Calibrated intensity per ADU.
 
     Returns
     -------

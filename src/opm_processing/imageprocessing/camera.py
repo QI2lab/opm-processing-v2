@@ -1,7 +1,7 @@
-"""Camera-coordinate artifact correction."""
+"""Camera calibration and detector illumination correction."""
 
 import numpy as np
-
+from numba import njit, prange
 
 QI2LAB_STAGE_SCAN_DETECTOR_WIDTH = 1900
 QI2LAB_STAGE_SCAN_GAIN_START_X = 1046
@@ -71,30 +71,175 @@ QI2LAB_STAGE_SCAN_GAIN_VALUES = np.asarray(
 
 
 def qi2lab_stage_scan_camera_gain() -> np.ndarray:
-    """Return the fixed detector-X gain measured for the qi2lab stage camera."""
+    """Return the fixed detector-X gain measured for the qi2lab stage camera.
+
+    Returns
+    -------
+    np.ndarray
+        Float32 detector-X response with unity outside the measured gain interval.
+    """
     gain = np.ones(QI2LAB_STAGE_SCAN_DETECTOR_WIDTH, dtype=np.float32)
     stop = QI2LAB_STAGE_SCAN_GAIN_START_X + QI2LAB_STAGE_SCAN_GAIN_VALUES.size
     gain[QI2LAB_STAGE_SCAN_GAIN_START_X:stop] = QI2LAB_STAGE_SCAN_GAIN_VALUES
     return gain
 
 
-def correct_qi2lab_stage_scan_camera(
-    images: np.ndarray,
-    *,
-    x_offset: int = 0,
-    copy: bool = True,
+@njit(inline="always")
+def calibrated_pixel(
+    raw: np.uint16, offset: np.float32, conversion: np.float32
+) -> np.float32:
+    """Apply the camera transfer function to one ADC count.
+
+    Parameters
+    ----------
+    raw : np.uint16
+        Digitized camera value.
+    offset, conversion : np.float32
+        Electronic offset in ADU and conversion per ADU.
+
+    Returns
+    -------
+    np.float32
+        Calibrated intensity, clipped at zero.
+    """
+    value = np.float32(raw) - offset
+    value = np.float32(value * conversion)
+    return np.maximum(value, np.float32(0))
+
+
+@njit(parallel=True, error_model="numpy")
+def camera_correct_rows(
+    raw: np.ndarray, offset: np.float32, conversion: np.float32, gain: np.ndarray
 ) -> np.ndarray:
-    """Divide by the fixed qi2lab stage-scan gain, broadcasting over scan/Y."""
-    corrected = np.asarray(images, dtype=np.float32)
-    if copy:
-        corrected = corrected.copy()
-    start = int(x_offset)
-    stop = start + int(corrected.shape[-1])
-    if start < 0 or stop > QI2LAB_STAGE_SCAN_DETECTOR_WIDTH:
-        raise ValueError(
-            "The qi2lab stage-scan gain requires detector-X coordinates within "
-            f"0:{QI2LAB_STAGE_SCAN_DETECTOR_WIDTH}; received {start}:{stop}"
-        )
-    gain = qi2lab_stage_scan_camera_gain()[start:stop]
-    corrected /= gain.reshape((1,) * (corrected.ndim - 1) + (gain.size,))
-    return corrected
+    """Correct independent camera rows in parallel.
+
+    Parameters
+    ----------
+    raw : np.ndarray
+        Three-dimensional uint16 camera data.
+    offset, conversion : np.float32
+        Offset in ADU and conversion per ADU.
+    gain : np.ndarray
+        Float32 detector-X gain, or an empty array to disable gain correction.
+
+    Returns
+    -------
+    np.ndarray
+        Newly allocated float32 calibrated volume.
+    """
+    output = np.empty(raw.shape, dtype=np.float32)
+    _, ny, nx = raw.shape
+    for row in prange(raw.shape[0] * ny):
+        s, y = row // ny, row % ny
+        if gain.size:
+            for x in range(nx):
+                output[s, y, x] = (
+                    calibrated_pixel(raw[s, y, x], offset, conversion) / gain[x]
+                )
+        else:
+            for x in range(nx):
+                output[s, y, x] = calibrated_pixel(raw[s, y, x], offset, conversion)
+    return output
+
+
+def camera_correct(
+    raw: np.ndarray,
+    camera_offset: float,
+    camera_conversion: float,
+    *,
+    detector_x_offset: int = 0,
+    apply_stage_scan_gain: bool = False,
+) -> np.ndarray:
+    """Convert raw camera counts to nonnegative float32 intensities.
+
+    Parameters
+    ----------
+    raw : np.ndarray
+        Uint16 image or volume. Leading dimensions are independent images.
+    camera_offset : float
+        Electronic background in ADU.
+    camera_conversion : float
+        Calibrated intensity per ADU, including QE when required by the caller.
+    detector_x_offset : int
+        First detector column of a cropped acquisition.
+    apply_stage_scan_gain : bool
+        Divide by the measured qi2lab detector-X response after clipping.
+
+    Returns
+    -------
+    np.ndarray
+        Calibrated float32 data with the input shape. The input is unchanged.
+    """
+    raw = np.asarray(raw)
+    gain = np.empty(0, np.float32)
+    if apply_stage_scan_gain:
+        start = int(detector_x_offset)
+        stop = start + raw.shape[-1]
+        if start < 0 or stop > QI2LAB_STAGE_SCAN_DETECTOR_WIDTH:
+            raise ValueError("Detector-X crop is outside the calibrated detector")
+        gain = qi2lab_stage_scan_camera_gain()[start:stop]
+    offset, conversion = np.float32(camera_offset), np.float32(camera_conversion)
+    if raw.ndim == 3:
+        return camera_correct_rows(raw, offset, conversion, gain)
+    if raw.ndim == 2:
+        return camera_correct_rows(raw[None], offset, conversion, gain)[0]
+    # Preserve NumPy broadcasting for less common input dimensionalities.
+    calibrated = np.maximum(
+        (raw.astype(np.float32) - offset) * conversion, np.float32(0)
+    )
+    if gain.size:
+        calibrated /= gain
+    return calibrated
+
+
+@njit(parallel=True, error_model="numpy")
+def illumination_correct_rows(
+    calibrated: np.ndarray, illumination: np.ndarray
+) -> np.ndarray:
+    """Divide independent camera rows by a detector illumination profile.
+
+    Parameters
+    ----------
+    calibrated : np.ndarray
+        Three-dimensional float32 calibrated image.
+    illumination : np.ndarray
+        Two-dimensional float32 detector profile.
+
+    Returns
+    -------
+    np.ndarray
+        Corrected float32 volume in a separate allocation.
+    """
+    output = np.empty(calibrated.shape, dtype=np.float32)
+    _, ny, nx = calibrated.shape
+    for row in prange(calibrated.shape[0] * ny):
+        s, y = row // ny, row % ny
+        for x in range(nx):
+            output[s, y, x] = calibrated[s, y, x] / illumination[y, x]
+    return output
+
+
+def illumination_correct(
+    calibrated: np.ndarray, illumination: np.ndarray
+) -> np.ndarray:
+    """Apply illumination correction independently of camera calibration.
+
+    Parameters
+    ----------
+    calibrated : np.ndarray
+        Float32 image or volume after camera correction and empty-tile checks.
+    illumination : np.ndarray
+        Float32 detector profile broadcastable to the image shape.
+
+    Returns
+    -------
+    np.ndarray
+        Float32 intensities divided by the profile. Neither input is modified.
+    """
+    calibrated, illumination = np.asarray(calibrated), np.asarray(illumination)
+    if illumination.shape == calibrated.shape[-2:]:
+        if calibrated.ndim == 3:
+            return illumination_correct_rows(calibrated, illumination)
+        if calibrated.ndim == 2:
+            return illumination_correct_rows(calibrated[None], illumination)[0]
+    return calibrated / illumination

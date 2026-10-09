@@ -11,20 +11,19 @@ acquired planes. Its adjoint is C^T S^T: insert zeros, then convolve with the
 adjoint PSF. Missing planes are unobserved, not measured zeros. The RL update
 includes H^T(1) normalization, which is essential for this sampling operator.
 
-Unlike the production solver's reflected boundary constraint, this experiment
+Unlike the production solver's reflected input padding, this experiment
 assumes zero fluorescence outside the reconstruction volume. This gives an
 explicit linear forward model and its exact transpose, including at edges.
 """
 
 from __future__ import annotations
 
-import logging
 from numbers import Integral
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from opm_processing.imageprocessing.rlgc import (
-    _kl_div_into,
     _linear_fft_pad_width,
     _observed_region_slices,
     _split_observed_counts,
@@ -33,23 +32,102 @@ from opm_processing.imageprocessing.rlgc import (
     fft_conv,
     filter_update,
     pad_psf,
+    split_kl_changes,
 )
 
+if TYPE_CHECKING:
+    import logging
 
-def _convolve_core(image, otf, padded_shape, core):
-    """Convolve a zero-extended object and crop to its original field of view."""
+
+def _convolve_core(
+    image: cp.ndarray,
+    otf: cp.ndarray,
+    padded_shape: tuple[int, int, int],
+    core: tuple[slice, slice, slice],
+) -> cp.ndarray:
+    """Convolve a zero-extended object and crop to its original field of view.
+
+    Parameters
+    ----------
+    image
+        Nonnegative image samples on the operator input grid.
+    otf
+        Frequency-domain optical transfer function on the padded convolution grid.
+    padded_shape
+        FFT grid dimensions including zero padding.
+    core
+        Slices selecting the original image support from the FFT grid.
+
+    Returns
+    -------
+    cupy.ndarray
+        Convolved image on the original support after zero-padded FFT convolution.
+    """
     padded = cp.zeros(padded_shape, dtype=cp.float32)
     padded[core] = image
     return fft_conv(padded, otf, padded_shape)[core].copy()
 
 
-def _forward(image, otf, padded_shape, core, factor):
-    """Blur on the fine grid before selecting measured scan planes."""
+def _forward(
+    image: cp.ndarray,
+    otf: cp.ndarray,
+    padded_shape: tuple[int, int, int],
+    core: tuple[slice, slice, slice],
+    factor: int,
+) -> cp.ndarray:
+    """Blur on the fine grid before selecting measured scan planes.
+
+    Parameters
+    ----------
+    image
+        Nonnegative image samples on the operator input grid.
+    otf
+        Frequency-domain optical transfer function on the padded convolution grid.
+    padded_shape
+        FFT grid dimensions including zero padding.
+    core
+        Slices selecting the original image support from the FFT grid.
+    factor
+        Integer spacing between measured scan planes on the fine reconstruction grid.
+
+    Returns
+    -------
+    cupy.ndarray
+        Predicted camera planes at the measured fine-grid scan indices.
+    """
     return _convolve_core(image, otf, padded_shape, core)[::factor].copy()
 
 
-def _adjoint(image, otf_adjoint, padded_shape, core, fine_shape, factor):
-    """Scatter measurements into a zero-filled fine grid and apply C transpose."""
+def _adjoint(
+    image: cp.ndarray,
+    otf_adjoint: cp.ndarray,
+    padded_shape: tuple[int, int, int],
+    core: tuple[slice, slice, slice],
+    fine_shape: tuple[int, int, int],
+    factor: int,
+) -> cp.ndarray:
+    """Scatter measurements into a zero-filled fine grid and apply C transpose.
+
+    Parameters
+    ----------
+    image
+        Nonnegative image samples on the operator input grid.
+    otf_adjoint
+        Conjugate optical transfer function for adjoint convolution.
+    padded_shape
+        FFT grid dimensions including zero padding.
+    core
+        Slices selecting the original image support from the FFT grid.
+    fine_shape
+        Endpoint-preserving fine reconstruction dimensions in scan, Y, X order.
+    factor
+        Integer spacing between measured scan planes on the fine reconstruction grid.
+
+    Returns
+    -------
+    cupy.ndarray
+        Adjoint optical backprojection on the endpoint-preserving fine scan grid.
+    """
     scattered = cp.zeros(fine_shape, dtype=cp.float32)
     scattered[::factor] = image
     return _convolve_core(scattered, otf_adjoint, padded_shape, core)
@@ -64,8 +142,8 @@ def rlgc_undersampled(
     max_iterations: int = 100,
     gpu_id: int = 0,
     safe_mode: bool = True,
-    limit: float = 0.1,
-    max_delta: float = 0.01,
+    limit: float = 0.001,
+    max_delta: float = 0.001,
     rng_seed: int | None = 42,
     release_memory: bool = True,
     logger: logging.Logger | None = None,
@@ -93,11 +171,13 @@ def rlgc_undersampled(
     gpu_id : int, default=0
         CUDA device.
     safe_mode : bool, default=True
-        In GC mode, roll back if either split KLD worsens; otherwise require
-        both to worsen. Splits and likelihoods include only acquired planes.
-    limit : float, default=0.1
+        In GC mode, compare normalized observation-to-prediction KLD against
+        the same fresh split for both estimates. Roll back if either half
+        worsens; otherwise require both to worsen. Only acquired planes enter
+        this statistic; the previous prediction is reused without another FFT.
+    limit : float, default=0.001
         In GC mode, stop below this fraction of fine-grid voxels updated.
-    max_delta : float, default=0.01
+    max_delta : float, default=0.001
         Stop when the maximum change relative to the reconstruction peak is
         below this value. Use zero for fixed-iteration ordinary RL tests.
     rng_seed : int or None, default=42
@@ -138,16 +218,42 @@ def rlgc_undersampled(
     with cp.cuda.Device(gpu_id):
         try:
             pads = _linear_fft_pad_width(fine_shape, psf.shape)
-            padded_shape = tuple(n + sum(p) for n, p in zip(fine_shape, pads))
+            padded_shape = tuple(
+                n + sum(p) for n, p in zip(fine_shape, pads, strict=False)
+            )
             core = _observed_region_slices(padded_shape, pads)
             otf = cp.fft.rfftn(pad_psf(cp.asarray(psf), padded_shape))
             otf_adjoint = cp.conjugate(otf)
             observed = cp.asarray(image)
 
-            def forward(estimate):
+            def forward(estimate: cp.ndarray) -> cp.ndarray:
+                """Blur the fine estimate and select only acquired scan planes.
+
+                Parameters
+                ----------
+                estimate
+                    Current fluorescence reconstruction on the fine scan grid.
+
+                Returns
+                -------
+                array or scalar
+                    Predicted measured camera planes from the fine estimate.
+                """
                 return _forward(estimate, otf, padded_shape, core, factor)
 
-            def adjoint(values):
+            def adjoint(values: cp.ndarray) -> cp.ndarray:
+                """Scatter acquired-plane values and apply the adjoint optical convolution.
+
+                Parameters
+                ----------
+                values
+                    Values on acquired camera planes to backproject.
+
+                Returns
+                -------
+                array or scalar
+                    Backprojected measured-plane values on the fine reconstruction grid.
+                """
                 return _adjoint(
                     values, otf_adjoint, padded_shape, core, fine_shape, factor
                 )
@@ -157,6 +263,7 @@ def rlgc_undersampled(
             # A positive seed avoids locking unmeasured voxels at zero.
             recon = cp.maximum(recon, cp.max(recon) * cp.float32(1e-7))
             previous = None
+            previous_prediction = None
             rng = cp.random.default_rng(rng_seed) if gradient_consensus else None
             scratch = cp.empty_like(observed)
             for iteration in range(max_iterations):
@@ -165,14 +272,10 @@ def rlgc_undersampled(
                     split1 = _split_observed_counts(observed, rng)
                     split2 = observed - split1
                     if previous is not None:
-                        old_prediction = cp.maximum(forward(previous), 1e-6)
-                        worse = [
-                            bool(
-                                _kl_div_into(predicted, split, scratch)
-                                > _kl_div_into(old_prediction, split, scratch)
-                            )
-                            for split in (split1, split2)
-                        ]
+                        changes = split_kl_changes(
+                            predicted, previous_prediction, split1, split2, scratch
+                        )
+                        worse = [change > 0 for change in changes]
                         if any(worse) if safe_mode else all(worse):
                             recon = previous
                             break
@@ -195,6 +298,7 @@ def rlgc_undersampled(
                 delta = float(
                     cp.max(cp.abs(updated - recon)) / cp.maximum(cp.max(updated), 1e-6)
                 )
+                previous_prediction = predicted
                 previous, recon = recon, updated
                 if logger is not None:
                     logger.info(

@@ -58,7 +58,7 @@ establish the cause of the tilt in live experimental data.
 Render the figure from the saved acquisitions:
 
 ```powershell
-uv run --no-sync --with matplotlib python -m opm_processing.imageprocessing.publication_opm_simulation --acquisitions diagnostics/meridian_sphere_camera_0p4/scan_0.4um diagnostics/meridian_sphere_camera/scan_0.8um diagnostics/meridian_sphere_camera_1p2/scan_1.2um --output diagnostics/publication_opm_sampling
+uv run --no-sync --with matplotlib python -m scripts.publication_opm_simulation --acquisitions diagnostics/meridian_sphere_camera_0p4/scan_0.4um diagnostics/meridian_sphere_camera/scan_0.8um diagnostics/meridian_sphere_camera_1p2/scan_1.2um --output diagnostics/publication_opm_sampling
 ```
 
 The output contains the combined figure and separate forward/reconstruction
@@ -85,7 +85,7 @@ in `plane_geometry_check.json`. This checks the coordinate mapping, not every
 optical assumption in the simulation.
 
 ```powershell
-uv run --no-sync --with matplotlib python -m opm_processing.imageprocessing.plot_opm_plane_geometry diagnostics/publication_opm_sampling
+uv run --no-sync --with matplotlib python -m scripts.plot_opm_plane_geometry diagnostics/publication_opm_sampling
 ```
 
 `fixed_objective_frames.png` (also PDF/SVG) makes a different check: the
@@ -103,5 +103,5 @@ Both image rows share display limits 0–0.5, with higher values displayed white
 No camera-frame panel is a projection through the stack.
 
 ```powershell
-uv run --no-sync --with matplotlib python -m opm_processing.imageprocessing.plot_fixed_objective_simulation diagnostics/meridian_sphere_camera_0p4/scan_0.4um --output diagnostics/publication_opm_sampling
+uv run --no-sync --with matplotlib python -m scripts.plot_fixed_objective_simulation diagnostics/meridian_sphere_camera_0p4/scan_0.4um --output diagnostics/publication_opm_sampling
 ```

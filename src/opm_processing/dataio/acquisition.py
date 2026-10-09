@@ -11,10 +11,13 @@ import json
 import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import yaozarrs
 from yaozarrs import ZarrGroup, v05
+
+if TYPE_CHECKING:
+    import tensorstore as ts
 
 
 @dataclass(frozen=True)
@@ -57,22 +60,46 @@ class AcquisitionMetadata:
 
     @property
     def index_sizes(self) -> dict[str, int]:
-        """Return logical axis sizes keyed by lower-case axis name."""
-        return dict(zip(self.axes, self.shape))
+        """Return logical axis sizes keyed by lower-case axis name.
+
+        Returns
+        -------
+        dict[str, int]
+            Logical acquired dimensions keyed by lowercase axis name.
+        """
+        return dict(zip(self.axes, self.shape, strict=False))
 
     @property
     def channel_names(self) -> tuple[str, ...]:
-        """Return channel names in storage order."""
+        """Return channel names in storage order.
+
+        Returns
+        -------
+        tuple[str, ...]
+            Channel names in stored channel order.
+        """
         return tuple(channel.name for channel in self.channels)
 
     @property
     def tile_count(self) -> int:
-        """Return the number of independently positioned image series."""
+        """Return the number of independently positioned image series.
+
+        Returns
+        -------
+        int
+            Number of independently positioned acquisition series.
+        """
         return self.index_sizes.get("p", 1)
 
     @property
     def scan_position_count(self) -> int:
-        """Return the number of scan-axis samples per tile."""
+        """Return the number of scan-axis samples per tile.
+
+        Returns
+        -------
+        int
+            Scan-plane count per tile, or one for a planar acquisition.
+        """
         return self.index_sizes.get("z", 1)
 
     @property
@@ -82,27 +109,62 @@ class AcquisitionMetadata:
         Time, position, and channel are iteration axes. An absent Z index and
         an explicit singleton Z index both describe two-dimensional acquired
         data; two or more Z samples describe a three-dimensional acquisition.
+
+        Returns
+        -------
+        bool
+            True for an absent or singleton scan-plane dimension.
         """
         return self.index_sizes.get("z", 1) == 1
 
     @property
     def scan_span_um(self) -> float | None:
-        """Return the center-to-center span of the scan-axis samples."""
+        """Return the center-to-center span of the scan-axis samples.
+
+        Returns
+        -------
+        float | None
+            Center-to-center scan span in micrometers, or None without recorded spacing.
+        """
         if self.scan_axis_step_um is None:
             return None
         return (self.scan_position_count - 1) * self.scan_axis_step_um
 
     @property
     def orientation_map(self) -> dict[str, str]:
-        """Return acquisition orientation settings keyed by metadata name."""
+        """Return acquisition orientation settings keyed by metadata name.
+
+        Returns
+        -------
+        dict[str, str]
+            Recorded acquisition orientation settings by name.
+        """
         return dict(self.orientations)
 
     @property
     def stage_axis_flips_xyz(self) -> tuple[bool, bool, bool]:
-        """Derive stage-coordinate flips from recorded camera orientation."""
+        """Derive stage-coordinate flips from recorded camera orientation.
+
+        Returns
+        -------
+        tuple[bool, bool, bool]
+            Stage-placement sign reversals for X, Y, and Z.
+        """
         orientations = {key: value.strip().lower() for key, value in self.orientations}
 
         def is_flipped(key: str) -> bool:
+            """Interpret the recorded camera/stage orientation sign.
+
+            Parameters
+            ----------
+            key : str
+                Camera/stage orientation setting whose sign is interpreted.
+
+            Returns
+            -------
+            bool
+                True for a negative or reversed recorded orientation.
+            """
             return orientations.get(key, "normal") in {
                 "negative",
                 "flipped",
@@ -119,7 +181,13 @@ class AcquisitionMetadata:
 
     @property
     def scan_axis_reversed(self) -> bool:
-        """Return whether stored scan samples must be reversed before deskew."""
+        """Return whether stored scan samples must be reversed before deskew.
+
+        Returns
+        -------
+        bool
+            Whether scan samples must be reversed before production deskewing.
+        """
         # During a stage scan the sample moves opposite the stage trajectory in
         # the stationary OPM imaging plane. The deskew convention follows sample
         # coordinates, so stage-scan samples must always be reversed regardless
@@ -138,6 +206,7 @@ class AcquisitionMetadata:
                 for start, end in zip(
                     self.scan_start_positions_xyz,
                     self.scan_end_positions_xyz,
+                    strict=False,
                 )
                 if end[axis] != start[axis]
             ]
@@ -156,7 +225,13 @@ class AcquisitionMetadata:
         }
 
     def to_dict(self) -> dict[str, Any]:
-        """Return a JSON-serializable manifest."""
+        """Return a JSON-serializable manifest.
+
+        Returns
+        -------
+        dict[str, Any]
+            JSON-compatible acquisition description with derived dimensions and geometry.
+        """
         result = asdict(self)
         result["path"] = str(self.path)
         result["index_sizes"] = self.index_sizes
@@ -171,7 +246,18 @@ class AcquisitionMetadata:
 
 
 def acquisition_stem(path: str | Path) -> str:
-    """Return a stable acquisition name for ``.zarr`` and ``.ome.zarr`` paths."""
+    """Return a stable acquisition name for ``.zarr`` and ``.ome.zarr`` paths.
+
+    Parameters
+    ----------
+    path : str | Path
+        Acquisition path with a .zarr or .ome.zarr suffix.
+
+    Returns
+    -------
+    str
+        Acquisition name with its .ome.zarr or .zarr suffix removed.
+    """
     name = Path(path).name
     for suffix in (".ome.zarr", ".zarr"):
         if name.endswith(suffix):
@@ -180,10 +266,19 @@ def acquisition_stem(path: str | Path) -> str:
 
 
 def resolve_acquisition_path(path: str | Path) -> Path:
-    """Resolve either an acquisition store or its containing directory."""
+    """Resolve either an acquisition store or its containing directory.
+
+    Parameters
+    ----------
+    path : str | Path
+        Acquisition store or directory containing one raw acquisition.
+
+    Returns
+    -------
+    Path
+        Absolute path to the single selected raw acquisition store.
+    """
     candidate = Path(path).expanduser().resolve()
-    if not candidate.is_dir():
-        raise ValueError(f"Acquisition path is not a directory: {candidate}")
     if (candidate / "zarr.json").is_file() or (candidate / ".zattrs").is_file():
         return candidate
     stores = sorted(
@@ -201,16 +296,8 @@ def resolve_acquisition_path(path: str | Path) -> Path:
     # the root, so use yaozarrs to disambiguate without opening pixel arrays.
     opm_v2_stores = []
     for store in stores:
-        try:
-            root = yaozarrs.open_group(store)
-        except (OSError, TypeError, ValueError):
-            continue
-        opm_v2 = root.attrs.get("opm_v2")
-        if isinstance(opm_v2, dict) and {
-            "acquisition_order",
-            "configuration",
-            "index_sizes",
-        }.issubset(opm_v2):
+        root = yaozarrs.open_group(store)
+        if "opm_v2" in root.attrs:
             opm_v2_stores.append(store)
 
     if len(opm_v2_stores) == 1:
@@ -232,6 +319,18 @@ def resolve_acquisition_path(path: str | Path) -> Path:
 
 
 def _number(value: Any) -> float | None:
+    """Convert an optional acquisition numeric value to a float.
+
+    Parameters
+    ----------
+    value : Any
+        Scalar or structured metadata value to convert.
+
+    Returns
+    -------
+    float | None
+        Float value, or None when an optional field is absent or nonnumeric.
+    """
     if value is None or isinstance(value, bool):
         return None
     try:
@@ -241,17 +340,54 @@ def _number(value: Any) -> float | None:
 
 
 def _integer(value: Any, default: int = 0) -> int:
+    """Read an optional acquisition index with its default.
+
+    Parameters
+    ----------
+    value : Any
+        Scalar or structured metadata value to convert.
+    default : int
+        Integer returned when the metadata field is absent.
+
+    Returns
+    -------
+    int
+        Integer index or the supplied default.
+    """
     number = _number(value)
     return default if number is None else int(number)
 
 
 def _wavelength(name: str) -> float | None:
+    """Infer the emission wavelength from a named acquisition channel.
+
+    Parameters
+    ----------
+    name : str
+        Stored channel name used to infer an emission wavelength in nanometers.
+
+    Returns
+    -------
+    float | None
+        Emission wavelength in nanometers, or None when absent from the name.
+    """
     match = re.search(r"(?<!\d)(\d+(?:\.\d+)?)\s*nm\b", name, re.IGNORECASE)
     return float(match.group(1)) if match else None
 
 
 def _event_parts(frame: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Return normalized event index and event metadata for both schemas."""
+    """Return normalized event index and event metadata for both schemas.
+
+    Parameters
+    ----------
+    frame : dict[str, Any]
+        Camera frame record containing event indices and instrument metadata.
+
+    Returns
+    -------
+    tuple[dict, dict]
+        Event index and instrument metadata dictionaries from the frame record.
+    """
     if "event_index" in frame:
         return frame.get("event_index", {}), frame.get("event_metadata", {})
     event = frame.get("mda_event", {})
@@ -259,7 +395,20 @@ def _event_parts(frame: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]
 
 
 def _initial_frame_metadata(path: Path, count: int) -> list[dict[str, Any]]:
-    """Decode at most ``count`` leading frame records without loading the journal."""
+    """Decode at most ``count`` leading frame records without loading the journal.
+
+    Parameters
+    ----------
+    path : Path
+        Position-group zarr.json containing the frame history.
+    count : int
+        Maximum number of leading frame records to decode.
+
+    Returns
+    -------
+    list[dict]
+        Leading frame records available in the position journal, up to count.
+    """
     if count < 1:
         return []
     marker = '"frame_metadata"'
@@ -285,10 +434,6 @@ def _initial_frame_metadata(path: Path, count: int) -> list[dict[str, Any]]:
                         value, end = decoder.raw_decode(buffer, cursor)
                     except json.JSONDecodeError:
                         break
-                    if not isinstance(value, dict):
-                        raise ValueError(
-                            f"Frame metadata entries must be objects: {path}"
-                        )
                     frames.append(value)
                     cursor = end
             chunk = stream.read(64 * 1024)
@@ -303,22 +448,38 @@ def _initial_frame_metadata(path: Path, count: int) -> list[dict[str, Any]]:
 
 
 def _array_layout(path: Path) -> tuple[tuple[int, ...], tuple[str, ...]]:
-    """Read the small Zarr-v3 array document without opening its parent group."""
+    """Read the small Zarr-v3 array document without opening its parent group.
+
+    Parameters
+    ----------
+    path : Path
+        Zarr array directory whose zarr.json supplies shape and dimension names.
+
+    Returns
+    -------
+    tuple[tuple[int, ...], tuple[str, ...]]
+        Stored array shape and lowercase dimension names.
+    """
     metadata_path = Path(path) / "zarr.json"
-    try:
-        document = json.loads(metadata_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise ValueError(f"Cannot read Zarr array metadata: {metadata_path}") from error
-    if document.get("zarr_format") != 3 or document.get("node_type") != "array":
-        raise ValueError(f"Expected a Zarr-v3 array: {path}")
-    shape = tuple(int(value) for value in document.get("shape", ()))
-    if not shape:
-        raise ValueError(f"Zarr array has no shape: {path}")
-    names = tuple(str(value).lower() for value in document.get("dimension_names", ()))
+    document = json.loads(metadata_path.read_text(encoding="utf-8"))
+    shape = tuple(int(value) for value in document["shape"])
+    names = tuple(str(value).lower() for value in document["dimension_names"])
     return shape, names
 
 
 def _first_by_channel(frames: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+    """Select the first initial frame recorded for each channel.
+
+    Parameters
+    ----------
+    frames : list[dict[str, Any]]
+        Leading acquisition frame records used to select one record per channel.
+
+    Returns
+    -------
+    dict[int, dict[str, Any]]
+        Channel indices mapped to their first acquisition frame.
+    """
     selected: dict[int, dict[str, Any]] = {}
     for frame in frames:
         index, _ = _event_parts(frame)
@@ -334,6 +495,24 @@ def _channel_metadata(
     configured_powers: list[Any] | None = None,
     configured_exposures: list[Any] | None = None,
 ) -> tuple[ChannelMetadata, ...]:
+    """Combine stored channel names with recorded exposure and laser settings.
+
+    Parameters
+    ----------
+    names : list[str]
+        Ordered channel names from the OME image metadata.
+    frames : list[dict[str, Any]]
+        Numerically ordered projection TIFF paths for one position/channel.
+    configured_powers : list[Any] | None
+        Per-channel laser powers from acquisition configuration, when present.
+    configured_exposures : list[Any] | None
+        Per-channel exposure times in milliseconds from acquisition configuration.
+
+    Returns
+    -------
+    tuple[ChannelMetadata, ...]
+        Ordered channel records with wavelengths, exposures, and laser powers.
+    """
     by_channel = _first_by_channel(frames)
     channels: list[ChannelMetadata] = []
     for channel_index, name in enumerate(names):
@@ -374,6 +553,20 @@ def _positions_from_frame_sets(
     str | None,
     float | None,
 ]:
+    """Recover per-position scan endpoints and stage motion from initial frames.
+
+    Parameters
+    ----------
+    frame_sets : list[list[dict[str, Any]]]
+        Initial frame records for each acquisition position.
+    scan_position_count : int | None
+        Total acquired scan planes used to extrapolate the stage trajectory.
+
+    Returns
+    -------
+    tuple[tuple[tuple[float, float, float], ...], tuple[tuple[float, float, float], ...], tuple[tuple[float, float, float], ...], str | None, float | None]
+        Stage origins, scan endpoints, inferred scan axis, and step size.
+    """
     positions_zxy: list[tuple[float, float, float]] = []
     starts_xyz: list[tuple[float, float, float]] = []
     ends_xyz: list[tuple[float, float, float]] = []
@@ -438,6 +631,18 @@ def _positions_from_frame_sets(
 
 
 def _sidecars(path: Path) -> tuple[str, ...]:
+    """List JSON sidecars beside the acquisition store.
+
+    Parameters
+    ----------
+    path : Path
+        Acquisition store whose neighboring JSON files are listed.
+
+    Returns
+    -------
+    tuple[str, ...]
+        Absolute paths of neighboring JSON sidecars.
+    """
     return tuple(
         str(item.resolve())
         for item in sorted(path.parent.glob("*.json"))
@@ -446,43 +651,36 @@ def _sidecars(path: Path) -> tuple[str, ...]:
 
 
 def _inspect_ome_zarr(path: Path, root: ZarrGroup) -> AcquisitionMetadata:
-    """Normalize the current OPM OME-Zarr layout without parsing every journal."""
+    """Normalize the current OPM OME-Zarr layout without parsing every journal.
+
+    Parameters
+    ----------
+    path : Path
+        Raw OME-Zarr acquisition directory.
+    root : ZarrGroup
+        Opened OME-Zarr root group used to avoid rereading root metadata.
+
+    Returns
+    -------
+    AcquisitionMetadata
+        Acquisition description assembled from OME metadata and initial frame records.
+    """
     attributes = root.attrs
-    opm = attributes.get("opm_v2")
-    if not isinstance(opm, dict):
-        raise ValueError(f"OME-Zarr store lacks opm_v2 acquisition metadata: {path}")
+    opm = attributes["opm_v2"]
     layout = root.ome_metadata()
     if isinstance(layout, v05.Bf2Raw):
         ome_group = root["OME"]
-        if not isinstance(ome_group, ZarrGroup):
-            raise ValueError(f"OME metadata node is not a group: {path}")
         series_metadata = ome_group.ome_metadata()
-        if not isinstance(series_metadata, v05.Series):
-            raise ValueError(f"OME group lacks typed series metadata: {path}")
         series_names = tuple(str(series_name) for series_name in series_metadata.series)
-        if not series_names:
-            raise ValueError(f"OME-Zarr acquisition has no image series: {path}")
         first_image_group = root[series_names[0]]
-        if not isinstance(first_image_group, ZarrGroup):
-            raise ValueError(f"Series {series_names[0]} is not an image group")
-    elif isinstance(layout, v05.Image):
+    else:
         # ome-writers stores one-position acquisitions directly as an Image
         # group. Multi-position acquisitions use the Bio-Formats2Raw layout.
         series_names = ("",)
         first_image_group = root
-    else:
-        raise ValueError(
-            f"Expected an OME-Zarr v0.5 Image or Bio-Formats2Raw layout: {path}"
-        )
 
     image_metadata = first_image_group.ome_metadata()
-    if not isinstance(image_metadata, v05.Image):
-        raise ValueError(f"Series {series_names[0] or '<root>'} lacks OME metadata")
-    if len(image_metadata.multiscales) != 1:
-        raise ValueError("Each acquisition series must contain one multiscale image")
     multiscale = image_metadata.multiscales[0]
-    if not multiscale.datasets:
-        raise ValueError("Acquisition image has no datasets")
     dataset_path = str(multiscale.datasets[0].path)
 
     array_shapes: list[tuple[int, ...]] = []
@@ -494,22 +692,12 @@ def _inspect_ome_zarr(path: Path, root: ZarrGroup) -> AcquisitionMetadata:
         array_paths.append(relative_path)
         array_shapes.append(current_shape)
         if current_names:
-            if dimension_names and current_names != dimension_names:
-                raise ValueError("All OPM position arrays must use the same dimensions")
             dimension_names = current_names
 
-    if any(shape != array_shapes[0] for shape in array_shapes[1:]):
-        raise ValueError("All OPM position series must have the same array shape")
     if not dimension_names:
         dimension_names = tuple("tczyx"[-len(array_shapes[0]) :])
     axes = (dimension_names[0], "p", *dimension_names[1:])
     shape = (array_shapes[0][0], len(series_names), *array_shapes[0][1:])
-    sizes = opm.get("index_sizes", {})
-    for axis, expected in sizes.items():
-        if axis in axes and int(expected) != shape[axes.index(axis)]:
-            raise ValueError(
-                f"opm_v2 index size {axis}={expected} disagrees with array shape {shape}"
-            )
 
     channel_names: list[str] = []
     if image_metadata.omero is not None:
@@ -533,7 +721,9 @@ def _inspect_ome_zarr(path: Path, root: ZarrGroup) -> AcquisitionMetadata:
         frame_sets = [all_frames[:initial_frame_count]]
     else:
         frame_sets = [
-            _initial_frame_metadata(path / series_name / "zarr.json", initial_frame_count)
+            _initial_frame_metadata(
+                path / series_name / "zarr.json", initial_frame_count
+            )
             for series_name in series_names
         ]
 
@@ -559,10 +749,24 @@ def _inspect_ome_zarr(path: Path, root: ZarrGroup) -> AcquisitionMetadata:
     channel_states = list(daq_config.get("channel_states", []))
 
     def enabled_values(key: str) -> list[Any]:
+        """Select acquisition channel settings for the enabled channels.
+
+        Parameters
+        ----------
+        key : str
+            Acquisition configuration or orientation field to read.
+
+        Returns
+        -------
+        list[Any]
+            Configured values corresponding to the enabled acquisition channels.
+        """
         values = list(daq_config.get(key, []))
         if len(channel_states) == len(values):
             values = [
-                value for value, enabled in zip(values, channel_states) if enabled
+                value
+                for value, enabled in zip(values, channel_states, strict=False)
+                if enabled
             ]
         return values
 
@@ -630,23 +834,41 @@ def _inspect_ome_zarr(path: Path, root: ZarrGroup) -> AcquisitionMetadata:
 def inspect_acquisition(
     path: str | Path, *, root: ZarrGroup | None = None
 ) -> AcquisitionMetadata:
-    """Parse an OME-Zarr OPM manifest without opening or reading pixel data."""
+    """Parse an OME-Zarr OPM manifest without opening or reading pixel data.
+
+    Parameters
+    ----------
+    path : str | Path
+        Acquisition store or containing directory to inspect without reading pixels.
+    root : ZarrGroup | None
+        Opened OME-Zarr root group used to avoid rereading root metadata.
+
+    Returns
+    -------
+    AcquisitionMetadata
+        Normalized acquisition dimensions, channels, calibration, and scan geometry.
+    """
     store = resolve_acquisition_path(path)
     if root is None:
-        try:
-            root = yaozarrs.open_group(store)
-        except ValueError as error:
-            raise ValueError(
-                "The shared acquisition inspector requires a group-based OME-Zarr "
-                f"store; {store} is a legacy root-array acquisition"
-            ) from error
+        root = yaozarrs.open_group(store)
     return _inspect_ome_zarr(store, root)
 
 
 def open_acquisition_datastore(
     acquisition: AcquisitionMetadata | str | Path,
-):
-    """Open a logical TPCZYX TensorStore after metadata inspection."""
+) -> ts.TensorStore:
+    """Open a logical TPCZYX TensorStore after metadata inspection.
+
+    Parameters
+    ----------
+    acquisition : AcquisitionMetadata | str | Path
+        Inspected acquisition dimensions, stage geometry, and camera calibration.
+
+    Returns
+    -------
+    TensorStore
+        Virtual TPCZYX view stacking the per-position TCZYX acquisition arrays.
+    """
     import tensorstore as ts
 
     metadata = (
@@ -667,8 +889,6 @@ def open_acquisition_datastore(
                 }
             ).result()
         )
-    if not arrays:
-        raise ValueError(f"Acquisition has no arrays: {metadata.path}")
     return ts.stack(arrays, axis=1)
 
 

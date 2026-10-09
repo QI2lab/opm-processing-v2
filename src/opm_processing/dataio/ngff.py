@@ -2,28 +2,61 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import numpy as np
 
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 SPATIAL_DECIMALS = 3
 
 
 def round_spatial(value: float) -> float:
-    """Round one physical coordinate or spacing to one nanometer."""
+    """Round one physical coordinate or spacing to one nanometer.
+
+    Parameters
+    ----------
+    value : float
+        Physical coordinate or spacing in micrometers.
+
+    Returns
+    -------
+    float
+        Value rounded to three decimal places.
+    """
     return round(float(value), SPATIAL_DECIMALS)
 
 
 def round_spatial_values(values: Sequence[float]) -> tuple[float, ...]:
-    """Round physical coordinate values to three decimal places."""
+    """Round physical coordinate values to three decimal places.
+
+    Parameters
+    ----------
+    values : Sequence[float]
+        Physical coordinates or spacings in micrometers.
+
+    Returns
+    -------
+    tuple[float, ...]
+        Rounded values in the original axis order.
+    """
     return tuple(round_spatial(value) for value in values)
 
 
 def round_tczyx_transform(values: Sequence[float]) -> list[float]:
-    """Round only the spatial ZYX values of a TCZYX transform."""
-    if len(values) != 5:
-        raise ValueError("A TCZYX coordinate transform must contain five values")
+    """Round only the spatial ZYX values of a TCZYX transform.
+
+    Parameters
+    ----------
+    values : Sequence[float]
+        Five TCZYX scale or translation values; spatial units are micrometers.
+
+    Returns
+    -------
+    list[float]
+        Transform preserving T and C and rounding the spatial values.
+    """
     return [float(values[0]), float(values[1]), *round_spatial_values(values[2:])]
 
 
@@ -32,7 +65,22 @@ def downsample_yx(
     factor: int,
     method: str = "stride",
 ) -> np.ndarray:
-    """Downsample the last two axes, using striding by default."""
+    """Downsample the last two axes, using striding by default.
+
+    Parameters
+    ----------
+    image : np.ndarray
+        Image with YX as its last two dimensions.
+    factor : int
+        Positive integer reduction along Y and X.
+    method : str
+        stride selects pixels; block_mean averages complete blocks.
+
+    Returns
+    -------
+    np.ndarray
+        Reduced image preserving the input dtype and leading axes.
+    """
     factor = int(factor)
     if factor < 1:
         raise ValueError("Pyramid factors must be positive integers")

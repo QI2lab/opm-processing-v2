@@ -114,11 +114,11 @@ estimates. The input hashes, measured/zero-plane counts, physical display
 grids and projection arrays are saved alongside the figure.
 
 ```powershell
-uv run --no-sync --with matplotlib python -m opm_processing.imageprocessing.plot_acquisition_reconstruction_projections --acquisitions diagnostics/meridian_sphere_camera_0p4/scan_0.4um diagnostics/meridian_sphere_camera/scan_0.8um diagnostics/meridian_sphere_camera_1p2/scan_1.2um diagnostics/meridian_sphere_camera_1p6/scan_1.6um --output diagnostics/fixed_plane_sampling_series
+uv run --no-sync --with matplotlib python -m scripts.plot_acquisition_reconstruction_projections --acquisitions diagnostics/meridian_sphere_camera_0p4/scan_0.4um diagnostics/meridian_sphere_camera/scan_0.8um diagnostics/meridian_sphere_camera_1p2/scan_1.2um diagnostics/meridian_sphere_camera_1p6/scan_1.6um --output diagnostics/fixed_plane_sampling_series
 ```
 
 ## Reproduce the figures
 
 ```powershell
-uv run --no-sync --with matplotlib python -m opm_processing.imageprocessing.publication_fixed_plane_series --acquisitions diagnostics/meridian_sphere_camera_0p4/scan_0.4um diagnostics/meridian_sphere_camera/scan_0.8um diagnostics/meridian_sphere_camera_1p2/scan_1.2um diagnostics/meridian_sphere_camera_1p6/scan_1.6um --output diagnostics/fixed_plane_sampling_series
+uv run --no-sync --with matplotlib python -m scripts.publication_fixed_plane_series --acquisitions diagnostics/meridian_sphere_camera_0p4/scan_0.4um diagnostics/meridian_sphere_camera/scan_0.8um diagnostics/meridian_sphere_camera_1p2/scan_1.2um diagnostics/meridian_sphere_camera_1p6/scan_1.6um --output diagnostics/fixed_plane_sampling_series
 ```

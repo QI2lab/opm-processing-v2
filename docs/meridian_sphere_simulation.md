@@ -79,13 +79,13 @@ shutter timing are not included.
 Run from the repository root:
 
 ```powershell
-uv run python -m opm_processing.imageprocessing.opm_simulation --output diagnostics/meridian_sphere --scan-steps 0.2 0.8
+uv run python -m scripts.opm_simulation --output diagnostics/meridian_sphere --scan-steps 0.2 0.8
 ```
 
 Then add camera integration and noise:
 
 ```powershell
-uv run python -m opm_processing.imageprocessing.opm_simulation --output diagnostics/meridian_sphere_camera --scan-steps 0.2 0.8 --camera-samples 3 --peak-electrons 500 --background-electrons 2 --read-noise 1.5
+uv run python -m scripts.opm_simulation --output diagnostics/meridian_sphere_camera --scan-steps 0.2 0.8 --camera-samples 3 --peak-electrons 500 --background-electrons 2 --read-noise 1.5
 ```
 
 Geometry and optics can be changed with `--diameter`, `--tube-diameter`,
@@ -106,7 +106,7 @@ and `raw_instrument.png` shows the oblique data before deskewing.
 Render the saved volumes without rerunning optics:
 
 ```powershell
-uv run --with matplotlib python -m opm_processing.imageprocessing.plot_opm_simulation diagnostics/meridian_sphere/scan_0.2um
+uv run --with matplotlib python -m scripts.plot_opm_simulation diagnostics/meridian_sphere/scan_0.2um
 ```
 
 ## Results and checks
@@ -131,12 +131,14 @@ Projection figures use shared intensity scales and include the projection of
 the absolute volumetric error, rather than differences between independent
 maximum projections.
 
-The 23 unit/integration cases cover exact tube geometry and empty interior,
+The original 23 numerical cases covered exact tube geometry and empty interior,
 pixel-area quadrature, Poisson/read-noise moments, the two convolution routes,
 physical sphere centering, deskew/reference agreement at two scan steps, and
-the existing fine-grid PSF sampling-convergence checks. Arrays stay in memory
-during tests. These validate this stationary forward model; they do not explain
-motion or the residual tilt in the live acquisition.
+fine-grid PSF sampling-convergence checks. Current in-memory simulation checks
+are unit tests. Integration tests must exercise simulated data from disk input
+to verified disk output, as described in the [testing guide](development/testing.md).
+These checks validate the specified stationary forward model; they do not
+explain motion or residual tilt in a live acquisition.
 
 ## GC after the complete camera simulation
 
@@ -163,9 +165,9 @@ orthogonal deskew. The Cartesian microscope reference is also deconvolved with
 its corresponding pixel-integrated PSF.
 
 ```powershell
-uv run python -m opm_processing.imageprocessing.deconvolve_opm_simulation diagnostics/meridian_sphere_camera/scan_0.2um
-uv run python -m opm_processing.imageprocessing.deconvolve_opm_simulation diagnostics/meridian_sphere_camera/scan_0.8um
-uv run python -m opm_processing.imageprocessing.deconvolve_opm_simulation diagnostics/meridian_sphere_camera/scan_0.8um --scan-upsample 2
+uv run python -m scripts.deconvolve_opm_simulation diagnostics/meridian_sphere_camera/scan_0.2um
+uv run python -m scripts.deconvolve_opm_simulation diagnostics/meridian_sphere_camera/scan_0.8um
+uv run python -m scripts.deconvolve_opm_simulation diagnostics/meridian_sphere_camera/scan_0.8um --scan-upsample 2
 ```
 
 Outputs are in `decon_native` or `decon_upsample2` subdirectories and can be
@@ -191,8 +193,8 @@ electrons, 2 background electrons, 1.5-electron read noise and seed 42. Its 37
 measured planes reconstruct to 109 planes at 0.4 um using factor 3. Reproduce it:
 
 ```powershell
-uv run python -m opm_processing.imageprocessing.opm_simulation --output diagnostics/meridian_sphere_camera_1p2 --scan-steps 1.2 --camera-samples 3 --peak-electrons 500 --background-electrons 2 --read-noise 1.5 --seed 42
-uv run python -m opm_processing.imageprocessing.deconvolve_opm_simulation diagnostics/meridian_sphere_camera_1p2/scan_1.2um --scan-upsample 3
+uv run python -m scripts.opm_simulation --output diagnostics/meridian_sphere_camera_1p2 --scan-steps 1.2 --camera-samples 3 --peak-electrons 500 --background-electrons 2 --read-noise 1.5 --seed 42
+uv run python -m scripts.deconvolve_opm_simulation diagnostics/meridian_sphere_camera_1p2/scan_1.2um --scan-upsample 3
 ```
 
 Against the deconvolved Cartesian reference, this reconstruction has 14.15%

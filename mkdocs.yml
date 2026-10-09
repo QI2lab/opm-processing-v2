@@ -1,0 +1,117 @@
+site_name: opm-processing-v2
+site_description: Processing, reconstruction, and fusion of qi2lab OPM acquisitions.
+site_author: Quantitative Imaging and Inference Lab
+site_url: https://qi2lab.github.io/opm-processing-v2/
+repo_url: https://github.com/qi2lab/opm-processing-v2
+repo_name: opm-processing-v2
+edit_uri: edit/perf/numba-deskew-corrections/docs/
+strict: true
+
+theme:
+  name: material
+  features:
+    - content.tabs.link
+    - content.code.annotate
+    - content.code.copy
+    - navigation.footer
+    - navigation.instant
+    - navigation.instant.progress
+  icon:
+    repo: fontawesome/brands/github
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: white
+      accent: dark blue
+      toggle:
+        icon: material/lightbulb-outline
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: grey
+      accent: light blue
+      toggle:
+        icon: material/lightbulb
+        name: Switch to light mode
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [src]
+          options:
+            allow_inspection: false
+            docstring_style: numpy
+            members: false
+            show_source: false
+            show_signature_annotations: true
+            separate_signature: true
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.superfences
+  - pymdownx.details
+  - pymdownx.snippets:
+      base_path: ["."]
+      check_paths: true
+
+validation:
+  nav:
+    omitted_files: warn
+  links:
+    not_found: warn
+    anchors: warn
+    unrecognized_links: warn
+
+nav:
+  - Home: index.md
+  - Getting started:
+      - Installation: getting-started/installation.md
+      - First workflow: getting-started/quickstart.md
+  - Guides:
+      - Processing: guides/processing.md
+      - Live acquisition: guides/live.md
+      - Registration and fusion: guides/fusion.md
+      - Selecting an ROI: guides/roi.md
+      - Exporting images and movies: guides/exports.md
+      - Viewing and troubleshooting: guides/viewing.md
+  - Reference:
+      - Commands: reference/cli/index.md
+      - inspect-opm: reference/cli/inspect-opm.md
+      - process: reference/cli/process.md
+      - fuse: reference/cli/fuse.md
+      - display: reference/cli/display.md
+      - process-ROI: reference/cli/process-roi.md
+      - export-ome-tiff: reference/cli/export-ome-tiff.md
+      - export-projections: reference/cli/export-projections.md
+      - encode-projections: reference/cli/encode-projections.md
+      - convert-timelapse: reference/cli/convert-timelapse.md
+      - Dataset layout and metadata: reference/data.md
+      - Python:
+          - Acquisition and state: reference/python/dataio.md
+          - Image processing: reference/python/imageprocessing.md
+          - Workflows: reference/python/workflows.md
+  - Methods:
+      - Calibration and deskew: methods/deskew.md
+      - PSFs and deconvolution: methods/deconvolution.md
+      - Registration and blending: methods/fusion.md
+      - Orthogonal interpolation geometry: orthogonal_interpolation_diagram.md
+  - Examples:
+      - Simulation scripts: examples/index.md
+      - Meridian sphere: meridian_sphere_simulation.md
+      - Publication figure: opm_publication_figure.md
+      - Fixed-plane sampling: fixed_plane_sampling_series.md
+  - Development:
+      - Contributing: development/contributing.md
+      - Running tests: development/testing.md
+      - Building documentation: development/documentation.md
