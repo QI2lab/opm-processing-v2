@@ -1,0 +1,22 @@
+name: Draft new pull requests
+
+on:
+  pull_request_target:
+    types: [opened]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  draft:
+    name: Convert new pull request to draft
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      # Update PR metadata only; do not check out or execute pull request code.
+      - name: Convert to draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: gh pr ready "$PR_NUMBER" --undo

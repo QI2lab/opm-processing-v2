@@ -3,10 +3,11 @@ name: CI
 on:
   push:
     branches:
-      - "**"
+      - main
     tags:
       - "v*"
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
   workflow_dispatch:
 
 permissions:
@@ -20,6 +21,10 @@ concurrency:
 jobs:
   test-cpu:
     name: CPU / ${{ matrix.platform }} (${{ matrix.python-version }})
+    # Opening a PR starts the draft workflow; wait until it is ready for review.
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.action != 'opened' && github.event.pull_request.draft == false)
     runs-on: ${{ matrix.platform }}
     strategy:
       fail-fast: false
