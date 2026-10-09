@@ -17,12 +17,11 @@ from opm_processing.dataio.processing_state import (
     processing_state_path,
 )
 from opm_processing.dataio.roi import PhysicalRoi
-from opm_processing.imageprocessing.tilefusion import TileFusion
 from opm_processing.imageprocessing.maxtilefusion import (
     regenerate_fused_max_projection,
 )
+from opm_processing.imageprocessing.tilefusion import TileFusion
 from opm_processing.process import process_skewed
-
 
 app = typer.Typer(pretty_exceptions_enable=False)
 

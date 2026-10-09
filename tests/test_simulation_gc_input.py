@@ -4,7 +4,6 @@ import json
 from pathlib import Path
 
 import pytest
-
 from scripts import deconvolve_opm_simulation as experiment
 
 

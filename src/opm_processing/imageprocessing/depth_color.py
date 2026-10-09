@@ -6,10 +6,16 @@ This independent NumPy implementation selects the brightest voxel before
 coloring, rather than mixing RGB maxima from different depths.
 """
 
+from __future__ import annotations
+
 from functools import lru_cache
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from cmap import Colormap
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 
 @lru_cache(maxsize=32)
@@ -37,7 +43,9 @@ def depth_palette(planes: int, colormap: str = "turbo") -> np.ndarray:
     return palette
 
 
-def depth_projection(volume, axis, limits, colormap="turbo"):
+def depth_projection(
+    volume: np.ndarray, axis: int, limits: Sequence[float], colormap: str = "turbo"
+) -> np.ndarray:
     """Color the raw-intensity maximum's depth; first voxel wins an exact tie.
 
     Parameters
@@ -73,7 +81,9 @@ def depth_projection(volume, axis, limits, colormap="turbo"):
     ).astype(np.uint8)
 
 
-def depth_legends(shape, spacing, colormap="turbo"):
+def depth_legends(
+    shape: Sequence[int], spacing: Sequence[float], colormap: str = "turbo"
+) -> list[dict[str, Any]]:
     """Describe local voxel-center depth ranges for XY/Z, XZ/Y and YZ/X.
 
     Parameters
@@ -91,14 +101,14 @@ def depth_legends(shape, spacing, colormap="turbo"):
         Colorbar labels and physical depth extents for the XY, XZ, and YZ views.
     """
     return [
-        dict(
-            projection=projection,
-            axis=axis,
-            max_um=(int(n) - 1) * float(step),
-            planes=int(n),
-            colormap=colormap,
-        )
+        {
+            "projection": projection,
+            "axis": axis,
+            "max_um": (int(n) - 1) * float(step),
+            "planes": int(n),
+            "colormap": colormap,
+        }
         for projection, axis, n, step in zip(
-            ("XY", "XZ", "YZ"), ("Z", "Y", "X"), shape, spacing
+            ("XY", "XZ", "YZ"), ("Z", "Y", "X"), shape, spacing, strict=False
         )
     ]

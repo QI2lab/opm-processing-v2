@@ -1,14 +1,14 @@
 """Simulated disk-to-disk OME-BigTIFF exports with pixel and metadata truth."""
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import numpy as np
 import pytest
 import tifffile
 import zarr
 from ome_types import from_xml, to_xml
-from ome_types.model import CommentAnnotation, AnnotationRef
+from ome_types.model import AnnotationRef, CommentAnnotation
 from typer.testing import CliRunner
 from yaozarrs import open_group, v05
 from yaozarrs.write.v05 import prepare_image
@@ -85,7 +85,7 @@ def test_fused_pair_roundtrip_pixels_and_metadata(tmp_path, source_xml, workers)
                             color=color,
                             window=v05.OmeroWindow(start=0, end=2000, min=0, max=2000),
                         )
-                        for name, color in (("488nm α", "33CC99"), ("637nm", "FF3300"))
+                        for name, color in (("488nm Î±", "33CC99"), ("637nm", "FF3300"))
                     ]
                 )
             }
@@ -96,12 +96,12 @@ def test_fused_pair_roundtrip_pixels_and_metadata(tmp_path, source_xml, workers)
     source_ome = from_xml(companion.read_text(encoding="utf-8"))
     if source_xml:
         source_ome.images[0].acquisition_date = datetime(
-            2026, 10, 5, 19, 12, 32, tzinfo=timezone.utc
+            2026, 10, 5, 19, 12, 32, tzinfo=UTC
         )
         source_ome.images[0].pixels.time_increment = 8.5
         source_ome.images[0].pixels.channels[0].emission_wavelength = 525
         source_ome.structured_annotations.comment_annotations.append(
-            CommentAnnotation(id="Annotation:sample", value="Simulated specimen μ")
+            CommentAnnotation(id="Annotation:sample", value="Simulated specimen Î¼")
         )
         source_ome.images[0].annotation_refs.append(
             AnnotationRef(id="Annotation:sample")
@@ -158,7 +158,7 @@ def test_fused_pair_roundtrip_pixels_and_metadata(tmp_path, source_xml, workers)
             ],
             chunks=(1, 1, 1, 128, 128),
             writer="tensorstore",
-            extra_attributes={"specimen": "Simulated α"},
+            extra_attributes={"specimen": "Simulated Î±"},
             overwrite=True,
         )
         arrays["0"].write(data).result()
@@ -212,8 +212,11 @@ def test_fused_pair_roundtrip_pixels_and_metadata(tmp_path, source_xml, workers)
                 pixels.physical_size_y,
                 pixels.physical_size_x,
             ) == spacing
-            assert pixels.physical_size_x_unit.value == "µm"
-            assert [channel.name for channel in pixels.channels] == ["488nm α", "637nm"]
+            assert pixels.physical_size_x_unit.value == "Âµm"
+            assert [channel.name for channel in pixels.channels] == [
+                "488nm Î±",
+                "637nm",
+            ]
             assert [channel.excitation_wavelength for channel in pixels.channels] == [
                 488,
                 637,
@@ -225,7 +228,7 @@ def test_fused_pair_roundtrip_pixels_and_metadata(tmp_path, source_xml, workers)
                 assert pixels.time_increment == 8.5
                 assert (
                     exported.structured_annotations.comment_annotations[0].value
-                    == "Simulated specimen μ"
+                    == "Simulated specimen Î¼"
                 )
             z_origin = origin[0] if expected.shape[2] == 3 else origin[0] + 0.23
             assert image.stage_label.z == z_origin
@@ -244,7 +247,7 @@ def test_fused_pair_roundtrip_pixels_and_metadata(tmp_path, source_xml, workers)
             assert json.loads(annotations["ProcessingState"]) == state.document
             assert json.loads(annotations["NGFF"]) == dict(open_group(source).attrs)
             assert json.loads(annotations["Acquisition"])["channel_names"] == [
-                "488nm α",
+                "488nm Î±",
                 "637nm",
             ]
             assert json.loads(annotations["AcquisitionSettings"])["configuration"][

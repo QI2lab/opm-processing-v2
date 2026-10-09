@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import json
 import math
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +17,6 @@ from opm_processing.dataio.processing_state import (
     ProcessingState,
     processing_state_path,
 )
-
 
 ROI_SCHEMA = "opm-processing-roi-v1"
 

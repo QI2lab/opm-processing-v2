@@ -249,7 +249,7 @@ def _write_opm_v2_zarr(
     """Write a current group-based OME-Zarr acquisition fixture."""
     normalized = raw_data if "z" in labels else raw_data[:, :, :, None, :, :]
     normalized_chunks = chunks if "z" in labels else (*chunks[:3], 1, *chunks[-2:])
-    time_count, position_count, channel_count, z_count, y_count, x_count = (
+    time_count, position_count, channel_count, z_count, _y_count, _x_count = (
         int(value) for value in normalized.shape
     )
     frames_by_position: list[list[dict]] = [[] for _ in range(position_count)]
@@ -524,7 +524,8 @@ def _create_opm_v2_tiled_ground_truth_zarr(
     )
     max_offsets = np.max(true_image_offsets, axis=0)
     ground_truth_shape = tuple(
-        int(tile_size + offset) for tile_size, offset in zip(tile_zyx, max_offsets)
+        int(tile_size + offset)
+        for tile_size, offset in zip(tile_zyx, max_offsets, strict=False)
     )
 
     rng = np.random.default_rng(config.rng_seed)
@@ -561,7 +562,7 @@ def _create_opm_v2_tiled_ground_truth_zarr(
         radius_z,
         radius_y,
         radius_x,
-    ) in zip(ellipsoid_amplitudes, ellipsoids_zyx_radii):
+    ) in zip(ellipsoid_amplitudes, ellipsoids_zyx_radii, strict=False):
         elliptical_radius = np.sqrt(
             ((zz - center_z) / radius_z) ** 2
             + ((yy - center_y) / radius_y) ** 2
@@ -760,12 +761,13 @@ def opm_v2_spatial_tiling_ground_truth_zarr(
 @pytest.fixture
 def roi_run(tmp_path: Path, monkeypatch):
     """Build a three-channel acquisition with two selected nonzero positions."""
+    import importlib
     from types import SimpleNamespace
+
     from opm_processing import process_roi as roi_command
     from opm_processing.dataio.acquisition import AcquisitionMetadata, ChannelMetadata
     from opm_processing.dataio.roi import PhysicalRoi
     from opm_processing.imageprocessing.opmtools import orthogonal_deskew
-    import importlib
 
     process = importlib.import_module("opm_processing.process")
     rlgc = importlib.import_module("opm_processing.imageprocessing.rlgc")

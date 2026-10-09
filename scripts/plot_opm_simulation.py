@@ -8,6 +8,8 @@ Requires matplotlib; run from the repository root with
 ``uv run --with matplotlib python -m scripts.plot_opm_simulation DIRECTORY``.
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 from pathlib import Path
@@ -20,7 +22,7 @@ import numpy as np
 from tifffile import imread
 
 
-def main():
+def main() -> None:
     """Export common-scale physical projections and an instrument-frame view."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory", type=Path)

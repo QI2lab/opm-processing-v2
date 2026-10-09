@@ -63,7 +63,7 @@ def test_optical_illumination_and_camera_transfer(stage_gain, strided):
         raw, illumination = raw[::2, ::2, :], illumination[::2, :]
         measured = measured[::2, ::2, :]
     original = raw.copy()
-    options = dict(detector_x_offset=1040, apply_stage_scan_gain=stage_gain)
+    options = {"detector_x_offset": 1040, "apply_stage_scan_gain": stage_gain}
     calibrated = camera_correct(raw, offset, conversion, **options)
     reference = calibrated.copy()
     corrected = illumination_correct(calibrated, illumination)

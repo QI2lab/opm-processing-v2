@@ -2,34 +2,24 @@
 
 from __future__ import annotations
 
-
-from pathlib import Path
-
-from itertools import islice
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from functools import lru_cache
-
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
-
-from typing import Annotated
-
+from itertools import islice
+from pathlib import Path
+from typing import TYPE_CHECKING, Annotated, Any
 
 import numpy as np
-
 import tifffile
-
 import typer
-
 from PIL import Image, ImageDraw, ImageFont
-
 from tqdm import tqdm
 
-
-from opm_processing.dataio.acquisition import inspect_acquisition
-
+from opm_processing.dataio.acquisition import AcquisitionMetadata, inspect_acquisition
 from opm_processing.dataio.position_collection import open_position_collection
-
 from opm_processing.dataio.processing_state import ProcessingState
 
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable, Iterator, Sequence
 
 app = typer.Typer(pretty_exceptions_enable=False)
 
@@ -73,7 +63,7 @@ def find_datasets(path: Path) -> list[Path]:
     return datasets
 
 
-def acquisition_for(path: Path, override: Path | None = None):
+def acquisition_for(path: Path, override: Path | None = None) -> AcquisitionMetadata:
     """Find the raw acquisition explicitly or through its processing sidecar.
 
     Parameters
@@ -113,7 +103,7 @@ def acquisition_for(path: Path, override: Path | None = None):
     return inspect_acquisition(matches[0])
 
 
-def volume_interval_ms(acquisition) -> float:
+def volume_interval_ms(acquisition: AcquisitionMetadata) -> float:
     """Compute scan planes times exposure times channels (sum unequal exposures).
 
     Parameters
@@ -191,7 +181,7 @@ def contrast_limits(volume: np.ndarray) -> tuple[float, float]:
 
 
 @lru_cache(maxsize=4)
-def annotation_font(size=20):
+def annotation_font(size: int = 20) -> ImageFont.FreeTypeFont:
     """Load a Unicode font instead of Pillow's limited default font.
 
     Parameters
@@ -215,8 +205,14 @@ def annotation_font(size=20):
 
 
 def projection_panels(
-    volume, voxel_size_um, limits, depth_color=False, depth_colormap="turbo"
-):
+    volume: np.ndarray,
+    voxel_size_um: Sequence[float],
+    limits: Sequence[float],
+    depth_color: bool = False,
+    depth_colormap: str = "turbo",
+) -> tuple[
+    tuple[Image.Image, Image.Image, Image.Image], float, list[dict[str, Any]] | None
+]:
     """Compute the three physically scaled panels once per volume.
 
     Parameters
@@ -247,7 +243,7 @@ def projection_panels(
 
     low, high = limits
 
-    def panel(values, size):
+    def panel(values: np.ndarray, size: tuple[int, int]) -> Image.Image:
         """Scale and resize one maximum projection into an 8-bit display panel.
 
         Parameters
@@ -278,8 +274,8 @@ def projection_panels(
 
     if depth_color:
         from opm_processing.imageprocessing.depth_color import (
-            depth_projection,
             depth_legends,
+            depth_projection,
         )
 
         xy, xz, yz = (
@@ -307,8 +303,16 @@ def projection_panels(
 
 
 def assemble_canvas(
-    xy, xz, yz, pixel_um, elapsed_ms, scale_bar_um=None, *, font_size=20, legends=None
-):
+    xy: Image.Image,
+    xz: Image.Image,
+    yz: Image.Image,
+    pixel_um: float,
+    elapsed_ms: float,
+    scale_bar_um: float | None = None,
+    *,
+    font_size: int = 20,
+    legends: list[dict[str, Any]] | None = None,
+) -> tuple[np.ndarray, float, float]:
     """Compose panels and supersample text without resampling image data.
 
     Parameters
@@ -359,7 +363,7 @@ def assemble_canvas(
         power = 10 ** np.floor(np.log10(target))
 
         scale_bar_um = max(
-            (v * power for v in (0.1, 0.2, 0.5, 1, 2, 5) if v * power <= target)
+            v * power for v in (0.1, 0.2, 0.5, 1, 2, 5) if v * power <= target
         )
 
     if not np.isfinite(scale_bar_um) or scale_bar_um <= 0:
@@ -371,7 +375,7 @@ def assemble_canvas(
 
     text_width = int(
         np.ceil(
-            max((font.getbbox(text)[2] for text in (label, time_units, bar_label)))
+            max(font.getbbox(text)[2] for text in (label, time_units, bar_label))
             / text_sampling
         )
     )
@@ -411,7 +415,7 @@ def assemble_canvas(
         )
 
         overlay = Image.new(
-            "RGBA", tuple((v * text_sampling for v in label_size)), (0, 0, 0, 0)
+            "RGBA", tuple(v * text_sampling for v in label_size), (0, 0, 0, 0)
         )
 
         ImageDraw.Draw(overlay).text(
@@ -431,7 +435,7 @@ def assemble_canvas(
     annotation_size = (corner_width, corner_height)
 
     annotations = Image.new(
-        "L", tuple((size * text_sampling for size in annotation_size)), 0
+        "L", tuple(size * text_sampling for size in annotation_size), 0
     )
 
     text_draw = ImageDraw.Draw(annotations)
@@ -505,7 +509,9 @@ def assemble_canvas(
     return (np.asarray(canvas), pixel_um, scale_bar_um)
 
 
-def run_timepoints(function, timepoints, workers):
+def run_timepoints(
+    function: Callable[[int], None], timepoints: Iterable[int], workers: int
+) -> Iterator[int]:
     """Keep at most workers tasks in flight; propagate failures before encoding.
 
     Parameters
@@ -557,18 +563,18 @@ def run_timepoints(function, timepoints, workers):
 def export_dataset(
     dataset: Path,
     output: Path,
-    acquisition,
-    scale_bar_um=None,
+    acquisition: AcquisitionMetadata,
+    scale_bar_um: float | None = None,
     *,
-    video=False,
-    fps=None,
-    bitrate=8_000_000,
-    gpu=0,
-    depth_color=False,
-    depth_colormap="turbo",
-    workers=2,
-    timepoints=None,
-):
+    video: bool = False,
+    fps: float | None = None,
+    bitrate: int = 8_000_000,
+    gpu: int = 0,
+    depth_color: bool = False,
+    depth_colormap: str = "turbo",
+    workers: int = 2,
+    timepoints: tuple[int, int] | None = None,
+) -> None:
     """Export independent timepoints with bounded concurrent reads and rendering.
 
     Parameters
@@ -610,7 +616,7 @@ def export_dataset(
                     f"Require 0 <= START < STOP <= {array.shape[0]} for --timepoints (STOP is exclusive)."
                 )
 
-    from opm_processing.imageprocessing.depth_color import depth_palette, depth_legends
+    from opm_processing.imageprocessing.depth_color import depth_legends, depth_palette
 
     if depth_color:
         depth_palette(1, depth_colormap)  # Validate before writing any frames.
@@ -639,8 +645,10 @@ def export_dataset(
 
             limits = contrast_limits(first)
 
-            def write_timepoint(t, volume=None):
+            def write_timepoint(t: int, volume: np.ndarray | None = None) -> None:
                 """Read, project, annotate, and write one timepoint TIFF.
+
+                All scheduled writes finish before the position/channel loop advances.
 
                 Parameters
                 ----------
@@ -655,12 +663,12 @@ def export_dataset(
                     Writes one annotated TIFF using the fixed channel contrast limits.
                 """
                 if volume is None:
-                    volume = np.asarray(array[t, channel].read().result())
+                    volume = np.asarray(array[t, channel].read().result())  # noqa: B023
 
                 panels, display_pixel_um, legends = projection_panels(
                     volume,
                     collection.voxel_size_um,
-                    limits,
+                    limits,  # noqa: B023
                     depth_color,
                     depth_colormap,
                 )
@@ -674,7 +682,7 @@ def export_dataset(
                 )
 
                 tifffile.imwrite(
-                    destination / f"{stem}_t{t:0{digits}d}.tiff",
+                    destination / f"{stem}_t{t:0{digits}d}.tiff",  # noqa: B023
                     canvas,
                     photometric="rgb" if depth_color else "minisblack",
                     compression="deflate",
@@ -702,11 +710,11 @@ def export_dataset(
                         "timepoint": t,
                         "elapsed_ms": t * interval,
                         "volume_interval_ms": interval,
-                        "contrast_limits": limits,
+                        "contrast_limits": limits,  # noqa: B023
                         "scale_bar_um": bar_um,
-                        "position": position,
-                        "channel": channel,
-                        "channel_name": collection.channel_names[channel],
+                        "position": position,  # noqa: B023
+                        "channel": channel,  # noqa: B023
+                        "channel_name": collection.channel_names[channel],  # noqa: B023
                     },
                 )
 
@@ -808,7 +816,7 @@ def export_projections(
             help="Render START STOP timepoints (zero-based, STOP exclusive). Default: all. Contrast stays fixed to dataset timepoint 0."
         ),
     ] = None,
-):
+) -> None:
     """Export annotated, physically scaled XY/XZ/YZ TIFFs for every timepoint.
 
     Parameters
@@ -857,7 +865,7 @@ def export_projections(
         )
 
 
-def main():
+def main() -> None:
     """Run the projection exporter CLI."""
     app()
 

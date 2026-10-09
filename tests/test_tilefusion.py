@@ -11,13 +11,13 @@ from typer.testing import CliRunner
 from yaozarrs import open_group, v05
 from yaozarrs.write.v05 import prepare_image
 
-from opm_processing.fuse import app as fuse_app
-from opm_processing.dataio.processing_state import ProcessingState
 from opm_processing.dataio.position_collection import (
     create_position_collection,
     open_image_array,
     open_position_collection,
 )
+from opm_processing.dataio.processing_state import ProcessingState
+from opm_processing.fuse import app as fuse_app
 from opm_processing.imageprocessing import maxtilefusion as maxtilefusion_module
 from opm_processing.imageprocessing import tilefusion as tilefusion_module
 from opm_processing.imageprocessing.coordinates import (
@@ -418,7 +418,7 @@ def test_max_projection_fusion_writes_centered_multiscales_and_offsets(
     assert datasets[0].translation_transform is not None
     base_translation = np.asarray(datasets[0].translation_transform.translation[-3:])
     expected = source
-    for factor, dataset in zip((1, 2, 4, 8), datasets):
+    for factor, dataset in zip((1, 2, 4, 8), datasets, strict=False):
         assert dataset.scale_transform.scale == [
             1.0,
             1.0,
@@ -897,7 +897,7 @@ def test_multiscale_storage_round_trip_matches_reference(
         rounded_offset
         + (np.asarray(padded_shape, dtype=np.float64) - 1.0) * rounded_pixel_size / 2.0
     )
-    for absolute_factor, dataset in zip((1, 2, 4), datasets):
+    for absolute_factor, dataset in zip((1, 2, 4), datasets, strict=False):
         z_factor = 1 if is_2d else absolute_factor
         expected_scale = np.asarray(
             [
@@ -1147,7 +1147,9 @@ def test_regenerate_max_z_flag_preserves_multiscale_pyramid_round_trip(
     assert isinstance(metadata, v05.Image)
     datasets = metadata.multiscales[0].datasets
     assert [dataset.path for dataset in datasets] == ["0", "1"]
-    for level, (dataset, level_data) in enumerate(zip(datasets, registered_levels)):
+    for level, (dataset, level_data) in enumerate(
+        zip(datasets, registered_levels, strict=False)
+    ):
         actual = reopened[dataset.path].to_tensorstore().read().result()
         np.testing.assert_array_equal(
             actual,

@@ -125,7 +125,10 @@ def test_native_gc_recovers_independent_optical_specimen(
     xyz = skewed_coordinates(truth.shape)
     localization_errors = []
     for center in beads:
-        region = sum((coord - c) ** 2 for coord, c in zip(xyz, center)) < 0.6**2
+        region = (
+            sum((coord - c) ** 2 for coord, c in zip(xyz, center, strict=False))
+            < 0.6**2
+        )
         mass = np.maximum(recovered, 0) * region
         centroid = np.asarray([np.sum(mass * coord) / mass.sum() for coord in xyz])
         localization_errors.append(float(np.linalg.norm(centroid - center)))
@@ -457,7 +460,10 @@ def test_native_optical_deconvolution_disk_round_trip(
         z * 0.115 - (truth.shape[1] - 1) * 0.115 * np.sin(np.pi / 6) / 2,
     )
     for center in beads:
-        region = sum((coord - c) ** 2 for coord, c in zip(xyz, center)) < 0.6**2
+        region = (
+            sum((coord - c) ** 2 for coord, c in zip(xyz, center, strict=False))
+            < 0.6**2
+        )
         mass = actual * region
         centroid = np.asarray([np.sum(mass * coord) / mass.sum() for coord in xyz])
         assert np.linalg.norm(centroid - center) < 0.15

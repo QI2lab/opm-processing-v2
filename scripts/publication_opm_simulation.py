@@ -11,27 +11,36 @@ Requires matplotlib; run as
 from the repository root.
 """
 
+from __future__ import annotations
+
 import argparse
 import hashlib
 import json
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.colors import Normalize
-from matplotlib.cm import ScalarMappable
 import numpy as np
+from matplotlib.cm import ScalarMappable
+from matplotlib.colors import Normalize
 from tifffile import imread, imwrite
 
-from .psf_sampling_experiment import sample_skewed
+from scripts.psf_sampling_experiment import sample_skewed
 
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from matplotlib.axes import Axes
+    from matplotlib.figure import Figure
+    from matplotlib.gridspec import SubplotSpec
 
 PLANES = ((0, 2, 1, "XY"), (1, 2, 0, "XZ"), (2, 1, 0, "YZ"))
 
 
-def axes_from_metadata(items):
+def axes_from_metadata(items: Sequence[dict[str, float]]) -> tuple[np.ndarray, ...]:
     """Recover physical voxel-center coordinates from exported metadata.
 
     Parameters
@@ -47,7 +56,9 @@ def axes_from_metadata(items):
     return tuple(a["origin_um"] + np.arange(a["size"]) * a["step_um"] for a in items)
 
 
-def record(volume, axes, instrument=False):
+def record(
+    volume: np.ndarray, axes: Sequence[np.ndarray], instrument: bool = False
+) -> dict[str, Any]:
     """Compute the three full-volume maximum-intensity projections.
 
     Parameters
@@ -64,14 +75,16 @@ def record(volume, axes, instrument=False):
     dict
         Image samples and physical axes packaged for the publication projection panels.
     """
-    return dict(
-        projections=[volume.max(axis=a) for a, _, _, _ in PLANES],
-        axes=axes,
-        instrument=instrument,
-    )
+    return {
+        "projections": [volume.max(axis=a) for a, _, _, _ in PLANES],
+        "axes": axes,
+        "instrument": instrument,
+    }
 
 
-def insert_missing_planes(raw, raw_axes, display_axes):
+def insert_missing_planes(
+    raw: np.ndarray, raw_axes: Sequence[np.ndarray], display_axes: Sequence[np.ndarray]
+) -> tuple[np.ndarray, np.ndarray]:
     """Place measured planes by physical position; unmeasured planes remain zero.
 
     Parameters
@@ -88,7 +101,7 @@ def insert_missing_planes(raw, raw_axes, display_axes):
     np.ndarray
         Camera samples inserted into the display grid with unmeasured planes left zero.
     """
-    for source, target in zip(raw_axes[1:], display_axes[1:]):
+    for source, target in zip(raw_axes[1:], display_axes[1:], strict=False):
         np.testing.assert_allclose(source, target, atol=1e-10)
     coordinates = (raw_axes[0] - display_axes[0][0]) / 0.4
     indices = np.rint(coordinates).astype(int)
@@ -104,7 +117,7 @@ def insert_missing_planes(raw, raw_axes, display_axes):
     return result, mask
 
 
-def image_panel(ax, item, row):
+def image_panel(ax: Axes, item: dict[str, Any], row: int) -> None:
     """Display physical coordinates without smoothing or independent rescaling.
 
     Parameters
@@ -160,7 +173,13 @@ def image_panel(ax, item, row):
     )
 
 
-def draw_block(fig, spec, records, titles, heading):
+def draw_block(
+    fig: Figure,
+    spec: SubplotSpec,
+    records: Sequence[dict[str, Any]],
+    titles: Sequence[str],
+    heading: str,
+) -> None:
     """Lay out a labeled group of three projections for each volume.
 
     Parameters
@@ -190,7 +209,7 @@ def draw_block(fig, spec, records, titles, heading):
                 ax.set_title(titles[col], fontsize=8, pad=8)
 
 
-def save_figure(fig, output, stem):
+def save_figure(fig: Figure, output: Path, stem: str) -> None:
     """Export vector text and high-resolution raster images for publication.
 
     Parameters
@@ -210,7 +229,7 @@ def save_figure(fig, output, stem):
     plt.close(fig)
 
 
-def main():
+def main() -> None:
     """Validate saved acquisitions and render the forward and reconstruction panels."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -238,7 +257,7 @@ def main():
     )
     metas = [json.loads((d / "simulation.json").read_text()) for d in args.acquisitions]
     p = metas[0]["parameters"]
-    for meta, step in zip(metas, (0.4, 0.8, 1.2)):
+    for meta, step in zip(metas, (0.4, 0.8, 1.2), strict=False):
         assert meta["parameters"] == p
         assert np.isclose(meta["acquisition"]["scan_step_um"], step)
         for key in (
@@ -273,7 +292,9 @@ def main():
         "cases": [],
     }
     reconstructions = []
-    for directory, meta, factor in zip(args.acquisitions, metas, (1, 2, 3)):
+    for directory, meta, factor in zip(
+        args.acquisitions, metas, (1, 2, 3), strict=False
+    ):
         raw_path = directory / "raw_skewed.tif"
         raw = imread(raw_path)
         raw_axes = axes_from_metadata(meta["raw_axes_syx"])
@@ -306,22 +327,22 @@ def main():
             reconstructions.append(record(reference, output_axes))
         else:
             np.testing.assert_allclose(reference, reference_fixed, rtol=1e-6, atol=1e-7)
-            for a, b in zip(output_axes, reference_axes):
+            for a, b in zip(output_axes, reference_axes, strict=False):
                 np.testing.assert_allclose(a, b, atol=1e-9)
         reconstructed = imread(decon_dir / "deskewed.ome.tif")
         assert np.isfinite(reconstructed).all()
         reconstructions.append(record(reconstructed, output_axes))
         manifest["cases"].append(
-            dict(
-                acquisition=str(directory.resolve()),
-                reconstruction=str(decon_dir.resolve()),
-                acquisition_settings=meta["acquisition"],
-                raw_electrons_sha256=electron_hash,
-                measured_planes=int(mask.sum()),
-                zero_planes=int((~mask).sum()),
-                measured_scan_indices=np.flatnonzero(mask).tolist(),
-                metrics=dm["metrics"],
-            )
+            {
+                "acquisition": str(directory.resolve()),
+                "reconstruction": str(decon_dir.resolve()),
+                "acquisition_settings": meta["acquisition"],
+                "raw_electrons_sha256": electron_hash,
+                "measured_planes": int(mask.sum()),
+                "zero_planes": int((~mask).sum()),
+                "measured_scan_indices": np.flatnonzero(mask).tolist(),
+                "metrics": dm["metrics"],
+            }
         )
     manifest["camera_display_axes_syx"] = metas[0]["raw_axes_syx"]
     manifest["fine_instrument_axes_syx"] = metas[0]["fine_instrument_axes_syx"]

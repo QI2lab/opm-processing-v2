@@ -14,12 +14,11 @@ import yaml
 from tifffile import TiffWriter
 from tqdm import tqdm
 
-from opm_processing.imageprocessing.camera import camera_correct
-
 from opm_processing.dataio.acquisition import (
     inspect_acquisition,
     open_acquisition_datastore,
 )
+from opm_processing.imageprocessing.camera import camera_correct
 
 app = typer.Typer()
 

@@ -100,7 +100,7 @@ def test_lookup_splits_preserve_distribution_and_fallback(
         if assign_fractional_remainder
         else (np.floor(levels) / 2, levels - np.floor(levels) / 2)
     )
-    for half, mean in zip((first, second), means):
+    for half, mean in zip((first, second), means, strict=False):
         # Six standard errors, plus float32 rounding at the largest count.
         mean_error = np.abs(cp.asnumpy(half.mean(axis=1)) - mean)
         assert np.all(mean_error <= 6 * np.sqrt(expected_variance / 200_000) + 2e-5)

@@ -13,9 +13,11 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 PROCESSING_STATE_SCHEMA = "opm-processing-state"
 PROCESSING_STATE_VERSION = 1
@@ -111,7 +113,7 @@ class ProcessingState:
     document: dict[str, Any]
 
     @classmethod
-    def create(cls, path: Path, source_path: Path) -> "ProcessingState":
+    def create(cls, path: Path, source_path: Path) -> ProcessingState:
         """Create a new empty state document and persist it immediately.
 
         Parameters
@@ -142,7 +144,7 @@ class ProcessingState:
         return state
 
     @classmethod
-    def read(cls, path: Path) -> "ProcessingState":
+    def read(cls, path: Path) -> ProcessingState:
         """Read a processing-state document and require the current schema version.
 
         Parameters
@@ -164,9 +166,7 @@ class ProcessingState:
         return cls(path=state_path, document=document)
 
     @classmethod
-    def open(
-        cls, path: Path, source_path: Path, *, overwrite: bool
-    ) -> "ProcessingState":
+    def open(cls, path: Path, source_path: Path, *, overwrite: bool) -> ProcessingState:
         """Create or reopen state while enforcing its acquisition identity.
 
         Parameters

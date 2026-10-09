@@ -19,7 +19,6 @@ from opm_processing.imageprocessing.tilefusion import TileFusion
 from opm_processing.process import process
 from tests.testing_utils import masked_correlation, shell_line_width_x
 
-
 pytestmark = pytest.mark.gpu
 
 
@@ -144,11 +143,11 @@ def _align_fused_to_ground_truth(
 
     fused_slices = tuple(
         slice(int(start), int(start + size))
-        for start, size in zip(fused_start, common_shape)
+        for start, size in zip(fused_start, common_shape, strict=False)
     )
     truth_slices = tuple(
         slice(int(start), int(start + size))
-        for start, size in zip(truth_start, common_shape)
+        for start, size in zip(truth_start, common_shape, strict=False)
     )
     aligned = np.zeros_like(truth, dtype=fused.dtype)
     aligned[truth_slices] = fused[fused_slices]
@@ -185,7 +184,7 @@ def _tile_observation_coverage(
     for offset in tile_offsets_zyx_px:
         slices = tuple(
             slice(int(start), int(start) + int(length))
-            for start, length in zip(offset, tile_shape)
+            for start, length in zip(offset, tile_shape, strict=False)
         )
         coverage[slices] += tile_support
     return coverage

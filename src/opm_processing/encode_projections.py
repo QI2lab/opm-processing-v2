@@ -2,19 +2,22 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
-from fractions import Fraction
-from pathlib import Path
 import re
 import subprocess
 import tempfile
-from typing import Annotated, Sequence
+from collections import defaultdict
+from fractions import Fraction
+from pathlib import Path
+from typing import TYPE_CHECKING, Annotated, Any
 
 import imageio_ffmpeg
 import numpy as np
 import tifffile
 import typer
 from tqdm import tqdm
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 app = typer.Typer(pretty_exceptions_enable=False)
 FRAME_PATTERN = re.compile(r"(.+)_t(\d+)\.tiff?$", re.IGNORECASE)
@@ -96,14 +99,14 @@ def encode_sequence(
     frames: Sequence[Path],
     output: Path,
     *,
-    fps=None,
-    bitrate=8_000_000,
-    gpu=0,
-    codec="h264",
-    rate_control="cbr",
-    gop_seconds=2,
-    encoder_options=None,
-):
+    fps: float | None = None,
+    bitrate: int = 8_000_000,
+    gpu: int = 0,
+    codec: str = "h264",
+    rate_control: str = "cbr",
+    gop_seconds: float = 2,
+    encoder_options: dict[str, Any] | None = None,
+) -> Path:
     """Encode one ordered sequence and atomically publish a fast-start H.264 MP4.
 
     Parameters
@@ -264,7 +267,7 @@ def encode_projections(
     rate_control: Annotated[
         str, typer.Option(help="cbr or vbr; both retain the configured bitrate target.")
     ] = "cbr",
-):
+) -> None:
     """Write one high-quality H.264 MP4 beside each projection TIFF sequence.
 
     Parameters
@@ -309,7 +312,7 @@ def encode_projections(
         typer.echo(f"Wrote {output}")
 
 
-def main():
+def main() -> None:
     """Run the video encoding CLI."""
     app()
 

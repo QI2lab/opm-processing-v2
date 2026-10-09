@@ -10,6 +10,7 @@ import numpy as np
 import typer
 from napari.experimental import link_layers
 from yaozarrs import open_group, v05
+
 from opm_processing.dataio.acquisition import (
     acquisition_stem,
     resolve_acquisition_path,

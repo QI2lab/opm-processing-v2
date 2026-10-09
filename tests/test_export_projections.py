@@ -6,8 +6,8 @@ import numpy as np
 import pytest
 import tifffile
 
-from opm_processing.dataio.position_collection import create_position_collection
 from opm_processing import export_projections as exporter
+from opm_processing.dataio.position_collection import create_position_collection
 
 
 @pytest.mark.unit
@@ -16,7 +16,10 @@ def test_physical_sphere_projections_and_scale():
     spacing = (0.4, 0.2, 0.1)
     shape = (31, 61, 121)
     z, y, x = np.meshgrid(
-        *[(np.arange(n) - (n - 1) / 2) * d for n, d in zip(shape, spacing)],
+        *[
+            (np.arange(n) - (n - 1) / 2) * d
+            for n, d in zip(shape, spacing, strict=False)
+        ],
         indexing="ij",
     )
     sphere = (x * x + y * y + z * z <= 4**2).astype(float)

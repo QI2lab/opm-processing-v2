@@ -9,6 +9,8 @@ tile the input for a larger fixed-iteration timing workload; that workload is
 not a new physical validation. No acquisition stores are modified.
 """
 
+from __future__ import annotations
+
 import argparse
 import gc
 import importlib.util
@@ -40,7 +42,9 @@ def main() -> None:
     calls = [0]
     original_fft = native.fft_conv
 
-    def previous_fft(values, transfer, shape):
+    def previous_fft(
+        values: cp.ndarray, transfer: cp.ndarray, shape: tuple[int, ...]
+    ) -> cp.ndarray:
         """Reproduce the former extra frequency allocation and transform copy.
 
         Parameters
@@ -67,7 +71,9 @@ def main() -> None:
         workspace *= transfer
         return cp.fft.irfftn(workspace, s=shape).astype(cp.float32, copy=False)
 
-    def current_fft(values, transfer, shape):
+    def current_fft(
+        values: cp.ndarray, transfer: cp.ndarray, shape: tuple[int, ...]
+    ) -> cp.ndarray:
         """Count current convolution calls without changing execution.
 
         Parameters
@@ -106,7 +112,7 @@ def main() -> None:
     memory_pool = cp.cuda.MemoryPool()
     peak_live = [0]
 
-    def measured_allocator(size):
+    def measured_allocator(size: int) -> cp.cuda.MemoryPointer:
         """Allocate a device block and track peak live bytes in an isolated pool.
 
         Parameters
@@ -152,13 +158,13 @@ def main() -> None:
                     calls[0] = 0
                     cp.cuda.Stream.null.synchronize()
                     started = time.perf_counter()
-                    kwargs = dict(
-                        max_iterations=args.iterations,
-                        limit=0,
-                        max_delta=0,
-                        rng_seed=42,
-                        release_memory=False,
-                    )
+                    kwargs = {
+                        "max_iterations": args.iterations,
+                        "limit": 0,
+                        "max_delta": 0,
+                        "rng_seed": 42,
+                        "release_memory": False,
+                    }
                     if factor is None:
                         result = module.rlgc(image, psf, **kwargs)
                     else:

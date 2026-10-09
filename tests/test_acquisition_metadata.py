@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from pathlib import Path
+from typing import TYPE_CHECKING
 
-import pytest
 import numpy as np
+import pytest
 import zarr
 from tifffile import imread
 from yaozarrs import DimSpec, open_group, v05
@@ -21,8 +21,11 @@ from opm_processing.dataio.position_collection import (
     create_position_collection,
     open_position_collection,
 )
-from opm_processing.process import process
 from opm_processing.imageprocessing.opmtools import orthogonal_deskew
+from opm_processing.process import process
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 @pytest.mark.unit
@@ -61,9 +64,7 @@ def test_position_collection_multiscales_round_spatial_metadata(
         [0.0, 0.0, 4.568, 5.679, 6.789],
     )
     for dataset, scale, translation in zip(
-        datasets,
-        expected_scales,
-        expected_translations,
+        datasets, expected_scales, expected_translations, strict=False
     ):
         assert dataset.scale_transform.scale == scale
         assert dataset.translation_transform is not None

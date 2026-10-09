@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
+
 from opm_processing.dataio.acquisition import (
     acquisition_stem,
     resolve_acquisition_path,
@@ -22,7 +23,6 @@ from opm_processing.imageprocessing.tilefusion import (
     require_gpu_backend,
     resolve_fusion_input,
 )
-
 
 app = typer.Typer()
 app.pretty_exceptions_enable = False

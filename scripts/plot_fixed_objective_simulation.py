@@ -9,6 +9,8 @@ Run from the repository root with
 ``uv run --with matplotlib python -m scripts.plot_fixed_objective_simulation ACQUISITION --output DIR``.
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 from pathlib import Path
@@ -17,15 +19,15 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.patches import Circle
 import numpy as np
+from matplotlib.patches import Circle
 from scipy.interpolate import RegularGridInterpolator
 from tifffile import imread
 
-from .opm_simulation import pixel_average, prepare_sphere
+from scripts.opm_simulation import pixel_average, prepare_sphere
 
 
-def main():
+def main() -> None:
     """Translate the Cartesian optical field past a stationary detection plane."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("acquisition", type=Path)
@@ -77,9 +79,9 @@ def main():
         samples,
     )
     errors = []
-    for s, direct, skew in zip(selected, frames, skew_route):
+    for s, direct, skew in zip(selected, frames, skew_route, strict=False):
         error = float(np.linalg.norm(direct - skew) / np.linalg.norm(direct))
-        errors.append(dict(scan_position_um=float(s), relative_l2=error))
+        errors.append({"scan_position_um": float(s), "relative_l2": error})
     raw = imread(args.acquisition / "raw_skewed.tif")[indices]
     plt.rcParams.update({"font.size": 8, "pdf.fonttype": 42, "svg.fonttype": "none"})
     fig, axs = plt.subplots(3, 5, figsize=(12, 9), layout="constrained")
@@ -133,13 +135,13 @@ def main():
     for suffix in ("png", "pdf", "svg"):
         fig.savefig(args.output / f"fixed_objective_frames.{suffix}", dpi=300)
     plt.close(fig)
-    report = dict(
-        assumptions="Stationary oblique plane; lateral Y translation; spatially invariant Cartesian PSF",
-        comparison="Noiseless fixed-plane prediction vs fine-skewed convolution, both pixel-integrated",
-        frame_errors=errors,
-        display_limits=[0, 0.5],
-        scan_positions_um=selected.tolist(),
-    )
+    report = {
+        "assumptions": "Stationary oblique plane; lateral Y translation; spatially invariant Cartesian PSF",
+        "comparison": "Noiseless fixed-plane prediction vs fine-skewed convolution, both pixel-integrated",
+        "frame_errors": errors,
+        "display_limits": [0, 0.5],
+        "scan_positions_um": selected.tolist(),
+    }
     (args.output / "fixed_objective_check.json").write_text(
         json.dumps(report, indent=2)
     )

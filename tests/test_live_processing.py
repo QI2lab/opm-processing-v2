@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import importlib
 import json
-from pathlib import Path
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
@@ -24,20 +24,25 @@ from opm_processing.dataio.live import (
     iter_live_tiles,
     read_lifecycle_event,
 )
-from opm_processing.dataio.position_collection import create_position_collection
-from opm_processing.dataio.position_collection import open_position_collection
+from opm_processing.dataio.position_collection import (
+    create_position_collection,
+    open_position_collection,
+)
 from opm_processing.dataio.processing_state import (
     ProcessingState,
     processing_state_path,
 )
 from opm_processing.imageprocessing.opmtools import orthogonal_deskew
 from opm_processing.process import (
+    app,
     is_empty_tile,
     open_live_acquisition,
-    validate_empty_tile_options,
-    app,
     process,
+    validate_empty_tile_options,
 )
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def _manifest_document(data_path: Path, *, timepoints: int = 2) -> dict:
@@ -650,7 +655,7 @@ def test_live_empty_channel_skips_deconvolution_and_writes_zero(
     }
     assert len(max_output.multiscale_factors_yx) > 1
     for factor, level_arrays in zip(
-        max_output.multiscale_factors_yx, max_output.multiscale_arrays
+        max_output.multiscale_factors_yx, max_output.multiscale_arrays, strict=False
     ):
         assert np.count_nonzero(level_arrays[0][0, 0].read().result()) == 0
         np.testing.assert_array_equal(

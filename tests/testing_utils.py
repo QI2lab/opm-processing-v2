@@ -45,9 +45,9 @@ def shell_line_width_x(
     half_window: int,
 ) -> float:
     """Measure discrete FWHM of an ellipsoidal shell along its X normal."""
-    z_index = int(round(center_zyx[0]))
-    y_index = int(round(center_zyx[1]))
-    x_index = int(round(wall_x))
+    z_index = round(center_zyx[0])
+    y_index = round(center_zyx[1])
+    x_index = round(wall_x)
     start = max(0, x_index - half_window)
     stop = min(volume.shape[2], x_index + half_window + 1)
     profile = np.asarray(volume[z_index, y_index, start:stop], dtype=np.float64)

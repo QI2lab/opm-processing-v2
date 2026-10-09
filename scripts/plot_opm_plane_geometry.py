@@ -8,6 +8,8 @@ Requires matplotlib; run from the repository root with
 ``uv run --with matplotlib python -m scripts.plot_opm_plane_geometry DIRECTORY``.
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 from pathlib import Path
@@ -19,10 +21,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 from tifffile import imread
 
-from .psf_sampling_experiment import sample_skewed
+from scripts.psf_sampling_experiment import sample_skewed
 
 
-def main():
+def main() -> None:
     """Check the sampler's plane equation and plot raw cells at physical positions."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory", type=Path)
@@ -36,7 +38,7 @@ def main():
     # camera frame and equal that frame's scan position. Exercise the actual
     # sampler, not just the plotting transform, on this analytic field.
     axes = tuple(np.linspace(-6, 6, 61) for _ in range(3))
-    zz, yy, xx = np.meshgrid(*axes, indexing="ij", sparse=True)
+    zz, yy, _xx = np.meshgrid(*axes, indexing="ij", sparse=True)
     field = np.broadcast_to(yy - zz * cotangent, (61, 61, 61)).copy()
     checks = []
     for step in (0.4, 0.8, 1.2):
@@ -53,7 +55,7 @@ def main():
         )
         error = float(np.max(np.abs(values - expected)))
         np.testing.assert_allclose(values, expected, atol=1e-12, rtol=0)
-        checks.append(dict(scan_step_um=step, maximum_plane_equation_error_um=error))
+        checks.append({"scan_step_um": step, "maximum_plane_equation_error_um": error})
     source_axes = manifest["camera_display_axes_syx"]
     edges = []
     for a in source_axes[:2]:
@@ -105,13 +107,13 @@ def main():
     for suffix in ("png", "pdf", "svg"):
         fig.savefig(directory / f"plane_geometry.{suffix}", dpi=400)
     plt.close(fig)
-    report = dict(
-        plane_equation="Z = tan(theta) * (Y - s)",
-        angle_deg=params["angle_deg"],
-        side_view_slope=float(np.tan(theta)),
-        sampler_checks=checks,
-        display="Affine placement of raw pixel cells; no intensity interpolation",
-    )
+    report = {
+        "plane_equation": "Z = tan(theta) * (Y - s)",
+        "angle_deg": params["angle_deg"],
+        "side_view_slope": float(np.tan(theta)),
+        "sampler_checks": checks,
+        "display": "Affine placement of raw pixel cells; no intensity interpolation",
+    }
     (directory / "plane_geometry_check.json").write_text(json.dumps(report, indent=2))
     print(json.dumps(report, indent=2))
 

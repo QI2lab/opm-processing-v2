@@ -79,7 +79,7 @@ def test_nvenc_round_trip_moving_gaussian(tmp_path):
     assert metadata["size"] == (322, 256)
     frames = list(decoded)
     assert len(frames) == len(originals)
-    for raw, reference in zip(frames, originals):
+    for raw, reference in zip(frames, originals, strict=False):
         rgb = np.frombuffer(raw, np.uint8).reshape(256, 322, 3)
         restored = rgb[:255, :321, 0].astype(float)
         error = restored - reference

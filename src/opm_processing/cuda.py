@@ -7,7 +7,6 @@ import sysconfig
 import warnings
 from pathlib import Path
 
-
 _CUDA_LIBRARIES = (
     ("cuda_runtime", ("libcudart.so.12",)),
     ("cuda_nvrtc", ("libnvrtc.so.12",)),

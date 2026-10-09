@@ -8,8 +8,8 @@ import tensorstore as ts
 from scipy.ndimage import gaussian_filter1d
 from typer.testing import CliRunner
 
-from opm_processing.imageprocessing.tilefusion import TileFusion, _fit_depth_gains
 from opm_processing.fuse import app as fuse_app
+from opm_processing.imageprocessing.tilefusion import TileFusion, _fit_depth_gains
 
 
 @pytest.mark.integration
@@ -91,7 +91,9 @@ def test_directory_fusion_uses_deconvolved_tiles_and_preserves_partial_z_bins(tm
     state.initialize_run(
         decon_path, configuration={"simulated_deconvolution": True}, overwrite=True
     )
-    for position, (source, destination) in enumerate(zip(plain.arrays, decon.arrays)):
+    for position, (source, destination) in enumerate(
+        zip(plain.arrays, decon.arrays, strict=False)
+    ):
         photons = source.read().result()
         destination.write(photons).result()
         source.write(gaussian_filter1d(photons, 1, axis=-1)).result()

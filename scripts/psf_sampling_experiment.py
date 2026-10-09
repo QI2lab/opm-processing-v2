@@ -9,19 +9,26 @@ the sphere simulation adds camera integration and noise separately.
 This module is imported by the experiment scripts and has no CLI.
 """
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import numpy as np
 import psfmodels
 from scipy.interpolate import RegularGridInterpolator
 
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
 
 def cartesian_psf(
     spacing_um: float,
-    half_extent_zyx_um=(1.5, 0.9, 0.9),
+    half_extent_zyx_um: Sequence[float] = (1.5, 0.9, 0.9),
     *,
     wavelength_um: float = 0.637,
     numerical_aperture: float = 1.35,
     depth_um: float = 0.0,
-):
+) -> tuple[tuple[np.ndarray, np.ndarray, np.ndarray], np.ndarray]:
     """Return centered physical ZYX axes and a normalized fine optical PSF.
 
     The grid covers the requested physical extent at the supplied isotropic
@@ -90,14 +97,14 @@ def cartesian_psf(
 
 def sample_skewed(
     field: np.ndarray,
-    axes_zyx_um,
-    shape_syx,
+    axes_zyx_um: Sequence[np.ndarray],
+    shape_syx: Sequence[int],
     *,
     pixel_size_um: float = 0.115,
     scan_step_um: float = 0.8,
     angle_deg: float = 30.0,
-    center_xyz_um=(0.0, 0.0, 0.0),
-):
+    center_xyz_um: Sequence[float] = (0.0, 0.0, 0.0),
+) -> np.ndarray:
     """Trilinearly sample a Cartesian image at physical raw pixel centers.
 
     Output order is scan, camera-row, camera-column, centered at the given XYZ

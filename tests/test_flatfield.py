@@ -6,16 +6,16 @@ import numpy as np
 import pytest
 import tensorstore as ts
 
+from opm_processing.imageprocessing.camera import (
+    camera_correct,
+    illumination_correct,
+    qi2lab_stage_scan_camera_gain,
+)
 from opm_processing.imageprocessing.flatfield import (
     _flatfield_tile_indices,
     _flatfield_working_shape,
     _stage_z_groups,
     estimate_illuminations,
-)
-from opm_processing.imageprocessing.camera import (
-    camera_correct,
-    illumination_correct,
-    qi2lab_stage_scan_camera_gain,
 )
 
 
@@ -44,7 +44,7 @@ def test_processing_uses_existing_flatfield_with_separate_output(
     """
     from opm_processing.dataio.acquisition import acquisition_stem
     from opm_processing.dataio.position_collection import open_position_collection
-    from opm_processing.process import write_flatfield, process
+    from opm_processing.process import process, write_flatfield
 
     acquisition = opm_v2_projection_zarr
     output_dir = tmp_path / "processed"

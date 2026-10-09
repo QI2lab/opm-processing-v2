@@ -1,9 +1,16 @@
 """Estimate deskew dimensions and interpolate calibrated oblique scans to ZYX grids."""
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import numpy as np
-from numpy.typing import ArrayLike
-from typing import Sequence
 from numba import njit, prange
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from numpy.typing import ArrayLike
 
 
 @njit
@@ -13,12 +20,12 @@ def deskew_shape_estimator(
     distance: float = 0.4,
     pixel_size: float = 0.115,
     crop_after_deskew: bool = True,
-    divisble_by: int = 4,
-):
+    divisible_by: int = 4,
+) -> tuple[list[int], int, int, int]:
     """Generate shape of orthogonal interpolation output array.
 
     This function automatically pads the YX dimensions to be
-    an integer divisble by `divisble_by`.
+    an integer divisible by `divisible_by`.
 
     Parameters
     ----------
@@ -33,13 +40,19 @@ def deskew_shape_estimator(
 
     crop_after_deskew : bool
         Remove the lateral triangular deskew margins from the output shape.
-    divisble_by : int
+    divisible_by : int
         Pad output YX dimensions to multiples of this integer.
 
     Returns
     -------
-    output_shape: Sequence[int]
-        shape of deskewed array
+    output_shape : list[int]
+        Deskewed ZYX dimensions, including YX padding.
+    pad_y : int
+        Added rows along laboratory Y.
+    pad_x : int
+        Added columns along laboratory X.
+    crop_y : int
+        Rows removed from each end of laboratory Y before padding.
     """
     # change step size from physical space (nm) to camera space (pixels)
     pixel_step = distance / pixel_size  # (pixels)
@@ -62,9 +75,9 @@ def deskew_shape_estimator(
     else:
         crop_y = 0
 
-    # pad YX array size to make sure it is divisble by 4
-    pad_y = (divisble_by - (final_ny % divisble_by)) % divisble_by
-    pad_x = (divisble_by - (final_nx % divisble_by)) % divisble_by
+    # Pad YX dimensions to the configured multiple.
+    pad_y = (divisible_by - (final_ny % divisible_by)) % divisible_by
+    pad_x = (divisible_by - (final_nx % divisible_by)) % divisible_by
     padded_final_ny = final_ny + pad_y
     padded_final_nx = final_nx + pad_x
 

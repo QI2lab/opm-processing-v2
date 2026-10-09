@@ -1,7 +1,9 @@
 """Persist simulated combined-laser acquisitions for reconstruction tests."""
 
 from pathlib import Path
+
 import numpy as np
+
 from opm_processing.dataio.acquisition import AcquisitionMetadata, ChannelMetadata
 from tests.conftest import _opm_v2_frame_metadata, _write_opm_v2_zarr
 

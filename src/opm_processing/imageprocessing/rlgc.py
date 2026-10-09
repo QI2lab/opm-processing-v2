@@ -24,8 +24,8 @@ from opm_processing.cuda import preload_cuda_libraries
 
 preload_cuda_libraries()
 
-import cupy as cp  # noqa: E402
-from cupy import ElementwiseKernel  # noqa: E402
+import cupy as cp
+from cupy import ElementwiseKernel
 
 # -----------------------------------------------------------------------------
 # CUDA kernel: multiplicative RL step gated by the existing consensus sign rule

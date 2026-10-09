@@ -1,7 +1,7 @@
 """Interrupted ROI processing must retain only durably completed channels."""
 
-from dataclasses import replace
 import importlib
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -88,7 +88,7 @@ def test_roi_resumes_at_last_durable_channel(roi_run, monkeypatch, interruption)
 
     assert len(run.decon_calls) == 6 - len(saved)
     resumed = open_position_collection(output)
-    for array, expected_array in zip(resumed.arrays, expected):
+    for array, expected_array in zip(resumed.arrays, expected, strict=False):
         np.testing.assert_array_equal(array.read().result(), expected_array)
     state = ProcessingState.read(state_path)
     assert state.completed_tiles(output) == {(0, 1), (0, 2)}
@@ -109,15 +109,15 @@ def test_empty_roi_channel_is_checkpointed_and_skipped(roi_run, monkeypatch):
         raise KeyboardInterrupt
 
     monkeypatch.setattr(ProcessingState, "complete_channel", stop_after_empty)
-    options = dict(
-        acquisition=run.metadata,
-        roi_selection=run.roi,
-        output_dir=run.output_dir,
-        max_projection=False,
-        create_fused_max_projection=False,
-        skip_empty_below=1.0,
-        resume=True,
-    )
+    options = {
+        "acquisition": run.metadata,
+        "roi_selection": run.roi,
+        "output_dir": run.output_dir,
+        "max_projection": False,
+        "create_fused_max_projection": False,
+        "skip_empty_below": 1.0,
+        "resume": True,
+    }
     with pytest.raises(KeyboardInterrupt):
         run.process.process_skewed(run.source, **options)
     output = run.output_dir / "sample_deskewed.ome.zarr"
@@ -161,7 +161,7 @@ def test_roi_resumes_existing_tile_only_checkpoints(roi_run, monkeypatch):
     roi_command.process_roi(run.source, run.roi_path)
     assert run.decon_calls == [50.0, 51.0, 52.0]
     output = open_position_collection(run.output_dir / "sample_decon_deskewed.ome.zarr")
-    for array, expected in zip(output.arrays, run.expected_tiles):
+    for array, expected in zip(output.arrays, run.expected_tiles, strict=False):
         np.testing.assert_array_equal(array.read().result(), expected)
 
 
@@ -189,7 +189,7 @@ def test_roi_resume_rejects_changed_tile_mapping_and_settings(roi_run):
     assert state_path.read_bytes() == saved_state
 
     for array, expected in zip(
-        open_position_collection(output_path).arrays, saved_pixels
+        open_position_collection(output_path).arrays, saved_pixels, strict=False
     ):
         np.testing.assert_array_equal(array.read().result(), expected)
 

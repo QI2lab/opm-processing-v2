@@ -3,7 +3,6 @@
 import numpy as np
 from numba import njit, prange
 
-
 QI2LAB_STAGE_SCAN_DETECTOR_WIDTH = 1900
 QI2LAB_STAGE_SCAN_GAIN_START_X = 1046
 QI2LAB_STAGE_SCAN_GAIN_VALUES = np.asarray(

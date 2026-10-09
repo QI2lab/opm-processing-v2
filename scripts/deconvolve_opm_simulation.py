@@ -12,25 +12,24 @@ Run from the repository root with
 ``uv run python -m scripts.deconvolve_opm_simulation ACQUISITION``.
 """
 
+from __future__ import annotations
+
 import argparse
 import hashlib
 import json
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 from scipy.signal import fftconvolve
 from tifffile import imread, imwrite
 
-from .opm_simulation import (
-    centered_axis,
-    comparison_metrics,
-    pixel_average,
-)
 from opm_processing.imageprocessing.opmtools import orthogonal_deskew
-from .psf_sampling_experiment import sample_skewed
+from scripts.opm_simulation import centered_axis, comparison_metrics, pixel_average
+from scripts.psf_sampling_experiment import sample_skewed
 
 
-def full_volume_error(image, truth):
+def full_volume_error(image: np.ndarray, truth: np.ndarray) -> float:
     """Include both missing fluorescence and false fluorescence outside the tubes.
 
     Parameters
@@ -48,7 +47,9 @@ def full_volume_error(image, truth):
     return float(np.linalg.norm(image - truth) / np.linalg.norm(truth))
 
 
-def deconvolve_saved_simulation(directory, scan_upsample=None):
+def deconvolve_saved_simulation(
+    directory: Path, scan_upsample: int | None = None
+) -> dict[str, Any]:
     """Keep exported data fixed and compare native or upsampled RLGC with truth.
 
     Require completed optical convolution, camera integration and detection
@@ -113,6 +114,7 @@ def deconvolve_saved_simulation(directory, scan_upsample=None):
         for e, d in zip(
             (hy + hz / np.tan(theta), hz / np.sin(theta), hx),
             (step, pixel, pixel),
+            strict=False,
         )
     )
     # Same fine Cartesian optical field as the forward simulation. Only the
@@ -168,14 +170,16 @@ def deconvolve_saved_simulation(directory, scan_upsample=None):
         first_col,
     )
     offsets = [
-        (a["origin_um"] - o) / pixel for a, o in zip(meta["output_axes_zyx"], origin)
+        (a["origin_um"] - o) / pixel
+        for a, o in zip(meta["output_axes_zyx"], origin, strict=False)
     ]
     if not np.allclose(offsets, np.round(offsets), atol=1e-6):
         raise ValueError(
             "Reconstructed grid does not coincide with the recorded physical comparison grid"
         )
     crop = tuple(
-        slice(int(round(o)), int(round(o)) + n) for o, n in zip(offsets, truth.shape)
+        slice(round(o), round(o) + n)
+        for o, n in zip(offsets, truth.shape, strict=False)
     )
     deskewed = deskewed[crop].copy()
     if deskewed.shape != truth.shape:
@@ -192,13 +196,13 @@ def deconvolve_saved_simulation(directory, scan_upsample=None):
         raise FloatingPointError(
             "Cartesian GC returned non-finite values; no output was exported"
         )
-    metrics = dict(
-        opm_before_vs_truth=full_volume_error(original_deskewed, truth),
-        opm_after_vs_truth=full_volume_error(deskewed, truth),
-        normal_before_vs_truth=full_volume_error(normal, truth),
-        normal_after_vs_truth=full_volume_error(normal_reconstructed, truth),
-        deskew_vs_normal=comparison_metrics(deskewed, normal_reconstructed),
-    )
+    metrics = {
+        "opm_before_vs_truth": full_volume_error(original_deskewed, truth),
+        "opm_after_vs_truth": full_volume_error(deskewed, truth),
+        "normal_before_vs_truth": full_volume_error(normal, truth),
+        "normal_after_vs_truth": full_volume_error(normal_reconstructed, truth),
+        "deskew_vs_normal": comparison_metrics(deskewed, normal_reconstructed),
+    }
     print(json.dumps(metrics), flush=True)
     output = directory / (
         "decon_native" if scan_upsample is None else f"decon_upsample{scan_upsample}"
@@ -224,16 +228,16 @@ def deconvolve_saved_simulation(directory, scan_upsample=None):
     meta.update(
         metrics=metrics,
         comparison_stage="deconvolution",
-        deconvolution=dict(
-            raw_source=str(raw_path.resolve()),
-            raw_file_sha256=hashlib.sha256(raw_path.read_bytes()).hexdigest(),
-            scan_upsample=scan_upsample,
-            reconstruction_step_um=step,
-            reconstruction_shape_syx=list(reconstructed.shape),
-            counts_per_density=counts_per_density,
-            added_noise=False,
-            solver="rlgc" if scan_upsample is None else "rlgc_undersampled",
-        ),
+        deconvolution={
+            "raw_source": str(raw_path.resolve()),
+            "raw_file_sha256": hashlib.sha256(raw_path.read_bytes()).hexdigest(),
+            "scan_upsample": scan_upsample,
+            "reconstruction_step_um": step,
+            "reconstruction_shape_syx": list(reconstructed.shape),
+            "counts_per_density": counts_per_density,
+            "added_noise": False,
+            "solver": "rlgc" if scan_upsample is None else "rlgc_undersampled",
+        },
     )
     (output / "simulation.json").write_text(
         json.dumps(meta, indent=2), encoding="utf-8"
@@ -241,7 +245,7 @@ def deconvolve_saved_simulation(directory, scan_upsample=None):
     return metrics
 
 
-def main():
+def main() -> None:
     """Run reconstruction on existing exported data without rerunning acquisition."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory", type=Path)

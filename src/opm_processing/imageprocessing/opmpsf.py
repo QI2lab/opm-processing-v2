@@ -4,12 +4,25 @@ Sample the vectorial optical model in physical coordinates and interpolate its
 Cartesian planes onto the acquisition scan grid used by production deconvolution.
 """
 
-import psfmodels as psfm
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import numpy as np
+import psfmodels as psfm
 from scipy.interpolate import RegularGridInterpolator
 
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
-def _interpolate_psf_plane(x_grid, y_grid, values, x_coords, y_coords):
+
+def _interpolate_psf_plane(
+    x_grid: np.ndarray,
+    y_grid: np.ndarray,
+    values: np.ndarray,
+    x_coords: np.ndarray,
+    y_coords: np.ndarray,
+) -> np.ndarray:
     """Interpolate one regular-grid PSF plane onto an output XY grid.
 
     Parameters
@@ -43,7 +56,13 @@ def _interpolate_psf_plane(x_grid, y_grid, values, x_coords, y_coords):
 
 
 # ROI tools
-def get_skewed_roi_size(sizes, theta, dc, dstep, ensure_odd=True):
+def get_skewed_roi_size(
+    sizes: Sequence[float],
+    theta: float,
+    dc: float,
+    dstep: float,
+    ensure_odd: bool = True,
+) -> list[int]:
     """Calculate the ROI size in the OPM matrix to include sufficient xy and z points.
 
     Parameters
@@ -87,7 +106,13 @@ def get_skewed_roi_size(sizes, theta, dc, dstep, ensure_odd=True):
 
 
 # coordinate transformations between OPM and coverslip frames
-def get_skewed_coords(sizes, dc, ds, theta, scan_direction="lateral"):
+def get_skewed_coords(
+    sizes: Sequence[int],
+    dc: float,
+    ds: float,
+    theta: float,
+    scan_direction: str = "lateral",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Get laboratory coordinates (i.e., coverslip coordinates) for a stage-scanning OPM set.
 
     Parameters
@@ -146,7 +171,7 @@ def get_skewed_coords(sizes, dc, ds, theta, scan_direction="lateral"):
         )
     else:
         raise ValueError(
-            "scan_direction must be `lateral` or `axial` but was `%s`" % scan_direction
+            f"scan_direction must be `lateral` or `axial` but was `{scan_direction}`"
         )
 
     return x, y, z
@@ -203,17 +228,17 @@ def create_psf_silicone_100x(
     x, y = np.meshgrid(x, y)
     r = np.sqrt(np.power(x, 2) + np.power(y, 2))
     sigma = 10
-    filter = np.exp(-np.power(r, 2) / (2 * sigma**2))
-    filter = filter / np.max(filter)
+    radial_taper = np.exp(-np.power(r, 2) / (2 * sigma**2))
+    radial_taper = radial_taper / np.max(radial_taper)
 
-    psf = psf * filter
+    psf = psf * radial_taper
 
     return psf
 
 
 def generate_proj_psf(
-    em_wvl: float, pixel_size_um: float = 0.115, pz: float = 15.0, plot=False
-):
+    em_wvl: float, pixel_size_um: float = 0.115, pz: float = 15.0, plot: bool = False
+) -> np.ndarray:
     """Generate a central optical-plane kernel with the existing lateral mask.
 
     The solver normalizes the kernel after masking.
@@ -262,10 +287,10 @@ def generate_proj_psf(
     x, y = np.meshgrid(x, y)
     r = np.sqrt(np.power(x, 2) + np.power(y, 2))
     sigma = 15
-    filter = np.exp(-np.power(r, 2) / (2 * sigma**2))
-    filter = filter / np.max(filter)
+    radial_taper = np.exp(-np.power(r, 2) / (2 * sigma**2))
+    radial_taper = radial_taper / np.max(radial_taper)
 
-    psf = psf * filter
+    psf = psf * radial_taper
 
     return psf
 
@@ -276,8 +301,8 @@ def generate_skewed_psf(
     scan_axis_step_um: float = 0.4,
     theta_deg: float = 30.0,
     pz: float = 0.0,
-    plot=False,
-):
+    plot: bool = False,
+) -> np.ndarray:
     """Create OPM PSF in skewed coordinates.
 
     Parameters

@@ -4,15 +4,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from ome_types import from_xml, to_xml
 from ome_types.model import (
+    OME,
     Channel,
     Image,
     MetadataOnly,
-    OME,
     Pixels,
     StageLabel,
     UnitsLength,
@@ -26,6 +26,9 @@ from opm_processing.dataio.ngff import (
     round_spatial_values,
     round_tczyx_transform,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 
 def convert_metadata(obj: Any) -> Any:
@@ -313,7 +316,7 @@ def create_variable_position_collection(
         {"name": "x", "type": "space", "unit": "micrometer"},
     ]
     scale = round_tczyx_transform((1, 1, *voxel_size))
-    for series, (shape, origin) in enumerate(zip(shapes, origins)):
+    for series, (shape, origin) in enumerate(zip(shapes, origins, strict=False)):
         image = v05.Image(
             multiscales=[
                 v05.Multiscale(
@@ -388,7 +391,9 @@ def _build_variable_ome_xml(
         "complex128": "double-complex",
     }.get(dtype.name, dtype.name)
     images = []
-    for series, (shape, origin) in enumerate(zip(shapes_tczyx, origins_zyx_um)):
+    for series, (shape, origin) in enumerate(
+        zip(shapes_tczyx, origins_zyx_um, strict=False)
+    ):
         t, c, z, y, x = (int(value) for value in shape)
         origin_z, origin_y, origin_x = (round_spatial(value) for value in origin)
         images.append(
@@ -559,11 +564,9 @@ def open_position_collection(path: str | Path) -> PositionCollection:
         )
         if factors is None:
             factors = tuple(
-                int(
-                    round(
-                        dataset.scale_transform.scale[-1]
-                        / datasets[0].scale_transform.scale[-1]
-                    )
+                round(
+                    dataset.scale_transform.scale[-1]
+                    / datasets[0].scale_transform.scale[-1]
                 )
                 for dataset in datasets
             )

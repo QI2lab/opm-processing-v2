@@ -48,8 +48,11 @@ psf = generate_skewed_psf(
     theta_deg=30,
 )
 reconstruction = rlgc_undersampled(
-    measured_volume, psf, scan_upsample_factor=factor,
-    gradient_consensus=True, max_iterations=100,
+    measured_volume,
+    psf,
+    scan_upsample_factor=factor,
+    gradient_consensus=True,
+    max_iterations=100,
 )
 ```
 

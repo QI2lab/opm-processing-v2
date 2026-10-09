@@ -11,6 +11,8 @@ Requires matplotlib; run as
 from the repository root.
 """
 
+from __future__ import annotations
+
 import argparse
 import hashlib
 import json
@@ -19,17 +21,28 @@ from pathlib import Path
 import matplotlib
 
 matplotlib.use("Agg")
+from typing import TYPE_CHECKING
+
 import matplotlib.pyplot as plt
-from matplotlib.colors import Normalize
-from matplotlib.cm import ScalarMappable
 import numpy as np
+from matplotlib.cm import ScalarMappable
+from matplotlib.colors import Normalize
 from scipy.ndimage import map_coordinates
 from tifffile import imread
 
-from .publication_fixed_plane_series import physical_axes
+from scripts.publication_fixed_plane_series import physical_axes
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 
-def acquisition_projections(raw, axes, factor, theta, display_axis):
+def acquisition_projections(
+    raw: np.ndarray,
+    axes: Sequence[np.ndarray],
+    factor: int,
+    theta: float,
+    display_axis: np.ndarray,
+) -> tuple[tuple[np.ndarray, np.ndarray, np.ndarray], int, int]:
     """Map raw cells into Cartesian space by nearest neighbor, preserving zero gaps.
 
     Parameters
@@ -84,7 +97,7 @@ def acquisition_projections(raw, axes, factor, theta, display_axis):
     return (xy, xz, yz), int(measured.sum()), int((~measured).sum())
 
 
-def main():
+def main() -> None:
     """Render paired acquisition and reconstruction projections for all four steps."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--acquisitions", type=Path, nargs=4, required=True)
@@ -96,14 +109,14 @@ def main():
     # complete common physical box for projections of both acquisition and reconstruction.
     display_axis = np.arange(-156, 157) * 0.05
     source = {"acquisition_display_axis_um": display_axis}
-    report = dict(
-        display_method="Nearest-neighbor physical voxelization, no intensity interpolation",
-        acquisition_display_grid_um=0.05,
-        zero_filled_scan_step_um=0.4,
-        physical_projection_box_um=[-7.8, 7.8],
-        intensity_limits=[0, 1],
-        cases=[],
-    )
+    report = {
+        "display_method": "Nearest-neighbor physical voxelization, no intensity interpolation",
+        "acquisition_display_grid_um": 0.05,
+        "zero_filled_scan_step_um": 0.4,
+        "physical_projection_box_um": [-7.8, 7.8],
+        "intensity_limits": [0, 1],
+        "cases": [],
+    }
     fig, axs = plt.subplots(4, 6, figsize=(15, 10.8), layout="constrained")
     orientations = ((0, 2, 1, "XY"), (1, 2, 0, "XZ"), (2, 1, 0, "YZ"))
     for row, directory in enumerate(args.acquisitions):
@@ -134,7 +147,7 @@ def main():
             keep = np.flatnonzero((axis >= -7.8) & (axis <= 7.8))
             crop.append(slice(int(keep[0]), int(keep[-1]) + 1))
         recon = recon[tuple(crop)]
-        rec_axes = tuple(a[s] for a, s in zip(rec_axes, crop))
+        rec_axes = tuple(a[s] for a, s in zip(rec_axes, crop, strict=False))
         for plane, (collapsed, horizontal, vertical, name) in enumerate(orientations):
             before = projections[plane]
             after = recon.max(axis=collapsed)
@@ -177,13 +190,13 @@ def main():
         for index, axis in enumerate(rec_axes):
             source[f"reconstruction_{step:.1f}um_axis{index}_um"] = axis
         report["cases"].append(
-            dict(
-                acquisition=str(directory.resolve()),
-                reconstruction=str(decon.resolve()),
-                raw_electrons_sha256=raw_hash,
-                measured_planes=measured,
-                zero_planes=zeros,
-            )
+            {
+                "acquisition": str(directory.resolve()),
+                "reconstruction": str(decon.resolve()),
+                "raw_electrons_sha256": raw_hash,
+                "measured_planes": measured,
+                "zero_planes": zeros,
+            }
         )
     fig.suptitle(
         "Acquisition → reconstruction: Cartesian maximum-intensity projections\n"

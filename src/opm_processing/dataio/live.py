@@ -8,12 +8,15 @@ import time
 from dataclasses import dataclass, replace
 from itertools import product
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import TYPE_CHECKING
 
 from opm_processing.dataio.acquisition import (
     AcquisitionMetadata,
     ChannelMetadata,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator
 
 LIVE_MANIFEST_SCHEMA = "opm_v2.live_acquisition"
 LIVE_MANIFEST_VERSION = "1.0"
@@ -45,7 +48,7 @@ class LiveManifest:
     orientations: tuple[tuple[str, str], ...]
 
     @classmethod
-    def read(cls, path: str | Path) -> "LiveManifest":
+    def read(cls, path: str | Path) -> LiveManifest:
         """Read the live controller's acquisition plan for the supported schema.
 
         Parameters
@@ -283,7 +286,7 @@ class LiveArrayChunks:
         path: Path,
         *,
         require_frame_chunks: bool = True,
-    ) -> "LiveArrayChunks":
+    ) -> LiveArrayChunks:
         """Read a position array's dimensions and raw chunk-key layout.
 
         Parameters

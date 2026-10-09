@@ -1,8 +1,11 @@
 """Estimate illumination fields for OPM image correction."""
 
+from __future__ import annotations
+
 import gc
 import io
 from contextlib import redirect_stdout
+from typing import TYPE_CHECKING
 
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
@@ -14,12 +17,14 @@ from opm_processing.imageprocessing.camera import (
 )
 from opm_processing.imageprocessing.coordinates import stage_z_level_indices
 
-
 preload_cuda_libraries()
 
-import torch  # noqa: E402
-import torch.nn.functional as F  # noqa: E402
-from basicpy import BaSiC  # noqa: E402
+import torch
+import torch.nn.functional as F
+from basicpy import BaSiC
+
+if TYPE_CHECKING:
+    import tensorstore as ts
 
 
 def _flatfield_sample_indices(
@@ -126,7 +131,7 @@ def _flatfield_tile_indices(
 
 
 def _camera_corrected_images(
-    selection,
+    selection: np.ndarray | ts.TensorStore,
     *,
     camera_offset: float,
     camera_conversion: float,
@@ -257,14 +262,14 @@ def _separable_residual_calibration(
 
 
 def estimate_illuminations(
-    datastore,
-    camera_offset,
-    camera_conversion,
-    stage_positions_zxy=None,
+    datastore: ts.TensorStore,
+    camera_offset: float,
+    camera_conversion: float,
+    stage_positions_zxy: np.ndarray | None = None,
     *,
     apply_stage_scan_gain: bool = False,
     signal_mask: np.ndarray | None = None,
-):
+) -> np.ndarray:
     """Estimate per-channel illumination fields from sampled images.
 
     Parameters

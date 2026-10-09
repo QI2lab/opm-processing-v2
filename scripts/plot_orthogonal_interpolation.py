@@ -8,27 +8,41 @@ Requires matplotlib; run from the repository root with
 ``uv run --with matplotlib python -m scripts.plot_orthogonal_interpolation --output DIR``.
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
 from matplotlib.lines import Line2D
 from matplotlib.patches import Arc, Polygon
-import numpy as np
 
 from opm_processing.imageprocessing.opmtools import orthogonal_deskew
 
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from matplotlib.axes import Axes
 
 BLUE = "#0072B2"
 ORANGE = "#D55E00"
 GREEN = "#00856A"
 
 
-def arrow(ax, start, end, color="black", style="-|>", **kwargs):
+def arrow(
+    ax: Axes,
+    start: Sequence[float],
+    end: Sequence[float],
+    color: str = "black",
+    style: str = "-|>",
+    **kwargs: Any,
+) -> None:
     """Draw a vector arrow in diagram coordinates.
 
     Parameters
@@ -52,7 +66,7 @@ def arrow(ax, start, end, color="black", style="-|>", **kwargs):
     )
 
 
-def project(x, y, z):
+def project(x: float, y: float, z: float) -> np.ndarray:
     """Use an explicit axonometric view preserving the YZ geometry.
 
     Parameters
@@ -72,7 +86,7 @@ def project(x, y, z):
     return np.array([y - 0.75 * x, z + 0.30 * x])
 
 
-def main():
+def main() -> None:
     """Render plane geometry, the four-sample stencil, and exact implementation rules."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
@@ -98,10 +112,11 @@ def main():
     # existing scale factor and unchanged camera-column index.
     data = np.zeros((4, 16, 3), dtype=np.float32)
     neighbor_values = ((10.0, 30.0), (20.0, 50.0))
-    for plane, (k, values) in enumerate(zip(lower, neighbor_values)):
+    for plane, (k, values) in enumerate(zip(lower, neighbor_values, strict=False)):
         data[plane, k : k + 2, 1] = values
     interpolated = [
-        (1 - w) * a + w * b for w, (a, b) in zip(fractions, neighbor_values)
+        (1 - w) * a + w * b
+        for w, (a, b) in zip(fractions, neighbor_values, strict=False)
     ]
     expected = pitch / spacing * sum(interpolated)
     result = orthogonal_deskew(
@@ -139,8 +154,10 @@ def main():
         (0.0, BLUE, r"$\Pi_i$"),
     ):
 
-        def location(u, v):
+        def location(u: float, v: float) -> np.ndarray:
             """Map plane-basis coordinates to the illustrated detector plane.
+
+            Coordinates are evaluated before the scan-position loop advances.
 
             Parameters
             ----------
@@ -154,7 +171,7 @@ def main():
             numpy.ndarray
                 Physical diagram coordinates of the point on the plane.
             """
-            return project(u, si + v * np.cos(theta), v * np.sin(theta))
+            return project(u, si + v * np.cos(theta), v * np.sin(theta))  # noqa: B023
 
         corners = [location(u, v) for u, v in ((0, 0), (3.4, 0), (3.4, 7.2), (0, 7.2))]
         ax.add_patch(
@@ -210,7 +227,7 @@ def main():
     )
     selected_pairs = [
         np.array([si, 0]) + np.arange(k, k + 2)[:, None] * pitch * tangent
-        for si, k in zip((0, spacing), lower)
+        for si, k in zip((0, spacing), lower, strict=False)
     ]
     # Outline the actual four contributing samples. The connector edges need
     # not be perpendicular: orthogonality refers to P's projections onto planes.
@@ -259,7 +276,7 @@ def main():
             "",
             xy=point,
             xytext=qi,
-            arrowprops=dict(arrowstyle="-|>", color=GREEN, lw=2.1),
+            arrowprops={"arrowstyle": "-|>", "color": GREEN, "lw": 2.1},
             zorder=5,
         )
     ax.scatter(*point, marker="*", s=165, color="black", zorder=7)
@@ -269,14 +286,14 @@ def main():
         xy=feet[0],
         xytext=(3.65, 3.3),
         color=BLUE,
-        arrowprops=dict(arrowstyle="-", color=BLUE),
+        arrowprops={"arrowstyle": "-", "color": BLUE},
     )
     ax.annotate(
         r"$Q_{i+1}$",
         xy=feet[1],
         xytext=(6.15, 0.85),
         color=ORANGE,
-        arrowprops=dict(arrowstyle="-", color=ORANGE),
+        arrowprops={"arrowstyle": "-", "color": ORANGE},
     )
     for text, xy, at, color in (
         (r"$I_i[k_i]$", 5 * tangent, (3.0, 2.25), BLUE),
@@ -300,7 +317,7 @@ def main():
             xytext=at,
             color=color,
             fontsize=10,
-            arrowprops=dict(arrowstyle="-", color=color, lw=0.8),
+            arrowprops={"arrowstyle": "-", "color": color, "lw": 0.8},
         )
     ax.text(2.2, 4.05, "$X=u$ (µm)", fontsize=11)
     ax.text(7.35, 2.2, r"$\Pi_{i+1}$", color=ORANGE, fontsize=13)
@@ -350,22 +367,22 @@ def main():
     for suffix in ("pdf", "svg", "png"):
         fig.savefig(args.output / f"orthogonal_interpolation.{suffix}", dpi=600)
     plt.close(fig)
-    report = dict(
-        plane_indices=[0, 1],
-        target_yz=point.tolist(),
-        virtual_scan=virtual_scan,
-        projected_points_yz=np.asarray(feet).tolist(),
-        lower_row_indices=lower,
-        row_fractions=fractions,
-        interpolation_values=interpolated,
-        expected_output=expected,
-        production_output=float(result[2, 5, 1]),
-        untouched_columns_zero=True,
-        schematic_pitch=pitch,
-        schematic_scan_step=spacing,
-        plane_normal_yz=normal.tolist(),
-        production_scale="p / delta_s times the sum of the two within-plane interpolants",
-    )
+    report = {
+        "plane_indices": [0, 1],
+        "target_yz": point.tolist(),
+        "virtual_scan": virtual_scan,
+        "projected_points_yz": np.asarray(feet).tolist(),
+        "lower_row_indices": lower,
+        "row_fractions": fractions,
+        "interpolation_values": interpolated,
+        "expected_output": expected,
+        "production_output": float(result[2, 5, 1]),
+        "untouched_columns_zero": True,
+        "schematic_pitch": pitch,
+        "schematic_scan_step": spacing,
+        "plane_normal_yz": normal.tolist(),
+        "production_scale": "p / delta_s times the sum of the two within-plane interpolants",
+    }
     (args.output / "geometry_check.json").write_text(json.dumps(report, indent=2))
     print(json.dumps(report, indent=2))
 

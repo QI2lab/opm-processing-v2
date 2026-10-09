@@ -98,8 +98,9 @@ dev = [
     "pdbpp",  # https://github.com/pdbpp/pdbpp
     "pytest",
     "pytest-cov",
+    "prek==0.5.5",
     "rich",  # https://github.com/Textualize/rich
-    "ruff",
+    "ruff==0.16.6",
 ]
 
 [project.urls]
@@ -125,13 +126,29 @@ fuse = "opm_processing.fuse:main"
 # tomatoes = "opm_processing:main_tomatoes"
 
 [tool.ruff]
+line-length = 88
+target-version = "py312"
+src = ["src"]
 
 [tool.ruff.lint]
-extend-select = ["D"]
-ignore = ["E402"]
+allowed-confusables = ["µ", "α", "−", "×", "–", "′"]
+select = ["E", "W", "F", "D", "I", "UP", "C4", "B", "A001", "ANN", "RUF", "TC", "TID"]
+ignore = ["ANN401", "D401", "E402", "E501"]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+[tool.ruff.lint.flake8-type-checking]
+runtime-evaluated-decorators = ["app.command"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["D", "ANN"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "numpy"
+
+[tool.ruff.format]
+docstring-code-format = true
 
 
 # https://docs.pytest.org/

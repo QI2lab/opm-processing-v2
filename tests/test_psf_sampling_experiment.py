@@ -3,7 +3,6 @@
 import numpy as np
 import pytest
 from scipy.signal import fftconvolve
-
 from scripts.psf_sampling_experiment import (
     cartesian_psf,
     sample_skewed,
@@ -58,7 +57,10 @@ def fine_optical_images():
         center = (0.07, 0.11, -0.04)
         sigma = 0.12
         density = np.exp(
-            -sum((coord - origin) ** 2 for coord, origin in zip((x, y, z), center))
+            -sum(
+                (coord - origin) ** 2
+                for coord, origin in zip((x, y, z), center, strict=False)
+            )
             / (2 * sigma**2)
         ) / ((2 * np.pi) ** 1.5 * sigma**3)
         image = fftconvolve(density, psf, mode="same")

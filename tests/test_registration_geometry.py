@@ -33,7 +33,10 @@ def test_stage_grid_allows_depth_footprint_drift_and_preserves_overlap():
     assert depth_limits[0] == 6  # Preserve half of the 13-voxel Z overlap.
     assert 240 <= depth_limits[1] <= 260
     assert depth_limits[2] == 31
-    assert all(abs(shift) <= limit for shift, limit in zip((1, -182, 9), depth_limits))
+    assert all(
+        abs(shift) <= limit
+        for shift, limit in zip((1, -182, 9), depth_limits, strict=False)
+    )
     assert limits[0, 1][1] < depth_limits[1]
     np.testing.assert_array_equal(positions, original)
     reordered = _infer_registration_limits(
@@ -173,7 +176,8 @@ def test_aligned_registration_views_preserve_fractional_translation(offsets):
     )
     # For a linear field, interpolation recovers the exact continuous object.
     assert reference.shape == tuple(
-        length - int(np.ceil(abs(offset))) for length, offset in zip(shape, offsets)
+        length - int(np.ceil(abs(offset)))
+        for length, offset in zip(shape, offsets, strict=False)
     )
     assert bool(xp.allclose(reference, aligned, atol=2e-5, rtol=0))
 

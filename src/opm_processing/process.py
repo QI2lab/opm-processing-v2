@@ -4,16 +4,17 @@ Deskew qi2lab OPM data.
 This file deskews and creates maximum projections of raw qi2lab OPM data.
 """
 
+from __future__ import annotations
+
 import hashlib
 import math
 import multiprocessing as mp
 import sys
 import time
 import traceback
-from collections.abc import Iterable, Iterator, Sequence
 from contextlib import ExitStack
 from pathlib import Path
-from typing import Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any
 
 import numpy as np
 import typer
@@ -48,13 +49,13 @@ from opm_processing.dataio.roi import (
     PhysicalRoi,
     world_roi_to_skewed_bounds,
 )
-from opm_processing.imageprocessing.coordinates import (
-    stage_z_level_indices,
-)
 from opm_processing.imageprocessing.camera import (
+    QI2LAB_STAGE_SCAN_DETECTOR_WIDTH,
     camera_correct,
     illumination_correct,
-    QI2LAB_STAGE_SCAN_DETECTOR_WIDTH,
+)
+from opm_processing.imageprocessing.coordinates import (
+    stage_z_level_indices,
 )
 from opm_processing.imageprocessing.maxtilefusion import MaxTileFusion
 from opm_processing.imageprocessing.opmpsf import generate_proj_psf, generate_skewed_psf
@@ -62,6 +63,12 @@ from opm_processing.imageprocessing.opmtools import (
     deskew_shape_estimator,
     orthogonal_deskew,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable, Iterator, Sequence
+    from multiprocessing.connection import Connection
+
+    import tensorstore as ts
 
 app = typer.Typer()
 app.pretty_exceptions_enable = False
@@ -384,8 +391,7 @@ def queue_position_pyramid_writes(
     """
     writes = []
     for factor, level_arrays in zip(
-        collection.multiscale_factors_yx,
-        collection.multiscale_arrays,
+        collection.multiscale_factors_yx, collection.multiscale_arrays, strict=False
     ):
         value = (
             level_zero
@@ -465,7 +471,7 @@ def is_empty_tile(
 
 
 def build_illumination_signal_decisions(
-    datastore,
+    datastore: ts.TensorStore,
     stage_z_indices: np.ndarray,
     camera_offset: float,
     camera_conversion: float,
@@ -521,7 +527,7 @@ def build_illumination_signal_decisions(
         unit="nonzero tile",
     )
     try:
-        for stage_level, positions in enumerate(position_groups):
+        for _stage_level, positions in enumerate(position_groups):
             target_count = min(32, len(positions))
             candidates = positions
             if len(positions) > target_count:
@@ -678,7 +684,7 @@ def write_flatfield(
 
 def load_or_estimate_flatfield(
     path: Path,
-    datastore,
+    datastore: ts.TensorStore,
     camera_offset: float,
     camera_conversion: float,
     pixel_size_um: float,
@@ -1009,7 +1015,7 @@ def apply_stage_axis_flips(
         Transformed floating-point coordinate copy; the input is unchanged.
     """
     transformed = np.asarray(stage_positions, dtype=float).copy()
-    for should_flip, column in zip(axis_flips_xyz, (2, 1, 0)):
+    for should_flip, column in zip(axis_flips_xyz, (2, 1, 0), strict=False):
         if should_flip:
             transformed[:, column] = (
                 np.max(transformed[:, column]) - transformed[:, column]
@@ -1058,8 +1064,8 @@ def process(
     write_fused_max_projection_tiff: bool = False,
     z_downsample_level: int = 2,
     crop_after_deskew: bool = False,
-    time_range: tuple[int, int] = None,
-    pos_range: tuple[int, int] = None,
+    time_range: tuple[int, int] | None = None,
+    pos_range: tuple[int, int] | None = None,
     eager_mode: bool = False,
     decon_crop_scan: int | None = None,
     decon_gpu_id: int = 0,
@@ -1109,7 +1115,7 @@ def process(
             ),
         ),
     ] = None,
-):
+) -> None:
     """Process an OPM acquisition using its recorded scan and camera calibration.
 
     Parameters
@@ -1297,8 +1303,8 @@ def process_skewed(
     write_fused_max_projection_tiff: bool = False,
     z_downsample_level: int = 2,
     crop_after_deskew: bool = False,
-    time_range: tuple[int, int] = None,
-    pos_range: tuple[int, int] = None,
+    time_range: tuple[int, int] | None = None,
+    pos_range: tuple[int, int] | None = None,
     decon_crop_scan: int | None = None,
     decon_gpu_id: int = 0,
     decon_verbose: int = 1,
@@ -1311,7 +1317,7 @@ def process_skewed(
     roi_selection: PhysicalRoi | None = None,
     resume: bool = False,
     decon_scan_upsample: int | None = None,
-):
+) -> None:
     """Calibrate, optionally deconvolve, and deskew mirror or stage scan tiles.
 
     Parameters
@@ -2249,13 +2255,13 @@ def process_skewed(
                         "PhysicalSizeY": pixel_size_um,
                         "PhysicalSizeYUnit": "µm",
                     }
-                    options = dict(
-                        compression="zlib",
-                        compressionargs={"level": 8},
-                        predictor=True,
-                        photometric="minisblack",
-                        resolutionunit="CENTIMETER",
-                    )
+                    options = {
+                        "compression": "zlib",
+                        "compressionargs": {"level": 8},
+                        "predictor": True,
+                        "photometric": "minisblack",
+                        "resolutionunit": "CENTIMETER",
+                    }
                     tif.write(
                         max_projection,
                         resolution=(1e4 / pixel_size_um, 1e4 / pixel_size_um),
@@ -2273,15 +2279,15 @@ def process_projection(
     skip_empty_min_signal_fraction: float = 0.01,
     flatfield_correction: bool = True,
     write_fused_max_projection_tiff: bool = True,
-    time_range: tuple[int, int] = None,
-    pos_range: tuple[int, int] = None,
+    time_range: tuple[int, int] | None = None,
+    pos_range: tuple[int, int] | None = None,
     eager_deconvolution: bool = False,
     resume: bool = False,
     decon_gpu_id: int = 0,
     decon_verbose: int = 1,
     decon_psf_paths: list[Path] | None = None,
     output_dir: Path | None = None,
-):
+) -> None:
     """Calibrate and optionally deconvolve planar acquisition tiles.
 
     Parameters
@@ -2662,13 +2668,13 @@ def process_projection(
                     "PhysicalSizeZ": 1.0,
                     "PhysicalSizeZUnit": "µm",
                 }
-                options = dict(
-                    compression="zlib",
-                    compressionargs={"level": 8},
-                    predictor=True,
-                    photometric="minisblack",
-                    resolutionunit="CENTIMETER",
-                )
+                options = {
+                    "compression": "zlib",
+                    "compressionargs": {"level": 8},
+                    "predictor": True,
+                    "photometric": "minisblack",
+                    "resolutionunit": "CENTIMETER",
+                }
                 tif.write(
                     max_projection,
                     resolution=(1e4 / pixel_size_um, 1e4 / pixel_size_um),
@@ -2678,14 +2684,14 @@ def process_projection(
 
 
 def run_estimate_illuminations(
-    datastore,
-    camera_offset,
-    camera_conversion,
-    stage_positions_zxy,
-    apply_stage_scan_gain,
-    signal_mask,
-    conn,
-):
+    datastore: ts.TensorStore,
+    camera_offset: float,
+    camera_conversion: float,
+    stage_positions_zxy: np.ndarray | None,
+    apply_stage_scan_gain: bool,
+    signal_mask: np.ndarray | None,
+    conn: Connection,
+) -> None:
     """Run ``estimate_illuminations`` in a subprocess.
 
     Parameters
@@ -2742,13 +2748,13 @@ def run_estimate_illuminations(
 
 
 def call_estimate_illuminations(
-    datastore,
-    camera_offset,
-    camera_conversion,
-    stage_positions_zxy,
-    apply_stage_scan_gain,
-    signal_mask,
-):
+    datastore: ts.TensorStore,
+    camera_offset: float,
+    camera_conversion: float,
+    stage_positions_zxy: np.ndarray | None,
+    apply_stage_scan_gain: bool,
+    signal_mask: np.ndarray | None,
+) -> np.ndarray:
     """Call ``estimate_illuminations`` in an isolated subprocess.
 
     Parameters
@@ -2818,7 +2824,7 @@ def call_estimate_illuminations(
 
 
 # entry for point for CLI
-def main():
+def main() -> None:
     """Run the OPM processing command-line application.
 
     Returns

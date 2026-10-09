@@ -11,6 +11,8 @@ The lookup sampler and taper are experiments; production defaults are unchanged.
 Run from the repository root with python -m scripts.audit_deconvolution.
 """
 
+from __future__ import annotations
+
 import argparse
 import importlib.util
 import json
@@ -218,7 +220,9 @@ def main() -> None:
     fft_functions = {module: module.fft_conv for _, module, *_ in variants}
     counts = [0]
 
-    def counted_fft(image, transfer, shape):
+    def counted_fft(
+        image: cp.ndarray, transfer: cp.ndarray, shape: tuple[int, ...]
+    ) -> cp.ndarray:
         """Count optical convolutions during one reconstruction.
 
         Parameters

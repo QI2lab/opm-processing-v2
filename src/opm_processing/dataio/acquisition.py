@@ -11,10 +11,13 @@ import json
 import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import yaozarrs
 from yaozarrs import ZarrGroup, v05
+
+if TYPE_CHECKING:
+    import tensorstore as ts
 
 
 @dataclass(frozen=True)
@@ -64,7 +67,7 @@ class AcquisitionMetadata:
         dict[str, int]
             Logical acquired dimensions keyed by lowercase axis name.
         """
-        return dict(zip(self.axes, self.shape))
+        return dict(zip(self.axes, self.shape, strict=False))
 
     @property
     def channel_names(self) -> tuple[str, ...]:
@@ -203,6 +206,7 @@ class AcquisitionMetadata:
                 for start, end in zip(
                     self.scan_start_positions_xyz,
                     self.scan_end_positions_xyz,
+                    strict=False,
                 )
                 if end[axis] != start[axis]
             ]
@@ -760,7 +764,9 @@ def _inspect_ome_zarr(path: Path, root: ZarrGroup) -> AcquisitionMetadata:
         values = list(daq_config.get(key, []))
         if len(channel_states) == len(values):
             values = [
-                value for value, enabled in zip(values, channel_states) if enabled
+                value
+                for value, enabled in zip(values, channel_states, strict=False)
+                if enabled
             ]
         return values
 
@@ -850,7 +856,7 @@ def inspect_acquisition(
 
 def open_acquisition_datastore(
     acquisition: AcquisitionMetadata | str | Path,
-):
+) -> ts.TensorStore:
     """Open a logical TPCZYX TensorStore after metadata inspection.
 
     Parameters

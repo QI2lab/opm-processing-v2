@@ -10,18 +10,18 @@ import pytest
 from yaozarrs import open_group, v05
 from yaozarrs.write.v05 import prepare_image
 
-from opm_processing.dataio.roi import (
-    PhysicalRoi,
-    roi_from_image_pixel_rectangle,
-    roi_from_world_rectangle,
-    world_roi_to_skewed_bounds,
-)
 from opm_processing.dataio.position_collection import (
     create_position_collection,
     create_variable_position_collection,
     open_position_collection,
 )
 from opm_processing.dataio.processing_state import ProcessingState
+from opm_processing.dataio.roi import (
+    PhysicalRoi,
+    roi_from_image_pixel_rectangle,
+    roi_from_world_rectangle,
+    world_roi_to_skewed_bounds,
+)
 from opm_processing.imageprocessing.tilefusion import TileFusion
 
 

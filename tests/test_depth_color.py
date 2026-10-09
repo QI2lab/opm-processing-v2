@@ -6,13 +6,13 @@ import numpy as np
 import pytest
 import tifffile
 
-from opm_processing.imageprocessing.depth_color import (
-    depth_projection,
-    depth_palette,
-    depth_legends,
-)
-from opm_processing.dataio.position_collection import create_position_collection
 from opm_processing import export_projections as exporter
+from opm_processing.dataio.position_collection import create_position_collection
+from opm_processing.imageprocessing.depth_color import (
+    depth_legends,
+    depth_palette,
+    depth_projection,
+)
 
 
 @pytest.mark.unit

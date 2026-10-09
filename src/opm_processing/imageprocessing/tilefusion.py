@@ -21,11 +21,13 @@ Notes
   use GPU; fusion is performed on CPU using Numba kernels.
 """
 
+from __future__ import annotations
+
 import gc
+import itertools
 import json
 import math
 from collections import deque
-from collections.abc import Sequence
 from concurrent.futures import (
     FIRST_COMPLETED,
     Future,
@@ -33,7 +35,7 @@ from concurrent.futures import (
     wait,
 )
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import psutil
@@ -58,13 +60,16 @@ from opm_processing.dataio.processing_state import (
     ProcessingState,
     processing_state_path,
 )
-from opm_processing.dataio.roi import PhysicalRoi
 from opm_processing.imageprocessing.coordinates import (
-    stage_z_level_indices,
     stage_positions_to_image_coordinates,
+    stage_z_level_indices,
 )
 from opm_processing.imageprocessing.opmtools import orthogonal_deskew
 
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from opm_processing.dataio.roi import PhysicalRoi
 
 # -----------------------------------------------------------------------------
 # Optional GPU stack (safe globals)
@@ -93,10 +98,12 @@ try:
     from cucim.skimage.exposure import match_histograms as _mh  # type: ignore
     from cucim.skimage.measure import block_reduce as _br  # type: ignore
     from cucim.skimage.metrics import structural_similarity as _ssim_gpu  # type: ignore
-    from cucim.skimage.registration import phase_cross_correlation as _pcc  # type: ignore
-    from cupyx.scipy.ndimage import sobel as _sobel  # type: ignore
-    from cupyx.scipy.ndimage import shift as _shift  # type: ignore
+    from cucim.skimage.registration import (
+        phase_cross_correlation as _pcc,  # type: ignore
+    )
     from cupyx.scipy.ndimage import minimum_filter as _minimum_filter  # type: ignore
+    from cupyx.scipy.ndimage import shift as _shift  # type: ignore
+    from cupyx.scipy.ndimage import sobel as _sobel  # type: ignore
 
     cp = _cp
     xp = _cp
@@ -108,16 +115,16 @@ try:
     minimum_filter = _minimum_filter
     ssim_cuda = _ssim_gpu
     USING_GPU = True
-except Exception as error:  # noqa: BLE001
+except Exception as error:
     # GPU stack unavailable; fall back to CPU.
     GPU_IMPORT_ERROR = error
+    from scipy.ndimage import minimum_filter as _minimum_filter  # type: ignore
+    from scipy.ndimage import shift as _shift  # type: ignore
+    from scipy.ndimage import sobel as _sobel  # type: ignore
     from skimage.exposure import match_histograms as _mh  # type: ignore
     from skimage.measure import block_reduce as _br  # type: ignore
     from skimage.metrics import structural_similarity as _cpu_ssim  # type: ignore
     from skimage.registration import phase_cross_correlation as _pcc  # type: ignore
-    from scipy.ndimage import sobel as _sobel  # type: ignore
-    from scipy.ndimage import shift as _shift  # type: ignore
-    from scipy.ndimage import minimum_filter as _minimum_filter  # type: ignore
 
     match_histograms = _mh
     block_reduce = _br
@@ -356,7 +363,10 @@ def _aligned_registration_views(
         If the translation leaves no overlapping samples on an array axis.
     """
     offsets = tuple(float(value) for value in shift)
-    if any(abs(offset) >= length for length, offset in zip(fixed.shape, offsets)):
+    if any(
+        abs(offset) >= length
+        for length, offset in zip(fixed.shape, offsets, strict=False)
+    ):
         raise ValueError("registration shift leaves no overlapping samples")
     if any(not offset.is_integer() for offset in offsets):
         aligned = shift_filter(moving, offsets, order=1, prefilter=False)
@@ -365,13 +375,13 @@ def _aligned_registration_views(
                 math.ceil(max(0, offset)),
                 math.floor(min(length, length + offset)),
             )
-            for length, offset in zip(fixed.shape, offsets)
+            for length, offset in zip(fixed.shape, offsets, strict=False)
         )
         return fixed[slices], aligned[slices]
 
     fixed_slices: list[slice] = []
     moving_slices: list[slice] = []
-    for length, offset_float in zip(fixed.shape, offsets):
+    for length, offset_float in zip(fixed.shape, offsets, strict=False):
         offset = int(offset_float)
         if offset >= 0:
             fixed_slices.append(slice(offset, int(length)))
@@ -414,7 +424,9 @@ def _bounded_phase_correlation_peak(
 
     valid_peak = xp.ones(cross_correlation.shape, dtype=xp.bool_)
     signed_coordinates: list[Any] = []
-    for axis, (length, limit) in enumerate(zip(cross_correlation.shape, limits)):
+    for axis, (length, limit) in enumerate(
+        zip(cross_correlation.shape, limits, strict=False)
+    ):
         coordinates = xp.arange(length)
         signed = xp.where(
             coordinates > length // 2,
@@ -721,9 +733,9 @@ def _partition_fusion_block(
             list[tuple[int, tuple[int, int, int]]],
         ]
     ] = []
-    for rz0, rz1 in zip(z_cuts, z_cuts[1:]):
-        for ry0, ry1 in zip(y_cuts, y_cuts[1:]):
-            for rx0, rx1 in zip(x_cuts, x_cuts[1:]):
+    for rz0, rz1 in itertools.pairwise(z_cuts):
+        for ry0, ry1 in itertools.pairwise(y_cuts):
+            for rx0, rx1 in itertools.pairwise(x_cuts):
                 region_contributors = [
                     (p, offset)
                     for p, offset in contributors
@@ -896,6 +908,8 @@ def _select_nearest_registration_pairs(
         def local_find(index: int) -> int:
             """Find a tile representative within the current overlap component.
 
+            This disjoint-set helper is consumed before the component loop advances.
+
             Parameters
             ----------
             index : int
@@ -906,9 +920,9 @@ def _select_nearest_registration_pairs(
             int
                 Representative tile index within the overlap component.
             """
-            while local_parent[index] != index:
-                local_parent[index] = local_parent[local_parent[index]]
-                index = local_parent[index]
+            while local_parent[index] != index:  # noqa: B023
+                local_parent[index] = local_parent[local_parent[index]]  # noqa: B023
+                index = local_parent[index]  # noqa: B023
             return index
 
         merges_needed = len(component_nodes) - 1
@@ -1017,7 +1031,7 @@ def _registration_sampling(
     window -= 1 - window % 2
     return tuple(
         max(1, min(factor, length // max(3, window)))
-        for factor, length in zip(downsample_factors, overlap_shape)
+        for factor, length in zip(downsample_factors, overlap_shape, strict=False)
     )
 
 
@@ -1387,6 +1401,7 @@ class TileFusion:
                     records,
                     self.position_arrays,
                     collection.spatial_origins_zyx_um,
+                    strict=False,
                 )
             ):
                 time_index = int(record["time_index"])
@@ -1649,7 +1664,7 @@ class TileFusion:
         if reconstruction is not None:
             scan_count, raw_camera_y, _ = map(int, reconstruction["shape_syx"])
             scan_step_um = float(reconstruction["scan_axis_step_um"])
-        z_downsample = int(round(float(self._pixel_size[0]) / raw_pixel_size_um))
+        z_downsample = round(float(self._pixel_size[0]) / raw_pixel_size_um)
 
         support = orthogonal_deskew(
             np.full(
@@ -1686,7 +1701,7 @@ class TileFusion:
         angle_deg = float(self.acquisition.angle_deg)
         scan_step_um = float(self.acquisition.scan_axis_step_um)
         raw_pixel_size_um = float(self.acquisition.pixel_size_um)
-        z_downsample = int(round(float(self._pixel_size[0]) / raw_pixel_size_um))
+        z_downsample = round(float(self._pixel_size[0]) / raw_pixel_size_um)
 
         masks: list[np.ndarray] = []
         for record in self._roi_tile_records:
@@ -1728,7 +1743,13 @@ class TileFusion:
     def _load_zero_channel_metadata(self) -> None:
         """Load completed and zero-channel decisions from processing state."""
         completed = self.processing_state.completed_tiles(self.data)
-        expected = set(zip(self._tile_time_indices, self._tile_source_position_indices))
+        expected = set(
+            zip(
+                self._tile_time_indices,
+                self._tile_source_position_indices,
+                strict=False,
+            )
+        )
         missing = expected - completed
         if missing:
             raise ValueError(
@@ -1737,7 +1758,11 @@ class TileFusion:
             )
         zero_keys = self.processing_state.zero_channels(self.data)
         for tile_index, (time_index, position_index) in enumerate(
-            zip(self._tile_time_indices, self._tile_source_position_indices)
+            zip(
+                self._tile_time_indices,
+                self._tile_source_position_indices,
+                strict=False,
+            )
         ):
             for channel_index in range(int(self.channels)):
                 key = (int(time_index), int(position_index), channel_index)
@@ -1983,7 +2008,7 @@ class TileFusion:
             limits = xp.asarray(max_shift, dtype=xp.float32)
             disambiguate = not all(
                 2.0 * float(limit) < float(length)
-                for limit, length in zip(max_shift, arr1.shape)
+                for limit, length in zip(max_shift, arr1.shape, strict=False)
             )
 
         def correlate(fixed: Any, moving: Any) -> Any:
@@ -2313,9 +2338,7 @@ class TileFusion:
                     paired_bounds = [
                         overlap_bounds_1d(offset, int(length_i), int(length_j))
                         for offset, length_i, length_j in zip(
-                            (dz, dy, dx),
-                            shape_i,
-                            shape_j,
+                            (dz, dy, dx), shape_i, shape_j, strict=False
                         )
                     ]
                     bounds_i = [bounds[0] for bounds in paired_bounds]
@@ -2395,25 +2418,28 @@ class TileFusion:
                 pending_read_bytes = 0
 
                 def fill_read_ahead() -> None:
-                    """Schedule overlap reads until the bounded prefetch queue is full."""
+                    """Schedule overlap reads until the bounded prefetch queue is full.
+
+                    The queue is consumed completely before the timepoint loop advances.
+                    """
                     nonlocal deferred_spec, pending_read_bytes
-                    while len(pending_reads) < read_ahead_pairs:
+                    while len(pending_reads) < read_ahead_pairs:  # noqa: B023
                         if deferred_spec is not None:
                             spec = deferred_spec
                             deferred_spec = None
                         else:
                             try:
-                                spec = next(spec_iterator)
+                                spec = next(spec_iterator)  # noqa: B023
                             except StopIteration:
                                 return
                         _, _, i, j, bounds_i, bounds_j, _, _, _, pair_bytes = spec
                         if (
-                            pending_reads
-                            and pending_read_bytes + pair_bytes > read_ahead_budget
+                            pending_reads  # noqa: B023
+                            and pending_read_bytes + pair_bytes > read_ahead_budget  # noqa: B023
                         ):
                             deferred_spec = spec
                             return
-                        pending_reads.append(
+                        pending_reads.append(  # noqa: B023
                             (
                                 spec,
                                 executor.submit(
@@ -2515,7 +2541,9 @@ class TileFusion:
                     else:
                         max_shift_ds = tuple(
                             limit / factor
-                            for limit, factor in zip(max_shift, df_zyx_eff)
+                            for limit, factor in zip(
+                                max_shift, df_zyx_eff, strict=False
+                            )
                         )
                     shift_ds, score = self.register_and_score(
                         g1,
@@ -2821,7 +2849,7 @@ class TileFusion:
         if not self.pairwise_metrics:
             return
 
-        def pair_sampling(i, j):
+        def pair_sampling(i: int, j: int) -> tuple[int, int, int]:
             """Read effective registration sampling for a tile pair.
 
             Parameters
@@ -2845,7 +2873,7 @@ class TileFusion:
             overlap = tuple(
                 min(length_i, delta + length_j) - max(0, delta)
                 for delta, length_i, length_j in zip(
-                    offset, self._tile_shapes[i], self._tile_shapes[j]
+                    offset, self._tile_shapes[i], self._tile_shapes[j], strict=False
                 )
             )
             return _registration_sampling(
@@ -2983,7 +3011,7 @@ class TileFusion:
             bounds = [
                 (max(0, delta), min(length_i, delta + length_j))
                 for delta, length_i, length_j in zip(
-                    offset, self._tile_shapes[i], self._tile_shapes[j]
+                    offset, self._tile_shapes[i], self._tile_shapes[j], strict=False
                 )
             ]
             if any(hi - lo < 4 for lo, hi in bounds):
@@ -2994,11 +3022,11 @@ class TileFusion:
                     length = min(hi - lo, 32 if axis == 0 else 256)
                     if axis > 0:
                         length -= length % 4
-                    start = lo + int(round(fraction * (hi - lo - length)))
+                    start = lo + round(fraction * (hi - lo - length))
                     patch_bounds.append((start, start + length))
                 moving_bounds = [
                     (lo - delta, hi - delta)
-                    for (lo, hi), delta in zip(patch_bounds, offset)
+                    for (lo, hi), delta in zip(patch_bounds, offset, strict=False)
                 ]
                 fixed_slices = tuple(slice(lo, hi) for lo, hi in patch_bounds)
                 moving_slices = tuple(slice(lo, hi) for lo, hi in moving_bounds)
@@ -3050,7 +3078,7 @@ class TileFusion:
         for (time, channel), measurements in sorted(observations.items()):
             gains = _fit_depth_gains(level_count, measurements)
             for tile, (tile_time, level) in enumerate(
-                zip(self._tile_time_indices, levels)
+                zip(self._tile_time_indices, levels, strict=False)
             ):
                 if tile_time == time:
                     self._depth_intensity_gains[tile, channel] = gains[level]
@@ -3158,6 +3186,8 @@ class TileFusion:
             def find(index: int) -> int:
                 """Find a tile component representative with path compression.
 
+                This disjoint-set helper is consumed before the component loop advances.
+
                 Parameters
                 ----------
                 index : int
@@ -3168,9 +3198,9 @@ class TileFusion:
                 int
                     Representative tile index of the connected component.
                 """
-                while parent[index] != index:
-                    parent[index] = parent[parent[index]]
-                    index = parent[index]
+                while parent[index] != index:  # noqa: B023
+                    parent[index] = parent[parent[index]]  # noqa: B023
+                    index = parent[index]  # noqa: B023
                 return index
 
             for left, right in getattr(
@@ -3348,15 +3378,21 @@ class TileFusion:
 
         max_z = max(
             float(position[0]) + int(shape[0]) * dz_um
-            for position, shape in zip(self._tile_positions, self._tile_shapes)
+            for position, shape in zip(
+                self._tile_positions, self._tile_shapes, strict=False
+            )
         )
         max_y = max(
             float(position[1]) + int(shape[1]) * dy_um
-            for position, shape in zip(self._tile_positions, self._tile_shapes)
+            for position, shape in zip(
+                self._tile_positions, self._tile_shapes, strict=False
+            )
         )
         max_x = max(
             float(position[2]) + int(shape[2]) * dx_um
-            for position, shape in zip(self._tile_positions, self._tile_shapes)
+            for position, shape in zip(
+                self._tile_positions, self._tile_shapes, strict=False
+            )
         )
         if getattr(self, "roi_selection", None) is not None:
             roi_y0, roi_y1, roi_x0, roi_x1 = self.roi_selection.bounds_yx_um
@@ -4061,6 +4097,8 @@ class TileFusion:
             ) -> None:
                 """Read, downsample, and write one output-aligned block.
 
+                All workers finish before the multiscale level loop advances.
+
                 Parameters
                 ----------
                 t : int
@@ -4081,20 +4119,20 @@ class TileFusion:
                     Exclusive X bound of the output block.
                 """
                 slab = (
-                    inp[
+                    inp[  # noqa: B023
                         t,
                         c,
                         slice(
-                            z0 * z_factor,
-                            min(int(inp.shape[2]), z1 * z_factor),
+                            z0 * z_factor,  # noqa: B023
+                            min(int(inp.shape[2]), z1 * z_factor),  # noqa: B023
                         ),
                         slice(
-                            y0 * relative_factor,
-                            min(int(inp.shape[3]), y1 * relative_factor),
+                            y0 * relative_factor,  # noqa: B023
+                            min(int(inp.shape[3]), y1 * relative_factor),  # noqa: B023
                         ),
                         slice(
-                            x0 * relative_factor,
-                            min(int(inp.shape[4]), x1 * relative_factor),
+                            x0 * relative_factor,  # noqa: B023
+                            min(int(inp.shape[4]), x1 * relative_factor),  # noqa: B023
                         ),
                     ]
                     .read()
@@ -4102,18 +4140,18 @@ class TileFusion:
                 )
                 if self.multiscale_downsample == "stride":
                     down = slab[
-                        ::z_factor,
-                        ::relative_factor,
-                        ::relative_factor,
+                        ::z_factor,  # noqa: B023
+                        ::relative_factor,  # noqa: B023
+                        ::relative_factor,  # noqa: B023
                     ]
                 else:
                     arr = xp.asarray(slab)
                     down_arr = block_reduce(
                         arr,
                         block_size=(
-                            z_factor,
-                            relative_factor,
-                            relative_factor,
+                            z_factor,  # noqa: B023
+                            relative_factor,  # noqa: B023
+                            relative_factor,  # noqa: B023
                         ),
                         func=xp.mean,
                     )
@@ -4122,7 +4160,7 @@ class TileFusion:
                         if USING_GPU and cp is not None
                         else np.asarray(down_arr)
                     )
-                out[
+                out[  # noqa: B023
                     t,
                     c,
                     slice(z0, z1),
@@ -4141,6 +4179,8 @@ class TileFusion:
             def collect_completed(done: set[Future[Any]]) -> None:
                 """Propagate worker failures and advance the transient bar.
 
+                All workers finish before the multiscale level loop advances.
+
                 Parameters
                 ----------
                 done : set[Future[Any]]
@@ -4148,7 +4188,7 @@ class TileFusion:
                 """
                 for future in done:
                     future.result()
-                    chunk_bar.update()
+                    chunk_bar.update()  # noqa: B023
 
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 for t in range(int(self.time_dim)):
@@ -4248,7 +4288,9 @@ class TileFusion:
         if not reuse_registered:
             self._tile_positions = [
                 tuple(np.array(pos) + off * np.array(self._pixel_size))
-                for pos, off in zip(self._tile_positions, self.global_offsets)
+                for pos, off in zip(
+                    self._tile_positions, self.global_offsets, strict=False
+                )
             ]
 
         self._compute_fused_image_space()

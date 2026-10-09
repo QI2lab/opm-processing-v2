@@ -11,9 +11,12 @@ Run from the repository root with
 ``uv run python -m scripts.opm_simulation --output DIR``.
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from scipy.ndimage import map_coordinates
@@ -21,14 +24,13 @@ from scipy.signal import fftconvolve
 from tifffile import imwrite
 
 from opm_processing.imageprocessing.opmtools import orthogonal_deskew
+from scripts.psf_sampling_experiment import cartesian_psf, sample_skewed
 
-from .psf_sampling_experiment import (
-    cartesian_psf,
-    sample_skewed,
-)
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 
-def centered_axis(half_extent, spacing):
+def centered_axis(half_extent: float, spacing: float) -> np.ndarray:
     """Cover a physical half extent with an odd grid centered on zero.
 
     Parameters
@@ -47,7 +49,12 @@ def centered_axis(half_extent, spacing):
     return np.arange(-radius, radius + 1) * spacing
 
 
-def meridian_sphere(axes_zyx, diameter_um=10.0, tube_diameter_um=1.0, meridians=12):
+def meridian_sphere(
+    axes_zyx: Sequence[np.ndarray],
+    diameter_um: float = 10.0,
+    tube_diameter_um: float = 1.0,
+    meridians: int = 12,
+) -> np.ndarray:
     """Construct uniform fluorescent tubes around meridian great-circle arcs.
 
     Diameter refers to the sphere traced by the tube centerlines; the outer
@@ -88,7 +95,11 @@ def meridian_sphere(axes_zyx, diameter_um=10.0, tube_diameter_um=1.0, meridians=
     return fluorescent.astype(np.float32)
 
 
-def resample_grid(field, source_axes, target_axes):
+def resample_grid(
+    field: np.ndarray,
+    source_axes: Sequence[np.ndarray],
+    target_axes: Sequence[np.ndarray],
+) -> np.ndarray:
     """Sample a uniform rectilinear field without allocating full XYZ meshes.
 
     Parameters
@@ -107,7 +118,7 @@ def resample_grid(field, source_axes, target_axes):
     """
     coords = [
         (target - source[0]) / (source[1] - source[0])
-        for source, target in zip(source_axes, target_axes)
+        for source, target in zip(source_axes, target_axes, strict=False)
     ]
     result = np.empty(tuple(len(a) for a in target_axes), dtype=np.float32)
     yy, xx = np.meshgrid(coords[1], coords[2], indexing="ij")
@@ -123,7 +134,13 @@ def resample_grid(field, source_axes, target_axes):
     return result
 
 
-def pixel_average(field, source_axes, target_axes, pitch_um, samples=1):
+def pixel_average(
+    field: np.ndarray,
+    source_axes: Sequence[np.ndarray],
+    target_axes: Sequence[np.ndarray],
+    pitch_um: float,
+    samples: int = 1,
+) -> np.ndarray:
     """Average uniformly spaced subpixel centers over a camera pixel's area.
 
     The first axis is plane index; only the two camera axes are integrated.
@@ -162,7 +179,9 @@ def pixel_average(field, source_axes, target_axes, pitch_um, samples=1):
     return result / samples**2
 
 
-def camera_noise(expected_electrons, read_noise_e=0.0, seed=42):
+def camera_noise(
+    expected_electrons: np.ndarray, read_noise_e: float = 0.0, seed: int = 42
+) -> np.ndarray:
     """Apply Poisson detection then independent Gaussian read noise, in electrons.
 
     Parameters
@@ -190,16 +209,16 @@ def camera_noise(expected_electrons, read_noise_e=0.0, seed=42):
 
 def prepare_sphere(
     *,
-    diameter_um=10.0,
-    tube_diameter_um=1.0,
-    meridians=12,
-    fine_spacing_um=0.05,
-    pixel_size_um=0.115,
-    fine_scan_step_um=0.1,
-    angle_deg=30.0,
-    numerical_aperture=1.35,
-    wavelength_um=0.637,
-):
+    diameter_um: float = 10.0,
+    tube_diameter_um: float = 1.0,
+    meridians: int = 12,
+    fine_spacing_um: float = 0.05,
+    pixel_size_um: float = 0.115,
+    fine_scan_step_um: float = 0.1,
+    angle_deg: float = 30.0,
+    numerical_aperture: float = 1.35,
+    wavelength_um: float = 0.637,
+) -> dict[str, Any]:
     """Construct independent Cartesian and fine-skewed optical convolutions.
 
     Parameters
@@ -237,17 +256,17 @@ def prepare_sphere(
         raise ValueError(
             "Cartesian fine spacing must be below the camera's projected Z sampling"
         )
-    params = dict(
-        diameter_um=diameter_um,
-        tube_diameter_um=tube_diameter_um,
-        meridians=meridians,
-        fine_spacing_um=fine_spacing_um,
-        pixel_size_um=pixel_size_um,
-        fine_scan_step_um=fine_scan_step_um,
-        angle_deg=angle_deg,
-        numerical_aperture=numerical_aperture,
-        wavelength_um=wavelength_um,
-    )
+    params = {
+        "diameter_um": diameter_um,
+        "tube_diameter_um": tube_diameter_um,
+        "meridians": meridians,
+        "fine_spacing_um": fine_spacing_um,
+        "pixel_size_um": pixel_size_um,
+        "fine_scan_step_um": fine_scan_step_um,
+        "angle_deg": angle_deg,
+        "numerical_aperture": numerical_aperture,
+        "wavelength_um": wavelength_um,
+    }
     print("Generating fine Cartesian object and vectorial PSF", flush=True)
     psf_axes, psf = cartesian_psf(
         fine_spacing_um,
@@ -273,6 +292,7 @@ def prepare_sphere(
         for e, d in zip(
             instrument_extents,
             (fine_scan_step_um, fine_camera_step, fine_camera_step),
+            strict=False,
         )
     )
     fine_shape = tuple(len(a) for a in fine_axes)
@@ -292,6 +312,7 @@ def prepare_sphere(
         for e, d in zip(
             psf_extents,
             (fine_scan_step_um, fine_camera_step, fine_camera_step),
+            strict=False,
         )
     )
     skewed_psf = sample_skewed(
@@ -305,21 +326,21 @@ def prepare_sphere(
     skewed_psf /= skewed_psf.sum()
     print(f"Fine instrument convolution with skewed PSF {skewed_psf.shape}", flush=True)
     skewed_blurred = np.maximum(fftconvolve(skewed_truth, skewed_psf, mode="same"), 0)
-    return dict(
-        params=params,
-        axes=axes,
-        truth=truth,
-        cartesian_blurred=cartesian_blurred,
-        psf_axes=psf_axes,
-        psf_cartesian=psf,
-        fine_axes=fine_axes,
-        skewed_psf=skewed_psf,
-        skewed_blurred=skewed_blurred,
-        instrument_extents=instrument_extents,
-    )
+    return {
+        "params": params,
+        "axes": axes,
+        "truth": truth,
+        "cartesian_blurred": cartesian_blurred,
+        "psf_axes": psf_axes,
+        "psf_cartesian": psf,
+        "fine_axes": fine_axes,
+        "skewed_psf": skewed_psf,
+        "skewed_blurred": skewed_blurred,
+        "instrument_extents": instrument_extents,
+    }
 
 
-def comparison_metrics(actual, reference):
+def comparison_metrics(actual: np.ndarray, reference: np.ndarray) -> dict[str, float]:
     """Compare absolute density, without fitting a gain or registering images.
 
     Parameters
@@ -337,24 +358,24 @@ def comparison_metrics(actual, reference):
     # Exclude the vast empty background from correlation.
     mask = reference > reference.max() * 0.01
     a, b = actual[mask].astype(np.float64), reference[mask].astype(np.float64)
-    return dict(
-        relative_l2=float(np.linalg.norm(a - b) / np.linalg.norm(b)),
-        correlation=float(np.corrcoef(a, b)[0, 1]),
-        total_signal_ratio=float(
+    return {
+        "relative_l2": float(np.linalg.norm(a - b) / np.linalg.norm(b)),
+        "correlation": float(np.corrcoef(a, b)[0, 1]),
+        "total_signal_ratio": float(
             actual.sum(dtype=np.float64) / reference.sum(dtype=np.float64)
         ),
-    )
+    }
 
 
 def acquire_sphere(
-    prepared,
-    scan_step_um=0.2,
-    camera_samples=1,
-    peak_electrons=None,
-    background_electrons=0.0,
-    read_noise_e=0.0,
-    seed=42,
-):
+    prepared: dict[str, Any],
+    scan_step_um: float = 0.2,
+    camera_samples: int = 1,
+    peak_electrons: float | None = None,
+    background_electrons: float = 0.0,
+    read_noise_e: float = 0.0,
+    seed: int = 42,
+) -> dict[str, Any]:
     """Acquire, optionally integrate/noise, and run unchanged production deskew.
 
     Parameters
@@ -391,8 +412,7 @@ def acquire_sphere(
     raw_axes = tuple(
         centered_axis(e, d)
         for e, d in zip(
-            prepared["instrument_extents"],
-            (scan_step_um, pixel, pixel),
+            prepared["instrument_extents"], (scan_step_um, pixel, pixel), strict=False
         )
     )
     print(
@@ -456,7 +476,7 @@ def acquire_sphere(
         for i, a in enumerate(output_axes)
     ]
     crop = tuple(slice(int(b[0]), int(b[-1]) + 1) for b in bounds)
-    output_axes = tuple(a[s] for a, s in zip(output_axes, crop))
+    output_axes = tuple(a[s] for a, s in zip(output_axes, crop, strict=False))
     deskewed = deskewed[crop].copy()
     reference = pixel_average(
         prepared["cartesian_blurred"],
@@ -472,36 +492,38 @@ def acquire_sphere(
         )
         reference = np.maximum((reference_e - background_electrons) / gain, 0)
     truth_sampled = resample_grid(prepared["truth"], prepared["axes"], output_axes)
-    metrics = dict(
-        forward_routes=forward_metrics,
-        deskew_vs_normal=comparison_metrics(deskewed, reference),
-        deskew_vs_noiseless_normal=comparison_metrics(deskewed, reference_clean),
-    )
+    metrics = {
+        "forward_routes": forward_metrics,
+        "deskew_vs_normal": comparison_metrics(deskewed, reference),
+        "deskew_vs_noiseless_normal": comparison_metrics(deskewed, reference_clean),
+    }
     print(json.dumps(metrics), flush=True)
-    return dict(
-        raw=raw,
-        raw_clean=raw_clean,
-        raw_electrons=raw_electrons,
-        raw_axes=raw_axes,
-        output_axes=output_axes,
-        deskewed=deskewed,
-        normal=reference,
-        normal_clean=reference_clean,
-        truth_sampled=truth_sampled,
-        metrics=metrics,
-        settings=dict(
-            scan_step_um=scan_step_um,
-            camera_samples=camera_samples,
-            peak_electrons=peak_electrons,
-            counts_per_density=gain,
-            background_electrons=background_electrons,
-            read_noise_e=read_noise_e,
-            seed=seed,
-        ),
-    )
+    return {
+        "raw": raw,
+        "raw_clean": raw_clean,
+        "raw_electrons": raw_electrons,
+        "raw_axes": raw_axes,
+        "output_axes": output_axes,
+        "deskewed": deskewed,
+        "normal": reference,
+        "normal_clean": reference_clean,
+        "truth_sampled": truth_sampled,
+        "metrics": metrics,
+        "settings": {
+            "scan_step_um": scan_step_um,
+            "camera_samples": camera_samples,
+            "peak_electrons": peak_electrons,
+            "counts_per_density": gain,
+            "background_electrons": background_electrons,
+            "read_noise_e": read_noise_e,
+            "seed": seed,
+        },
+    }
 
 
-def save_simulation(prepared, acquired, output):
+def save_simulation(
+    prepared: dict[str, Any], acquired: dict[str, Any], output: Path
+) -> None:
     """Write viewable volumes and complete physical axes/parameters, without plots.
 
     Parameters
@@ -543,7 +565,7 @@ def save_simulation(prepared, acquired, output):
             output / "raw_electrons.tif", acquired["raw_electrons"], compression="zlib"
         )
 
-    def axes(values):
+    def axes(values: Sequence[np.ndarray]) -> list[dict[str, float | int]]:
         """Serialize physical coordinate arrays as axis origin, step, and size records.
 
         Parameters
@@ -557,21 +579,21 @@ def save_simulation(prepared, acquired, output):
             Axis records describing each physical coordinate array.
         """
         return [
-            dict(origin_um=float(a[0]), step_um=float(a[1] - a[0]), size=len(a))
+            {"origin_um": float(a[0]), "step_um": float(a[1] - a[0]), "size": len(a)}
             for a in values
         ]
 
-    metadata = dict(
-        parameters=prepared["params"],
-        acquisition=acquired["settings"],
-        metrics=acquired["metrics"],
-        raw_axes_syx=axes(acquired["raw_axes"]),
-        output_axes_zyx=axes(acquired["output_axes"]),
-        fine_cartesian_axes_zyx=axes(prepared["axes"]),
-        fine_instrument_axes_syx=axes(prepared["fine_axes"]),
-        cartesian_psf_axes_zyx=axes(prepared["psf_axes"]),
-        skewed_psf_axes_syx=[
-            dict(origin_um=-(n - 1) / 2 * d, step_um=d, size=n)
+    metadata = {
+        "parameters": prepared["params"],
+        "acquisition": acquired["settings"],
+        "metrics": acquired["metrics"],
+        "raw_axes_syx": axes(acquired["raw_axes"]),
+        "output_axes_zyx": axes(acquired["output_axes"]),
+        "fine_cartesian_axes_zyx": axes(prepared["axes"]),
+        "fine_instrument_axes_syx": axes(prepared["fine_axes"]),
+        "cartesian_psf_axes_zyx": axes(prepared["psf_axes"]),
+        "skewed_psf_axes_syx": [
+            {"origin_um": -(n - 1) / 2 * d, "step_um": d, "size": n}
             for n, d in zip(
                 prepared["skewed_psf"].shape,
                 (
@@ -579,15 +601,16 @@ def save_simulation(prepared, acquired, output):
                     pixel / 2,
                     pixel / 2,
                 ),
+                strict=False,
             )
         ],
-        fluorescence="union of tubes, diameter measured at meridian centerlines",
-        comparison_gain="deskew multiplied by scan_step/(2*pixel), no fitted gain",
-    )
+        "fluorescence": "union of tubes, diameter measured at meridian centerlines",
+        "comparison_gain": "deskew multiplied by scan_step/(2*pixel), no fitted gain",
+    }
     (output / "simulation.json").write_text(json.dumps(metadata, indent=2))
 
 
-def main():
+def main() -> None:
     """Run the reproducible sphere experiment, exporting each requested scan step."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)

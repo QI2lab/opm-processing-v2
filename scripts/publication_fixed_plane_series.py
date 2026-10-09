@@ -10,6 +10,8 @@ manifest.json provenance to --output. Requires matplotlib; run as
 from the repository root.
 """
 
+from __future__ import annotations
+
 import argparse
 import hashlib
 import json
@@ -18,15 +20,24 @@ from pathlib import Path
 import matplotlib
 
 matplotlib.use("Agg")
+from typing import TYPE_CHECKING
+
 import matplotlib.pyplot as plt
-from matplotlib.patches import Circle
 import numpy as np
+from matplotlib.patches import Circle
 from scipy.interpolate import RegularGridInterpolator
 from scipy.signal import fftconvolve
 from tifffile import imread
 
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
-def physical_axes(metadata):
+    from matplotlib.axes import Axes
+    from matplotlib.figure import Figure
+    from matplotlib.image import AxesImage
+
+
+def physical_axes(metadata: Sequence[dict[str, float]]) -> tuple[np.ndarray, ...]:
     """Expand recorded coordinates to physical voxel centers.
 
     Parameters
@@ -42,7 +53,16 @@ def physical_axes(metadata):
     return tuple(a["origin_um"] + np.arange(a["size"]) * a["step_um"] for a in metadata)
 
 
-def fixed_plane_frames(field, axes, scans, rows, columns, theta, pitch, samples=1):
+def fixed_plane_frames(
+    field: np.ndarray,
+    axes: Sequence[np.ndarray],
+    scans: np.ndarray,
+    rows: np.ndarray,
+    columns: np.ndarray,
+    theta: float,
+    pitch: float,
+    samples: int = 1,
+) -> np.ndarray:
     """Translate a Cartesian field past a fixed detector, optionally averaging pixels.
 
     Parameters
@@ -86,7 +106,7 @@ def fixed_plane_frames(field, axes, scans, rows, columns, theta, pitch, samples=
     return np.asarray(frames)
 
 
-def diagram(ax, scan, theta, radius=5):
+def diagram(ax: Axes, scan: float, theta: float, radius: float = 5) -> None:
     """Show a stationary plane while the object translates in laboratory Y.
 
     Parameters
@@ -115,7 +135,9 @@ def diagram(ax, scan, theta, radius=5):
     )
 
 
-def camera_panel(ax, frame, axes, title, vmax):
+def camera_panel(
+    ax: Axes, frame: np.ndarray, axes: Sequence[np.ndarray], title: str, vmax: float
+) -> AxesImage:
     """Render one frame with physical coordinates and unobstructed image pixels.
 
     Parameters
@@ -165,7 +187,7 @@ def camera_panel(ax, frame, axes, title, vmax):
     return im
 
 
-def save(fig, directory, stem):
+def save(fig: Figure, directory: Path, stem: str) -> None:
     """Export the same layout with vector labels and publication-resolution pixels.
 
     Parameters
@@ -182,7 +204,7 @@ def save(fig, directory, stem):
     plt.close(fig)
 
 
-def main():
+def main() -> None:
     """Prepare matching acquisition, reconstruction and missing-plane comparisons."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--acquisitions", type=Path, nargs=4, required=True)
@@ -211,17 +233,19 @@ def main():
     fine_axes = physical_axes(metas[0]["fine_cartesian_axes_zyx"])
     common_scans = np.array([-10.4, -8, -4, 0, 4, 8, 10.4], dtype=float)
     consecutive_scans = np.arange(-4, 5) * 0.4
-    manifest = dict(
-        parameters=p,
-        reconstruction_step_um=0.4,
-        cases=[],
-        reconstruction_display_scan_positions_um=common_scans.tolist(),
-        consecutive_scan_positions_um=consecutive_scans.tolist(),
-        camera_display_limits=[0, 0.5],
-        reconstruction_display_limits=[0, 1],
-    )
+    manifest = {
+        "parameters": p,
+        "reconstruction_step_um": 0.4,
+        "cases": [],
+        "reconstruction_display_scan_positions_um": common_scans.tolist(),
+        "consecutive_scan_positions_um": consecutive_scans.tolist(),
+        "camera_display_limits": [0, 0.5],
+        "reconstruction_display_limits": [0, 1],
+    }
     overviews = []
-    for factor, (directory, meta) in enumerate(zip(args.acquisitions, metas), 1):
+    for factor, (directory, meta) in enumerate(
+        zip(args.acquisitions, metas, strict=False), 1
+    ):
         step = 0.4 * factor
         assert meta["parameters"] == p
         assert np.isclose(meta["acquisition"]["scan_step_um"], step)
@@ -350,14 +374,14 @@ def main():
             reference, cart_axes, consecutive_scans, rows, columns, theta, pitch
         )
         overviews.append(
-            dict(
-                step=step,
-                raw=consecutive_raw,
-                measured=measured,
-                rec=rec[ix],
-                reference=consecutive_ref,
-                axes=(rows, columns),
-            )
+            {
+                "step": step,
+                "raw": consecutive_raw,
+                "measured": measured,
+                "rec": rec[ix],
+                "reference": consecutive_ref,
+                "axes": (rows, columns),
+            }
         )
         np.savez_compressed(
             args.output / f"frame_source_{step:.1f}um.npz",
@@ -378,23 +402,23 @@ def main():
             consecutive_reference=consecutive_ref,
         )
         manifest["cases"].append(
-            dict(
-                acquisition=str(directory.resolve()),
-                reconstruction=str(decon_dir.resolve()),
-                scan_step_um=step,
-                acquired_planes=len(scans),
-                reconstructed_planes=rec.shape[0],
-                acquired_scan_positions_um=selected_scans.tolist(),
-                raw_electrons_sha256=raw_hash,
-                metrics=dm["metrics"],
-            )
+            {
+                "acquisition": str(directory.resolve()),
+                "reconstruction": str(decon_dir.resolve()),
+                "scan_step_um": step,
+                "acquired_planes": len(scans),
+                "reconstructed_planes": rec.shape[0],
+                "acquired_scan_positions_um": selected_scans.tolist(),
+                "raw_electrons_sha256": raw_hash,
+                "metrics": dm["metrics"],
+            }
         )
     for stage in ("raw", "rec"):
         fig, axs = plt.subplots(5, 9, figsize=(18, 12), layout="constrained")
         for col, s in enumerate(consecutive_scans):
             diagram(axs[0, col], s, theta)
         for row, case in enumerate(overviews, 1):
-            for col, s in enumerate(consecutive_scans):
+            for col, _scan in enumerate(consecutive_scans):
                 missing = not case["measured"][col]
                 status = "measured" if not missing else "inferred"
                 im = camera_panel(

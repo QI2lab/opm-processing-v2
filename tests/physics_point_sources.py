@@ -63,7 +63,7 @@ def sample_point_source(
     times = scan / scan_speed
     nodes, weights = np.polynomial.legendre.leggauss(5)
     result = np.zeros(shape)
-    for node, weight in zip(nodes, weights / 2):
+    for node, weight in zip(nodes, weights / 2, strict=False):
         time = times + node * exposure / 2
         coords = np.broadcast_arrays(
             z - center_xyz[2] - velocity_xyz[2] * time,
@@ -79,14 +79,20 @@ def point_moments(volume, voxel_size, center, radius=1.3):
     """Measure XYZ covariance and YZ principal-axis tilt in a physical sphere."""
     z, y, x = np.ogrid[: volume.shape[0], : volume.shape[1], : volume.shape[2]]
     xyz = np.broadcast_arrays(x * voxel_size[2], y * voxel_size[1], z * voxel_size[0])
-    region = sum((coord - c) ** 2 for coord, c in zip(xyz, center)) <= radius**2
+    region = (
+        sum((coord - c) ** 2 for coord, c in zip(xyz, center, strict=False))
+        <= radius**2
+    )
     mass = np.maximum(volume, 0).astype(np.float64) * region
     mass /= mass.sum()
     centroid = np.array([np.sum(mass * coord) for coord in xyz])
     covariance = np.array(
         [
-            [np.sum(mass * (a - ca) * (b - cb)) for b, cb in zip(xyz, centroid)]
-            for a, ca in zip(xyz, centroid)
+            [
+                np.sum(mass * (a - ca) * (b - cb))
+                for b, cb in zip(xyz, centroid, strict=False)
+            ]
+            for a, ca in zip(xyz, centroid, strict=False)
         ]
     )
     yz_tilt = np.rad2deg(
@@ -122,7 +128,7 @@ def skewed_coordinates(shape, scan_step=0.2, offset=(0, 0, 0)):
         and a 30 degree OPM angle.
     """
     scan, row, col = np.meshgrid(
-        *[np.arange(n) - (n - 1) / 2 + d for n, d in zip(shape, offset)],
+        *[np.arange(n) - (n - 1) / 2 + d for n, d in zip(shape, offset, strict=False)],
         indexing="ij",
         sparse=True,
     )
@@ -165,15 +171,18 @@ def fluorescent_specimen(shape, scan_step):
                     shape, scan_step=scan_step, offset=(ds, dy, dx)
                 )
                 for center in beads:
-                    distance2 = sum((coord - c) ** 2 for coord, c in zip(xyz, center))
+                    distance2 = sum(
+                        (coord - c) ** 2 for coord, c in zip(xyz, center, strict=False)
+                    )
                     truth += 10000 * (distance2 <= 0.19**2) / 27
                 projection = sum(
-                    (coord - s) * d for coord, s, d in zip(xyz, start, direction)
+                    (coord - s) * d
+                    for coord, s, d in zip(xyz, start, direction, strict=False)
                 )
                 projection = np.clip(projection / np.dot(direction, direction), 0, 1)
                 distance2 = sum(
                     (coord - (s + projection * d)) ** 2
-                    for coord, s, d in zip(xyz, start, direction)
+                    for coord, s, d in zip(xyz, start, direction, strict=False)
                 )
                 truth += 5000 * (distance2 <= 0.11**2) / 27
     return truth.astype(np.float32), beads

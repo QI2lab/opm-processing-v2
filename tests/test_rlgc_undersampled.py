@@ -24,13 +24,14 @@ import numpy as np
 import pytest
 from scipy import signal
 from typer.testing import CliRunner
+
+from opm_processing.dataio.position_collection import open_position_collection
+from opm_processing.dataio.processing_state import ProcessingState
 from tests.physics_point_sources import fluorescent_specimen, skewed_coordinates
 from tests.undersampled_test_support import (
     simulated_acquisition_metadata,
     write_simulated_acquisition,
 )
-from opm_processing.dataio.position_collection import open_position_collection
-from opm_processing.dataio.processing_state import ProcessingState
 
 
 @pytest.fixture(scope="module")
@@ -108,7 +109,7 @@ def test_physical_full_and_undersampled_rl(
     full_data = rng.poisson(expectation) if poisson else expectation
     # The same specimen, PSF, exposure and scan origin; no coarse-grid reblur.
     sparse_data = full_data[::factor].copy()
-    kwargs = dict(gradient_consensus=False, max_iterations=60, max_delta=0)
+    kwargs = {"gradient_consensus": False, "max_iterations": 60, "max_delta": 0}
     dense = solver.rlgc_undersampled(full_data, optical_psf, **kwargs)
     recovered = solver.rlgc_undersampled(sparse_data, optical_psf, factor, **kwargs)
     # Sample the same optical PSF about its center at the coarse spacing.
@@ -145,7 +146,9 @@ def test_physical_full_and_undersampled_rl(
     xyz = skewed_coordinates(truth.shape)
     errors = []
     for bead in beads:
-        region = sum((coord - c) ** 2 for coord, c in zip(xyz, bead)) < 0.6**2
+        region = (
+            sum((coord - c) ** 2 for coord, c in zip(xyz, bead, strict=False)) < 0.6**2
+        )
         mass = recovered * region
         centroid = np.array([np.sum(mass * coord) / mass.sum() for coord in xyz])
         truth_mass = truth * region
@@ -214,7 +217,7 @@ def test_optical_forward_adjoint_and_cpu_rl(cupy_gpu, optical_psf, factor):
     obj = rng.uniform(1, 10, shape).astype(np.float32)
     measured = rng.uniform(1, 10, obj[::factor].shape).astype(np.float32)
     pads = solver._linear_fft_pad_width(shape, psf.shape)
-    padded_shape = tuple(n + sum(p) for n, p in zip(shape, pads))
+    padded_shape = tuple(n + sum(p) for n, p in zip(shape, pads, strict=False))
     core = solver._observed_region_slices(padded_shape, pads)
     otf = cp.fft.rfftn(solver.pad_psf(cp.asarray(psf), padded_shape))
     forward = cp.asnumpy(
@@ -360,7 +363,9 @@ def test_combined_channel_cli_reconstructs_physical_specimen(
         z * 0.115 - (truth.shape[1] - 1) / 2 * 0.115 * np.sin(np.pi / 6),
     )
     for bead in beads:
-        region = sum((coord - c) ** 2 for coord, c in zip(xyz, bead)) < 0.6**2
+        region = (
+            sum((coord - c) ** 2 for coord, c in zip(xyz, bead, strict=False)) < 0.6**2
+        )
         mass = actual * region
         assert mass.sum() > 0
         centroid = np.array([np.sum(mass * coord) / mass.sum() for coord in xyz])

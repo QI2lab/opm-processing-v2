@@ -1,15 +1,16 @@
 """Fuse maximum-projection image tiles using stage positions."""
 
+from __future__ import annotations
+
 import math
-from collections.abc import Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import psutil
 import tensorstore as ts
 from tqdm import tqdm
-
 from yaozarrs import open_group, v05
 from yaozarrs.write.v05 import prepare_image
 
@@ -26,6 +27,9 @@ from opm_processing.dataio.processing_state import (
 from opm_processing.imageprocessing.coordinates import (
     stage_positions_to_image_coordinates,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 
 def regenerate_fused_max_projection(
@@ -320,7 +324,7 @@ class MaxTileFusion:
         reverse_stage_y: bool = True,
         reverse_stage_z: bool = True,
         opm_angle_deg: float | None = None,
-    ):
+    ) -> None:
         """Initialize maximum-projection fusion with a bounded source chunk cache.
 
         Parameters
@@ -434,7 +438,7 @@ class MaxTileFusion:
         self.weight_mask = self.generate_blending_weights(self.blend_pixels)
         self.fused_ts = self.create_fused_image()
 
-    def compute_fused_image_space(self):
+    def compute_fused_image_space(self) -> tuple[tuple[int, ...], tuple[float, float]]:
         """Compute the overall fused image size in yx given tile positions.
 
         Returns
@@ -471,7 +475,9 @@ class MaxTileFusion:
 
         return fused_shape, (float(min_y), float(min_x))
 
-    def generate_blending_weights(self, blend_pixels: tuple[int, int] | None = None):
+    def generate_blending_weights(
+        self, blend_pixels: tuple[int, int] | None = None
+    ) -> np.ndarray:
         """Generate a feathered blending weight mask for a tile.
 
         Parameters
@@ -517,7 +523,7 @@ class MaxTileFusion:
         # at exterior tile edges otherwise create holes when no neighbor exists.
         return np.maximum(weight_mask, np.finfo(np.float32).eps)
 
-    def create_fused_image(self):
+    def create_fused_image(self) -> ts.TensorStore:
         """Create the fused TCZYX image through yaozarrs.
 
         Returns
@@ -653,7 +659,7 @@ class MaxTileFusion:
                         progress.update()
             progress.close()
 
-    def fuse_tiles(self):
+    def fuse_tiles(self) -> None:
         """Fuse tiles into bounded spatial chunks.
 
         Only chunks intersecting a tile are materialized. This keeps peak RAM
@@ -808,7 +814,7 @@ class MaxTileFusion:
                 progress.update()
         progress.close()
 
-    def run(self):
+    def run(self) -> None:
         """Run the full fusion pipeline.
 
         Returns

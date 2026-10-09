@@ -18,8 +18,8 @@ explicit linear forward model and its exact transpose, including at edges.
 
 from __future__ import annotations
 
-import logging
 from numbers import Integral
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -35,8 +35,16 @@ from opm_processing.imageprocessing.rlgc import (
     split_kl_changes,
 )
 
+if TYPE_CHECKING:
+    import logging
 
-def _convolve_core(image, otf, padded_shape, core):
+
+def _convolve_core(
+    image: cp.ndarray,
+    otf: cp.ndarray,
+    padded_shape: tuple[int, int, int],
+    core: tuple[slice, slice, slice],
+) -> cp.ndarray:
     """Convolve a zero-extended object and crop to its original field of view.
 
     Parameters
@@ -60,7 +68,13 @@ def _convolve_core(image, otf, padded_shape, core):
     return fft_conv(padded, otf, padded_shape)[core].copy()
 
 
-def _forward(image, otf, padded_shape, core, factor):
+def _forward(
+    image: cp.ndarray,
+    otf: cp.ndarray,
+    padded_shape: tuple[int, int, int],
+    core: tuple[slice, slice, slice],
+    factor: int,
+) -> cp.ndarray:
     """Blur on the fine grid before selecting measured scan planes.
 
     Parameters
@@ -84,7 +98,14 @@ def _forward(image, otf, padded_shape, core, factor):
     return _convolve_core(image, otf, padded_shape, core)[::factor].copy()
 
 
-def _adjoint(image, otf_adjoint, padded_shape, core, fine_shape, factor):
+def _adjoint(
+    image: cp.ndarray,
+    otf_adjoint: cp.ndarray,
+    padded_shape: tuple[int, int, int],
+    core: tuple[slice, slice, slice],
+    fine_shape: tuple[int, int, int],
+    factor: int,
+) -> cp.ndarray:
     """Scatter measurements into a zero-filled fine grid and apply C transpose.
 
     Parameters
@@ -197,13 +218,15 @@ def rlgc_undersampled(
     with cp.cuda.Device(gpu_id):
         try:
             pads = _linear_fft_pad_width(fine_shape, psf.shape)
-            padded_shape = tuple(n + sum(p) for n, p in zip(fine_shape, pads))
+            padded_shape = tuple(
+                n + sum(p) for n, p in zip(fine_shape, pads, strict=False)
+            )
             core = _observed_region_slices(padded_shape, pads)
             otf = cp.fft.rfftn(pad_psf(cp.asarray(psf), padded_shape))
             otf_adjoint = cp.conjugate(otf)
             observed = cp.asarray(image)
 
-            def forward(estimate):
+            def forward(estimate: cp.ndarray) -> cp.ndarray:
                 """Blur the fine estimate and select only acquired scan planes.
 
                 Parameters
@@ -218,7 +241,7 @@ def rlgc_undersampled(
                 """
                 return _forward(estimate, otf, padded_shape, core, factor)
 
-            def adjoint(values):
+            def adjoint(values: cp.ndarray) -> cp.ndarray:
                 """Scatter acquired-plane values and apply the adjoint optical convolution.
 
                 Parameters

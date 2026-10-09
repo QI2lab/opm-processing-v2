@@ -8,13 +8,11 @@ NGFF metadata, source acquisition settings, and the processing journal.
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
 from pathlib import Path
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 from uuid import uuid4
 
 import numpy as np
-import tensorstore as ts
 import tifffile
 import typer
 from ome_types import from_xml, to_xml
@@ -39,6 +37,10 @@ from opm_processing.dataio.processing_state import (
     processing_state_path,
 )
 
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+    import tensorstore as ts
 
 app = typer.Typer(pretty_exceptions_enable=False)
 
@@ -148,7 +150,7 @@ def export_image(
     pixels.physical_size_z, pixels.physical_size_y, pixels.physical_size_x = scale[-3:]
     pixels.physical_size_x_unit = pixels.physical_size_y_unit = (
         pixels.physical_size_z_unit
-    ) = "µm"
+    ) = "Âµm"
     pixels.metadata_only = None
     pixels.bin_data_blocks = []
     pixels.tiff_data_blocks = [
@@ -158,7 +160,9 @@ def export_image(
     pixels.interleaved = False
 
     if metadata.omero is not None:
-        for channel, display in zip(pixels.channels, metadata.omero.channels):
+        for channel, display in zip(
+            pixels.channels, metadata.omero.channels, strict=False
+        ):
             channel.name = display.label or channel.name
             if display.color is not None:
                 channel.color = Color("#" + display.color)
@@ -304,7 +308,7 @@ def export_fused(
         destination / (source.name.removesuffix(".ome.zarr") + ".ome.tif")
         for source in sources
     ]
-    for source, target in zip(sources, targets):
+    for source, target in zip(sources, targets, strict=False):
         if not source.is_dir():
             raise FileNotFoundError(source)
         if target.exists() and not overwrite:
@@ -366,7 +370,9 @@ def export_fused(
                         Channel(id=f"Channel:0:{c.index}", samples_per_pixel=1)
                         for c in acquisition.channels
                     ]
-                for channel, acquired in zip(pixels.channels, acquisition.channels):
+                for channel, acquired in zip(
+                    pixels.channels, acquisition.channels, strict=False
+                ):
                     channel.name = acquired.name
                     if acquired.wavelength_nm is not None:
                         channel.excitation_wavelength = acquired.wavelength_nm
@@ -387,7 +393,7 @@ def export_fused(
                 )
                 if raw_metadata.omero is not None:
                     for channel, display in zip(
-                        pixels.channels, raw_metadata.omero.channels
+                        pixels.channels, raw_metadata.omero.channels, strict=False
                     ):
                         if display.color is not None:
                             channel.color = Color("#" + display.color)
@@ -399,7 +405,7 @@ def export_fused(
                         0
                     ].scale_transform.scale[0]
                     pixels.time_increment_unit = "s"
-    for source, target in zip(sources, targets):
+    for source, target in zip(sources, targets, strict=False):
         export_image(
             source,
             target,

@@ -6,6 +6,7 @@ dependencies:
 
 ```bash
 uv sync --group dev
+uv run prek install
 ```
 
 ## Code conventions
@@ -23,7 +24,7 @@ ignored `diagnostics/` or pytest temporary directories.
 ## Validate changes
 
 ```bash
-uv run ruff check .
+uv run prek run --all-files
 uv run pytest --strict-markers
 git diff --check
 ```
@@ -33,6 +34,11 @@ Use the [testing guide](testing.md) for CUDA selection and physical acceptance.
 Run performance measurements outside pytest and record the conditions and
 comparison baseline. Deskew, fusion, and deconvolution optimizations must retain
 their stated geometry and numerical behavior.
+
+Prek runs Ruff linting and formatting, spelling, project metadata validation,
+and GitHub Actions validation. The same hooks run on pushes and pull requests.
+Ruff follows the MERFISH repository's rule families, with NumPy docstrings
+required here. Automatic fixes use Ruff's safe fixes.
 
 ## Documentation
 

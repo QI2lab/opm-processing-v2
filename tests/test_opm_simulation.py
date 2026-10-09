@@ -2,7 +2,6 @@
 
 import numpy as np
 import pytest
-
 from scripts.opm_simulation import (
     acquire_sphere,
     camera_noise,

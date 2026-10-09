@@ -4,7 +4,6 @@ import os
 
 from opm_processing.cuda import suppress_spurious_cupy_cuda_path_warning
 
-
 os.environ.setdefault("NVRTC_OPTIONS", "--std=c++17")
 os.environ.setdefault("CCCL_IGNORE_DEPRECATED_CPP_DIALECT", "1")
 suppress_spurious_cupy_cuda_path_warning()
