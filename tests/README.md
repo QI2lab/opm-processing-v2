@@ -8,5 +8,5 @@ acceptance requirements; the documentation site includes that same file.
 From an installed development environment:
 
 ```powershell
-uv run --no-sync python -m pytest --strict-markers -q -m "not gpu"
+uv run --no-sync python -m pytest tests/cpu --strict-markers -q
 ```
