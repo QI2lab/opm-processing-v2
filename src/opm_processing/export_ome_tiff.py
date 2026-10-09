@@ -15,7 +15,7 @@ from uuid import uuid4
 import numpy as np
 import tifffile
 import typer
-from ome_types import from_xml, to_xml
+from ome_types import from_xml
 from ome_types.model import (
     OME,
     AnnotationRef,
@@ -61,22 +61,29 @@ def image_tiles(
     ------
     numpy.ndarray
         One YX tile in TCZ page order, then raster YX tile order. Edge tiles
-        retain their actual shape and are zero-padded by tifffile.
+        retain their actual shape and are zero-padded by tifffile. Separate
+        progress bars report timepoints, channels, and Z planes per channel.
     """
     nt, nc, nz, ny, nx = array.shape
     ty, tx = tile_shape
-    with tqdm(total=nt * nc * nz, desc="export planes", unit="plane") as progress:
-        for t in range(nt):
-            for c in range(nc):
-                for z in range(nz):
-                    for y in range(0, ny, ty):
-                        for x in range(0, nx, tx):
-                            yield (
-                                array[t, c, z, y : min(y + ty, ny), x : min(x + tx, nx)]
-                                .read()
-                                .result()
-                            )
-                    progress.update()
+    for t in tqdm(range(nt), desc="export time", unit="timepoint", position=0):
+        for c in tqdm(
+            range(nc), desc="export channels", unit="channel", position=1, leave=False
+        ):
+            for z in tqdm(
+                range(nz),
+                desc=f"export planes (channel {c + 1}/{nc})",
+                unit="plane",
+                position=2,
+                leave=False,
+            ):
+                for y in range(0, ny, ty):
+                    for x in range(0, nx, tx):
+                        yield (
+                            array[t, c, z, y : min(y + ty, ny), x : min(x + tx, nx)]
+                            .read()
+                            .result()
+                        )
 
 
 def export_image(
@@ -150,7 +157,7 @@ def export_image(
     pixels.physical_size_z, pixels.physical_size_y, pixels.physical_size_x = scale[-3:]
     pixels.physical_size_x_unit = pixels.physical_size_y_unit = (
         pixels.physical_size_z_unit
-    ) = "Âµm"
+    ) = "µm"
     pixels.metadata_only = None
     pixels.bin_data_blocks = []
     pixels.tiff_data_blocks = [
@@ -211,15 +218,15 @@ def export_image(
     )
     ome.structured_annotations.map_annotations.append(annotation)
     image.annotation_refs.append(AnnotationRef(id=annotation.id))
-    xml = to_xml(ome, include_namespace=True, validate=True)
-    # TIFF ImageDescription is ASCII; numeric references preserve Unicode in XML.
-    description = xml.encode("ascii", "xmlcharrefreplace").decode("ascii")
+    # Match expansion-processing's ome-writers TIFF backend: serialize the OME
+    # model directly to UTF-8 bytes and disable automatic TIFF shape metadata.
+    description = ome.to_xml().encode("utf-8")
 
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_name(f".{output.name}.{uuid4().hex}.tmp")
     try:
         with tifffile.TiffWriter(
-            temporary, bigtiff=True, ome=False, byteorder="<"
+            temporary, bigtiff=True, ome=False, shaped=False, byteorder="<"
         ) as writer:
             writer.write(
                 image_tiles(array, (512, 512)),
@@ -261,6 +268,12 @@ def export_fused(
     overwrite: Annotated[
         bool, typer.Option(help="Replace existing OME-TIFF exports.")
     ] = False,
+    metadata_only: Annotated[
+        bool,
+        typer.Option(
+            help="Repair OME XML encoding in existing exports without rewriting pixels."
+        ),
+    ] = False,
 ) -> None:
     """Export the full-resolution fused volume and its fused maximum-Z image.
 
@@ -275,13 +288,18 @@ def export_fused(
         Number of parallel compression workers, default four.
     overwrite : bool
         Replace existing exports only when explicitly enabled.
+    metadata_only : bool
+        Rewrite existing TIFF ImageDescription tags as UTF-8 OME XML. Image
+        planes, compression, and metadata values are preserved; both exports
+        must already exist. Source acquisition metadata is not reread.
 
     Raises
     ------
     ValueError
         If the directory does not identify one full fused store.
     FileNotFoundError
-        If either member of the fused volume/projection pair is missing.
+        If either fused store is missing, or metadata-only repair is requested
+        without both existing TIFF exports.
     FileExistsError
         If an export exists and overwrite is disabled.
     """
@@ -311,10 +329,19 @@ def export_fused(
     for source, target in zip(sources, targets, strict=False):
         if not source.is_dir():
             raise FileNotFoundError(source)
-        if target.exists() and not overwrite:
+        if metadata_only and not target.is_file():
+            raise FileNotFoundError(target)
+        if target.exists() and not overwrite and not metadata_only:
             raise FileExistsError(
                 f"{target} exists; use --overwrite to replace exports."
             )
+
+    if metadata_only:
+        for target in targets:
+            ome = from_xml(tifffile.tiffcomment(target))
+            tifffile.tiffcomment(target, comment=ome.to_xml().encode("utf-8"))
+            typer.echo(f"Repaired OME metadata: {target}")
+        return
 
     template = OME(creator="opm-processing-v2")
     provenance = {}

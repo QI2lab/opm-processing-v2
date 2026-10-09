@@ -2026,6 +2026,10 @@ class TileFusion:
             Any
                 Measured phase-correlation shift in registration pixels.
             """
+            # CPU disambiguation can move identical, textureless crops to an
+            # equivalent correlation peak. Their measured correction is zero.
+            if not USING_GPU and np.array_equal(fixed, moving):
+                return np.zeros(fixed.ndim, dtype=np.float32)
             shift, _, _ = phase_cross_correlation(
                 fixed,
                 moving,
