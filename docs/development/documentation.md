@@ -44,12 +44,12 @@ measurements under ignored `diagnostics/`, outside the published documentation.
 ## CI and publication
 
 The [published documentation](https://qi2lab.github.io/opm-processing-v2/)
-uses GitHub Actions as its Pages source. The workflow builds only when a pull
-request or push to `main` changes documentation, Python source used for reference
-pages, the included test contribution guide, `mkdocs.yml`, `pyproject.toml`, or
-the documentation workflow. Successful builds on `main` deploy to GitHub Pages;
-pull requests only validate the site. Manual runs can force a build, with
-deployment limited to `main`.
+uses GitHub Actions as its Pages source. Automatic builds run only when newly
+pushed commits change `docs/`, `tests/CONTRIBUTING.md`, or `mkdocs.yml`. The workflow
+checks the revisions from each push so unrelated commits do not rebuild earlier
+documentation changes in the same PR. Successful builds on `main` deploy to
+GitHub Pages; pull requests only validate the site. Manual runs can refresh
+generated Python references or force a build, with deployment limited to `main`.
 
 Build and deploy use only documentation dependencies. A local build produces
 `site/` without publishing it.
