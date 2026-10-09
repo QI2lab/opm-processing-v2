@@ -44,11 +44,12 @@ measurements under ignored `diagnostics/`, outside the published documentation.
 ## CI and publication
 
 The [published documentation](https://qi2lab.github.io/opm-processing-v2/)
-uses GitHub Actions as its Pages source. The workflow validates pull requests
-and deploys successful pushes to `main` and `perf/numba-deskew-corrections`.
-The latter currently holds the processing implementation described here; remove
-that branch from the deployment triggers after it is merged into `main`, and
-update `edit_uri` and source links to `main`.
+uses GitHub Actions as its Pages source. The workflow builds only when a pull
+request or push to `main` changes documentation, Python source used for reference
+pages, the included test contribution guide, `mkdocs.yml`, `pyproject.toml`, or
+the documentation workflow. Successful builds on `main` deploy to GitHub Pages;
+pull requests only validate the site. Manual runs can force a build, with
+deployment limited to `main`.
 
 Build and deploy use only documentation dependencies. A local build produces
 `site/` without publishing it.
