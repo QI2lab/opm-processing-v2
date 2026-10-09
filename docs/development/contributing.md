@@ -40,6 +40,19 @@ and GitHub Actions validation. The same hooks run on pushes and pull requests.
 Ruff follows the MERFISH repository's rule families, with NumPy docstrings
 required here. Automatic fixes use Ruff's safe fixes.
 
+## Pull requests
+
+New pull requests automatically become drafts. Mark a PR ready for review when
+it is ready to run the CPU suite on Ubuntu and Windows. Further commits to a
+ready PR rerun the tests; draft PRs run only prek and documentation checks.
+CPU tests also run on `main`, release tags, and manual workflow runs.
+
+To create a draft directly from the command line:
+
+```bash
+gh pr create --draft
+```
+
 ## Documentation
 
 Update command references when options change and method pages when numerical
