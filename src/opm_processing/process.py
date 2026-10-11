@@ -45,6 +45,7 @@ from opm_processing.dataio.processing_state import (
     ProcessingState,
     processing_state_path,
 )
+from opm_processing.dataio.ptv import mark_ptv_tile, publish_processing_state_ptv
 from opm_processing.dataio.roi import (
     PhysicalRoi,
     world_roi_to_skewed_bounds,
@@ -1616,6 +1617,19 @@ def process_skewed(
     )
     processing_configuration = {
         "kind": output_kind,
+        "calibration": {
+            "gain_offset_applied": True,
+            "camera_offset_adu": camera_offset,
+            "camera_conversion": camera_conversion,
+            "camera_correction": "opm_processing.imageprocessing.camera.camera_correct",
+            "stage_scan_gain_applied": bool(apply_qi2lab_stage_scan_gain),
+            "illumination_correction_applied": bool(flatfield_correction),
+            "localization_uncertainty": {
+                "coverage_validated": False,
+                "noise_model": "unvalidated",
+                "source": None,
+            },
+        },
         "timing": acquisition.timing_attributes(),
         "dtype": output_dtype.name,
         "flatfield": bool(flatfield_correction),
@@ -1829,6 +1843,9 @@ def process_skewed(
         resume=state_resume,
         output_preexisting=output_preexisting,
     )
+    ptv_export_enabled = acquisition.volume_interval_s is not None
+    if ptv_export_enabled:
+        publish_processing_state_ptv(output_path, processing_state)
     if max_projection:
         if state_resume and max_z_output_preexisting:
             try:
@@ -2203,7 +2220,7 @@ def process_skewed(
             if max_projection:
                 for ts_max_write in ts_max_writes:
                     ts_max_write.result()
-            tile_zero_channels = (
+            tile_zero_channels = tuple(
                 channel_index
                 for time_index, position_index, channel_index in zero_channels
                 if time_index == int(t_idx) and position_index == int(pos_idx)
@@ -2214,6 +2231,13 @@ def process_skewed(
                 pos_idx,
                 zero_channels=tile_zero_channels,
             )
+            if ptv_export_enabled:
+                mark_ptv_tile(
+                    output_path,
+                    int(t_idx),
+                    int(pos_idx),
+                    zero_channels=tile_zero_channels,
+                )
             if max_projection:
                 processing_state.complete_tile(max_z_output_path, t_idx, pos_idx)
 

@@ -254,11 +254,19 @@ class ProcessingState:
                 raise ValueError(
                     f"Existing processing run is incompatible with {output_path}"
                 )
+            # The fingerprint establishes exact compatibility before backfilling
+            # self-contained export evidence for an older resumable journal.
+            if "configuration" not in existing or "dataset_id" not in existing:
+                existing["configuration"] = _json_value(configuration)
+                existing.setdefault("dataset_id", str(uuid4()))
+                self.save()
             return
         record = {
             **expected,
             "completed_tiles": [],
             "zero_channels": [],
+            "configuration": _json_value(configuration),
+            "dataset_id": str(uuid4()),
         }
         if series:
             record["roi_series"] = series
