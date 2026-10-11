@@ -93,6 +93,7 @@ def export_image(
     provenance: dict[str, str],
     *,
     workers: int = 4,
+    bounds_yx: tuple[int, int, int, int] | None = None,
 ) -> None:
     """Write one fused image as tiled OME-BigTIFF without changing its pixels.
 
@@ -110,17 +111,34 @@ def export_image(
         JSON-encoded acquisition and processing records for OME annotations.
     workers : int
         Number of TIFF compression workers; reads and buffering remain bounded.
+    bounds_yx : tuple[int, int, int, int] | None
+        Optional level-zero (y start, y stop, x start, x stop) crop bounds.
     """
     root = open_group(source)
     metadata = root.ome_metadata()
     multiscale = metadata.multiscales[0]
     dataset = multiscale.datasets[0]
     array = root[dataset.path].to_tensorstore()
+    if bounds_yx is not None:
+        y0, y1, x0, x1 = bounds_yx
+        if not (0 <= y0 < y1 <= array.shape[-2] and 0 <= x0 < x1 <= array.shape[-1]):
+            raise ValueError(
+                "ROI bounds must be nonempty and inside the level-zero image"
+            )
+        array = array[:, :, :, y0:y1, x0:x1].translate_to[0, 0, 0, 0, 0]
     nt, nc, nz, ny, nx = array.shape
     dtype = np.dtype(array.dtype.numpy_dtype)
     scale = dataset.scale_transform.scale
     translation = dataset.translation_transform
-    origin = translation.translation if translation is not None else [0] * 5
+    origin = list(translation.translation) if translation is not None else [0] * 5
+    if bounds_yx is not None:
+        origin[3] += bounds_yx[0] * scale[3]
+        origin[4] += bounds_yx[2] * scale[4]
+        provenance = {
+            **provenance,
+            "ROIBoundsLevelZeroYX": json.dumps(bounds_yx),
+            "ROIOriginTCZYX": json.dumps(origin),
+        }
 
     ome = template.model_copy(deep=True)
     ome.uuid = None
@@ -343,6 +361,21 @@ def export_fused(
             typer.echo(f"Repaired OME metadata: {target}")
         return
 
+    template, provenance = load_export_metadata(fused)
+    for source, target in zip(sources, targets, strict=False):
+        export_image(
+            source,
+            target,
+            template,
+            provenance,
+            workers=workers,
+        )
+        typer.echo(f"Created {target}")
+
+
+def load_export_metadata(fused: Path) -> tuple[OME, dict[str, str]]:
+    """Load the shared acquisition template and processing provenance."""
+    stem = fused.name.removesuffix("_fused.ome.zarr")
     template = OME(creator="opm-processing-v2")
     provenance = {}
     state_path = processing_state_path(fused.parent, stem)
@@ -432,15 +465,7 @@ def export_fused(
                         0
                     ].scale_transform.scale[0]
                     pixels.time_increment_unit = "s"
-    for source, target in zip(sources, targets, strict=False):
-        export_image(
-            source,
-            target,
-            template,
-            provenance,
-            workers=workers,
-        )
-        typer.echo(f"Created {target}")
+    return template, provenance
 
 
 def main() -> None:

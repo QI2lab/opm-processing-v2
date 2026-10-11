@@ -393,6 +393,92 @@ def _aligned_registration_views(
     return fixed[tuple(fixed_slices)], moving[tuple(moving_slices)]
 
 
+def _registration_similarity(
+    arr1: Any,
+    arr2: Any,
+    candidate: Any,
+    win_size: int,
+    masks: tuple[Any, Any] | None = None,
+    registration_axis: int | None = None,
+) -> float:
+    """Evaluate overlap similarity for a candidate registration correction.
+
+    Parameters
+    ----------
+    candidate : Any
+        Candidate ZYX registration correction in pixels.
+
+    Returns
+    -------
+    float
+        Structural similarity of the translated overlapping patches.
+    """
+    try:
+        fixed_view, moving_view = _aligned_registration_views(
+            arr1,
+            arr2,
+            candidate,
+        )
+        valid_mask = None
+        if masks is not None:
+            fixed_mask, moving_mask = _aligned_registration_views(*masks, candidate)
+            tolerance = 4 * xp.finfo(xp.float32).eps
+            valid_mask = (fixed_mask >= 1 - tolerance) & (moving_mask >= 1 - tolerance)
+            # Remove completely unsupported edge planes before selecting
+            # the SSIM window; thin depth overlaps often have one.
+            bounds = []
+            for axis in range(valid_mask.ndim):
+                other_axes = tuple(
+                    index for index in range(valid_mask.ndim) if index != axis
+                )
+                supported = xp.flatnonzero(xp.any(valid_mask, axis=other_axes))
+                if supported.size == 0:
+                    return -math.inf
+                bounds.append(slice(int(supported[0]), int(supported[-1]) + 1))
+            bounds = tuple(bounds)
+            fixed_view = fixed_view[bounds]
+            moving_view = moving_view[bounds]
+            valid_mask = valid_mask[bounds]
+        # Stage-depth overlaps can be thinner than the configured
+        # window even without downsampling. Score the valid aligned
+        # support with the largest odd window that fits it.
+        effective_window = min(win_size, min(fixed_view.shape))
+        effective_window -= 1 - effective_window % 2
+        score = -math.inf
+        if effective_window >= 3:
+            score = _ssim(
+                fixed_view,
+                moving_view,
+                win_size=effective_window,
+                valid_mask=valid_mask,
+            )
+        # A thin depth overlap can have many common voxels but no
+        # complete 3D SSIM window. Compare XY means of the same valid
+        # planes instead, preserving geometric support in both views.
+        if (
+            not math.isfinite(score)
+            and fixed_view.ndim == 3
+            and registration_axis == 0
+            and fixed_view.shape[0] <= win_size + 2
+        ):
+            weights = xp.ones_like(fixed_view) if valid_mask is None else valid_mask
+            count = xp.sum(weights, axis=0)
+            fixed_view = xp.sum(fixed_view * weights, axis=0) / xp.maximum(count, 1)
+            moving_view = xp.sum(moving_view * weights, axis=0) / xp.maximum(count, 1)
+            window = min(win_size, min(fixed_view.shape))
+            window -= 1 - window % 2
+            if window >= 3:
+                score = _ssim(
+                    fixed_view,
+                    moving_view,
+                    win_size=window,
+                    valid_mask=count > 0,
+                )
+        return score
+    except ValueError:
+        return -math.inf
+
+
 def _bounded_phase_correlation_peak(
     fixed: Any,
     moving: Any,
@@ -446,6 +532,58 @@ def _bounded_phase_correlation_peak(
         [signed_coordinates[axis][index] for axis, index in enumerate(peak_index)],
         dtype=xp.float32,
     )
+
+
+def _refine_depth_candidate(
+    fixed: Any,
+    moving: Any,
+    masks: tuple[Any, Any],
+    nominal_z: int,
+    lateral_shift: Sequence[float],
+    z_limit: int,
+    win_size: int,
+) -> tuple[Any, float]:
+    """Search contextual depth samples at the measured lateral displacement.
+
+    Pearson correlation measures specimen agreement on common geometric support
+    for each integer Z correction. Cropping both inputs to the nominal thin
+    intersection before this search would remove the feature samples needed to
+    measure a correction. SSIM independently gates the selected match.
+    """
+    lateral = tuple(round(value) for value in lateral_shift)
+    best = None
+    best_score = -math.inf
+    # Measure a small guard band as well: a peak beyond the requested limit
+    # must be rejected by the caller rather than clamped onto the limit.
+    for correction in range(-z_limit - 2, z_limit + 3):
+        shift = (nominal_z + correction, *lateral)
+        try:
+            a, b = _aligned_registration_views(fixed, moving, shift)
+            ma, mb = _aligned_registration_views(*masks, shift)
+        except ValueError:
+            continue
+        common = (ma > 0.999) & (mb > 0.999)
+        if int(xp.count_nonzero(xp.any(common, axis=(1, 2)))) < 3:
+            continue
+        a, b = a[common], b[common]
+        if a.size < 3:
+            continue
+        a = a - xp.mean(a)
+        b = b - xp.mean(b)
+        denominator = xp.sqrt(xp.sum(a * a) * xp.sum(b * b))
+        if float(denominator) <= 0:
+            continue
+        correlation = float(xp.sum(a * b) / denominator)
+        if correlation > best_score:
+            best_score, best = correlation, shift
+    # Smooth unrelated fields can have high SSIM simply because most samples
+    # are background. Require positive specimen contrast agreement as well.
+    if best is None or best_score < 0.3:
+        return xp.asarray((nominal_z, *lateral_shift)), -math.inf
+    # Preserve the fractional lateral measurement when checking similarity.
+    best = xp.asarray((best[0], *lateral_shift), dtype=xp.float32)
+    matched = match_histograms(moving, fixed)
+    return best, _registration_similarity(fixed, matched, best, win_size, masks, 0)
 
 
 class _RegistrationDeviceBuffers:
@@ -1051,7 +1189,9 @@ def _infer_registration_limits(
     a floor. Untiled axes use ten percent of their tile extent. Depth pairs
     additionally allow the oblique-plane footprint displacement dz*cot(theta)
     along image Y. This is a search allowance, not a shear of tile origins.
-    Each pair retains at least half its overlap along every active axis.
+    Depth-face pairs allow up to twenty percent of their depth extent while
+    requiring at least three actually matched planes; other axes retain at
+    least half their overlap.
 
     Parameters
     ----------
@@ -1135,7 +1275,24 @@ def _infer_registration_limits(
         budget[1] += (
             abs(positions[right, 0] - positions[left, 0]) * cotangent / spacing[1]
         )
-        budget = np.minimum(np.ceil(budget), np.floor(overlap / 2))
+        cap = np.floor(overlap / 2)
+        separation = np.abs(positions[right] - positions[left]) / spacing
+        depth_pair = (
+            not is_2d
+            and int(np.argmax(separation / np.minimum(shapes[left], shapes[right])))
+            == 0
+        )
+        if depth_pair:
+            # Narrow depth intersections must not cap corrections at half their
+            # width. Context reads below permit matching outside that crop.
+            budget[0] = max(
+                budget[0], math.ceil(0.2 * min(shapes[left, 0], shapes[right, 0]))
+            )
+            # A correction towards the other tile increases the overlap. Do
+            # not limit that correction by the small nominal intersection.
+            # The contextual search checks actual common geometric support.
+            cap[0] = min(shapes[left, 0], shapes[right, 0]) - 3
+        budget = np.minimum(np.ceil(budget), cap)
         if is_2d:
             budget[0] = 0
         limits[pair] = tuple(int(value) for value in budget)
@@ -2056,92 +2213,9 @@ class TileFusion:
             return result
 
         def score_shift(candidate: Any) -> float:
-            """Evaluate overlap similarity for a candidate registration correction.
-
-            Parameters
-            ----------
-            candidate : Any
-                Candidate ZYX registration correction in pixels.
-
-            Returns
-            -------
-            float
-                Structural similarity of the translated overlapping patches.
-            """
-            try:
-                fixed_view, moving_view = _aligned_registration_views(
-                    arr1,
-                    arr2,
-                    candidate,
-                )
-                valid_mask = None
-                if masks is not None:
-                    fixed_mask, moving_mask = _aligned_registration_views(
-                        *masks, candidate
-                    )
-                    tolerance = 4 * xp.finfo(xp.float32).eps
-                    valid_mask = (fixed_mask >= 1 - tolerance) & (
-                        moving_mask >= 1 - tolerance
-                    )
-                    # Remove completely unsupported edge planes before selecting
-                    # the SSIM window; thin depth overlaps often have one.
-                    bounds = []
-                    for axis in range(valid_mask.ndim):
-                        other_axes = tuple(
-                            index for index in range(valid_mask.ndim) if index != axis
-                        )
-                        supported = xp.flatnonzero(xp.any(valid_mask, axis=other_axes))
-                        if supported.size == 0:
-                            return -math.inf
-                        bounds.append(slice(int(supported[0]), int(supported[-1]) + 1))
-                    bounds = tuple(bounds)
-                    fixed_view = fixed_view[bounds]
-                    moving_view = moving_view[bounds]
-                    valid_mask = valid_mask[bounds]
-                # Stage-depth overlaps can be thinner than the configured
-                # window even without downsampling. Score the valid aligned
-                # support with the largest odd window that fits it.
-                effective_window = min(win_size, min(fixed_view.shape))
-                effective_window -= 1 - effective_window % 2
-                score = -math.inf
-                if effective_window >= 3:
-                    score = _ssim(
-                        fixed_view,
-                        moving_view,
-                        win_size=effective_window,
-                        valid_mask=valid_mask,
-                    )
-                # A thin depth overlap can have many common voxels but no
-                # complete 3D SSIM window. Compare XY means of the same valid
-                # planes instead, preserving geometric support in both views.
-                if (
-                    not math.isfinite(score)
-                    and fixed_view.ndim == 3
-                    and registration_axis == 0
-                    and fixed_view.shape[0] <= win_size + 2
-                ):
-                    weights = (
-                        xp.ones_like(fixed_view) if valid_mask is None else valid_mask
-                    )
-                    count = xp.sum(weights, axis=0)
-                    fixed_view = xp.sum(fixed_view * weights, axis=0) / xp.maximum(
-                        count, 1
-                    )
-                    moving_view = xp.sum(moving_view * weights, axis=0) / xp.maximum(
-                        count, 1
-                    )
-                    window = min(win_size, min(fixed_view.shape))
-                    window -= 1 - window % 2
-                    if window >= 3:
-                        score = _ssim(
-                            fixed_view,
-                            moving_view,
-                            win_size=window,
-                            valid_mask=count > 0,
-                        )
-                return score
-            except ValueError:
-                return -math.inf
+            return _registration_similarity(
+                arr1, arr2, candidate, win_size, masks, registration_axis
+            )
 
         shift_apply = correlate(arr1, arr2)
         if (
@@ -2313,6 +2387,7 @@ class TileFusion:
                 ] = {}
                 candidate_scores: dict[tuple[int, int], float] = {}
                 rejected_shifts: list[tuple[int, int, int]] = []
+                rejected_links = []
                 pair_specs = []
                 input_itemsize = int(
                     np.dtype(self.position_arrays[0].dtype.numpy_dtype).itemsize
@@ -2389,6 +2464,30 @@ class TileFusion:
                         if self._is_2d
                         else boundary_axis
                     )
+                    context_z = None
+                    if not self._is_2d and boundary_axis == 0:
+                        max_z = getattr(self, "_pair_registration_limits", {}).get(
+                            (i, j), self.max_registration_shift_zyx
+                        )[0]
+                        if max_z > 0:
+                            max_z += 2
+                            bounds_i[0] = (
+                                max(0, bounds_i[0][0] - max_z),
+                                min(shape_i[0], bounds_i[0][1] + max_z),
+                            )
+                            bounds_j[0] = (
+                                max(0, bounds_j[0][0] - max_z),
+                                min(shape_j[0], bounds_j[0][1] + max_z),
+                            )
+                            # Keep a common array extent, including variable ROI tiles.
+                            length = min(
+                                bounds_i[0][1] - bounds_i[0][0],
+                                bounds_j[0][1] - bounds_j[0][0],
+                            )
+                            bounds_i[0] = (bounds_i[0][0], bounds_i[0][0] + length)
+                            bounds_j[0] = (bounds_j[0][0], bounds_j[0][0] + length)
+                            context_z = dz + bounds_j[0][0] - bounds_i[0][0]
+                            df_zyx_eff[0] = 1
                     df_zyx_eff_tuple = tuple(df_zyx_eff)
                     pair_specs.append(
                         (
@@ -2401,7 +2500,12 @@ class TileFusion:
                             df_zyx_eff_tuple,
                             thin_z_overlap,
                             registration_axis,
-                            (2 * math.prod(overlap_shape) * input_itemsize),
+                            (
+                                2
+                                * math.prod(hi - lo for lo, hi in bounds_i)
+                                * input_itemsize
+                            ),
+                            context_z,
                         )
                     )
 
@@ -2436,7 +2540,7 @@ class TileFusion:
                                 spec = next(spec_iterator)  # noqa: B023
                             except StopIteration:
                                 return
-                        _, _, i, j, bounds_i, bounds_j, _, _, _, pair_bytes = spec
+                        _, _, i, j, bounds_i, bounds_j, _, _, _, pair_bytes, _ = spec
                         if (
                             pending_reads  # noqa: B023
                             and pending_read_bytes + pair_bytes > read_ahead_budget  # noqa: B023
@@ -2486,6 +2590,7 @@ class TileFusion:
                         thin_z_overlap,
                         registration_axis,
                         pair_bytes,
+                        context_z,
                     ) = spec
                     patch_i = future_i.result()
                     patch_j = future_j.result()
@@ -2549,15 +2654,80 @@ class TileFusion:
                                 max_shift, df_zyx_eff, strict=False
                             )
                         )
+                    legacy_g1, legacy_g2 = g1, g2
+                    legacy_masks = tuple(support_masks)
+                    if context_z is not None:
+                        legacy_g1, legacy_g2 = _aligned_registration_views(
+                            g1, g2, (context_z, 0, 0)
+                        )
+                        legacy_masks = _aligned_registration_views(
+                            *legacy_masks, (context_z, 0, 0)
+                        )
                     shift_ds, score = self.register_and_score(
-                        g1,
-                        g2,
+                        legacy_g1,
+                        legacy_g2,
                         win_size=sw,
                         max_shift=max_shift_ds,
                         allow_bounded_peak=not thin_z_overlap,
                         registration_axis=registration_axis,
-                        support_masks=tuple(support_masks),
+                        support_masks=legacy_masks,
                     )
+                    if context_z is not None:
+                        lateral_allowed = all(
+                            abs(value) <= limit
+                            for value, limit in zip(
+                                shift_ds[1:], max_shift_ds[1:], strict=True
+                            )
+                        )
+                        refined = xp.asarray((context_z + shift_ds[0], *shift_ds[1:]))
+                        if lateral_allowed:
+                            refined, score = _refine_depth_candidate(
+                                g1,
+                                g2,
+                                tuple(support_masks),
+                                context_z,
+                                shift_ds[1:],
+                                int(max_shift_ds[0]),
+                                sw,
+                            )
+                        if not lateral_allowed or score < th:
+                            # A large depth error can leave too little matching
+                            # anatomy in the nominal crop to seed XY reliably.
+                            # Try the same phase estimator on the wider context.
+                            context_seed, _ = self.register_and_score(
+                                g1,
+                                g2,
+                                win_size=sw,
+                                allow_bounded_peak=False,
+                                registration_axis=0,
+                                support_masks=tuple(support_masks),
+                            )
+                            if all(
+                                abs(value) <= limit
+                                for value, limit in zip(
+                                    context_seed[1:], max_shift_ds[1:], strict=True
+                                )
+                            ):
+                                alternative, alternative_score = (
+                                    _refine_depth_candidate(
+                                        g1,
+                                        g2,
+                                        tuple(support_masks),
+                                        context_z,
+                                        context_seed[1:],
+                                        int(max_shift_ds[0]),
+                                        sw,
+                                    )
+                                )
+                                if math.isfinite(alternative_score) and (
+                                    not lateral_allowed or alternative_score > score
+                                ):
+                                    refined, score = alternative, alternative_score
+                        if USING_GPU and cp is not None:
+                            refined = cp.asnumpy(refined)
+                        refined = np.asarray(refined, dtype=np.float64)
+                        refined[0] -= context_z
+                        shift_ds = refined
                     progress.update()
                     shift_ds_array = np.asarray(shift_ds, dtype=np.float64)
                     if not math.isfinite(score) or not np.all(
@@ -2579,6 +2749,9 @@ class TileFusion:
                         or abs(dx_s) > max_shift[2]
                     ):
                         rejected_shifts.append((dz_s, dy_s, dx_s))
+                        rejected_links.append(
+                            (i, j, (dz_s, dy_s, dx_s), max_shift, score)
+                        )
                         if self._debug:
                             print(
                                 "Dropping link (%d, %d) shift=%s exceeds max=%s",
@@ -2612,6 +2785,11 @@ class TileFusion:
                         f"measured absolute corrections were {largest}. "
                         "Check --max-registration-shift-zyx if tiles remain misaligned."
                     )
+                    for i, j, correction, limits, similarity in rejected_links:
+                        print(
+                            f"  Rejected link ({i}, {j}): ZYX correction {correction}, "
+                            f"limits {limits}, SSIM {similarity:.3f}."
+                        )
                 if self._debug:
                     print(
                         "Registration source cache: TensorStore native LRU, "
@@ -2880,9 +3058,18 @@ class TileFusion:
                     offset, self._tile_shapes[i], self._tile_shapes[j], strict=False
                 )
             )
-            return _registration_sampling(
+            sampling = _registration_sampling(
                 overlap, self.downsample_factors, self.ssim_window, self._is_2d
             )
+            separation = np.abs(offset) / np.minimum(
+                self._tile_shapes[i], self._tile_shapes[j]
+            )
+            limit = getattr(self, "_pair_registration_limits", {}).get(
+                (i, j), getattr(self, "max_registration_shift_zyx", (0, 0, 0))
+            )[0]
+            if not self._is_2d and int(np.argmax(separation)) == 0 and limit > 0:
+                return (1, *sampling[1:])
+            return sampling
 
         links_all: list[dict[str, Any]] = [
             {
@@ -3294,7 +3481,7 @@ class TileFusion:
             "deskew_coverage": "normalize-valid-z-bin-samples-v1",
             "pair_selection": "all-thick-overlaps-nearest-thin-z-overlaps-v2",
             "acceptance": "threshold-only-no-forced-bridges-v2",
-            "overlap_roi": "full-physical-overlap-main-v1",
+            "overlap_roi": "depth-context-lateral-fallback-pearson-z-refinement-v3",
             "downsample": ("upstream-block-reduce-with-adaptive-zyx-ssim-support-v2"),
             "phase_registration": (
                 "thin-z-full-reject-out-of-range-thick-bounded-peak-v7"
@@ -3304,7 +3491,7 @@ class TileFusion:
             "ssim_window": self.ssim_window,
             "max_registration_shift_zyx": list(self.max_registration_shift_zyx),
             "shift_limits_policy": (
-                "stage-overlap-oblique-footprint-per-pair-v1"
+                "stage-overlap-contextual-depth-actual-support-per-pair-v3"
                 if getattr(self, "_automatic_registration_limits", False)
                 else "explicit"
             ),

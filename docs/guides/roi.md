@@ -1,5 +1,31 @@
 # Selecting and processing an ROI
 
+## Export ROIs from an existing fused volume
+
+```bash
+uv run export-rois "/path/to/processed"
+```
+
+This opens the full fused multiscale volume in napari with thick-slice
+maximum-intensity projection enabled. The initial Z slab covers the entire
+volume; right-click the Z slider to adjust its thickness and move the slider
+to inspect another depth. Timepoints remain separate. Draw multiple
+axis-aligned YX rectangles in the `export ROIs` layer, then close napari.
+The ROI outlines remain visible when changing the Z slab or timepoint.
+Each rectangle exports all Z planes, channels, and timepoints from level zero,
+regardless of the displayed slab or pyramid level while drawing. Selections round
+outward to pixel bounds and clip to the image extent. Overlapping ROIs export
+independently; closing without any rectangles creates no exports.
+
+Outputs are lossless zlib-compressed OME-BigTIFF files at
+`roi_exports/<stem>_roi_001.ome.tiff`, numbered in shape order. Use `--output`
+to choose a destination, `--overwrite` to replace existing files, and
+`--workers` to configure compression workers. Acquisition metadata and
+processing provenance follow `export-ome-tiff`; stage and per-plane positions
+retain the crop's global coordinates, with level-zero crop bounds recorded
+in an OME annotation. Draw in the default YX view; rotated rectangles are
+rejected.
+
 First create a registered maximum-Z projection with [fuse](fusion.md). ROI
 selection uses its calibrated world coordinates.
 

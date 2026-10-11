@@ -8,6 +8,7 @@ from opm_processing.imageprocessing.tilefusion import (
     TileFusion,
     _aligned_registration_views,
     _infer_registration_limits,
+    _refine_depth_candidate,
     _ssim,
 )
 
@@ -28,7 +29,7 @@ def test_stage_grid_allows_depth_footprint_drift_and_preserves_overlap():
         30,
     )
     depth_limits = limits[0, 4]
-    assert depth_limits[0] == 6  # Preserve half of the 13-voxel Z overlap.
+    assert depth_limits[0] == 13  # Actual matched support gates depth corrections.
     assert 240 <= depth_limits[1] <= 260
     assert depth_limits[2] == 31
     assert all(
@@ -159,6 +160,69 @@ def test_inferred_depth_limits_recover_or_reject_measured_drift(
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("reverse", (False, True))
+@pytest.mark.parametrize("z_limit", (None, 6))
+@pytest.mark.parametrize("depth_error", (7, 11))
+def test_context_recovers_depth_error_beyond_half_overlap(
+    tensorstore_dataset, fusion_operator, reverse, z_limit, depth_error
+):
+    """Recover Z errors from a thirteen-plane nominal intersection.
+
+    Both signs preserve the specimen's Z direction. An explicit six-pixel
+    limit rejects the measured correction instead of clamping it.
+    """
+    rng = np.random.default_rng(20261009)
+    true_step = 51 - depth_error
+    truth = gaussian_filter(rng.uniform(0, 1000, (64 + true_step, 240, 160)), (1, 2, 2))
+    volumes = [truth[:64, 40:, :152], truth[true_step:, :200, 8:]]
+    positions = [(0, 0, 0), (51 * 0.23, 0, 0)]
+    if reverse:
+        volumes.reverse()
+        positions.reverse()
+    fusion = fusion_operator(
+        TileFusion,
+        _tile_support_zy=[np.ones(volume.shape[:2], np.float32) for volume in volumes],
+        downsample_factors=(3, 2, 2),
+        ssim_window=15,
+        threshold=0.7,
+        pairwise_metrics={},
+        position_dim=2,
+        time_dim=1,
+        _pixel_size=(0.23, 0.115, 0.115),
+        _tile_positions=positions,
+        _tile_shapes=[volume.shape for volume in volumes],
+        _tiles_by_time=((0, 1),),
+        _tile_time_indices=[0, 0],
+        _is_2d=False,
+        _max_workers=1,
+        _debug=False,
+        _tile_channel_nonzero={(0, 0): True, (1, 0): True},
+        position_arrays=tuple(
+            tensorstore_dataset(volume[None, None]) for volume in volumes
+        ),
+    )
+    fusion.z_dim, fusion.y_dim, fusion.x_dim = volumes[0].shape
+    fusion._pair_registration_limits = _infer_registration_limits(
+        positions,
+        fusion._tile_shapes,
+        fusion._pixel_size,
+        fusion.downsample_factors,
+        30,
+    )
+    if z_limit is not None:
+        fusion._pair_registration_limits[0, 1] = (z_limit, 100, 100)
+    fusion.max_registration_shift_zyx = fusion._pair_registration_limits[0, 1]
+    fusion.refine_tile_positions_with_cross_correlation()
+    if z_limit is not None:
+        assert fusion.pairwise_metrics == {}
+    else:
+        expected = np.array((-depth_error, -40, 8)) * (-1 if reverse else 1)
+        np.testing.assert_allclose(fusion.pairwise_metrics[0, 1][:3], expected, atol=1)
+        fusion.optimize_shifts()
+        np.testing.assert_allclose(fusion.global_offsets[1], expected, atol=1)
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize("offsets", ((0.5, -1.3), (0.5, -1.3, 2.4), (1, -2, 3)))
 def test_aligned_registration_views_preserve_fractional_translation(offsets):
     """Recover an analytic intensity ramp without rounding shifts or scoring padding.
@@ -182,6 +246,20 @@ def test_aligned_registration_views_preserve_fractional_translation(offsets):
         for length, offset in zip(shape, offsets, strict=False)
     )
     assert bool(np.allclose(reference, aligned, atol=2e-5, rtol=0))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("uniform", (True, False))
+def test_context_rejects_background_without_matching_specimen(uniform):
+    """Similar background levels must not manufacture a depth match."""
+    rng = np.random.default_rng(913)
+    fields = [np.full((25, 48, 40), 1000, np.float32) for _ in range(2)]
+    if not uniform:
+        for field in fields:
+            field += gaussian_filter(rng.normal(0, 5, field.shape), 1)
+    masks = tuple(np.ones_like(field) for field in fields)
+    _, score = _refine_depth_candidate(*fields, masks, 12, (0, 0), 9, 7)
+    assert not np.isfinite(score)
 
 
 @pytest.mark.unit

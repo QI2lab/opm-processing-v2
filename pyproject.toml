@@ -120,6 +120,7 @@ display = "opm_processing.display:main"
 export-projections = "opm_processing.export_projections:main"
 encode-projections = "opm_processing.encode_projections:main"
 export-ome-tiff = "opm_processing.export_ome_tiff:main"
+export-rois = "opm_processing.export_rois:main"
 fuse = "opm_processing.fuse:main"
 
 # [project.entry-points."some.group"]
