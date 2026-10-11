@@ -1,10 +1,9 @@
 """Read and write multi-position OME-Zarr collections with yaozarrs."""
 
-from __future__ import annotations
-
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import numpy as np
 from ome_types import from_xml, to_xml
@@ -26,9 +25,7 @@ from opm_processing.dataio.ngff import (
     round_spatial_values,
     round_tczyx_transform,
 )
-
-if TYPE_CHECKING:
-    from collections.abc import Sequence
+from opm_processing.dataio.timing import read_time_interval, time_axis
 
 
 def convert_metadata(obj: Any) -> Any:
@@ -67,6 +64,7 @@ class PositionCollection:
     stage_positions_zxy: tuple[tuple[float, float, float], ...] = ()
     channel_names: tuple[str, ...] = ()
     spatial_origins_zyx_um: tuple[tuple[float, float, float], ...] = ()
+    time_interval_s: float | None = None
 
     @property
     def shape(self) -> tuple[int, ...]:
@@ -95,6 +93,7 @@ def create_position_collection(
     multiscale_factors_yx: Sequence[int] = (),
     multiscale_downsample: str = "stride",
     spatial_offset_um: Sequence[float] = (0.0, 0.0, 0.0),
+    time_interval_s: float | None = None,
 ) -> PositionCollection:
     """Create a Bf2Raw collection with one TCZYX image per position.
 
@@ -124,12 +123,15 @@ def create_position_collection(
         Pyramid sampling method: stride or block_mean.
     spatial_offset_um : Sequence[float]
         Image origin in ZYX order, in micrometers.
+    time_interval_s : float or None
+        Physical snapshot interval in seconds; None leaves time unitless.
 
     Returns
     -------
     PositionCollection
         Ordered array handles and physical metadata for the collection.
     """
+    t_axis, t_scale = time_axis(time_interval_s)
     if multiscale_downsample not in ("stride", "block_mean"):
         raise ValueError('multiscale_downsample must be "stride" or "block_mean"')
 
@@ -155,6 +157,7 @@ def create_position_collection(
         voxel_size_um=voxel_size_um,
         stage_positions=rounded_stage_positions,
         channels=channels,
+        time_interval_s=time_interval_s,
     )
     builder = Bf2RawBuilder(
         output_path,
@@ -165,7 +168,7 @@ def create_position_collection(
         extra_attributes=root_attributes,
     )
     axes = [
-        {"name": "t", "type": "time"},
+        t_axis,
         {"name": "c", "type": "channel"},
         {"name": "z", "type": "space", "unit": "micrometer"},
         {"name": "y", "type": "space", "unit": "micrometer"},
@@ -176,7 +179,7 @@ def create_position_collection(
     for level, factor in enumerate(factors):
         scale = round_tczyx_transform(
             (
-                1,
+                t_scale,
                 1,
                 voxel_size_um[0],
                 voxel_size_um[1] * factor,
@@ -241,6 +244,7 @@ def create_position_collection(
         stage_positions_zxy=rounded_stage_positions or (),
         channel_names=tuple(channels or (f"channel-{index}" for index in range(c))),
         spatial_origins_zyx_um=origins,
+        time_interval_s=time_interval_s,
     )
 
 
@@ -255,6 +259,7 @@ def create_variable_position_collection(
     attributes: dict[str, Any] | None = None,
     chunks: tuple[int, ...] | str | None = "auto",
     overwrite: bool = True,
+    time_interval_s: float | None = None,
 ) -> PositionCollection:
     """Create a Bf2Raw collection whose cropped series have different shapes.
 
@@ -281,12 +286,15 @@ def create_variable_position_collection(
         TCZYX chunk dimensions or the automatic chunk policy.
     overwrite : bool
         Whether an existing destination may be replaced.
+    time_interval_s : float or None
+        Physical snapshot interval in seconds; None leaves time unitless.
 
     Returns
     -------
     PositionCollection
         Ordered cropped tile handles and their physical origins.
     """
+    t_axis, t_scale = time_axis(time_interval_s)
     shapes = tuple(tuple(int(value) for value in shape) for shape in shapes_tczyx)
     origins = tuple(round_spatial_values(origin) for origin in spatial_origins_zyx_um)
 
@@ -299,6 +307,7 @@ def create_variable_position_collection(
         voxel_size,
         origins,
         channels,
+        time_interval_s,
     )
     builder = Bf2RawBuilder(
         output_path,
@@ -309,13 +318,13 @@ def create_variable_position_collection(
         extra_attributes=root_attributes,
     )
     axes = [
-        {"name": "t", "type": "time"},
+        t_axis,
         {"name": "c", "type": "channel"},
         {"name": "z", "type": "space", "unit": "micrometer"},
         {"name": "y", "type": "space", "unit": "micrometer"},
         {"name": "x", "type": "space", "unit": "micrometer"},
     ]
-    scale = round_tczyx_transform((1, 1, *voxel_size))
+    scale = round_tczyx_transform((t_scale, 1, *voxel_size))
     for series, (shape, origin) in enumerate(zip(shapes, origins, strict=False)):
         image = v05.Image(
             multiscales=[
@@ -350,6 +359,7 @@ def create_variable_position_collection(
             channels or (f"channel-{index}" for index in range(int(shapes[0][1])))
         ),
         spatial_origins_zyx_um=origins,
+        time_interval_s=time_interval_s,
     )
 
 
@@ -359,6 +369,7 @@ def _build_variable_ome_xml(
     voxel_size_um: Sequence[float],
     origins_zyx_um: Sequence[Sequence[float]],
     channels: Sequence[str] | None,
+    time_interval_s: float | None = None,
 ) -> str:
     """Build OME-XML for independently shaped and positioned ROI tiles.
 
@@ -418,6 +429,8 @@ def _build_variable_ome_xml(
                     size_z=z,
                     size_c=c,
                     size_t=t,
+                    time_increment=time_interval_s,
+                    time_increment_unit="s",
                     physical_size_x=round_spatial(voxel_size_um[2]),
                     physical_size_y=round_spatial(voxel_size_um[1]),
                     physical_size_z=round_spatial(voxel_size_um[0]),
@@ -447,6 +460,7 @@ def _build_ome_xml(
     voxel_size_um: Sequence[float],
     stage_positions: Sequence[Sequence[float]] | None,
     channels: Sequence[str] | None,
+    time_interval_s: float | None = None,
 ) -> str:
     """Build a validated OME-XML companion for a Bf2Raw collection.
 
@@ -507,6 +521,8 @@ def _build_ome_xml(
                     size_z=z,
                     size_c=c,
                     size_t=t,
+                    time_increment=time_interval_s,
+                    time_increment_unit="s",
                     physical_size_x=round_spatial(voxel_size_um[2]),
                     physical_size_y=round_spatial(voxel_size_um[1]),
                     physical_size_z=round_spatial(voxel_size_um[0]),
@@ -553,11 +569,13 @@ def open_position_collection(path: str | Path) -> PositionCollection:
     )
     arrays = []
     series_levels = []
+    time_intervals = []
     spatial_origins = []
     factors: tuple[int, ...] | None = None
     for name in series_metadata.series:
         image_group = root[name]
         image_metadata = image_group.ome_metadata()
+        time_intervals.append(read_time_interval(image_metadata.multiscales[0]))
         datasets = image_metadata.multiscales[0].datasets
         level_arrays = tuple(
             image_group[dataset.path].to_tensorstore() for dataset in datasets
@@ -584,6 +602,8 @@ def open_position_collection(path: str | Path) -> PositionCollection:
             )
         )
     arrays = tuple(arrays)
+    if any(value != time_intervals[0] for value in time_intervals):
+        raise ValueError("Position series disagree on physical time scale")
     attributes = {key: value for key, value in root.attrs.items() if key != "ome"}
 
     if "opm_v2" in root.attrs:
@@ -627,6 +647,7 @@ def open_position_collection(path: str | Path) -> PositionCollection:
         stage_positions_zxy=stage_positions,
         channel_names=channel_names,
         spatial_origins_zyx_um=tuple(spatial_origins),
+        time_interval_s=time_intervals[0],
     )
 
 

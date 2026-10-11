@@ -16,6 +16,8 @@ from typing import TYPE_CHECKING, Any
 import yaozarrs
 from yaozarrs import ZarrGroup, v05
 
+from opm_processing.dataio.timing import hardware_volume_interval
+
 if TYPE_CHECKING:
     import tensorstore as ts
 
@@ -57,6 +59,19 @@ class AcquisitionMetadata:
     excess_scan_end_positions: int
     orientations: tuple[tuple[str, str], ...]
     sidecar_paths: tuple[str, ...]
+    acquired_plane_count: int | None = None
+    plane_period_s: float | None = None
+
+    @property
+    def volume_interval_s(self) -> float | None:
+        """Return recorded hardware cadence in seconds, excluding exposure guesses.
+
+        Returns
+        -------
+        float or None
+            Original acquired-plane count times the hardware plane period.
+        """
+        return hardware_volume_interval(self.acquired_plane_count, self.plane_period_s)
 
     @property
     def index_sizes(self) -> dict[str, int]:
@@ -828,6 +843,8 @@ def _inspect_ome_zarr(path: Path, root: ZarrGroup) -> AcquisitionMetadata:
         excess_scan_end_positions=_integer(opm_frame.get("excess_scan_end_positions")),
         orientations=orientations,
         sidecar_paths=_sidecars(path),
+        acquired_plane_count=opm.get("timing", {}).get("n_acquired_planes"),
+        plane_period_s=opm.get("timing", {}).get("dt_plane_s"),
     )
 
 
