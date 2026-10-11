@@ -14,6 +14,11 @@ and the [first workflow](https://qi2lab.github.io/opm-processing-v2/getting-star
 Requires Python 3.12 and [uv](https://docs.astral.sh/uv/).
 Windows and Linux installations include CUDA dependencies by default; Windows
 also requires the [cuCIM setup](docs/getting-started/installation.md#cucim-on-windows).
+The base distribution provides the yaozarrs/TensorStore IO SDK. Processing,
+visualization and their existing PyTorch dependency are in the `processing`
+extra; the default checkout workflow still selects them. IO consumers install
+the base distribution without extras. In a checkout, `uv sync --no-default-groups`
+selects only IO dependencies.
 
 ```bash
 uv sync

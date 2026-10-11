@@ -87,6 +87,7 @@ celerybeat-schedule
 
 # virtualenv
 .venv
+.uv-cache/
 venv/
 ENV/
 
