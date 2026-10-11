@@ -60,6 +60,7 @@ from opm_processing.dataio.processing_state import (
     ProcessingState,
     processing_state_path,
 )
+from opm_processing.dataio.timing import time_axis
 from opm_processing.imageprocessing.coordinates import (
     stage_positions_to_image_coordinates,
     stage_z_level_indices,
@@ -1543,6 +1544,7 @@ class TileFusion:
             reverse_stage_z = not self.acquisition.stage_axis_flips_xyz[2]
         self.reverse_stage_z = bool(reverse_stage_z)
         self._pixel_size = tuple(float(value) for value in collection.voxel_size_um)
+        self.time_interval_s = collection.time_interval_s
         self.roi_selection = roi_selection
         if self._variable_roi_tiles:
             records = roi_series
@@ -3639,8 +3641,9 @@ class TileFusion:
         factors = (1, *self.multiscale_factors)
         dz, dy, dx = round_spatial_values(self._pixel_size)
         offset_z, offset_y, offset_x = round_spatial_values(self.offset_um)
+        t_axis, t_scale = time_axis(getattr(self, "time_interval_s", None))
         axes = [
-            {"name": "t", "type": "time"},
+            t_axis,
             {"name": "c", "type": "channel"},
             {"name": "z", "type": "space", "unit": "micrometer"},
             {"name": "y", "type": "space", "unit": "micrometer"},
@@ -3668,7 +3671,7 @@ class TileFusion:
                         {
                             "scale": round_tczyx_transform(
                                 (
-                                    1,
+                                    t_scale,
                                     1,
                                     dz * z_factor,
                                     dy * factor,

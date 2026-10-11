@@ -74,3 +74,80 @@ def test_unknown_time_does_not_become_one_second(tmp_path):
     create_position_collection(path, (2, 1, 1, 4, 8, 8), (0.23, 0.115, 0.115))
     assert open_group(path)["0"].ome_metadata().multiscales[0].axes[0].unit is None
     assert open_position_collection(path).time_interval_s is None
+
+
+@pytest.mark.integration
+def test_processing_propagates_hardware_cadence(
+    current_single_position_mirror_timelapse, tmp_path
+):
+    from opm_processing.process import process
+
+    raw = current_single_position_mirror_timelapse
+    import json
+
+    metadata_path = raw / "zarr.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["attributes"]["opm_v2"]["timing"] = {
+        "n_acquired_planes": 4,
+        "dt_plane_s": 0.005,
+    }
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    process(
+        root_path=raw,
+        max_projection=True,
+        create_fused_max_projection=False,
+        z_downsample_level=1,
+    )
+    for name in (
+        "single_mirror_deskewed.ome.zarr",
+        "single_mirror_max_z_deskewed.ome.zarr",
+    ):
+        result = open_position_collection(raw.parent / name)
+        assert result.time_interval_s == pytest.approx(0.020)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("projection", [False, True])
+def test_fused_writer_preserves_time_axis(tmp_path, fusion_operator, projection):
+    import numpy as np
+
+    from opm_processing.imageprocessing.maxtilefusion import MaxTileFusion
+
+    path = tmp_path / "fused.ome.zarr"
+    if projection:
+        operator = fusion_operator(
+            MaxTileFusion,
+            time_interval_s=0.085,
+            time_range=None,
+            time_dim=3,
+            fused_shape=(8, 8),
+            channels=1,
+            z_pixel_size=0.23,
+            pixel_size=(0.115, 0.115),
+            offset=(0, 0),
+            spatial_offset_z_um=0,
+            output_dtype=np.dtype("uint16"),
+            output_path=path,
+            chunk_size=8,
+        )
+        operator.create_fused_image()
+    else:
+        operator = fusion_operator(
+            time_interval_s=0.085,
+            multiscale_factors=(2,),
+            multiscale_downsample="stride",
+            _pixel_size=(0.23, 0.115, 0.115),
+            offset_um=(0, 0, 0),
+            padded_shape=(4, 8, 8),
+            _is_2d=False,
+            time_dim=3,
+            channels=1,
+            chunk_y=4,
+            chunk_x=4,
+        )
+        operator._prepare_fused_image(path, z_slices_per_write=2)
+    image = open_group(path).ome_metadata()
+    assert image.multiscales[0].axes[0].unit == "second"
+    assert all(
+        d.scale_transform.scale[0] == 0.085 for d in image.multiscales[0].datasets
+    )

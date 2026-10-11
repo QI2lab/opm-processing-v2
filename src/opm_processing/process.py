@@ -1681,6 +1681,7 @@ def process_skewed(
             roi_output_shapes,
             deskewed_voxel_size_um,
             spatial_origins_zyx_um=[plan["origin_zyx_um"] for plan in roi_plans],
+            time_interval_s=acquisition.volume_interval_s,
             channels=channels,
             dtype=output_dtype,
             overwrite=True,
@@ -1696,6 +1697,7 @@ def process_skewed(
             output_path,
             output_shape,
             deskewed_voxel_size_um,
+            time_interval_s=acquisition.volume_interval_s,
             stage_positions=stage_positions[:pos_shape],
             channels=channels,
             dtype=output_dtype,
@@ -1750,6 +1752,7 @@ def process_skewed(
                 max_z_output_path,
                 max_z_output_shape,
                 max_z_voxel_size_um,
+                time_interval_s=acquisition.volume_interval_s,
                 stage_positions=stage_positions[:pos_shape],
                 channels=channels,
                 dtype=output_dtype,
@@ -2223,6 +2226,7 @@ def process_skewed(
                 dtype=np.float64,
             ),
             spatial_offset_z_um=float(max_z_collection.spatial_origins_zyx_um[0][0]),
+            time_interval_s=max_z_collection.time_interval_s,
             reverse_stage_z=not stage_z_flipped,
             opm_angle_deg=opm_tilt_deg,
         )
@@ -2470,6 +2474,7 @@ def process_projection(
             output_path,
             datastore.shape,
             voxel_size_um,
+            time_interval_s=acquisition.volume_interval_s,
             stage_positions=stage_positions,
             channels=channels,
             overwrite=True,
@@ -2628,6 +2633,7 @@ def process_projection(
             pixel_size=np.asarray((pixel_size_um, pixel_size_um), dtype=np.float32),
             time_range=time_range,
             reverse_stage_z=not stage_z_flipped,
+            time_interval_s=output_collection.time_interval_s,
             opm_angle_deg=opm_tilt_deg,
         )
         tile_fusion.run()

@@ -24,6 +24,7 @@ from opm_processing.dataio.processing_state import (
     ProcessingState,
     processing_state_path,
 )
+from opm_processing.dataio.timing import time_axis
 from opm_processing.imageprocessing.coordinates import (
     stage_positions_to_image_coordinates,
 )
@@ -324,6 +325,7 @@ class MaxTileFusion:
         reverse_stage_y: bool = True,
         reverse_stage_z: bool = True,
         opm_angle_deg: float | None = None,
+        time_interval_s: float | None = None,
     ) -> None:
         """Initialize maximum-projection fusion with a bounded source chunk cache.
 
@@ -360,6 +362,8 @@ class MaxTileFusion:
         opm_angle_deg
             Retained for compatibility. Deskewed tile placement is independent
             of the OPM angle.
+        time_interval_s
+            Physical snapshot interval in seconds, preserved in the fused output.
 
         Returns
         -------
@@ -367,6 +371,8 @@ class MaxTileFusion:
             No value is returned.
         """
         self.pad_y = pad_yx[0]
+        time_axis(time_interval_s)
+        self.time_interval_s = time_interval_s
         self.pad_x = pad_yx[1]
 
         source_context = ts.Context(
@@ -539,8 +545,15 @@ class MaxTileFusion:
             factor for factor in (1, 2, 4, 8, 16, 32) if factor <= min(self.fused_shape)
         )
         self.multiscale_factors_yx = factors
+        interval_s = getattr(self, "time_interval_s", None)
+        t_axis, t_scale = time_axis(interval_s)
+        t_origin = (
+            0
+            if self.time_range is None or interval_s is None
+            else self.time_range[0] * t_scale
+        )
         axes = [
-            {"name": "t", "type": "time"},
+            t_axis,
             {"name": "c", "type": "channel"},
             {"name": "z", "type": "space", "unit": "micrometer"},
             {"name": "y", "type": "space", "unit": "micrometer"},
@@ -556,7 +569,7 @@ class MaxTileFusion:
                         v05.ScaleTransformation(
                             scale=round_tczyx_transform(
                                 (
-                                    1,
+                                    t_scale,
                                     1,
                                     self.z_pixel_size,
                                     self.pixel_size[0] * factor,
@@ -567,7 +580,7 @@ class MaxTileFusion:
                         v05.TranslationTransformation(
                             translation=round_tczyx_transform(
                                 (
-                                    0,
+                                    t_origin,
                                     0,
                                     self.spatial_offset_z_um,
                                     self.offset[0],
