@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -61,6 +61,73 @@ class AcquisitionMetadata:
     sidecar_paths: tuple[str, ...]
     acquired_plane_count: int | None = None
     plane_period_s: float | None = None
+    timing_source: str | None = None
+
+    def with_plane_period(self, plane_period_s: float | None) -> AcquisitionMetadata:
+        """Supply an operator-confirmed hardware period for a legacy acquisition.
+
+        Parameters
+        ----------
+        plane_period_s : float or None
+            Confirmed period in seconds; None preserves recorded timing.
+
+        Returns
+        -------
+        AcquisitionMetadata
+            Timing with the original raw plane count and its source recorded.
+
+        Raises
+        ------
+        ValueError
+            The supplied period is invalid or contradicts recorded timing.
+        """
+        if plane_period_s is None:
+            _ = self.volume_interval_s
+            return self
+        planes = (
+            self.scan_position_count
+            if self.acquired_plane_count is None
+            else self.acquired_plane_count
+        )
+        hardware_volume_interval(planes, plane_period_s)
+        if self.plane_period_s is not None and self.plane_period_s != plane_period_s:
+            raise ValueError(
+                "Supplied hardware plane period contradicts acquisition metadata"
+            )
+        return replace(
+            self,
+            acquired_plane_count=planes,
+            plane_period_s=plane_period_s,
+            timing_source=self.timing_source
+            or (
+                "raw acquisition opm_v2.timing"
+                if self.plane_period_s is not None
+                else "operator-confirmed hardware plane period"
+            ),
+        )
+
+    def timing_attributes(self) -> dict:
+        """Return self-contained hardware timing provenance for a processed store.
+
+        Returns
+        -------
+        dict
+            Producer timing metadata, or an empty dictionary when timing is unknown.
+        """
+        interval = self.volume_interval_s
+        if interval is None:
+            return {}
+        return {
+            "opm_processing": {
+                "timing": {
+                    "schema_version": 1,
+                    "n_acquired_planes": self.acquired_plane_count,
+                    "dt_plane_s": self.plane_period_s,
+                    "dt_volume_s": interval,
+                    "source": self.timing_source or "raw acquisition opm_v2.timing",
+                }
+            }
+        }
 
     @property
     def volume_interval_s(self) -> float | None:
@@ -845,6 +912,7 @@ def _inspect_ome_zarr(path: Path, root: ZarrGroup) -> AcquisitionMetadata:
         sidecar_paths=_sidecars(path),
         acquired_plane_count=opm.get("timing", {}).get("n_acquired_planes"),
         plane_period_s=opm.get("timing", {}).get("dt_plane_s"),
+        timing_source=opm.get("timing", {}).get("source"),
     )
 
 

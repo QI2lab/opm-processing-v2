@@ -1115,6 +1115,13 @@ def process(
             ),
         ),
     ] = None,
+    plane_period_ms: Annotated[
+        float | None,
+        typer.Option(
+            "--plane-period-ms",
+            help="Confirmed hardware plane period in milliseconds for legacy acquisitions.",
+        ),
+    ] = None,
 ) -> None:
     """Process an OPM acquisition using its recorded scan and camera calibration.
 
@@ -1122,6 +1129,9 @@ def process(
     ----------
     root_path : pathlib.Path
         Raw acquisition store, or its containing directory for live processing.
+    plane_period_ms : float or None
+        Confirmed hardware trigger period for missing legacy timing metadata.
+        Recorded periods cannot be overridden. Exposure is not used as a period.
     deconvolve : bool
         Apply Richardson–Lucy gradient-consensus deconvolution before saving.
     save_float32 : bool
@@ -1205,6 +1215,9 @@ def process(
         if time_range is not None or pos_range is not None:
             raise ValueError("--live does not support time or position subranges")
         acquisition, live_manifest, live_log_path = open_live_acquisition(root_path)
+        acquisition = acquisition.with_plane_period(
+            None if plane_period_ms is None else plane_period_ms / 1000
+        )
         root_path = acquisition.path
         opm_mode = acquisition.mode.casefold()
         if "mirror" not in opm_mode and "stage" not in opm_mode:
@@ -1239,6 +1252,9 @@ def process(
         return
 
     acquisition = inspect_acquisition(root_path)
+    acquisition = acquisition.with_plane_period(
+        None if plane_period_ms is None else plane_period_ms / 1000
+    )
     root_path = acquisition.path
     opm_mode = acquisition.mode.casefold()
     sizes = acquisition.index_sizes
@@ -1600,6 +1616,7 @@ def process_skewed(
     )
     processing_configuration = {
         "kind": output_kind,
+        "timing": acquisition.timing_attributes(),
         "dtype": output_dtype.name,
         "flatfield": bool(flatfield_correction),
         "selection": {
@@ -1682,6 +1699,7 @@ def process_skewed(
             deskewed_voxel_size_um,
             spatial_origins_zyx_um=[plan["origin_zyx_um"] for plan in roi_plans],
             time_interval_s=acquisition.volume_interval_s,
+            attributes=acquisition.timing_attributes(),
             channels=channels,
             dtype=output_dtype,
             overwrite=True,
@@ -1698,10 +1716,15 @@ def process_skewed(
             output_shape,
             deskewed_voxel_size_um,
             time_interval_s=acquisition.volume_interval_s,
+            attributes=acquisition.timing_attributes(),
             stage_positions=stage_positions[:pos_shape],
             channels=channels,
             dtype=output_dtype,
             overwrite=True,
+        )
+    if output_collection.time_interval_s != acquisition.volume_interval_s:
+        raise ValueError(
+            "Existing output time scale disagrees with hardware volume cadence"
         )
     ts_store = output_collection.arrays
 
@@ -1753,12 +1776,17 @@ def process_skewed(
                 max_z_output_shape,
                 max_z_voxel_size_um,
                 time_interval_s=acquisition.volume_interval_s,
+                attributes=acquisition.timing_attributes(),
                 stage_positions=stage_positions[:pos_shape],
                 channels=channels,
                 dtype=output_dtype,
                 multiscale_factors_yx=max_z_factors_yx,
                 spatial_offset_um=max_z_offset_um,
                 overwrite=True,
+            )
+        if max_z_collection.time_interval_s != acquisition.volume_interval_s:
+            raise ValueError(
+                "Existing projection time scale disagrees with hardware volume cadence"
             )
         max_z_ts_store = max_z_collection.arrays
 
@@ -2441,6 +2469,7 @@ def process_projection(
     voxel_size_um = (1.0, pixel_size_um, pixel_size_um)
     processing_configuration = {
         "kind": output_kind,
+        "timing": acquisition.timing_attributes(),
         "dtype": output_dtype.name,
         "flatfield": bool(flatfield_correction),
         "selection": {"time": time_range, "position": pos_range},
@@ -2475,10 +2504,15 @@ def process_projection(
             datastore.shape,
             voxel_size_um,
             time_interval_s=acquisition.volume_interval_s,
+            attributes=acquisition.timing_attributes(),
             stage_positions=stage_positions,
             channels=channels,
             overwrite=True,
             dtype=output_dtype,
+        )
+    if output_collection.time_interval_s != acquisition.volume_interval_s:
+        raise ValueError(
+            "Existing output time scale disagrees with hardware volume cadence"
         )
     ts_store = output_collection.arrays
 

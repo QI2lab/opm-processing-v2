@@ -77,8 +77,9 @@ def test_unknown_time_does_not_become_one_second(tmp_path):
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("recorded", [False, True])
 def test_processing_propagates_hardware_cadence(
-    current_single_position_mirror_timelapse, tmp_path
+    current_single_position_mirror_timelapse, tmp_path, recorded
 ):
     from opm_processing.process import process
 
@@ -87,16 +88,18 @@ def test_processing_propagates_hardware_cadence(
 
     metadata_path = raw / "zarr.json"
     metadata = json.loads(metadata_path.read_text())
-    metadata["attributes"]["opm_v2"]["timing"] = {
-        "n_acquired_planes": 4,
-        "dt_plane_s": 0.005,
-    }
+    if recorded:
+        metadata["attributes"]["opm_v2"]["timing"] = {
+            "n_acquired_planes": 4,
+            "dt_plane_s": 0.005,
+        }
     metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
     process(
         root_path=raw,
         max_projection=True,
         create_fused_max_projection=False,
         z_downsample_level=1,
+        plane_period_ms=None if recorded else 5.0,
     )
     for name in (
         "single_mirror_deskewed.ome.zarr",
@@ -104,6 +107,33 @@ def test_processing_propagates_hardware_cadence(
     ):
         result = open_position_collection(raw.parent / name)
         assert result.time_interval_s == pytest.approx(0.020)
+        timing = result.attributes["opm_processing"]["timing"]
+        assert timing["n_acquired_planes"] == 4
+        assert timing["dt_plane_s"] == 0.005
+        assert timing["dt_volume_s"] == 0.020
+        assert timing["source"] == (
+            "raw acquisition opm_v2.timing"
+            if recorded
+            else "operator-confirmed hardware plane period"
+        )
+
+
+@pytest.mark.unit
+def test_confirmed_period_cannot_override_recorded_timing(
+    current_single_position_mirror_timelapse,
+):
+    acquired = inspect_acquisition(current_single_position_mirror_timelapse)
+    confirmed = acquired.with_plane_period(0.005)
+    assert confirmed.acquired_plane_count == acquired.scan_position_count
+    assert confirmed.with_plane_period(None) is confirmed
+    assert (
+        confirmed.with_plane_period(0.005).volume_interval_s
+        == confirmed.volume_interval_s
+    )
+    with pytest.raises(ValueError, match="contradicts"):
+        confirmed.with_plane_period(0.006)
+    with pytest.raises(ValueError, match="time_interval_s"):
+        acquired.with_plane_period(float("nan"))
 
 
 @pytest.mark.integration

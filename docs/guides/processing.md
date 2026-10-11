@@ -20,6 +20,28 @@ fractional calibrated intensities. `--z-downsample-level` controls the integer
 reduction of deskewed Z, defaulting to 2. Calibration and interpolation
 conventions are described in [methods](../methods/deskew.md).
 
+## Physical time axis
+
+When the raw acquisition records `opm_v2.timing.n_acquired_planes` and
+`opm_v2.timing.dt_plane_s`, processing writes their product as the OME-NGFF T
+scale with unit `second`. The count includes acquired planes discarded during
+processing; deskewed Z size and camera exposure do not determine the cadence.
+The same scale is preserved in projections, mosaics, and every pyramid level.
+Position collections also record the OME-XML time increment in seconds.
+
+For legacy acquisitions without a hardware-period field, supply the confirmed
+period explicitly:
+
+```bash
+uv run --locked process "/path/to/raw.ome.zarr" --plane-period-ms 5 --output "/path/to/processed"
+```
+
+For 17 acquired planes at 5.000 ms per plane, the output T scale is `0.085`
+seconds per volume. The processed store records the acquired count, hardware
+period, volume interval, and confirmation source under `opm_processing.timing`.
+A supplied period must agree with any recorded hardware period. Unknown timing
+remains a unitless index axis. Resume rejects a conflicting existing time scale.
+
 ## Select or skip data
 
 `--time-range START STOP` and `--pos-range START STOP` select zero-based,
