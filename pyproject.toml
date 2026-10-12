@@ -36,6 +36,7 @@ dependencies = [
     "numpy",
     "ome-types[lxml]",
     "tensorstore",
+    "typer>=0.15,<1",
     "yaozarrs[io,write-tensorstore] @ git+https://github.com/dpshepherd/yaozarrs.git@7eebe750654f71fbb0e722aeabdff8b47d12c1b5",
 ]
 
@@ -61,7 +62,6 @@ processing = [
     "torch==2.9.0; sys_platform == 'win32'",
     "torch; sys_platform != 'win32'",
     "tqdm",
-    "typer",
     "zarr>3.0.8",
     "napari-animation>=0.0.10",
     "pynvvideocodec>=2.2.3 ; sys_platform == 'linux' or sys_platform == 'win32'",

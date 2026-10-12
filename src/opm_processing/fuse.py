@@ -24,7 +24,7 @@ from opm_processing.imageprocessing.tilefusion import (
     resolve_fusion_input,
 )
 
-app = typer.Typer()
+app = typer.Typer(pretty_exceptions_enable=False)
 app.pretty_exceptions_enable = False
 
 

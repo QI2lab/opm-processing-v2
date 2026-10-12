@@ -71,7 +71,7 @@ if TYPE_CHECKING:
 
     import tensorstore as ts
 
-app = typer.Typer()
+app = typer.Typer(pretty_exceptions_enable=False)
 app.pretty_exceptions_enable = False
 
 # Reject cached fields made with a different camera-calibration contract.

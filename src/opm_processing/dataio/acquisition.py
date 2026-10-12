@@ -11,8 +11,9 @@ import json
 import re
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Annotated, Any
 
+import typer
 import yaozarrs
 from yaozarrs import ZarrGroup, v05
 
@@ -20,6 +21,8 @@ from opm_processing.dataio.timing import hardware_volume_interval
 
 if TYPE_CHECKING:
     import tensorstore as ts
+
+app = typer.Typer(pretty_exceptions_enable=False)
 
 
 @dataclass(frozen=True)
@@ -977,15 +980,23 @@ def open_acquisition_datastore(
     return ts.stack(arrays, axis=1)
 
 
-def main() -> None:
-    """Print a metadata-only acquisition manifest as JSON."""
-    import argparse
-    import json
+@app.command(help="Print a metadata-only acquisition manifest as JSON.")
+def inspect_command(
+    path: Annotated[Path, typer.Argument(help="Zarr store or containing directory")],
+) -> None:
+    """Print a metadata-only acquisition manifest as JSON.
 
-    parser = argparse.ArgumentParser(description=main.__doc__)
-    parser.add_argument("path", type=Path, help="Zarr store or containing directory")
-    arguments = parser.parse_args()
-    print(json.dumps(inspect_acquisition(arguments.path).to_dict(), indent=2))
+    Parameters
+    ----------
+    path : pathlib.Path
+        Acquisition OME-Zarr store or its containing directory.
+    """
+    typer.echo(json.dumps(inspect_acquisition(path).to_dict(), indent=2))
+
+
+def main() -> None:
+    """Run the metadata inspector with standard Python exception tracebacks."""
+    app()
 
 
 if __name__ == "__main__":

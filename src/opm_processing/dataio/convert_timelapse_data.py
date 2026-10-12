@@ -20,7 +20,7 @@ from opm_processing.dataio.acquisition import (
 )
 from opm_processing.imageprocessing.camera import camera_correct
 
-app = typer.Typer()
+app = typer.Typer(pretty_exceptions_enable=False)
 
 
 def save_raw_with_yaml(data_array: np.ndarray, output_path: Path) -> None:
