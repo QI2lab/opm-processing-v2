@@ -1,4 +1,4 @@
-"""Select rectangles on a fused multiscale volume and export level-zero crops."""
+"""Select rectangles on a fused volume or timelapse and export level-zero crops."""
 
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated
@@ -7,13 +7,44 @@ import numpy as np
 import typer
 from yaozarrs import open_group
 
-from opm_processing.export_ome_tiff import export_image, load_export_metadata
+from opm_processing.export_ome_tiff import (
+    export_image,
+    export_source_stem,
+    load_export_metadata,
+    resolve_export_image,
+)
 
 if TYPE_CHECKING:
     from napari.components import ViewerModel
     from napari.layers import Image
 
 app = typer.Typer(pretty_exceptions_enable=False)
+
+
+def resolve_roi_source(root_path: Path) -> Path:
+    """Prefer full fused, deconvolved, then deskewed volumes in a directory."""
+    if (root_path / "zarr.json").is_file() or (root_path / ".zgroup").is_file():
+        return root_path
+    for suffix in ("_fused.ome.zarr", "_decon_deskewed.ome.zarr", "_deskewed.ome.zarr"):
+        stores = sorted(
+            p
+            for p in root_path.glob(f"*{suffix}")
+            if p.is_dir()
+            and not p.name.endswith(f"_max_z{suffix}")
+            and (
+                suffix != "_deskewed.ome.zarr"
+                or not p.name.endswith("_decon_deskewed.ome.zarr")
+            )
+        )
+        if len(stores) > 1:
+            raise ValueError(
+                f"Expected one {suffix} store in {root_path}; found {len(stores)}. Pass an OME-Zarr store directly."
+            )
+        if stores:
+            return stores[0]
+    raise ValueError(
+        f"No full fused, deconvolved, or deskewed OME-Zarr found in {root_path}"
+    )
 
 
 def configure_roi_projection(viewer: "ViewerModel", layers: list["Image"]) -> None:
@@ -101,7 +132,10 @@ def select_rois(
 @app.command()
 def export_rois(
     root_path: Annotated[
-        Path, typer.Argument(help="Directory containing one full fused OME-Zarr.")
+        Path,
+        typer.Argument(
+            help="Processed output directory or full OME-Zarr store (fused or single position)."
+        ),
     ],
     output: Annotated[Path | None, typer.Option(help="Destination directory.")] = None,
     overwrite: Annotated[
@@ -111,25 +145,19 @@ def export_rois(
 ) -> None:
     """Draw multiple ROIs in napari, then export compressed OME-BigTIFF crops."""
     root_path = root_path.expanduser().resolve()
-    stores = sorted(
-        p
-        for p in root_path.glob("*_fused.ome.zarr")
-        if p.is_dir() and not p.name.endswith("_max_z_fused.ome.zarr")
-    )
-    if len(stores) != 1:
-        raise ValueError(
-            f"Expected one full fused OME-Zarr in {root_path}; found {len(stores)}"
-        )
-    source = stores[0]
-    root = open_group(source)
+    source = resolve_roi_source(root_path)
+    image_path = resolve_export_image(source)
+    root = open_group(image_path)
     dataset = root.ome_metadata().multiscales[0].datasets[0]
     shape = tuple(root[dataset.path].to_tensorstore().shape)
-    bounds = select_rois(source, shape)
+    bounds = select_rois(image_path, shape)
     if not bounds:
         typer.echo("No ROIs selected; no files exported.")
         return
-    destination = output.expanduser().resolve() if output else root_path / "roi_exports"
-    stem = source.name.removesuffix("_fused.ome.zarr")
+    destination = (
+        output.expanduser().resolve() if output else source.parent / "roi_exports"
+    )
+    stem = export_source_stem(source)
     targets = [
         destination / f"{stem}_roi_{i:03d}.ome.tiff" for i in range(1, len(bounds) + 1)
     ]

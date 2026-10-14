@@ -93,6 +93,7 @@ nav:
       - display: reference/cli/display.md
       - process-ROI: reference/cli/process-roi.md
       - export-ome-tiff: reference/cli/export-ome-tiff.md
+      - export-rois: reference/cli/export-rois.md
       - export-projections: reference/cli/export-projections.md
       - encode-projections: reference/cli/encode-projections.md
       - convert-timelapse: reference/cli/convert-timelapse.md

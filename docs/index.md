@@ -18,6 +18,7 @@ RLGC deconvolution, deskewing, tile registration, fusion, and image export.
 | Process while acquisition is running | [Live acquisition](guides/live.md) |
 | Register and combine stage tiles | [Registration and fusion](guides/fusion.md) |
 | Select a smaller raw-data region | [ROI guide](guides/roi.md) |
+| Export cropped volumes or single-position timelapses | [ROI export guide](guides/roi.md#export-rois-from-a-fused-volume-or-single-position-timelapse) |
 | Save OME-TIFFs, projections, or movies | [Export guide](guides/exports.md) |
 | Open outputs in napari or Fiji | [Viewing and troubleshooting](guides/viewing.md) |
 | Understand axes, output files, and metadata | [Data reference](reference/data.md) |

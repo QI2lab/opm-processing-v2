@@ -22,6 +22,19 @@ acquisition and journal accessible to retain their metadata.
 `--metadata-only` repairs the XML encoding of existing exports without rewriting
 or recompressing pixels. See [export-ome-tiff](../reference/cli/export-ome-tiff.md).
 
+## ROI OME-BigTIFF crops
+
+```bash
+uv run export-rois "/path/to/processed"
+```
+
+Draw multiple XY rectangles in napari, then close the viewer to export each
+crop at full resolution, including all Z planes, channels, and timepoints.
+Supports fused volumes and unfused single-position timelapses. Outputs go to
+`roi_exports` beside the selected store and retain global crop coordinates.
+Follow the [ROI export guide](roi.md#export-rois-from-a-fused-volume-or-single-position-timelapse)
+or see the [command reference](../reference/cli/export-rois.md).
+
 ## Annotated projection TIFFs
 
 ```bash

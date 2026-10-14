@@ -9,6 +9,9 @@ Read the [documentation](https://qi2lab.github.io/opm-processing-v2/), starting
 with [installation](https://qi2lab.github.io/opm-processing-v2/getting-started/installation/)
 and the [first workflow](https://qi2lab.github.io/opm-processing-v2/getting-started/quickstart/).
 
+To crop fused volumes or single-position timelapses interactively, follow the
+[ROI export guide](docs/guides/roi.md#export-rois-from-a-fused-volume-or-single-position-timelapse).
+
 ## Quick start
 
 Requires Python 3.12 and [uv](https://docs.astral.sh/uv/).
@@ -40,6 +43,7 @@ Append `--help` to any command for its installed options and defaults.
 | [display](docs/reference/cli/display.md) | View outputs and select an ROI. |
 | [process-ROI](docs/reference/cli/process-roi.md) | Process and fuse selected raw regions. |
 | [export-ome-tiff](docs/reference/cli/export-ome-tiff.md) | Export fused images as compressed OME-BigTIFF. |
+| [export-rois](docs/reference/cli/export-rois.md) | Draw multiple ROIs and export full-depth crops from fused volumes or single-position timelapses. |
 | [export-projections](docs/reference/cli/export-projections.md) | Export annotated projections and movies. |
 | [encode-projections](docs/reference/cli/encode-projections.md) | Encode existing projection TIFFs as movies. |
 | [convert-timelapse](docs/reference/cli/convert-timelapse.md) | Export raw scan-plane timelapses. |
