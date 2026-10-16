@@ -20,6 +20,18 @@ tile shapes, spacing, and scan geometry determine initial placement and
 automatic search limits. Registration downsampling adapts to each overlap.
 The similarity threshold defaults to 0.7.
 
+Depth-face registration retains extra Z context beyond the nominal overlap.
+After measuring the lateral displacement, it searches the contextual samples
+for Z alignment using correlation on common geometric support, then checks
+the match with SSIM. Automatic depth corrections permit up to twenty percent
+of the tile depth and require at least three actually matched planes, rather
+than being capped by the nominal overlap width.
+Explicit correction limits still apply; measured peaks beyond them are
+rejected, with tile indices and corrections reported in the warning. A weak
+lateral match in the nominal overlap is checked again using the wider context.
+Changes to this method invalidate saved pairwise registration so
+the next fusion run recomputes it.
+
 Override the automatic correction limits when the acquisition needs a specific
 search envelope, using processed-image pixels in ZYX order:
 

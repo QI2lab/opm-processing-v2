@@ -45,6 +45,42 @@ if TYPE_CHECKING:
 app = typer.Typer(pretty_exceptions_enable=False)
 
 
+def export_source_stem(source: Path) -> str:
+    """Return the acquisition basename of a fused or processed image store."""
+    for suffix in (
+        "_decon_deskewed.ome.zarr",
+        "_deskewed.ome.zarr",
+        "_fused.ome.zarr",
+        ".ome.zarr",
+    ):
+        if source.name.endswith(suffix):
+            return source.name.removesuffix(suffix)
+    return source.name.removesuffix(".zarr")
+
+
+def resolve_export_image(source: Path) -> Path:
+    """Resolve a root image or the sole image in a position collection."""
+    root = open_group(source)
+    if isinstance(root.ome_metadata(), v05.Bf2Raw):
+        series = root["OME"].ome_metadata().series
+        if len(series) != 1:
+            raise ValueError(
+                f"ROI export requires a single-position collection; {source} has "
+                f"{len(series)} positions. Fuse multi-position data first."
+            )
+        image_path = source / series[0]
+        root = open_group(image_path)
+    else:
+        image_path = source
+    metadata = root.ome_metadata()
+    if not isinstance(metadata, v05.Image):
+        raise ValueError(f"Expected an OME-Zarr image in {image_path}")
+    axes = [axis.name for axis in metadata.multiscales[0].axes]
+    if axes != list("tczyx"):
+        raise ValueError(f"Expected TCZYX image axes in {image_path}; found {axes}")
+    return image_path
+
+
 def image_tiles(
     array: ts.TensorStore, tile_shape: tuple[int, int]
 ) -> Iterator[np.ndarray]:
@@ -93,34 +129,69 @@ def export_image(
     provenance: dict[str, str],
     *,
     workers: int = 4,
+    bounds_yx: tuple[int, int, int, int] | None = None,
 ) -> None:
-    """Write one fused image as tiled OME-BigTIFF without changing its pixels.
+    """Write one image as tiled OME-BigTIFF without changing its pixels.
 
     Parameters
     ----------
     source : Path
-        Fused volume or fused maximum-Z OME-Zarr Image group.
+        OME-Zarr Image group or single-position processed collection.
     output : Path
         Destination OME-TIFF file, replaced after a successful export.
     template : OME
         Source OME metadata containing available channels, instrument details,
         acquisition date, timing, and annotations. Its image geometry is
-        replaced with the fused level-zero NGFF geometry.
+        replaced with the exported level-zero NGFF geometry.
     provenance : dict[str, str]
         JSON-encoded acquisition and processing records for OME annotations.
     workers : int
         Number of TIFF compression workers; reads and buffering remain bounded.
+    bounds_yx : tuple[int, int, int, int] | None
+        Optional level-zero (y start, y stop, x start, x stop) crop bounds.
     """
-    root = open_group(source)
+    image_path = resolve_export_image(source)
+    root = open_group(image_path)
     metadata = root.ome_metadata()
     multiscale = metadata.multiscales[0]
     dataset = multiscale.datasets[0]
     array = root[dataset.path].to_tensorstore()
+    if bounds_yx is not None:
+        y0, y1, x0, x1 = bounds_yx
+        if not (0 <= y0 < y1 <= array.shape[-2] and 0 <= x0 < x1 <= array.shape[-1]):
+            raise ValueError(
+                "ROI bounds must be nonempty and inside the level-zero image"
+            )
+        array = array[:, :, :, y0:y1, x0:x1].translate_to[0, 0, 0, 0, 0]
     nt, nc, nz, ny, nx = array.shape
     dtype = np.dtype(array.dtype.numpy_dtype)
     scale = dataset.scale_transform.scale
     translation = dataset.translation_transform
-    origin = translation.translation if translation is not None else [0] * 5
+    origin = list(translation.translation) if translation is not None else [0] * 5
+    if image_path != source:
+        # Ordinary processed collections use a local zero NGFF origin and
+        # store the global position in their OME StageLabel. ROI collections
+        # already have a nonzero global NGFF origin, which takes precedence.
+        companion = source / "OME" / "METADATA.ome.xml"
+        if companion.is_file() and not any(origin[-3:]):
+            stage = (
+                from_xml(companion.read_text(encoding="utf-8")).images[0].stage_label
+            )
+            if stage is not None:
+                origin[2:] = [
+                    float(stage.z or 0),
+                    float(stage.y or 0),
+                    float(stage.x or 0),
+                ]
+        provenance = {**provenance, "SourceImageGroup": str(image_path)}
+    if bounds_yx is not None:
+        origin[3] += bounds_yx[0] * scale[3]
+        origin[4] += bounds_yx[2] * scale[4]
+        provenance = {
+            **provenance,
+            "ROIBoundsLevelZeroYX": json.dumps(bounds_yx),
+            "ROIOriginTCZYX": json.dumps(origin),
+        }
 
     ome = template.model_copy(deep=True)
     ome.uuid = None
@@ -148,7 +219,7 @@ def export_image(
     if source.name.endswith("_max_z_fused.ome.zarr"):
         image.description = "Maximum-Z projection of the registered fused volume; Z position is the projected volume center."
     image.stage_label = StageLabel(
-        name="Fused origin", x=origin[4], y=origin[3], z=origin[2]
+        name="Image origin", x=origin[4], y=origin[3], z=origin[2]
     )
     pixels.dimension_order = "XYZCT"
     pixels.type = {"float32": "float", "float64": "double"}.get(dtype.name, dtype.name)
@@ -343,13 +414,32 @@ def export_fused(
             typer.echo(f"Repaired OME metadata: {target}")
         return
 
+    template, provenance = load_export_metadata(fused)
+    for source, target in zip(sources, targets, strict=False):
+        export_image(
+            source,
+            target,
+            template,
+            provenance,
+            workers=workers,
+        )
+        typer.echo(f"Created {target}")
+
+
+def load_export_metadata(image_store: Path) -> tuple[OME, dict[str, str]]:
+    """Load the shared acquisition template and processing provenance."""
+    stem = export_source_stem(image_store)
     template = OME(creator="opm-processing-v2")
     provenance = {}
-    state_path = processing_state_path(fused.parent, stem)
+    state_path = processing_state_path(image_store.parent, stem)
     if state_path.is_file():
         state = ProcessingState.read(state_path)
         provenance["ProcessingState"] = json.dumps(state.document, ensure_ascii=False)
-        processed = state.registered_output_for_fused(fused)
+        processed = (
+            state.registered_output_for_fused(image_store)
+            if image_store.name.endswith("_fused.ome.zarr")
+            else image_store
+        )
         source = Path(state.document["source"]["path"])
         if not source.is_absolute():
             source = state_path.parent / source
@@ -432,15 +522,13 @@ def export_fused(
                         0
                     ].scale_transform.scale[0]
                     pixels.time_increment_unit = "s"
-    for source, target in zip(sources, targets, strict=False):
-        export_image(
-            source,
-            target,
-            template,
-            provenance,
-            workers=workers,
-        )
-        typer.echo(f"Created {target}")
+    if not template.images:
+        companion = image_store / "OME" / "METADATA.ome.xml"
+        if companion.is_file():
+            source_xml = companion.read_text(encoding="utf-8")
+            template = from_xml(source_xml)
+            provenance["SourceOME"] = source_xml
+    return template, provenance
 
 
 def main() -> None:

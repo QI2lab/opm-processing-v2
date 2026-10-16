@@ -12,6 +12,19 @@ uv run process "/path/to/acquisition" --deconvolve --flatfield-correction --outp
 
 Camera calibration runs before optional illumination correction and
 deconvolution. `--flatfield-correction` estimates or reuses illumination fields.
+For each channel, the correction is the pixelwise maximum of the estimated
+stage-Z fields and is shared across all depths and timepoints. This prevents
+sample-free camera regions at one depth from imposing a separate correction
+on that depth. Depths excluded by signal selection do not contribute; channels
+without selected signal use a unity field. Saved flatfields contain one field
+per channel. Cached fields from the older per-depth estimator are re-estimated.
+
+To launch processing before acquisition finishes without a precomputed
+illumination file, add `--live-wait` alongside `--flatfield-correction` and
+pass the acquisition directory. The command waits for completion before
+estimating illumination or processing images. See the
+[live acquisition guide](live.md#wait-for-completion-before-processing).
+
 `--deconvolve` uses GPU RLGC; channel-ordered PSFs can be supplied with repeated
 `--decon-psf-paths` options. Otherwise theoretical PSFs are generated.
 
@@ -19,6 +32,28 @@ The default saved pixels are clipped uint16 values. `--save-float32` retains
 fractional calibrated intensities. `--z-downsample-level` controls the integer
 reduction of deskewed Z, defaulting to 2. Calibration and interpolation
 conventions are described in [methods](../methods/deskew.md).
+
+## Physical time axis
+
+When the raw acquisition records `opm_v2.timing.n_acquired_planes` and
+`opm_v2.timing.dt_plane_s`, processing writes their product as the OME-NGFF T
+scale with unit `second`. The count includes acquired planes discarded during
+processing; deskewed Z size and camera exposure do not determine the cadence.
+The same scale is preserved in projections, mosaics, and every pyramid level.
+Position collections also record the OME-XML time increment in seconds.
+
+For legacy acquisitions without a hardware-period field, supply the confirmed
+period explicitly:
+
+```bash
+uv run --locked process "/path/to/raw.ome.zarr" --plane-period-ms 5 --output "/path/to/processed"
+```
+
+For 17 acquired planes at 5.000 ms per plane, the output T scale is `0.085`
+seconds per volume. The processed store records the acquired count, hardware
+period, volume interval, and confirmation source under `opm_processing.timing`.
+A supplied period must agree with any recorded hardware period. Unknown timing
+remains a unitless index axis. Resume rejects a conflicting existing time scale.
 
 ## Select or skip data
 

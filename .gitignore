@@ -87,6 +87,7 @@ celerybeat-schedule
 
 # virtualenv
 .venv
+.uv-cache/
 venv/
 ENV/
 
@@ -130,3 +131,5 @@ src/cucim
 /.agents/
 
 uv.lock
+
+/.test-*

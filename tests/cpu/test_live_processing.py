@@ -7,6 +7,7 @@ import json
 
 import numpy as np
 import pytest
+from click import unstyle
 from typer.testing import CliRunner
 
 from opm_processing.dataio.acquisition import (
@@ -29,10 +30,263 @@ from opm_processing.imageprocessing.opmtools import orthogonal_deskew
 from opm_processing.process import (
     app,
     is_empty_tile,
+    open_live_acquisition,
     process,
 )
-from tests.fixtures.live import manifest_document
+from tests.fixtures.live import manifest_document, write_manifest
 from tests.reference.deskew import constant_deskew
+
+
+@pytest.mark.integration
+def test_live_wait_estimates_missing_flatfield_only_after_completion(
+    tmp_path, monkeypatch, live_acquisition_factory, depth_illumination
+):
+    """Wait through written tiles without a completed event, then fit and process."""
+    process_module = importlib.import_module("opm_processing.process")
+    from opm_processing.imageprocessing.flatfield import estimate_illuminations
+
+    raw = depth_illumination.raw[:1][None, :, None]
+    dataset = live_acquisition_factory(
+        shape=raw.shape, name="wait_estimate", completed=False
+    )
+    dataset.illumination_path.unlink()
+    destination = tmp_path / "processed"
+    field_path = destination / "wait_estimate_flatfield.ome.tif"
+    sleeps = []
+    estimates = []
+
+    def finish_acquisition(seconds):
+        assert not destination.exists()
+        assert not field_path.exists()
+        sleeps.append(seconds)
+        if len(sleeps) == 1:
+            dataset.collection.arrays[0].write(raw[:, 0]).result()
+        elif len(sleeps) == 2:
+            dataset.log.write_text(
+                json.dumps(
+                    {
+                        "event": "completed",
+                        "acquisition_id": dataset.manifest.acquisition_id,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+        else:
+            pytest.fail("Processing kept waiting after acquisition completion")
+
+    def estimate_after_completion(store, offset, conversion, positions, gain, mask):
+        assert (
+            read_lifecycle_event(dataset.log, dataset.manifest.acquisition_id)
+            == "completed"
+        )
+        np.testing.assert_array_equal(store.read().result(), raw)
+        estimates.append(True)
+        return estimate_illuminations(
+            store,
+            offset,
+            conversion,
+            positions,
+            apply_stage_scan_gain=gain,
+            signal_mask=mask,
+        )
+
+    monkeypatch.setattr(process_module.time, "sleep", finish_acquisition)
+    monkeypatch.setattr(
+        process_module, "call_estimate_illuminations", estimate_after_completion
+    )
+    result = CliRunner().invoke(
+        app,
+        [
+            str(tmp_path),
+            "--live-wait",
+            "--flatfield-correction",
+            "--save-float32",
+            "--output",
+            str(destination),
+            "--no-max-projection",
+            "--no-create-fused-max-projection",
+            "--z-downsample-level",
+            "1",
+        ],
+    )
+    assert result.exit_code == 0, result.exception
+    assert sleeps == [30.0, 30.0]
+    assert estimates == [True]
+    assert "starting offline processing" in result.output
+    field = process_module.read_current_flatfield(field_path, (1, 1, *raw.shape[-2:]))
+    assert field is not None
+    expected = orthogonal_deskew(
+        np.flip(
+            (raw[0, 0, 0].astype(np.float32) - 100) * np.float32(0.24) / field[0, 0],
+            axis=0,
+        ),
+        distance=0.4,
+        pixel_size=0.115,
+        downsample_factor=1,
+    )
+    actual = (
+        open_position_collection(destination / "wait_estimate_deskewed.ome.zarr")
+        .arrays[0][0, 0]
+        .read()
+        .result()
+    )
+    np.testing.assert_allclose(actual, expected, rtol=2e-6, atol=1e-5)
+
+
+@pytest.mark.integration
+def test_live_wait_requires_raw_tiles_after_completed_event(
+    tmp_path, monkeypatch, live_acquisition_factory
+):
+    """A completed log alone cannot start processing before raw chunks arrive."""
+    process_module = importlib.import_module("opm_processing.process")
+    dataset = live_acquisition_factory(shape=(1, 1, 1, 4, 8, 5))
+    dataset.illumination_path.unlink()
+    destination = tmp_path / "processed"
+    sleeps = []
+
+    def finish_writes(seconds):
+        assert not destination.exists()
+        sleeps.append(seconds)
+        assert len(sleeps) == 1
+        dataset.collection.arrays[0].write(np.uint16(137)).result()
+
+    monkeypatch.setattr(process_module.time, "sleep", finish_writes)
+    result = CliRunner().invoke(
+        app,
+        [
+            str(tmp_path),
+            "--live-wait",
+            "--save-float32",
+            "--output",
+            str(destination),
+            "--no-max-projection",
+            "--no-create-fused-max-projection",
+            "--z-downsample-level",
+            "1",
+        ],
+    )
+    assert result.exit_code == 0, result.exception
+    assert sleeps == [30.0]
+    assert not (destination / "sample_flatfield.ome.tif").exists()
+    actual = (
+        open_position_collection(destination / "sample_deskewed.ome.zarr")
+        .arrays[0][0, 0]
+        .read()
+        .result()
+    )
+    expected = constant_deskew((4, 8, 5), 37 * 0.24, downsample_factor=1)
+    np.testing.assert_allclose(actual, expected, rtol=4 * np.finfo(np.float32).eps)
+
+
+@pytest.mark.integration
+def test_live_wait_reuses_an_existing_flatfield(tmp_path, live_acquisition_factory):
+    """A completed live acquisition uses the usual cached illumination lookup."""
+    from opm_processing.process import write_flatfield
+
+    raw = np.full((1, 1, 1, 4, 8, 5), 137, dtype=np.uint16)
+    dataset = live_acquisition_factory(raw, name="wait_cached")
+    dataset.illumination_path.unlink()
+    write_flatfield(
+        tmp_path / "wait_cached_flatfield.ome.tif",
+        np.full((1, 1, 8, 5), 2, np.float32),
+        0.115,
+    )
+    result = CliRunner().invoke(
+        app,
+        [
+            str(tmp_path),
+            "--live-wait",
+            "--flatfield-correction",
+            "--save-float32",
+            "--no-max-projection",
+            "--no-create-fused-max-projection",
+            "--z-downsample-level",
+            "1",
+        ],
+    )
+    assert result.exit_code == 0, result.exception
+    assert "Using existing flatfield" in result.output
+    actual = (
+        open_position_collection(tmp_path / "wait_cached_deskewed.ome.zarr")
+        .arrays[0][0, 0]
+        .read()
+        .result()
+    )
+    expected = constant_deskew((4, 8, 5), 37 * 0.24 / 2, downsample_factor=1)
+    np.testing.assert_allclose(actual, expected, rtol=4 * np.finfo(np.float32).eps)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("event", ["canceled", "errored"])
+def test_live_wait_stops_before_processing_on_acquisition_failure(
+    tmp_path, live_acquisition_factory, event
+):
+    dataset = live_acquisition_factory(completed=False)
+    dataset.illumination_path.unlink()
+    dataset.log.write_text(
+        json.dumps({"event": event, "acquisition_id": dataset.manifest.acquisition_id})
+        + "\n",
+        encoding="utf-8",
+    )
+    destination = tmp_path / "processed"
+    result = CliRunner().invoke(
+        app,
+        [
+            str(tmp_path),
+            "--live-wait",
+            "--flatfield-correction",
+            "--output",
+            str(destination),
+        ],
+    )
+    assert isinstance(result.exception, RuntimeError)
+    assert event in str(result.exception)
+    assert not destination.exists()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("force_color", [False, True])
+def test_live_wait_and_streaming_live_are_mutually_exclusive(
+    tmp_path, monkeypatch, force_color
+):
+    from typer import rich_utils
+
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setattr(rich_utils, "FORCE_TERMINAL", force_color)
+    result = CliRunner().invoke(
+        app,
+        [
+            str(tmp_path),
+            "--live-wait",
+            "--live",
+            str(tmp_path / "illumination.ome.tif"),
+        ],
+        color=force_color,
+    )
+    assert result.exit_code == 2
+    if force_color:
+        assert "\x1b[" in result.output
+    assert "--live-wait cannot be combined with --live" in unstyle(result.output)
+
+
+@pytest.mark.unit
+def test_live_wait_accepts_single_position_root_image(
+    tmp_path, current_single_position_mirror_timelapse
+):
+    path = current_single_position_mirror_timelapse
+    original = inspect_acquisition(path)
+    document = manifest_document(path, timepoints=3)
+    document["index_sizes"] = {"t": 3, "p": 1, "c": 1, "z": 4}
+    document["channels"] = document["channels"][:1]
+    document["mode"] = "mirror"
+    manifest = write_manifest(path, document=document)
+    acquisition, actual_manifest, _log = open_live_acquisition(tmp_path)
+    assert acquisition.path == path
+    assert acquisition.shape == original.shape
+    assert actual_manifest == manifest
+    assert ZarrTileReadiness(acquisition).ready_tiles() == {(0, 0), (1, 0), (2, 0)}
 
 
 @pytest.mark.unit

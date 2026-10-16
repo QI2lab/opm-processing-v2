@@ -20,6 +20,7 @@ import numpy as np
 import typer
 from tifffile import TiffFile, TiffWriter, imread
 from tqdm import tqdm
+from yaozarrs import open_group, v05
 
 from opm_processing.dataio.acquisition import (
     AcquisitionMetadata,
@@ -32,6 +33,7 @@ from opm_processing.dataio.live import (
     LiveManifest,
     ZarrTileReadiness,
     iter_live_tiles,
+    read_lifecycle_event,
 )
 from opm_processing.dataio.ngff import downsample_yx, round_spatial
 from opm_processing.dataio.position_collection import (
@@ -45,6 +47,7 @@ from opm_processing.dataio.processing_state import (
     ProcessingState,
     processing_state_path,
 )
+from opm_processing.dataio.ptv import mark_ptv_tile, publish_processing_state_ptv
 from opm_processing.dataio.roi import (
     PhysicalRoi,
     world_roi_to_skewed_bounds,
@@ -70,11 +73,11 @@ if TYPE_CHECKING:
 
     import tensorstore as ts
 
-app = typer.Typer()
+app = typer.Typer(pretty_exceptions_enable=False)
 app.pretty_exceptions_enable = False
 
-# Reject cached fields made with a different camera-calibration contract.
-FLATFIELD_SOFTWARE = "opm-processing/basicpy-stage-depth-camera-contract-v10"
+# Reject cached fields made before depth estimates shared one maximum field.
+FLATFIELD_SOFTWARE = "opm-processing/basicpy-stage-z-max-camera-contract-v11"
 
 
 def progress_tile_groups(
@@ -621,12 +624,12 @@ def read_current_flatfield(
     path : pathlib.Path
         Filesystem path of the artifact to read or write.
     expected_shape : tuple[int, int, int, int]
-        Required depth, channel, Y, X dimensions.
+        Required singleton depth, channel, Y, X dimensions.
 
     Returns
     -------
     numpy.ndarray or None
-        Depth-CYX fields, or None when the estimator version or acquisition
+        Shared 1CYX fields, or None when the estimator version or acquisition
         dimensions differ from this run.
     """
     with TiffFile(path) as tif:
@@ -636,6 +639,8 @@ def read_current_flatfield(
         flatfields = tif.asarray().astype(np.float32)
     if expected_shape[0] == 1 and flatfields.shape == expected_shape[1:]:
         flatfields = flatfields[np.newaxis, ...]
+    elif expected_shape[:2] == (1, 1) and flatfields.shape == expected_shape[2:]:
+        flatfields = flatfields[np.newaxis, np.newaxis, ...]
     if flatfields.shape != expected_shape:
         return None
     return flatfields
@@ -646,14 +651,14 @@ def write_flatfield(
     flatfields: np.ndarray,
     pixel_size_um: float,
 ) -> None:
-    """Write reusable physical-stage-Z illumination fields.
+    """Write one reusable illumination field per channel, shared across depth.
 
     Parameters
     ----------
     path : pathlib.Path
         Filesystem path of the artifact to read or write.
     flatfields : numpy.ndarray
-        Positive float32 illumination fields in depth, channel, Y, X order.
+        Positive float32 illumination fields in singleton-depth, channel, Y, X order.
     pixel_size_um : float
         Camera pixel pitch in micrometers.
 
@@ -663,6 +668,8 @@ def write_flatfield(
         Fields are written with spatial metadata and the current estimator
         identifier.
     """
+    if flatfields.ndim != 4 or flatfields.shape[0] != 1:
+        raise ValueError("Shared flatfields must have shape (1, channels, Y, X)")
     with TiffWriter(path, bigtiff=True) as tif:
         metadata = {
             "axes": "ZCYX",
@@ -725,11 +732,11 @@ def load_or_estimate_flatfield(
     Returns
     -------
     numpy.ndarray
-        Depth-CYX illumination fields reused from disk or estimated and saved.
+        Shared 1CYX illumination fields reused from disk or estimated and saved.
     """
     stage_z_indices = stage_z_level_indices(stage_positions_zxy)
     expected_shape = (
-        int(stage_z_indices.max()) + 1,
+        1,
         datastore.shape[2],
         datastore.shape[-2],
         datastore.shape[-1],
@@ -799,7 +806,7 @@ def open_live_acquisition(
     Parameters
     ----------
     root_path : pathlib.Path
-        Raw acquisition store, or its containing directory for live processing.
+        Containing acquisition directory with one live manifest and lifecycle log.
 
     Returns
     -------
@@ -815,11 +822,13 @@ def open_live_acquisition(
     requested_path = Path(root_path).expanduser().resolve()
     if requested_path.name.endswith((".zarr", ".ome.zarr")):
         raise ValueError(
-            "--live requires the containing acquisition directory, not the "
+            "--live and --live-wait require the containing acquisition directory, not the "
             "OME-Zarr path"
         )
     if not requested_path.is_dir():
-        raise ValueError("--live requires the containing acquisition directory")
+        raise ValueError(
+            "--live and --live-wait require the containing acquisition directory"
+        )
     while True:
         manifests = sorted(requested_path.glob("*.manifest.json"))
         if len(manifests) == 1:
@@ -839,16 +848,28 @@ def open_live_acquisition(
     log_path = manifest_path.with_name(f"{manifest_stem}.log.jsonl")
     manifest = LiveManifest.read(manifest_path)
     root_path = manifest.data_path
-    required_metadata = [root_path / "zarr.json", root_path / "OME" / "zarr.json"]
-    required_metadata.extend(
-        metadata_path
-        for position in range(manifest.index_sizes["p"])
-        for metadata_path in (
-            root_path / str(position) / "zarr.json",
-            root_path / str(position) / "0" / "zarr.json",
-        )
-    )
-    while not all(path.is_file() for path in required_metadata):
+    while True:
+        event = read_lifecycle_event(log_path, manifest.acquisition_id)
+        if event in {"canceled", "errored"}:
+            raise RuntimeError(f"Live acquisition {event}; processing was not started")
+        if (root_path / "zarr.json").is_file():
+            layout = open_group(root_path).ome_metadata()
+            if isinstance(layout, v05.Image):
+                required_metadata = [
+                    root_path / layout.multiscales[0].datasets[0].path / "zarr.json"
+                ]
+            else:
+                required_metadata = [root_path / "OME" / "zarr.json"]
+                required_metadata.extend(
+                    metadata_path
+                    for position in range(manifest.index_sizes["p"])
+                    for metadata_path in (
+                        root_path / str(position) / "zarr.json",
+                        root_path / str(position) / "0" / "zarr.json",
+                    )
+                )
+            if all(path.is_file() for path in required_metadata):
+                break
         print(
             f"Waiting {LIVE_POLL_INTERVAL_SECONDS:g} seconds for OME-Zarr metadata..."
         )
@@ -1115,6 +1136,24 @@ def process(
             ),
         ),
     ] = None,
+    live_wait: Annotated[
+        bool,
+        typer.Option(
+            "--live-wait",
+            help=(
+                "Wait for live acquisition completion and all raw tiles before "
+                "processing. Supports --flatfield-correction without a supplied "
+                "illumination file. Pass the acquisition directory."
+            ),
+        ),
+    ] = False,
+    plane_period_ms: Annotated[
+        float | None,
+        typer.Option(
+            "--plane-period-ms",
+            help="Confirmed hardware plane period in milliseconds for legacy acquisitions.",
+        ),
+    ] = None,
 ) -> None:
     """Process an OPM acquisition using its recorded scan and camera calibration.
 
@@ -1122,6 +1161,9 @@ def process(
     ----------
     root_path : pathlib.Path
         Raw acquisition store, or its containing directory for live processing.
+    plane_period_ms : float or None
+        Confirmed hardware trigger period for missing legacy timing metadata.
+        Recorded periods cannot be overridden. Exposure is not used as a period.
     deconvolve : bool
         Apply Richardson–Lucy gradient-consensus deconvolution before saving.
     save_float32 : bool
@@ -1173,6 +1215,9 @@ def process(
     live : Path or None
         Supplied CYX illumination TIFF enabling live processing; None processes
         offline.
+    live_wait : bool
+        Wait for successful live acquisition completion and all expected raw
+        tiles, then process offline, estimating illumination when requested.
 
     Returns
     -------
@@ -1196,6 +1241,9 @@ def process(
                 "--decon-crop-scan and --decon-fallback-step-scan are unsupported"
             )
 
+    if live_wait and live is not None:
+        raise typer.BadParameter("--live-wait cannot be combined with --live")
+
     if live is not None:
         if flatfield_correction:
             raise ValueError(
@@ -1205,6 +1253,9 @@ def process(
         if time_range is not None or pos_range is not None:
             raise ValueError("--live does not support time or position subranges")
         acquisition, live_manifest, live_log_path = open_live_acquisition(root_path)
+        acquisition = acquisition.with_plane_period(
+            None if plane_period_ms is None else plane_period_ms / 1000
+        )
         root_path = acquisition.path
         opm_mode = acquisition.mode.casefold()
         if "mirror" not in opm_mode and "stage" not in opm_mode:
@@ -1238,7 +1289,24 @@ def process(
         )
         return
 
-    acquisition = inspect_acquisition(root_path)
+    if live_wait:
+        acquisition, manifest, log_path = open_live_acquisition(root_path)
+        print(
+            "Waiting for live acquisition completion before calibration and processing..."
+        )
+        for _tile in iter_live_tiles(
+            ZarrTileReadiness(acquisition), manifest, log_path, sleeper=time.sleep
+        ):
+            pass
+        # Refresh metadata after the controller has finished writing, then keep
+        # its manifest geometry and calibration for the ordinary offline path.
+        acquisition = manifest.apply(inspect_acquisition(acquisition.path))
+        print("Live acquisition completed; starting offline processing.")
+    else:
+        acquisition = inspect_acquisition(root_path)
+    acquisition = acquisition.with_plane_period(
+        None if plane_period_ms is None else plane_period_ms / 1000
+    )
     root_path = acquisition.path
     opm_mode = acquisition.mode.casefold()
     sizes = acquisition.index_sizes
@@ -1600,6 +1668,20 @@ def process_skewed(
     )
     processing_configuration = {
         "kind": output_kind,
+        "calibration": {
+            "gain_offset_applied": True,
+            "camera_offset_adu": camera_offset,
+            "camera_conversion": camera_conversion,
+            "camera_correction": "opm_processing.imageprocessing.camera.camera_correct",
+            "stage_scan_gain_applied": bool(apply_qi2lab_stage_scan_gain),
+            "illumination_correction_applied": bool(flatfield_correction),
+            "localization_uncertainty": {
+                "coverage_validated": False,
+                "noise_model": "unvalidated",
+                "source": None,
+            },
+        },
+        "timing": acquisition.timing_attributes(),
         "dtype": output_dtype.name,
         "flatfield": bool(flatfield_correction),
         "selection": {
@@ -1681,6 +1763,8 @@ def process_skewed(
             roi_output_shapes,
             deskewed_voxel_size_um,
             spatial_origins_zyx_um=[plan["origin_zyx_um"] for plan in roi_plans],
+            time_interval_s=acquisition.volume_interval_s,
+            attributes=acquisition.timing_attributes(),
             channels=channels,
             dtype=output_dtype,
             overwrite=True,
@@ -1696,10 +1780,16 @@ def process_skewed(
             output_path,
             output_shape,
             deskewed_voxel_size_um,
+            time_interval_s=acquisition.volume_interval_s,
+            attributes=acquisition.timing_attributes(),
             stage_positions=stage_positions[:pos_shape],
             channels=channels,
             dtype=output_dtype,
             overwrite=True,
+        )
+    if output_collection.time_interval_s != acquisition.volume_interval_s:
+        raise ValueError(
+            "Existing output time scale disagrees with hardware volume cadence"
         )
     ts_store = output_collection.arrays
 
@@ -1750,12 +1840,18 @@ def process_skewed(
                 max_z_output_path,
                 max_z_output_shape,
                 max_z_voxel_size_um,
+                time_interval_s=acquisition.volume_interval_s,
+                attributes=acquisition.timing_attributes(),
                 stage_positions=stage_positions[:pos_shape],
                 channels=channels,
                 dtype=output_dtype,
                 multiscale_factors_yx=max_z_factors_yx,
                 spatial_offset_um=max_z_offset_um,
                 overwrite=True,
+            )
+        if max_z_collection.time_interval_s != acquisition.volume_interval_s:
+            raise ValueError(
+                "Existing projection time scale disagrees with hardware volume cadence"
             )
         max_z_ts_store = max_z_collection.arrays
 
@@ -1778,7 +1874,7 @@ def process_skewed(
     else:
         flatfields = np.ones(
             (
-                int(stage_z_indices.max()) + 1,
+                1,
                 datastore.shape[2],
                 datastore.shape[-2],
                 datastore.shape[-1],
@@ -1798,6 +1894,9 @@ def process_skewed(
         resume=state_resume,
         output_preexisting=output_preexisting,
     )
+    ptv_export_enabled = acquisition.volume_interval_s is not None
+    if ptv_export_enabled:
+        publish_processing_state_ptv(output_path, processing_state)
     if max_projection:
         if state_resume and max_z_output_preexisting:
             try:
@@ -1962,7 +2061,7 @@ def process_skewed(
                     continue
                 if skewed_roi is None:
                     raw_selection = datastore[t_idx, pos_idx, chan_idx, :]
-                    illumination = flatfields[stage_z_indices[pos_idx], chan_idx, :]
+                    illumination = flatfields[0, chan_idx, :]
                     detector_x_offset = 0
                 else:
                     useful_start = int(skewed_roi.scan_start)
@@ -1986,7 +2085,7 @@ def process_skewed(
                         skewed_roi.x_start : skewed_roi.x_stop,
                     ]
                     illumination = flatfields[
-                        stage_z_indices[pos_idx],
+                        0,
                         chan_idx,
                         :,
                         skewed_roi.x_start : skewed_roi.x_stop,
@@ -2172,7 +2271,7 @@ def process_skewed(
             if max_projection:
                 for ts_max_write in ts_max_writes:
                     ts_max_write.result()
-            tile_zero_channels = (
+            tile_zero_channels = tuple(
                 channel_index
                 for time_index, position_index, channel_index in zero_channels
                 if time_index == int(t_idx) and position_index == int(pos_idx)
@@ -2183,6 +2282,13 @@ def process_skewed(
                 pos_idx,
                 zero_channels=tile_zero_channels,
             )
+            if ptv_export_enabled:
+                mark_ptv_tile(
+                    output_path,
+                    int(t_idx),
+                    int(pos_idx),
+                    zero_channels=tile_zero_channels,
+                )
             if max_projection:
                 processing_state.complete_tile(max_z_output_path, t_idx, pos_idx)
 
@@ -2223,6 +2329,7 @@ def process_skewed(
                 dtype=np.float64,
             ),
             spatial_offset_z_um=float(max_z_collection.spatial_origins_zyx_um[0][0]),
+            time_interval_s=max_z_collection.time_interval_s,
             reverse_stage_z=not stage_z_flipped,
             opm_angle_deg=opm_tilt_deg,
         )
@@ -2437,6 +2544,7 @@ def process_projection(
     voxel_size_um = (1.0, pixel_size_um, pixel_size_um)
     processing_configuration = {
         "kind": output_kind,
+        "timing": acquisition.timing_attributes(),
         "dtype": output_dtype.name,
         "flatfield": bool(flatfield_correction),
         "selection": {"time": time_range, "position": pos_range},
@@ -2470,10 +2578,16 @@ def process_projection(
             output_path,
             datastore.shape,
             voxel_size_um,
+            time_interval_s=acquisition.volume_interval_s,
+            attributes=acquisition.timing_attributes(),
             stage_positions=stage_positions,
             channels=channels,
             overwrite=True,
             dtype=output_dtype,
+        )
+    if output_collection.time_interval_s != acquisition.volume_interval_s:
+        raise ValueError(
+            "Existing output time scale disagrees with hardware volume cadence"
         )
     ts_store = output_collection.arrays
 
@@ -2493,7 +2607,7 @@ def process_projection(
     else:
         flatfields = np.ones(
             (
-                int(stage_z_indices.max()) + 1,
+                1,
                 datastore.shape[2],
                 datastore.shape[-2],
                 datastore.shape[-1],
@@ -2577,7 +2691,7 @@ def process_projection(
                 continue
             camera_corrected_data = illumination_correct(
                 camera_calibrated_data,
-                flatfields[stage_z_indices[pos_idx], chan_idx, :],
+                flatfields[0, chan_idx, :],
             )
 
             if deconvolve:
@@ -2628,6 +2742,7 @@ def process_projection(
             pixel_size=np.asarray((pixel_size_um, pixel_size_um), dtype=np.float32),
             time_range=time_range,
             reverse_stage_z=not stage_z_flipped,
+            time_interval_s=output_collection.time_interval_s,
             opm_angle_deg=opm_tilt_deg,
         )
         tile_fusion.run()
@@ -2776,7 +2891,7 @@ def call_estimate_illuminations(
     Returns
     -------
     numpy.ndarray
-        Estimated depth-CYX fields after the isolated worker exits successfully.
+        Shared per-channel fields after the isolated worker exits successfully.
 
     Notes
     -----

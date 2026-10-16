@@ -1,6 +1,6 @@
 # https://peps.python.org/pep-0517/
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.27.0"]
 build-backend = "hatchling.build"
 
 # read more about configuring hatch at:
@@ -33,6 +33,17 @@ classifiers = [
 ]
 # add your package dependencies here
 dependencies = [
+    "numpy",
+    "ome-types[lxml]",
+    "tensorstore",
+    "typer>=0.15,<1",
+    "yaozarrs[io,write-tensorstore] @ git+https://github.com/dpshepherd/yaozarrs.git@7eebe750654f71fbb0e722aeabdff8b47d12c1b5",
+]
+
+[project.optional-dependencies]
+# The base distribution is a lightweight public IO/metadata SDK. Processing
+# keeps its existing scientific/GUI stack, selected by the ordinary uv workflow.
+processing = [
     "basicpy @ git+https://github.com/QI2lab/BaSiCPy.git@main",
     "cmap",
     "imagecodecs",
@@ -40,8 +51,6 @@ dependencies = [
     "napari-ome-zarr>=0.9.0",
     "napari-plugin-engine",
     "numba",
-    "numpy",
-    "ome-types[lxml]",
     "psutil",
     "psfmodels",
     "pyyaml",
@@ -49,21 +58,18 @@ dependencies = [
     "ryomen",
     "scikit-image",
     "scipy",
-    "tensorstore",
     "tifffile",
     "torch==2.9.0; sys_platform == 'win32'",
     "torch; sys_platform != 'win32'",
     "tqdm",
-    "typer",
-    "yaozarrs[io,write-tensorstore] @ git+https://github.com/dpshepherd/yaozarrs.git@fix-v3-extra-attributes-location",
     "zarr>3.0.8",
     "napari-animation>=0.0.10",
     "pynvvideocodec>=2.2.3 ; sys_platform == 'linux' or sys_platform == 'win32'",
     "imageio-ffmpeg>=0.6",
 ]
 
-[project.optional-dependencies]
 gpu = [
+    "opm-processing-v2[processing]",
     "cucim-cu12==26.6.*; sys_platform == 'linux'",
     "cupy-cuda12x[ctk]>=14.1.1",
 ]
@@ -82,9 +88,10 @@ name = "nvidia"
 url = "https://pypi.nvidia.com"
 
 [tool.uv]
-default-groups = ["gpu"]
+default-groups = ["processing", "gpu"]
 
 [dependency-groups]
+processing = ["opm-processing-v2[processing]"]
 docs = [
     "mkdocs>=1.6,<2",
     "mkdocs-material>=9.6,<10",
@@ -120,6 +127,7 @@ display = "opm_processing.display:main"
 export-projections = "opm_processing.export_projections:main"
 encode-projections = "opm_processing.encode_projections:main"
 export-ome-tiff = "opm_processing.export_ome_tiff:main"
+export-rois = "opm_processing.export_rois:main"
 fuse = "opm_processing.fuse:main"
 
 # [project.entry-points."some.group"]

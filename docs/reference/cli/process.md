@@ -13,6 +13,7 @@ output beside the acquisition by default.
 | `--resume` | Continue compatible completed tiles; otherwise overwrite output. |
 | `--output PATH` | Set the output directory. |
 | `--live PATH` | Process during acquisition using a supplied CYX illumination TIFF; pass the acquisition directory. |
+| `--live-wait` | Wait for successful live completion and all raw tiles, then process offline. Combine with `--flatfield-correction` to estimate missing illumination. Mutually exclusive with `--live`; pass the acquisition directory. |
 | `--time-range START STOP` | Select timepoints. |
 | `--pos-range START STOP` | Select positions. |
 | `--z-downsample-level VALUE` | Deskewed Z reduction factor; default 2. |
@@ -31,5 +32,14 @@ output beside the acquisition by default.
 ```bash
 uv run process "/path/to/acquisition" --deconvolve --flatfield-correction
 ```
+
+Start before acquisition finishes, without a precomputed illumination file:
+
+```bash
+uv run process "/path/to/acquisition-directory" --live-wait --flatfield-correction --deconvolve
+```
+
+See the [live acquisition guide](../../guides/live.md) for required controller
+sidecars and completion behavior.
 
 Append `--help` to list all options and defaults.
