@@ -77,7 +77,7 @@ jobs:
         if: steps.changes.outputs.changed == 'true'
         run: uv run --python .venv-docs --no-project mkdocs build --clean --strict
       - name: Upload GitHub Pages artifact
-        uses: actions/upload-pages-artifact@v4
+        uses: actions/upload-pages-artifact@v5
         if: steps.changes.outputs.changed == 'true' && github.ref == 'refs/heads/main'
         with:
           path: site
