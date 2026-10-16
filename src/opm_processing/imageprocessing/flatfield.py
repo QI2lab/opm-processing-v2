@@ -270,7 +270,7 @@ def estimate_illuminations(
     apply_stage_scan_gain: bool = False,
     signal_mask: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Estimate per-channel illumination fields from sampled images.
+    """Estimate shared per-channel illumination as the maximum over stage Z.
 
     Parameters
     ----------
@@ -291,17 +291,18 @@ def estimate_illuminations(
     Returns
     -------
     numpy.ndarray
-        Illumination fields in CYX order for a global estimate or ZCYX order
-        when stage positions are supplied.
+        Illumination fields in CYX order without stage positions, or 1CYX order
+        when stage positions are supplied. Each channel is the pixelwise maximum
+        of the fitted stage-depth fields and is applied at every depth.
     """
-    stage_z_levels, position_groups = _stage_z_groups(
+    _stage_z_levels, position_groups = _stage_z_groups(
         int(datastore.shape[1]),
         stage_positions_zxy,
     )
-    # flatfields shape: physical stage z, c, y, x
+    # Retain one shared camera correction per channel, irrespective of depth.
     flatfields = np.zeros(
         (
-            len(stage_z_levels),
+            1,
             datastore.shape[2],
             datastore.shape[-2],
             datastore.shape[-1],
@@ -311,6 +312,7 @@ def estimate_illuminations(
     camera_shape = (datastore.shape[-2], datastore.shape[-1])
     working_shape = _flatfield_working_shape(camera_shape)
     n_channels = int(datastore.shape[2])
+    fitted_channels = np.zeros(n_channels, dtype=bool)
     if signal_mask is not None:
         signal_mask = np.asarray(signal_mask, dtype=bool)
 
@@ -337,7 +339,8 @@ def estimate_illuminations(
             )
             selected_positions = _flatfield_tile_indices(eligible_positions)
             if not selected_positions:
-                flatfields[stage_level_index, chan_idx] = 1.0
+                # Empty depths provide no illumination evidence. A unity field
+                # here would incorrectly floor valid estimates from other Z.
                 progress.update()
                 continue
             samples_per_position = _flatfield_sample_indices(
@@ -401,12 +404,16 @@ def estimate_illuminations(
                 np.asarray(basic.flatfield, dtype=np.float32),
                 calibration_images,
             )
-            flatfields[stage_level_index, chan_idx, :] = _resize_image_stack(
+            depth_flatfield = _resize_image_stack(
                 fitted_flatfield[np.newaxis, :, :],
                 camera_shape,
             )[0]
+            np.maximum(
+                flatfields[0, chan_idx], depth_flatfield, out=flatfields[0, chan_idx]
+            )
+            fitted_channels[chan_idx] = True
 
-            del basic, fitted_flatfield, fit_images, calibration_images
+            del basic, fitted_flatfield, depth_flatfield, fit_images, calibration_images
 
             gc.collect()
             if torch.cuda.is_available():
@@ -416,4 +423,6 @@ def estimate_illuminations(
 
     progress.close()
 
+    # Channels without signal at any depth receive no illumination correction.
+    flatfields[0, ~fitted_channels] = 1.0
     return flatfields[0] if stage_positions_zxy is None else flatfields

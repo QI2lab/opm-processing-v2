@@ -20,6 +20,7 @@ import numpy as np
 import typer
 from tifffile import TiffFile, TiffWriter, imread
 from tqdm import tqdm
+from yaozarrs import open_group, v05
 
 from opm_processing.dataio.acquisition import (
     AcquisitionMetadata,
@@ -32,6 +33,7 @@ from opm_processing.dataio.live import (
     LiveManifest,
     ZarrTileReadiness,
     iter_live_tiles,
+    read_lifecycle_event,
 )
 from opm_processing.dataio.ngff import downsample_yx, round_spatial
 from opm_processing.dataio.position_collection import (
@@ -74,8 +76,8 @@ if TYPE_CHECKING:
 app = typer.Typer(pretty_exceptions_enable=False)
 app.pretty_exceptions_enable = False
 
-# Reject cached fields made with a different camera-calibration contract.
-FLATFIELD_SOFTWARE = "opm-processing/basicpy-stage-depth-camera-contract-v10"
+# Reject cached fields made before depth estimates shared one maximum field.
+FLATFIELD_SOFTWARE = "opm-processing/basicpy-stage-z-max-camera-contract-v11"
 
 
 def progress_tile_groups(
@@ -622,12 +624,12 @@ def read_current_flatfield(
     path : pathlib.Path
         Filesystem path of the artifact to read or write.
     expected_shape : tuple[int, int, int, int]
-        Required depth, channel, Y, X dimensions.
+        Required singleton depth, channel, Y, X dimensions.
 
     Returns
     -------
     numpy.ndarray or None
-        Depth-CYX fields, or None when the estimator version or acquisition
+        Shared 1CYX fields, or None when the estimator version or acquisition
         dimensions differ from this run.
     """
     with TiffFile(path) as tif:
@@ -637,6 +639,8 @@ def read_current_flatfield(
         flatfields = tif.asarray().astype(np.float32)
     if expected_shape[0] == 1 and flatfields.shape == expected_shape[1:]:
         flatfields = flatfields[np.newaxis, ...]
+    elif expected_shape[:2] == (1, 1) and flatfields.shape == expected_shape[2:]:
+        flatfields = flatfields[np.newaxis, np.newaxis, ...]
     if flatfields.shape != expected_shape:
         return None
     return flatfields
@@ -647,14 +651,14 @@ def write_flatfield(
     flatfields: np.ndarray,
     pixel_size_um: float,
 ) -> None:
-    """Write reusable physical-stage-Z illumination fields.
+    """Write one reusable illumination field per channel, shared across depth.
 
     Parameters
     ----------
     path : pathlib.Path
         Filesystem path of the artifact to read or write.
     flatfields : numpy.ndarray
-        Positive float32 illumination fields in depth, channel, Y, X order.
+        Positive float32 illumination fields in singleton-depth, channel, Y, X order.
     pixel_size_um : float
         Camera pixel pitch in micrometers.
 
@@ -664,6 +668,8 @@ def write_flatfield(
         Fields are written with spatial metadata and the current estimator
         identifier.
     """
+    if flatfields.ndim != 4 or flatfields.shape[0] != 1:
+        raise ValueError("Shared flatfields must have shape (1, channels, Y, X)")
     with TiffWriter(path, bigtiff=True) as tif:
         metadata = {
             "axes": "ZCYX",
@@ -726,11 +732,11 @@ def load_or_estimate_flatfield(
     Returns
     -------
     numpy.ndarray
-        Depth-CYX illumination fields reused from disk or estimated and saved.
+        Shared 1CYX illumination fields reused from disk or estimated and saved.
     """
     stage_z_indices = stage_z_level_indices(stage_positions_zxy)
     expected_shape = (
-        int(stage_z_indices.max()) + 1,
+        1,
         datastore.shape[2],
         datastore.shape[-2],
         datastore.shape[-1],
@@ -800,7 +806,7 @@ def open_live_acquisition(
     Parameters
     ----------
     root_path : pathlib.Path
-        Raw acquisition store, or its containing directory for live processing.
+        Containing acquisition directory with one live manifest and lifecycle log.
 
     Returns
     -------
@@ -816,11 +822,13 @@ def open_live_acquisition(
     requested_path = Path(root_path).expanduser().resolve()
     if requested_path.name.endswith((".zarr", ".ome.zarr")):
         raise ValueError(
-            "--live requires the containing acquisition directory, not the "
+            "--live and --live-wait require the containing acquisition directory, not the "
             "OME-Zarr path"
         )
     if not requested_path.is_dir():
-        raise ValueError("--live requires the containing acquisition directory")
+        raise ValueError(
+            "--live and --live-wait require the containing acquisition directory"
+        )
     while True:
         manifests = sorted(requested_path.glob("*.manifest.json"))
         if len(manifests) == 1:
@@ -840,16 +848,28 @@ def open_live_acquisition(
     log_path = manifest_path.with_name(f"{manifest_stem}.log.jsonl")
     manifest = LiveManifest.read(manifest_path)
     root_path = manifest.data_path
-    required_metadata = [root_path / "zarr.json", root_path / "OME" / "zarr.json"]
-    required_metadata.extend(
-        metadata_path
-        for position in range(manifest.index_sizes["p"])
-        for metadata_path in (
-            root_path / str(position) / "zarr.json",
-            root_path / str(position) / "0" / "zarr.json",
-        )
-    )
-    while not all(path.is_file() for path in required_metadata):
+    while True:
+        event = read_lifecycle_event(log_path, manifest.acquisition_id)
+        if event in {"canceled", "errored"}:
+            raise RuntimeError(f"Live acquisition {event}; processing was not started")
+        if (root_path / "zarr.json").is_file():
+            layout = open_group(root_path).ome_metadata()
+            if isinstance(layout, v05.Image):
+                required_metadata = [
+                    root_path / layout.multiscales[0].datasets[0].path / "zarr.json"
+                ]
+            else:
+                required_metadata = [root_path / "OME" / "zarr.json"]
+                required_metadata.extend(
+                    metadata_path
+                    for position in range(manifest.index_sizes["p"])
+                    for metadata_path in (
+                        root_path / str(position) / "zarr.json",
+                        root_path / str(position) / "0" / "zarr.json",
+                    )
+                )
+            if all(path.is_file() for path in required_metadata):
+                break
         print(
             f"Waiting {LIVE_POLL_INTERVAL_SECONDS:g} seconds for OME-Zarr metadata..."
         )
@@ -1116,6 +1136,17 @@ def process(
             ),
         ),
     ] = None,
+    live_wait: Annotated[
+        bool,
+        typer.Option(
+            "--live-wait",
+            help=(
+                "Wait for live acquisition completion and all raw tiles before "
+                "processing. Supports --flatfield-correction without a supplied "
+                "illumination file. Pass the acquisition directory."
+            ),
+        ),
+    ] = False,
     plane_period_ms: Annotated[
         float | None,
         typer.Option(
@@ -1184,6 +1215,9 @@ def process(
     live : Path or None
         Supplied CYX illumination TIFF enabling live processing; None processes
         offline.
+    live_wait : bool
+        Wait for successful live acquisition completion and all expected raw
+        tiles, then process offline, estimating illumination when requested.
 
     Returns
     -------
@@ -1206,6 +1240,9 @@ def process(
                 "Experimental undersampled RLGC uses a full GPU volume; "
                 "--decon-crop-scan and --decon-fallback-step-scan are unsupported"
             )
+
+    if live_wait and live is not None:
+        raise typer.BadParameter("--live-wait cannot be combined with --live")
 
     if live is not None:
         if flatfield_correction:
@@ -1252,7 +1289,21 @@ def process(
         )
         return
 
-    acquisition = inspect_acquisition(root_path)
+    if live_wait:
+        acquisition, manifest, log_path = open_live_acquisition(root_path)
+        print(
+            "Waiting for live acquisition completion before calibration and processing..."
+        )
+        for _tile in iter_live_tiles(
+            ZarrTileReadiness(acquisition), manifest, log_path, sleeper=time.sleep
+        ):
+            pass
+        # Refresh metadata after the controller has finished writing, then keep
+        # its manifest geometry and calibration for the ordinary offline path.
+        acquisition = manifest.apply(inspect_acquisition(acquisition.path))
+        print("Live acquisition completed; starting offline processing.")
+    else:
+        acquisition = inspect_acquisition(root_path)
     acquisition = acquisition.with_plane_period(
         None if plane_period_ms is None else plane_period_ms / 1000
     )
@@ -1823,7 +1874,7 @@ def process_skewed(
     else:
         flatfields = np.ones(
             (
-                int(stage_z_indices.max()) + 1,
+                1,
                 datastore.shape[2],
                 datastore.shape[-2],
                 datastore.shape[-1],
@@ -2010,7 +2061,7 @@ def process_skewed(
                     continue
                 if skewed_roi is None:
                     raw_selection = datastore[t_idx, pos_idx, chan_idx, :]
-                    illumination = flatfields[stage_z_indices[pos_idx], chan_idx, :]
+                    illumination = flatfields[0, chan_idx, :]
                     detector_x_offset = 0
                 else:
                     useful_start = int(skewed_roi.scan_start)
@@ -2034,7 +2085,7 @@ def process_skewed(
                         skewed_roi.x_start : skewed_roi.x_stop,
                     ]
                     illumination = flatfields[
-                        stage_z_indices[pos_idx],
+                        0,
                         chan_idx,
                         :,
                         skewed_roi.x_start : skewed_roi.x_stop,
@@ -2556,7 +2607,7 @@ def process_projection(
     else:
         flatfields = np.ones(
             (
-                int(stage_z_indices.max()) + 1,
+                1,
                 datastore.shape[2],
                 datastore.shape[-2],
                 datastore.shape[-1],
@@ -2640,7 +2691,7 @@ def process_projection(
                 continue
             camera_corrected_data = illumination_correct(
                 camera_calibrated_data,
-                flatfields[stage_z_indices[pos_idx], chan_idx, :],
+                flatfields[0, chan_idx, :],
             )
 
             if deconvolve:
@@ -2840,7 +2891,7 @@ def call_estimate_illuminations(
     Returns
     -------
     numpy.ndarray
-        Estimated depth-CYX fields after the isolated worker exits successfully.
+        Shared per-channel fields after the isolated worker exits successfully.
 
     Notes
     -----

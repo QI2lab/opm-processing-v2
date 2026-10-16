@@ -14,6 +14,11 @@ uses the matching calibration columns. Optional illumination correction divides
 the calibrated data by a CYX illumination field. Empty-channel decisions occur
 after camera calibration and before illumination division.
 
+Illumination fitting samples tiles separately at each stage-Z level. The final
+field for each channel is the pixelwise maximum over those depth estimates,
+shared by every stage position and timepoint. Empty depth/channel groups are
+excluded from the maximum; a channel with no selected signal uses unity.
+
 These calculations are separate from deconvolution and interpolation. See
 [camera_correct](../reference/python/imageprocessing.md#opm_processing.imageprocessing.camera.camera_correct)
 for parameter units and detector-gain behavior.

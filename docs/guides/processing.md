@@ -12,6 +12,19 @@ uv run process "/path/to/acquisition" --deconvolve --flatfield-correction --outp
 
 Camera calibration runs before optional illumination correction and
 deconvolution. `--flatfield-correction` estimates or reuses illumination fields.
+For each channel, the correction is the pixelwise maximum of the estimated
+stage-Z fields and is shared across all depths and timepoints. This prevents
+sample-free camera regions at one depth from imposing a separate correction
+on that depth. Depths excluded by signal selection do not contribute; channels
+without selected signal use a unity field. Saved flatfields contain one field
+per channel. Cached fields from the older per-depth estimator are re-estimated.
+
+To launch processing before acquisition finishes without a precomputed
+illumination file, add `--live-wait` alongside `--flatfield-correction` and
+pass the acquisition directory. The command waits for completion before
+estimating illumination or processing images. See the
+[live acquisition guide](live.md#wait-for-completion-before-processing).
+
 `--deconvolve` uses GPU RLGC; channel-ordered PSFs can be supplied with repeated
 `--decon-psf-paths` options. Otherwise theoretical PSFs are generated.
 

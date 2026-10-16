@@ -222,29 +222,105 @@ def test_processing_contract_uses_uint16_raw_float32_intermediates_and_final_cas
     np.testing.assert_array_equal(floats, boundary)
 
 
-@pytest.mark.unit
-def test_stage_z_flatfield_round_trips_exact_values(
-    tmp_path: Path,
+@pytest.mark.integration
+@pytest.mark.parametrize("channels", [1, 3])
+def test_shared_flatfield_round_trips_and_is_reused_at_multiple_depths(
+    tmp_path: Path, tensorstore_dataset, channels
 ):
-    """The reusable illumination retains every stage/channel field exactly."""
+    """The saved maximum field is reused unchanged for every stage depth."""
     from opm_processing.process import (
+        load_or_estimate_flatfield,
         read_current_flatfield,
         write_flatfield,
     )
 
-    for stage_level_count in (1, 2):
-        path = tmp_path / f"flatfield-{stage_level_count}.ome.tif"
-        flatfields = np.ones(
-            (stage_level_count, 3, 8, 12),
-            dtype=np.float32,
-        )
-        if stage_level_count > 1:
-            flatfields[1] *= 1.25
-        write_flatfield(path, flatfields, 0.115)
+    path = tmp_path / "flatfield.ome.tif"
+    flatfields = np.linspace(0.5, 1.5, channels * 8 * 12, dtype=np.float32).reshape(
+        1, channels, 8, 12
+    )
+    write_flatfield(path, flatfields, 0.115)
+    actual = read_current_flatfield(path, flatfields.shape)
+    assert actual is not None
+    np.testing.assert_array_equal(actual, flatfields)
+    actual = load_or_estimate_flatfield(
+        path,
+        tensorstore_dataset(np.zeros((1, 2, channels, 4, 8, 12), dtype=np.uint16)),
+        100,
+        0.25,
+        0.115,
+        np.asarray(((10, 20, 30), (0, 20, 30))),
+        apply_stage_scan_gain=False,
+        signal_threshold=None,
+        minimum_signal_fraction=0.01,
+        signal_mask=None,
+    )
+    np.testing.assert_array_equal(actual, flatfields)
 
-        actual = read_current_flatfield(path, flatfields.shape)
-        assert actual is not None
-        np.testing.assert_array_equal(actual, flatfields)
+
+@pytest.mark.integration
+def test_old_per_depth_flatfield_is_not_reused(tmp_path):
+    from tifffile import imwrite
+
+    from opm_processing.process import read_current_flatfield
+
+    path = tmp_path / "old-flatfield.ome.tif"
+    imwrite(
+        path,
+        np.ones((2, 1, 8, 12), dtype=np.float32),
+        photometric="minisblack",
+        metadata={"axes": "ZCYX"},
+        software="opm-processing/basicpy-stage-depth-camera-contract-v10",
+    )
+    assert read_current_flatfield(path, (1, 1, 8, 12)) is None
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("scan_planes", [1, 4])
+def test_processing_applies_the_same_field_at_every_depth(
+    tmp_path, acquisition_factory, scan_planes
+):
+    """Planar and deskewed outputs use the same channel field across Z and T."""
+    from opm_processing.dataio.position_collection import open_position_collection
+    from opm_processing.process import process, write_flatfield
+
+    rng = np.random.default_rng(3)
+    raw = rng.integers(200, 500, (2, 2, 2, scan_planes, 8, 12), dtype=np.uint16)
+    acquisition = acquisition_factory(
+        raw, stage_positions_zxy=((10, 20, 30), (0, 20, 30))
+    )
+    flatfields = np.ones((1, 2, 8, 12), dtype=np.float32)
+    flatfields[0, 0] = 2
+    flatfields[0, 1] = 1.25
+    write_flatfield(tmp_path / "sample_flatfield.ome.tif", flatfields, 0.115)
+    for correction, directory in ((False, "baseline"), (True, "corrected")):
+        process(
+            root_path=acquisition.path,
+            output=tmp_path / directory,
+            flatfield_correction=correction,
+            deconvolve=False,
+            save_float32=True,
+            z_downsample_level=1,
+            max_projection=False,
+            create_fused_max_projection=False,
+            write_fused_max_projection_tiff=False,
+        )
+    suffix = "2d" if scan_planes == 1 else "deskewed"
+    baseline = open_position_collection(
+        tmp_path / "baseline" / f"sample_{suffix}.ome.zarr"
+    )
+    corrected = open_position_collection(
+        tmp_path / "corrected" / f"sample_{suffix}.ome.zarr"
+    )
+    for position in range(2):
+        expected = baseline.arrays[position].read().result()
+        actual = corrected.arrays[position].read().result()
+        for channel in range(2):
+            np.testing.assert_allclose(
+                actual[:, channel],
+                expected[:, channel] / flatfields[0, channel, 0, 0],
+                rtol=1e-6,
+                atol=1e-6,
+            )
 
 
 @pytest.mark.unit
@@ -271,10 +347,10 @@ def test_flatfield_sample_loading_applies_detector_calibration(
 
 
 @pytest.mark.unit
-def test_single_tile_depth_fields_recover_known_illumination(
+def test_shared_field_recovers_maximum_of_known_depth_illuminations(
     tensorstore_dataset, depth_illumination
 ):
-    """Fit separate depth fields from scan planes with the real BaSiC solver."""
+    """The real BaSiC solver recovers the maximum envelope of depth fields."""
     case = depth_illumination
     estimated = estimate_illuminations(
         tensorstore_dataset(case.raw[None, :, None]),
@@ -282,19 +358,32 @@ def test_single_tile_depth_fields_recover_known_illumination(
         camera_conversion=0.25,
         stage_positions_zxy=np.asarray(((10, 20, 30), (0, 20, 30))),
     )
-    assert estimated.shape == (2, 1, case.height, case.width)
+    assert estimated.shape == (1, 1, case.height, case.width)
     assert np.all(np.isfinite(estimated))
     assert np.all(estimated > 0)
-    for depth in range(2):
-        assert (
-            np.corrcoef(estimated[depth, 0].ravel(), case.fields[depth].ravel())[0, 1]
-            > 0.95
-        )
-        calibrated = (case.raw[depth].astype(float) - 100) * 0.25
-        corrected = calibrated / estimated[depth, 0]
-        before = np.mean(np.abs(calibrated - case.specimen[depth]))
-        after = np.mean(np.abs(corrected - case.specimen[depth]))
-        assert after < 0.35 * before
+    expected = np.max(case.fields, axis=0)
+    assert np.corrcoef(estimated[0, 0].ravel(), expected.ravel())[0, 1] > 0.95
+    assert np.mean(np.abs(estimated[0, 0] - expected)) < 0.05
+
+
+@pytest.mark.unit
+def test_empty_depths_do_not_floor_the_shared_field(
+    tensorstore_dataset, depth_illumination
+):
+    """An excluded depth cannot raise valid dim pixels to unity in the maximum."""
+    case = depth_illumination
+    raw = np.stack((case.raw, case.raw), axis=1)[None]
+    estimated = estimate_illuminations(
+        tensorstore_dataset(raw),
+        camera_offset=100,
+        camera_conversion=0.25,
+        stage_positions_zxy=np.asarray(((10, 20, 30), (0, 20, 30))),
+        signal_mask=np.asarray([[[True, False], [False, False]]]),
+    )
+    assert estimated.shape == (1, 2, case.height, case.width)
+    assert np.corrcoef(estimated[0, 0].ravel(), case.fields[0].ravel())[0, 1] > 0.95
+    assert estimated[0, 0].min() < 0.8
+    np.testing.assert_array_equal(estimated[0, 1], 1.0)
 
 
 @pytest.mark.unit

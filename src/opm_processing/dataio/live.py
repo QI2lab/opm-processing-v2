@@ -436,7 +436,7 @@ def iter_live_tiles(
                 f"{len(expected)} complete tiles"
             )
         print(
-            "Live processing is caught up; waiting "
-            f"{poll_interval:g} seconds for another complete tile..."
+            f"Waiting {poll_interval:g} seconds for acquisition completion "
+            "or another complete tile..."
         )
         sleeper(poll_interval)
