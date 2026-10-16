@@ -62,7 +62,7 @@ jobs:
           fi
       - name: Set up uv and Python
         if: steps.changes.outputs.changed == 'true'
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           python-version: "3.12"
       - name: Install documentation dependencies
@@ -71,13 +71,13 @@ jobs:
           uv venv .venv-docs --python 3.12
           uv --no-config pip install --python .venv-docs --group docs --index-url https://pypi.org/simple
       - name: Configure GitHub Pages
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@v6
         if: steps.changes.outputs.changed == 'true' && github.ref == 'refs/heads/main'
       - name: Build documentation
         if: steps.changes.outputs.changed == 'true'
         run: uv run --python .venv-docs --no-project mkdocs build --clean --strict
       - name: Upload GitHub Pages artifact
-        uses: actions/upload-pages-artifact@v4
+        uses: actions/upload-pages-artifact@v5
         if: steps.changes.outputs.changed == 'true' && github.ref == 'refs/heads/main'
         with:
           path: site
@@ -97,4 +97,4 @@ jobs:
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
