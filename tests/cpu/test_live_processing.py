@@ -7,6 +7,7 @@ import json
 
 import numpy as np
 import pytest
+from click import unstyle
 from typer.testing import CliRunner
 
 from opm_processing.dataio.acquisition import (
@@ -245,7 +246,15 @@ def test_live_wait_stops_before_processing_on_acquisition_failure(
 
 
 @pytest.mark.unit
-def test_live_wait_and_streaming_live_are_mutually_exclusive(tmp_path):
+@pytest.mark.parametrize("force_color", [False, True])
+def test_live_wait_and_streaming_live_are_mutually_exclusive(
+    tmp_path, monkeypatch, force_color
+):
+    from typer import rich_utils
+
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setattr(rich_utils, "FORCE_TERMINAL", force_color)
     result = CliRunner().invoke(
         app,
         [
@@ -254,9 +263,12 @@ def test_live_wait_and_streaming_live_are_mutually_exclusive(tmp_path):
             "--live",
             str(tmp_path / "illumination.ome.tif"),
         ],
+        color=force_color,
     )
     assert result.exit_code == 2
-    assert "--live-wait cannot be combined with --live" in result.output
+    if force_color:
+        assert "\x1b[" in result.output
+    assert "--live-wait cannot be combined with --live" in unstyle(result.output)
 
 
 @pytest.mark.unit
