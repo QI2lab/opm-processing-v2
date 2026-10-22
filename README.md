@@ -9,8 +9,8 @@ Read the [documentation](https://qi2lab.github.io/opm-processing-v2/), starting
 with [installation](https://qi2lab.github.io/opm-processing-v2/getting-started/installation/)
 and the [first workflow](https://qi2lab.github.io/opm-processing-v2/getting-started/quickstart/).
 
-To crop fused volumes or single-position timelapses interactively, follow the
-[ROI export guide](docs/guides/roi.md#export-rois-from-a-fused-volume-or-single-position-timelapse).
+To select and reconstruct raw regions interactively, follow the
+[ROI export guide](docs/guides/roi.md).
 
 ## Quick start
 
@@ -30,6 +30,10 @@ uv run fuse "/path/to/acquisition"
 uv run export-ome-tiff "/path/to/acquisition"
 ```
 
+Deconvolution reads camera and optical calibration from OME-Zarr. See the
+[required metadata and solver parameters](docs/methods/deconvolution.md).
+Missing read-noise calibration selects the no-read-noise model.
+
 ## Commands
 
 Each command's reference describes its arguments, options, and an example.
@@ -40,19 +44,16 @@ Append `--help` to any command for its installed options and defaults.
 | [inspect-opm](docs/reference/cli/inspect-opm.md) | Inspect acquisition metadata. |
 | [process](docs/reference/cli/process.md) | Calibrate, deconvolve, and deskew. |
 | [fuse](docs/reference/cli/fuse.md) | Register and blend processed tiles. |
-| [display](docs/reference/cli/display.md) | View outputs and select an ROI. |
-| [process-ROI](docs/reference/cli/process-roi.md) | Process and fuse selected raw regions. |
 | [export-ome-tiff](docs/reference/cli/export-ome-tiff.md) | Export fused images as compressed OME-BigTIFF. |
-| [export-rois](docs/reference/cli/export-rois.md) | Draw multiple ROIs and export full-depth crops from fused volumes or single-position timelapses. |
+| [export-rois](docs/reference/cli/export-rois.md) | Select multiple ROIs and reconstruct raw regions into OME-Zarr and optional TIFF. |
 | [export-projections](docs/reference/cli/export-projections.md) | Export annotated projections and movies. |
 | [encode-projections](docs/reference/cli/encode-projections.md) | Encode existing projection TIFFs as movies. |
-| [convert-timelapse](docs/reference/cli/convert-timelapse.md) | Export raw scan-plane timelapses. |
 
 ## Development
 
 See [contributing](docs/development/contributing.md),
 [running tests](docs/development/testing.md), and
-[simulation examples](docs/examples/index.md).
+[deconvolution usage](docs/examples/index.md).
 
 Preview the documentation in a separate environment:
 

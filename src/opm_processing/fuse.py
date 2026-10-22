@@ -59,6 +59,17 @@ def register_and_fuse(
             ),
         ),
     ] = None,
+    registration_retries: Annotated[
+        int,
+        typer.Option(
+            min=0,
+            help=(
+                "Retry only pairs with expanded limits, then refit the full "
+                "global solution. Explicit shift limits "
+                "remain fixed. Set 0 to disable retries."
+            ),
+        ),
+    ] = 2,
     normalize_depth_intensity: Annotated[
         bool,
         typer.Option(
@@ -84,7 +95,7 @@ def register_and_fuse(
         Path | None,
         typer.Option(
             "--roi",
-            help="Physical ROI JSON created by display --roi-output.",
+            help="Physical ROI JSON saved by export-rois.",
         ),
     ] = None,
 ) -> None:
@@ -122,13 +133,17 @@ def register_and_fuse(
     normalize_depth_intensity : bool
         Match registered depth layers using channel gains shared across XY tiles
         at each depth and timepoint. Save the gains alongside the fused image.
+    registration_retries : int
+        Maximum automatic search expansions; each remeasures only expanded
+        pairs and refits the full graph. Zero disables retries; explicit limits
+        stay fixed.
     require_gpu : bool
         Require CUDA registration instead of allowing the CPU backend.
     regenerate_max_z : bool
         Regenerate all maximum-Z pyramid levels from the existing fused image
         without registering or fusing tiles again.
     roi : pathlib.Path or None
-        Display-exported ROI restricting positions and fused YX bounds while
+        Saved ROI restricting positions and fused YX bounds while
         retaining every Z plane; None fuses the full acquisition.
 
     Returns
@@ -172,6 +187,7 @@ def register_and_fuse(
             optimization_rel_threshold=optimization_rel_threshold,
             optimization_abs_threshold=optimization_abs_threshold,
             max_registration_shift_zyx=max_registration_shift_zyx,
+            registration_retries=registration_retries,
             roi_selection=None if roi is None else PhysicalRoi.read(roi),
             normalize_depth_intensity=normalize_depth_intensity,
         )

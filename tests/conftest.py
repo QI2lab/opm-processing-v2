@@ -6,7 +6,6 @@ import pytest
 
 pytest_plugins = (
     "tests.fixtures.hardware",
-    "tests.fixtures.tensorstore",
     "tests.fixtures.acquisition",
     "tests.fixtures.tiling",
     "tests.fixtures.roi",
@@ -18,22 +17,24 @@ pytest_plugins = (
     "tests.fixtures.state",
     "tests.fixtures.camera",
     "tests.fixtures.illumination",
+    "tests.fixtures.pipeline",
+    "tests.fixtures.cli",
 )
 
 
 def pytest_collection_modifyitems(items):
-    """Require unit or disk-based integration tests during collection.
+    """Require unit or integration tests and consistent execution hardware.
 
     Parameters
     ----------
     items : list of pytest.Item
-        Collected correctness tests to validate.
+        Collected tests to validate.
 
     Raises
     ------
     pytest.UsageError
-        If categories or hardware placement are inconsistent, a forbidden
-        category is used, or an integration test has no temporary disk storage.
+        If a test lacks an allowed classification, uses a forbidden category, or
+        requires CUDA from the CPU suite.
     """
     for item in items:
         execution = item.path.relative_to(Path(__file__).parent).parts[0]
@@ -54,20 +55,20 @@ def pytest_collection_modifyitems(items):
             for name in ("smoke", "api", "regression", "benchmark")
         ):
             raise pytest.UsageError(
-                f"{item.nodeid}: smoke, API, regression, and benchmark tests are not permitted"
+                f"{item.nodeid}: only unit and integration tests are permitted"
             )
         categories = [
             name for name in ("unit", "integration") if item.get_closest_marker(name)
         ]
         if len(categories) != 1:
             raise pytest.UsageError(
-                f"{item.nodeid} must have exactly one of unit or integration"
+                f"{item.nodeid}: select exactly one of unit or integration"
             )
         if categories == ["integration"] and not {
-            "tmp_path",
-            "tmp_path_factory",
+            "simulated_camera",
+            "pipeline_optical_data",
+            "independent_photon_scene_factory",
         }.intersection(item.fixturenames):
             raise pytest.UsageError(
-                f"{item.nodeid}: integration tests require simulated input and "
-                "verified output on disk"
+                f"{item.nodeid}: integration tests require shared forward-model ground truth"
             )

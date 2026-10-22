@@ -1,4 +1,4 @@
-"""Full-resolution ROI exports and multiscale selection coordinates."""
+"""Physical GUI selections and raw-to-OME ROI processing integration."""
 
 import json
 
@@ -7,167 +7,194 @@ import pytest
 import tifffile
 from ome_types import from_xml
 from typer.testing import CliRunner
+from yaozarrs import open_group, v05
 
 from opm_processing import export_rois
-from opm_processing.dataio.position_collection import create_position_collection
+from opm_processing.dataio.position_collection import open_image_array
 from opm_processing.dataio.processing_state import ProcessingState
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("suffix", ["_decon_deskewed", "_deskewed"])
-@pytest.mark.parametrize("direct", [True, False])
-def test_single_position_timelapse_exports(tmp_path, monkeypatch, suffix, direct):
-    truth = np.arange(3 * 2 * 4 * 17 * 19, dtype=np.uint16).reshape(3, 2, 4, 17, 19)
-    source = tmp_path / f"sample{suffix}.ome.zarr"
-    spacing = (0.23, 0.115, 0.119)
-    stage = (-40.5, 20.25, -11.75)
-    collection = create_position_collection(
-        source,
-        (3, 1, 2, 4, 17, 19),
-        spacing,
-        stage_positions=[stage],
-        channels=["488nm", "637nm"],
-        time_interval_s=8.5,
-        multiscale_factors_yx=(2,),
-    )
-    collection.arrays[0].write(truth).result()
-    create_position_collection(
-        tmp_path / f"sample_max_z{suffix}.ome.zarr",
-        (3, 1, 2, 1, 17, 19),
-        spacing,
-    )
-    companion = source / "OME" / "METADATA.ome.xml"
-    template = from_xml(companion.read_text(encoding="utf-8"))
-    template.images[0].pixels.channels[0].emission_wavelength = 525
-    companion.write_text(template.to_xml(), encoding="utf-8")
-    # The processed run has no registration/fusion record.
-    state = ProcessingState.create(tmp_path / "sample.processing.json", source)
-    state.initialize_run(source, configuration={}, overwrite=True)
-    crops = [(1, 8, 2, 10), (3, 9, 4, 12)]
+@pytest.mark.parametrize(
+    "roi_preview",
+    [
+        ("mirror", 1, False),
+        ("stage", 1, False),
+        ("mirror", 2, False),
+        ("stage", 2, True),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize("tiff", [False, True])
+def test_raw_roi_exports_and_resume(roi_preview, tiff, monkeypatch):
+    """Reconstruct multiple rectangles with all times/channels and global origins."""
+    case = roi_preview
+    selections = [(3, 12, 2, 10), (5, 15, 4, 12)]
+    calls = []
 
-    def choose_rois(image_path, shape):
-        assert image_path == source / "0"
-        assert shape == truth.shape
-        return crops
+    def choose(source, shape):
+        """Supply user interaction while exercising actual processing and storage."""
+        calls.append(source)
+        assert shape[:3] == (2, 2, 1)
+        return selections
 
-    monkeypatch.setattr(export_rois, "select_rois", choose_rois)
-    result = CliRunner().invoke(export_rois.app, [str(source if direct else tmp_path)])
-    assert result.exit_code == 0, result.exception
-    for index, (y0, y1, x0, x1) in enumerate(crops, 1):
-        target = tmp_path / "roi_exports" / f"sample_roi_{index:03d}.ome.tiff"
-        expected = truth[:, :, :, y0:y1, x0:x1]
-        with tifffile.TiffFile(target) as tif:
-            np.testing.assert_array_equal(
-                tif.asarray().reshape(expected.shape), expected
+    monkeypatch.setattr(export_rois, "select_rois", choose)
+    args = [str(case.preview), "--save-float32"] + (["--tiff"] if tiff else [])
+    for _attempt in range(2):
+        result = CliRunner().invoke(export_rois.app, args)
+        assert result.exit_code == 0, result.exception
+        assert len(calls) == 1
+        for index, (y0, y1, x0, x1) in enumerate(selections, 1):
+            directory = case.preview.parent / "roi_exports" / f"roi_{index:03d}"
+            image = directory / "sample_fused.ome.zarr"
+            root = open_group(image)
+            assert isinstance(root.ome_metadata(), v05.Image)
+            data = open_image_array(image).read().result()
+            assert data.shape[:2] == (2, 2)
+            assert data.shape[-2:] == (y1 - y0, x1 - x0)
+            # The selected preimage must retain the same measured photons as
+            # full processing of this simulated specimen, at every time/channel.
+            expected = case.collection.arrays[0].read().result()[..., y0:y1, x0:x1]
+            np.testing.assert_allclose(data, expected, rtol=2e-6, atol=2e-3)
+            assert np.all(data.max(axis=(2, 3, 4)) > 0)
+            dataset = root.ome_metadata().multiscales[0].datasets[0]
+            origin = dataset.translation_transform.translation
+            pixel = case.dataset.metadata.pixel_size_um
+            assert origin[-2:] == pytest.approx(
+                (case.origin[1] + y0 * pixel, case.origin[2] + x0 * pixel)
             )
-            assert tif.is_bigtiff and tif.is_ome
-            assert tif.pages[0].compression == tifffile.COMPRESSION.ADOBE_DEFLATE
-            ome = from_xml(tif.ome_metadata, validate=True)
-            image = ome.images[0]
-            assert image.pixels.size_t == 3
-            assert image.pixels.size_c == 2
-            assert image.pixels.size_z == 4
-            assert image.pixels.time_increment == 8.5
-            assert [c.name for c in image.pixels.channels] == ["488nm", "637nm"]
-            assert image.pixels.channels[0].emission_wavelength == 525
-            assert image.stage_label.x == pytest.approx(stage[2] + x0 * spacing[2])
-            assert image.stage_label.y == pytest.approx(stage[1] + y0 * spacing[1])
-            for plane in image.pixels.planes:
-                assert plane.position_x == image.stage_label.x
-                assert plane.position_y == image.stage_label.y
-                assert plane.position_z == pytest.approx(
-                    stage[0] + plane.the_z * spacing[0]
-                )
-                assert plane.delta_t == pytest.approx(plane.the_t * 8.5)
-            provenance = ome.structured_annotations.map_annotations[-1].value
-            assert "ProcessingState" in provenance
-            assert json.loads(provenance["ROIBoundsLevelZeroYX"]) == [y0, y1, x0, x1]
-
-
-@pytest.mark.integration
-def test_standalone_timelapse_exports(tmp_path, fused_store_factory, monkeypatch):
-    truth = np.arange(3 * 2 * 4 * 17 * 19, dtype=np.uint16).reshape(3, 2, 4, 17, 19)
-    source = fused_store_factory(
-        truth,
-        name="timelapse",
-        spacing=(0.23, 0.115, 0.119),
-        origin=(-40.5, 20.25, -11.75),
-        time_step_s=8.5,
-        time_origin_s=2.5,
-        factors=(1, 2),
-    )
-    monkeypatch.setattr(
-        export_rois, "select_rois", lambda source, shape: [(1, 8, 2, 10)]
-    )
-    result = CliRunner().invoke(export_rois.app, [str(source)])
-    assert result.exit_code == 0, result.exception
-    with tifffile.TiffFile(
-        tmp_path / "roi_exports" / "timelapse_roi_001.ome.tiff"
-    ) as tif:
-        expected = truth[:, :, :, 1:8, 2:10]
-        np.testing.assert_array_equal(tif.asarray().reshape(expected.shape), expected)
-        pixels = from_xml(tif.ome_metadata, validate=True).images[0].pixels
-        for plane in pixels.planes:
-            assert plane.position_z == pytest.approx(-40.5 + plane.the_z * 0.23)
-            assert plane.position_y == pytest.approx(20.25 + 0.115)
-            assert plane.position_x == pytest.approx(-11.75 + 2 * 0.119)
-            assert plane.delta_t == pytest.approx(2.5 + plane.the_t * 8.5)
-
-
-@pytest.mark.integration
-def test_standalone_collection_global_origin(tmp_path, monkeypatch):
-    source = tmp_path / "sample_decon_deskewed.ome.zarr"
-    origin = (-40.5, 20.25, -11.75)
-    collection = create_position_collection(
-        source,
-        (2, 1, 1, 3, 5, 7),
-        (0.23, 0.115, 0.119),
-        stage_positions=[origin],
-        spatial_offset_um=origin,
-        channels=["488nm"],
-        time_interval_s=2.5,
-    )
-    collection.arrays[0].write(np.ones((2, 1, 3, 5, 7), dtype=np.uint16)).result()
-    monkeypatch.setattr(
-        export_rois, "select_rois", lambda source, shape: [(1, 4, 2, 6)]
-    )
-    result = CliRunner().invoke(export_rois.app, [str(tmp_path)])
-    assert result.exit_code == 0, result.exception
-    with tifffile.TiffFile(tmp_path / "roi_exports" / "sample_roi_001.ome.tiff") as tif:
-        ome = from_xml(tif.ome_metadata, validate=True)
-        image = ome.images[0]
-        assert image.stage_label.z == origin[0]
-        assert image.stage_label.y == pytest.approx(origin[1] + 0.115)
-        assert image.stage_label.x == pytest.approx(origin[2] + 2 * 0.119)
-        assert image.pixels.channels[0].name == "488nm"
-        assert image.pixels.time_increment == 2.5
-        assert "SourceOME" in ome.structured_annotations.map_annotations[-1].value
-
-
-@pytest.mark.integration
-def test_multi_position_requires_fusion(tmp_path, monkeypatch):
-    source = tmp_path / "sample_deskewed.ome.zarr"
-    create_position_collection(source, (2, 2, 1, 3, 5, 7), (0.23, 0.115, 0.115))
-
-    def unexpected_viewer(*args):
-        pytest.fail(
-            "A multi-position collection must be rejected before opening napari"
+            state = ProcessingState.read(directory / "sample.processing.json")
+            tiles = directory / "sample_deskewed.ome.zarr"
+            assert len(state.completed_channels(tiles)) == 2 * 2 * case.positions
+            if case.positions > 1:
+                assert state.registration(tiles)["pairwise_metrics"]
+            target = directory / f"sample_roi_{index:03d}.ome.tiff"
+            assert target.is_file() == tiff
+            if tiff:
+                with tifffile.TiffFile(target) as tif:
+                    np.testing.assert_array_equal(
+                        tif.asarray().reshape(data.shape), data
+                    )
+                    assert tif.is_ome and tif.is_bigtiff
+                    assert (
+                        tif.pages[0].compression == tifffile.COMPRESSION.ADOBE_DEFLATE
+                    )
+                    ome = from_xml(tif.ome_metadata, validate=True).images[0]
+                    assert (
+                        ome.pixels.time_increment
+                        == case.dataset.metadata.volume_interval_s
+                    )
+                    assert (
+                        ome.stage_label.z,
+                        ome.stage_label.y,
+                        ome.stage_label.x,
+                    ) == pytest.approx(origin[-3:])
+    manifest = json.loads(
+        (case.preview.parent / "roi_exports" / "selections.json").read_text(
+            encoding="utf-8"
         )
-
-    monkeypatch.setattr(export_rois, "select_rois", unexpected_viewer)
-    result = CliRunner().invoke(export_rois.app, [str(tmp_path)])
-    assert isinstance(result.exception, ValueError)
-    assert "has 2 positions" in str(result.exception)
+    )
+    assert len(manifest["rois"]) == 2
 
 
 @pytest.mark.unit
+def test_missing_preview_explains_creation(tmp_path):
+    """Missing previews fail before GUI creation with a complete CLI command."""
+    with pytest.raises(ValueError, match=r"uv run process .*--no-deconvolve"):
+        export_rois.resolve_roi_source(tmp_path)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "mosaic_acquisition", [("mirror", 0.4), ("stage", 1.2)], indirect=True
+)
+def test_roi_maps_extended_specimen_to_raw_tiles(mosaic_acquisition, monkeypatch):
+    """Keep the oblique preimage and measure fresh links across a real tile seam."""
+    from opm_processing.dataio.position_collection import open_position_collection
+    from opm_processing.imageprocessing.tilefusion import TileFusion
+    from opm_processing.process import process_skewed
+
+    case = mosaic_acquisition
+    process_skewed(
+        case.dataset.path,
+        acquisition=case.dataset.metadata,
+        max_projection=True,
+        create_fused_max_projection=True,
+        save_float32=True,
+        z_downsample_level=1,
+    )
+    preview = case.dataset.path.parent / "mosaic_max_z_fused.ome.zarr"
+    projection = open_image_array(preview).read().result()[0, 0, 0]
+    cy = int(np.argmax(projection.max(axis=1)))
+    offset = case.parameters["tile_offset_x_pixels"]
+    bounds = (cy - 16, cy + 16, offset - 8, case.parameters["camera_shape_yx"][1] + 8)
+    monkeypatch.setattr(export_rois, "select_rois", lambda source, shape: [bounds])
+    measurements = []
+    register = TileFusion.register_and_score
+
+    def measure(*args, **kwargs):
+        """Observe fresh local image measurements without changing their scores."""
+        result = register(*args, **kwargs)
+        measurements.append(result)
+        return result
+
+    monkeypatch.setattr(TileFusion, "register_and_score", staticmethod(measure))
+    result = CliRunner().invoke(export_rois.app, [str(preview), "--save-float32"])
+    assert result.exit_code == 0, result.exception
+    directory = preview.parent / "roi_exports" / "roi_001"
+    state = ProcessingState.read(directory / "mosaic.processing.json")
+    tiles = directory / "mosaic_deskewed.ome.zarr"
+    records = state.roi_series(tiles)
+    assert len(records) == 2
+    assert all(record["skewed_bounds_sx"][0] > 0 for record in records)
+    assert measurements and all(np.isfinite(score) for _, score in measurements)
+    # This sparse ROI may not meet the unchanged production SSIM gate. The
+    # interaction contract requires new local measurements, not forced links.
+    assert state.registration(tiles)["fused_path"] == "mosaic_fused.ome.zarr"
+    saved = open_position_collection(tiles)
+    assert all(np.any(array.read().result() > 0) for array in saved.arrays)
+    final = open_image_array(directory / "mosaic_fused.ome.zarr").read().result()
+    assert final.shape[-2:] == (bounds[1] - bounds[0], bounds[3] - bounds[2])
+    assert np.isfinite(final).all() and np.any(final > 0)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "roi_preview", [("mirror", 1, False), ("stage", 1, False)], indirect=True
+)
+def test_single_position_gui_keeps_time_and_global_coordinates(
+    roi_preview, napari_model, monkeypatch
+):
+    """Draw rectangles on plugin-loaded timelapse layers in stage space."""
+    import napari
+
+    viewer = napari_model
+    monkeypatch.setattr(napari, "Viewer", lambda: viewer)
+
+    def draw():
+        """Add a rectangle after inspecting the second acquired timepoint."""
+        viewer.dims.set_current_step(0, 1)
+        layer = viewer.layers[0]
+        np.testing.assert_allclose(layer.translate[-2:], roi_preview.origin[-2:])
+        vertices = np.asarray(((3, 2), (3, 10), (12, 10), (12, 2)))
+        viewer.layers.selection.active.add(vertices, shape_type="rectangle")
+        assert viewer.dims.current_step[0] == 1
+
+    monkeypatch.setattr(napari, "run", draw)
+    assert export_rois.select_rois(roi_preview.preview, (2, 2, 1, 32, 16)) == [
+        (3, 12, 2, 10)
+    ]
+
+
+@pytest.mark.integration
 @pytest.mark.parametrize("z_origin", [0.0, -2441.811])
-def test_draw_rois_on_thick_projection(monkeypatch, z_origin):
-    from pathlib import Path
+def test_draw_rois_on_thick_projection(
+    monkeypatch, z_origin, napari_model, fused_store_factory, simulated_camera
+):
+    """Draw level-zero rectangles on a physical full-depth maximum projection."""
     from types import SimpleNamespace
 
     import napari
-    from napari.components import ViewerModel
     from napari.utils._proxies import ReadOnlyWrapper
     from napari.utils.interactions import (
         mouse_move_callbacks,
@@ -175,18 +202,20 @@ def test_draw_rois_on_thick_projection(monkeypatch, z_origin):
         mouse_release_callbacks,
     )
 
-    viewer = ViewerModel()
-    data = np.zeros((2, 226, 32, 48), dtype=np.uint16)
-    image = viewer.add_image(
-        [data, data[:, ::2, ::4, ::4]],
-        multiscale=True,
-        scale=(1, 0.23, 0.115, 0.119),
-        translate=(0, z_origin, -5330.254, -91.32),
+    viewer = napari_model
+    observed = simulated_camera((226, 32, 48), step=0.23, geometry="cartesian").raw
+    data = np.stack((observed, observed))
+    source = fused_store_factory(
+        data[:, None],
+        spacing=(0.23, 0.115, 0.115),
+        origin=(z_origin, -5330.254, -91.32),
+        factors=(1, 2),
     )
     monkeypatch.setattr(napari, "Viewer", lambda: viewer)
-    monkeypatch.setattr(ViewerModel, "open", lambda *args, **kwargs: [image])
 
     def draw_rectangles():
+        """Deliver physical mouse events to the real rectangle-drawing callbacks."""
+        image = viewer.layers[0]
         rois = viewer.layers.selection.active
         rois.scale_factor = 0.001
         for time, level, corners in (
@@ -226,45 +255,15 @@ def test_draw_rois_on_thick_projection(monkeypatch, z_origin):
         assert rois._data_view._displayed.all()
 
     monkeypatch.setattr(napari, "run", draw_rectangles)
-    assert export_rois.select_rois(Path("sample_fused.ome.zarr"), data.shape) == [
+    assert export_rois.select_rois(source, data.shape) == [
         (3, 10, 4, 13),
         (12, 20, 20, 29),
     ]
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("source_xml", [True, False])
-def test_multiple_roi_exports(tmp_path, fused_export, monkeypatch):
-    crops = [(1, 8, 2, 10), (3, 9, 4, 12)]
-    monkeypatch.setattr(export_rois, "select_rois", lambda source, shape: crops)
-    result = CliRunner().invoke(export_rois.app, [str(tmp_path)])
-    assert result.exit_code == 0, result.exception
-    for i, (y0, y1, x0, x1) in enumerate(crops, 1):
-        target = tmp_path / "roi_exports" / f"sample_roi_{i:03d}.ome.tiff"
-        expected = fused_export.truth[:, :, :, y0:y1, x0:x1]
-        with tifffile.TiffFile(target) as tif:
-            np.testing.assert_array_equal(
-                tif.asarray().reshape(expected.shape), expected
-            )
-            assert tif.is_bigtiff and tif.is_ome
-            assert tif.pages[0].compression == tifffile.COMPRESSION.ADOBE_DEFLATE
-            image = from_xml(tif.ome_metadata, validate=True).images[0]
-            x = fused_export.origin[2] + x0 * fused_export.spacing[2]
-            y = fused_export.origin[1] + y0 * fused_export.spacing[1]
-            assert image.stage_label.x == pytest.approx(x)
-            assert image.stage_label.y == pytest.approx(y)
-            for plane in image.pixels.planes:
-                assert plane.position_x == pytest.approx(x)
-                assert plane.position_y == pytest.approx(y)
-                assert plane.position_z == pytest.approx(
-                    fused_export.origin[0] + plane.the_z * fused_export.spacing[0]
-                )
-    result = CliRunner().invoke(export_rois.app, [str(tmp_path)])
-    assert isinstance(result.exception, FileExistsError)
-
-
 @pytest.mark.unit
-def test_multiscale_transform_uses_level_zero():
+def test_multiscale_transform_uses_level_zero(napari_model):
+    """Map world coordinates to level zero independently of the displayed scale."""
     from napari.layers import Image
 
     layer = Image(
@@ -284,16 +283,17 @@ def test_multiscale_transform_uses_level_zero():
 
 @pytest.mark.unit
 @pytest.mark.parametrize("z_size", [5, 6])
-def test_thick_projection_preserves_time_and_multiscale_coordinates(z_size):
-    from napari.components import ViewerModel
-
+def test_thick_projection_preserves_time_and_multiscale_coordinates(
+    z_size, napari_model
+):
+    """Retain time selection and physical coordinates across projected scales."""
     rng = np.random.default_rng(42)
     data = rng.integers(0, 100, size=(2, z_size, 16, 24), dtype=np.uint16)
     data[0, 0, 1, 1] = 200
     data[0, -1, 2, 2] = 300
     data[1] += 1000
     pyramid = [data, data[:, ::2, ::2, ::2]]
-    viewer = ViewerModel()
+    viewer = napari_model
     layers = [
         viewer.add_image(
             [level + channel * 2000 for level in pyramid],
@@ -332,6 +332,7 @@ def test_thick_projection_preserves_time_and_multiscale_coordinates(z_size):
 
 @pytest.mark.unit
 def test_bounds_clip_and_reject_empty():
+    """Clip intersecting rectangles and reject selections outside the image."""
     assert export_rois.rectangle_bounds(
         np.array([[-2, -3], [-2, 8], [10, 8], [10, -3]]), (6, 7)
     ) == (0, 6, 0, 7)

@@ -4,3 +4,7 @@ ome = "ome"
 OT = "OT"
 Ba = "Ba"
 iy = "iy"
+
+[default.extend-identifiers]
+# NumPy's public array.flags attribute uses this spelling.
+writeable = "writeable"

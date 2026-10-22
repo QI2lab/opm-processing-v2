@@ -1,21 +1,30 @@
-# Simulation scripts
+# Deconvolution usage
 
-Repository simulations and figure generators live in `scripts/`. Run them as
-modules from the repository root so package imports resolve. Their opening
-docstrings describe inputs, calculations, and outputs. Generated data and figures
-belong in ignored `diagnostics/` directories.
+The example processes an OME-Zarr using its recorded acquisition calibration:
 
 ```bash
-uv run python -m scripts.opm_simulation --output diagnostics/meridian_sphere
-uv run --with matplotlib python -m scripts.plot_opm_simulation diagnostics/meridian_sphere/scan_0.2um
+uv run python scripts/deconvolve.py "/path/to/acquisition.ome.zarr" --output "/path/to/processed"
 ```
 
-| Workflow | Description |
-| --- | --- |
-| [Meridian sphere](../meridian_sphere_simulation.md) | Known fluorescent object, optical forward model, and camera sampling |
-| [Publication figure](../opm_publication_figure.md) | Acquisition and reconstruction panels at multiple scan spacings |
-| [Fixed-plane series](../fixed_plane_sampling_series.md) | Object passage through a stationary oblique plane |
+Its Python call is:
 
-Each workflow page records the physical assumptions and commands used for its
-figures. Experimental outcomes apply to those specified models and sampling;
-they do not establish performance for every specimen or optical mismatch.
+```python
+from pathlib import Path
+from opm_processing.process import process
+
+process(
+    root_path=Path("/path/to/acquisition.ome.zarr"),
+    deconvolve=True,
+    save_float32=True,
+    output=Path("/path/to/processed"),
+)
+```
+
+The pipeline selects each channel, timepoint and position using the stored axes.
+Camera calibration and scan geometry come from the OME-Zarr; missing read-noise
+calibration selects the no-read-noise model. Theoretical PSFs require recorded
+optical calibration and emission wavelengths. Measured PSFs can be supplied
+instead with `decon_psf_paths=[Path(...), ...]`, in channel order.
+
+See [deconvolution parameters and metadata](../methods/deconvolution.md) for the
+array API, units, required optical fields, illumination handling and FFT tiling.

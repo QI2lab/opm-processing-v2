@@ -22,17 +22,19 @@ acquisition and journal accessible to retain their metadata.
 `--metadata-only` repairs the XML encoding of existing exports without rewriting
 or recompressing pixels. See [export-ome-tiff](../reference/cli/export-ome-tiff.md).
 
-## ROI OME-BigTIFF crops
+## Reconstructed ROI exports
 
 ```bash
-uv run export-rois "/path/to/processed"
+uv run export-rois "/path/to/processed" --deconvolve --tiff
 ```
 
-Draw multiple XY rectangles in napari, then close the viewer to export each
-crop at full resolution, including all Z planes, channels, and timepoints.
-Supports fused volumes and unfused single-position timelapses. Outputs go to
-`roi_exports` beside the selected store and retain global crop coordinates.
-Follow the [ROI export guide](roi.md#export-rois-from-a-fused-volume-or-single-position-timelapse)
+Draw multiple XY rectangles on an existing deskewed maximum-Z preview in
+napari. Closing the viewer reconstructs their raw regions, retaining full Z,
+all channels, and all timepoints. Multi-position ROIs are locally registered
+and fused. `--deconvolve` enables RLGC; `--tiff` adds compressed OME-BigTIFF
+alongside the final OME-Zarr. Outputs go to numbered subdirectories under
+`roi_exports` and retain global coordinates.
+Follow the [ROI export guide](roi.md)
 or see the [command reference](../reference/cli/export-rois.md).
 
 ## Annotated projection TIFFs
@@ -87,10 +89,3 @@ Hardware encoding requires an NVENC-capable NVIDIA GPU and compatible driver.
 MP4s are lossy presentation copies. See
 [export-projections](../reference/cli/export-projections.md) and
 [encode-projections](../reference/cli/encode-projections.md) for options.
-
-## Raw timelapses
-
-[convert-timelapse](../reference/cli/convert-timelapse.md) exports the time series
-at selected raw positions and scan planes. Raw timelapse TIFFs retain camera
-counts; optional time-mean projections apply camera calibration. This command
-does not export a registered fused volume.

@@ -7,7 +7,9 @@ trajectory; pixel arrays are not opened until requested explicitly.
 
 from __future__ import annotations
 
+import codecs
 import json
+import math
 import re
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -65,6 +67,22 @@ class AcquisitionMetadata:
     acquired_plane_count: int | None = None
     plane_period_s: float | None = None
     timing_source: str | None = None
+    deconvolution: dict[str, Any] | None = None
+
+    def validate_processing_calibration(self) -> None:
+        """Reject missing or invalid recorded camera and scan calibration."""
+        required = ["pixel_size_um", "angle_deg", "camera_offset", "camera_conversion"]
+        if not self.is_2d:
+            required.append("scan_axis_step_um")
+        positive = {"pixel_size_um", "camera_conversion", "scan_axis_step_um"}
+        for name in required:
+            value = getattr(self, name)
+            if (
+                value is None
+                or not math.isfinite(value)
+                or (name in positive and value <= 0)
+            ):
+                raise ValueError(f"OME-Zarr has missing or invalid {name} calibration")
 
     def with_plane_period(self, plane_period_s: float | None) -> AcquisitionMetadata:
         """Supply an operator-confirmed hardware period for a legacy acquisition.
@@ -93,7 +111,9 @@ class AcquisitionMetadata:
             else self.acquired_plane_count
         )
         hardware_volume_interval(planes, plane_period_s)
-        if self.plane_period_s is not None and self.plane_period_s != plane_period_s:
+        if self.plane_period_s is not None and not math.isclose(
+            self.plane_period_s, plane_period_s, rel_tol=1e-9, abs_tol=1e-12
+        ):
             raise ValueError(
                 "Supplied hardware plane period contradicts acquisition metadata"
             )
@@ -103,7 +123,7 @@ class AcquisitionMetadata:
             plane_period_s=plane_period_s,
             timing_source=self.timing_source
             or (
-                "raw acquisition opm_v2.timing"
+                "recorded acquisition timing"
                 if self.plane_period_s is not None
                 else "operator-confirmed hardware plane period"
             ),
@@ -127,7 +147,7 @@ class AcquisitionMetadata:
                     "n_acquired_planes": self.acquired_plane_count,
                     "dt_plane_s": self.plane_period_s,
                     "dt_volume_s": interval,
-                    "source": self.timing_source or "raw acquisition opm_v2.timing",
+                    "source": self.timing_source or "recorded acquisition timing",
                 }
             }
         }
@@ -443,23 +463,6 @@ def _integer(value: Any, default: int = 0) -> int:
     return default if number is None else int(number)
 
 
-def _wavelength(name: str) -> float | None:
-    """Infer the emission wavelength from a named acquisition channel.
-
-    Parameters
-    ----------
-    name : str
-        Stored channel name used to infer an emission wavelength in nanometers.
-
-    Returns
-    -------
-    float | None
-        Emission wavelength in nanometers, or None when absent from the name.
-    """
-    match = re.search(r"(?<!\d)(\d+(?:\.\d+)?)\s*nm\b", name, re.IGNORECASE)
-    return float(match.group(1)) if match else None
-
-
 def _event_parts(frame: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
     """Return normalized event index and event metadata for both schemas.
 
@@ -496,60 +499,48 @@ def _initial_frame_metadata(path: Path, count: int) -> list[dict[str, Any]]:
     """
     if count < 1:
         return []
+    import tensorstore as ts
+
+    path = Path(path).resolve()
+    store = ts.KvStore.open({"driver": "file", "path": str(path.parent) + "/"}).result()
+    size = path.stat().st_size
+    offset = 0
+    utf8 = codecs.getincrementaldecoder("utf-8")()
     marker = '"frame_metadata"'
     decoder = json.JSONDecoder()
     buffer = ""
     cursor: int | None = None
     frames: list[dict[str, Any]] = []
-    with Path(path).open("r", encoding="utf-8") as stream:
-        while len(frames) < count:
-            if cursor is None:
-                marker_index = buffer.find(marker)
-                if marker_index >= 0:
-                    array_start = buffer.find("[", marker_index + len(marker))
-                    if array_start >= 0:
-                        cursor = array_start + 1
-            if cursor is not None:
-                while len(frames) < count:
-                    while cursor < len(buffer) and buffer[cursor] in " \t\r\n,":
-                        cursor += 1
-                    if cursor < len(buffer) and buffer[cursor] == "]":
-                        return frames
-                    try:
-                        value, end = decoder.raw_decode(buffer, cursor)
-                    except json.JSONDecodeError:
-                        break
-                    frames.append(value)
-                    cursor = end
-            chunk = stream.read(64 * 1024)
-            if not chunk:
-                if cursor is None:
-                    return []
-                if frames:
+    while len(frames) < count:
+        if cursor is None:
+            marker_index = buffer.find(marker)
+            if marker_index >= 0:
+                array_start = buffer.find("[", marker_index + len(marker))
+                if array_start >= 0:
+                    cursor = array_start + 1
+        if cursor is not None:
+            while len(frames) < count:
+                while cursor < len(buffer) and buffer[cursor] in " \t\r\n,":
+                    cursor += 1
+                if cursor < len(buffer) and buffer[cursor] == "]":
                     return frames
-                raise ValueError(f"Invalid frame_metadata array: {path}")
-            buffer += chunk
+                try:
+                    value, end = decoder.raw_decode(buffer, cursor)
+                except json.JSONDecodeError:
+                    break
+                frames.append(value)
+                cursor = end
+        if offset >= size:
+            if cursor is None:
+                return []
+            if frames:
+                return frames
+            raise ValueError(f"Invalid frame_metadata array: {path}")
+        end = min(offset + 64 * 1024, size)
+        chunk = store.read(path.name, byte_range=slice(offset, end)).result().value
+        offset = end
+        buffer += utf8.decode(chunk, final=offset == size)
     return frames
-
-
-def _array_layout(path: Path) -> tuple[tuple[int, ...], tuple[str, ...]]:
-    """Read the small Zarr-v3 array document without opening its parent group.
-
-    Parameters
-    ----------
-    path : Path
-        Zarr array directory whose zarr.json supplies shape and dimension names.
-
-    Returns
-    -------
-    tuple[tuple[int, ...], tuple[str, ...]]
-        Stored array shape and lowercase dimension names.
-    """
-    metadata_path = Path(path) / "zarr.json"
-    document = json.loads(metadata_path.read_text(encoding="utf-8"))
-    shape = tuple(int(value) for value in document["shape"])
-    names = tuple(str(value).lower() for value in document["dimension_names"])
-    return shape, names
 
 
 def _first_by_channel(frames: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
@@ -615,11 +606,16 @@ def _channel_metadata(
                 exposure = _number(configured_exposures[channel_index])
         powers = configured_powers or daq.get("laser_powers", [])
         power = _number(powers[channel_index]) if channel_index < len(powers) else None
+        wavelength_match = re.search(
+            r"(?<!\d)(\d+(?:\.\d+)?)\s*nm\b", name, re.IGNORECASE
+        )
         channels.append(
             ChannelMetadata(
                 index=channel_index,
                 name=name,
-                wavelength_nm=_wavelength(name),
+                wavelength_nm=float(wavelength_match.group(1))
+                if wavelength_match
+                else None,
                 exposure_ms=exposure,
                 laser_power=power,
             )
@@ -735,6 +731,68 @@ def _sidecars(path: Path) -> tuple[str, ...]:
     )
 
 
+def _camera_timing(
+    frame_sets: list[list[dict[str, Any]]],
+    channel_count: int,
+) -> tuple[float | None, str | None]:
+    """Read hardware scan cadence from camera exposures rounded to 0.01 ms.
+
+    Parameters
+    ----------
+    frame_sets : list[list[dict[str, Any]]]
+        Leading records for each position, containing actual camera
+        ``exposure_time`` in seconds or legacy ``exposure_ms`` in milliseconds.
+        Requested event settings and frame arrival timestamps are not used.
+    channel_count : int
+        Stored camera channels acquired at each scan position. Simultaneously
+        illuminated wavelengths recorded in one image count as one channel.
+
+    Returns
+    -------
+    period_s : float or None
+        Sum of rounded hardware exposures across acquired channels, in seconds.
+        None means that hardware exposure metadata is incomplete.
+    source : str or None
+        Hardware exposure fields used to calculate the period.
+
+    Raises
+    ------
+    ValueError
+        Recorded exposures are invalid or change across frames or positions.
+    """
+    exposures = {}
+    sources = set()
+    for frames in frame_sets:
+        present = set()
+        for frame in frames:
+            field = "exposure_time" if "exposure_time" in frame else "exposure_ms"
+            if frame.get(field) is None:
+                continue
+            value = _number(frame[field])
+            if value is None or not math.isfinite(value) or value <= 0:
+                raise ValueError(f"Invalid camera exposure: {field}={frame[field]!r}")
+            milliseconds = round(value * (1000 if field == "exposure_time" else 1), 2)
+            if milliseconds <= 0:
+                raise ValueError("Camera exposure rounds to zero at 0.01 ms precision")
+            index, _ = _event_parts(frame)
+            channel = _integer(index.get("c"))
+            if channel in exposures and exposures[channel] != milliseconds:
+                raise ValueError(
+                    "Recorded hardware exposures change across frames or positions"
+                )
+            exposures[channel] = milliseconds
+            present.add(channel)
+            sources.add(field)
+        if present != set(range(channel_count)):
+            return None, None
+    if not exposures:
+        return None, None
+    return (
+        math.fsum(exposures.values()) / 1000,
+        f"recorded camera {'/'.join(sorted(sources))}; rounded to 0.01 ms",
+    )
+
+
 def _inspect_ome_zarr(path: Path, root: ZarrGroup) -> AcquisitionMetadata:
     """Normalize the current OPM OME-Zarr layout without parsing every journal.
 
@@ -773,14 +831,23 @@ def _inspect_ome_zarr(path: Path, root: ZarrGroup) -> AcquisitionMetadata:
     dimension_names: tuple[str, ...] = ()
     for series_name in series_names:
         relative_path = f"{series_name}/{dataset_path}" if series_name else dataset_path
-        current_shape, current_names = _array_layout(path / relative_path)
+        array_metadata = root[relative_path].metadata
+        current_shape = tuple(array_metadata.shape)
+        current_names = tuple(
+            str(name).lower()
+            for name in (getattr(array_metadata, "dimension_names", None) or ())
+        )
         array_paths.append(relative_path)
         array_shapes.append(current_shape)
         if current_names:
             dimension_names = current_names
 
     if not dimension_names:
-        dimension_names = tuple("tczyx"[-len(array_shapes[0]) :])
+        dimension_names = tuple(
+            axis.name for axis in image_metadata.multiscales[0].axes
+        )
+    if dimension_names not in (("t", "c", "z", "y", "x"), ("t", "c", "y", "x")):
+        raise ValueError(f"Unsupported acquisition axis order: {dimension_names!r}")
     axes = (dimension_names[0], "p", *dimension_names[1:])
     shape = (array_shapes[0][0], len(series_names), *array_shapes[0][1:])
 
@@ -794,7 +861,22 @@ def _inspect_ome_zarr(path: Path, root: ZarrGroup) -> AcquisitionMetadata:
     axes_model = [axis.name for axis in multiscale.axes]
     scale = multiscale.datasets[0].scale_transform.scale
     if "x" in axes_model:
-        pixel_size_um = _number(scale[axes_model.index("x")])
+        index = axes_model.index("x")
+        unit = multiscale.axes[index].unit
+        units_to_um = {"micrometer": 1.0, "nanometer": 0.001, "millimeter": 1000.0}
+        if unit is not None:
+            if unit not in units_to_um:
+                raise ValueError(f"Unsupported camera pixel unit: {unit!r}")
+            pixel_size_um = float(scale[index]) * units_to_um[unit]
+            y_index = axes_model.index("y")
+            y_unit = multiscale.axes[y_index].unit
+            if y_unit not in units_to_um:
+                raise ValueError(f"Unsupported camera Y pixel unit: {y_unit!r}")
+            y_size_um = float(scale[y_index]) * units_to_um[y_unit]
+            if not abs(pixel_size_um - y_size_um) <= 1e-9 * abs(pixel_size_um):
+                raise ValueError(
+                    "OPM processing requires equal recorded camera X/Y pixel pitches"
+                )
 
     channel_count = shape[axes.index("c")]
     scan_position_count = shape[axes.index("z")] if "z" in axes else 1
@@ -888,6 +970,13 @@ def _inspect_ome_zarr(path: Path, root: ZarrGroup) -> AcquisitionMetadata:
         if key.endswith("_orientation")
     )
     mode = str(daq.get("mode") or config.get("opm_mode") or "unknown")
+    deconvolution = dict(attributes.get("opm_processing", {}).get("deconvolution", {}))
+    if "read_noise" not in deconvolution:
+        for key, units in (("read_noise_e", "electrons"), ("read_noise_adu", "ADU")):
+            if key in camera:
+                deconvolution["read_noise"] = {"rms": camera[key], "units": units}
+                break
+    plane_period_s, timing_source = _camera_timing(frame_sets, channel_count)
     return AcquisitionMetadata(
         path=path,
         storage_format="opm-v2-ome-zarr-v3",
@@ -906,6 +995,7 @@ def _inspect_ome_zarr(path: Path, root: ZarrGroup) -> AcquisitionMetadata:
         angle_deg=_number(opm_frame.get("angle_deg")),
         camera_offset=_number(camera.get("offset")),
         camera_conversion=_number(camera.get("e_to_ADU")),
+        deconvolution=deconvolution,
         excess_scan_positions=_integer(opm_frame.get("excess_scan_positions")),
         excess_scan_start_positions=_integer(
             opm_frame.get("excess_scan_start_positions")
@@ -913,9 +1003,11 @@ def _inspect_ome_zarr(path: Path, root: ZarrGroup) -> AcquisitionMetadata:
         excess_scan_end_positions=_integer(opm_frame.get("excess_scan_end_positions")),
         orientations=orientations,
         sidecar_paths=_sidecars(path),
-        acquired_plane_count=opm.get("timing", {}).get("n_acquired_planes"),
-        plane_period_s=opm.get("timing", {}).get("dt_plane_s"),
-        timing_source=opm.get("timing", {}).get("source"),
+        acquired_plane_count=scan_position_count
+        if plane_period_s is not None
+        else None,
+        plane_period_s=plane_period_s,
+        timing_source=timing_source,
     )
 
 
@@ -964,19 +1056,8 @@ def open_acquisition_datastore(
         if isinstance(acquisition, AcquisitionMetadata)
         else inspect_acquisition(acquisition)
     )
-    arrays = []
-    for array_path in metadata.array_paths:
-        arrays.append(
-            ts.open(
-                {
-                    "driver": "zarr3",
-                    "kvstore": {
-                        "driver": "file",
-                        "path": str(metadata.path / array_path),
-                    },
-                }
-            ).result()
-        )
+    root = yaozarrs.open_group(metadata.path)
+    arrays = [root[array_path].to_tensorstore() for array_path in metadata.array_paths]
     return ts.stack(arrays, axis=1)
 
 

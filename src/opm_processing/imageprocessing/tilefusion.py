@@ -9,7 +9,7 @@ Pipeline summary
 1) For each timepoint independently, register overlapping tile pairs using
    phase cross-correlation + SSIM scoring.
 2) For each timepoint independently, solve a robust global least-squares system
-   (two-round iterative outlier rejection) with tile 0 anchored to zero offset.
+   (two-round iterative outlier rejection) with one anchor per connected component.
 3) Build a *global* fused coordinate space spanning all timepoints.
 4) Fuse each timepoint into the shared global space using weighted accumulation.
 5) Build and stream NGFF multiscales through yaozarrs.
@@ -27,6 +27,7 @@ import gc
 import itertools
 import json
 import math
+import warnings
 from collections import deque
 from concurrent.futures import (
     FIRST_COMPLETED,
@@ -68,7 +69,7 @@ from opm_processing.imageprocessing.coordinates import (
 from opm_processing.imageprocessing.opmtools import orthogonal_deskew
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterable, Sequence
 
     from opm_processing.dataio.roi import PhysicalRoi
 
@@ -102,6 +103,9 @@ try:
     from cucim.skimage.registration import (
         phase_cross_correlation as _pcc,  # type: ignore
     )
+    from cucim.skimage.registration._masked_phase_cross_correlation import (
+        cross_correlate_masked as masked_cross_correlation,
+    )
     from cupyx.scipy.ndimage import minimum_filter as _minimum_filter  # type: ignore
     from cupyx.scipy.ndimage import shift as _shift  # type: ignore
     from cupyx.scipy.ndimage import sobel as _sobel  # type: ignore
@@ -126,6 +130,9 @@ except Exception as error:
     from skimage.measure import block_reduce as _br  # type: ignore
     from skimage.metrics import structural_similarity as _cpu_ssim  # type: ignore
     from skimage.registration import phase_cross_correlation as _pcc  # type: ignore
+    from skimage.registration._masked_phase_cross_correlation import (
+        cross_correlate_masked as masked_cross_correlation,
+    )
 
     match_histograms = _mh
     block_reduce = _br
@@ -406,8 +413,18 @@ def _registration_similarity(
 
     Parameters
     ----------
-    candidate : Any
-        Candidate ZYX registration correction in pixels.
+    arr1 : array-like
+        Reference intensity patch.
+    arr2 : array-like
+        Moving intensity patch on the same grid.
+    candidate : sequence of float
+        Candidate displacement in patch pixels.
+    win_size : int
+        Requested odd SSIM window width.
+    masks : tuple of array-like or None
+        Reference and moving interpolation-support masks.
+    registration_axis : int or None
+        Axis used to identify directional registration geometry.
 
     Returns
     -------
@@ -475,6 +492,21 @@ def _registration_similarity(
                     win_size=window,
                     valid_mask=count > 0,
                 )
+            valid_mask = count > 0
+            effective_window = window
+        # A cropped oblique footprint can have a large bounding box but no
+        # complete SSIM window of that size. Retain the same score and gate,
+        # using the largest odd window supported by actual acquired samples.
+        while (
+            not math.isfinite(score) and valid_mask is not None and effective_window > 3
+        ):
+            effective_window -= 2
+            score = _ssim(
+                fixed_view,
+                moving_view,
+                win_size=effective_window,
+                valid_mask=valid_mask,
+            )
         return score
     except ValueError:
         return -math.inf
@@ -535,6 +567,63 @@ def _bounded_phase_correlation_peak(
     )
 
 
+def _masked_registration_peak(
+    fixed: Any,
+    moving: Any,
+    masks: tuple[Any, Any],
+    max_shift: Sequence[float] | None,
+) -> Any:
+    """Find the nonperiodic normalized-correlation peak within physical limits.
+
+    The masks describe acquisition support. Padfield normalization subtracts
+    means and computes variance on each translation's common supported samples.
+    Search the allowed lags rather than discard an out-of-range global maximum.
+
+    Parameters
+    ----------
+    fixed : array-like
+        Reference intensity patch.
+    moving : array-like
+        Moving patch on the same grid.
+    masks : tuple of array-like
+        Reference and moving support masks.
+    max_shift : sequence of float or None
+        Maximum permitted correction on each patch axis.
+
+    Returns
+    -------
+    array-like or None
+        Nonperiodic displacement, or None when no informative peak exists.
+    """
+    correlation = masked_cross_correlation(
+        fixed,
+        moving,
+        *masks,
+        mode="full",
+        axes=tuple(range(fixed.ndim)),
+        overlap_ratio=0.5,
+    )
+    center = np.asarray(moving.shape) - 1
+    extent = (
+        center
+        if max_shift is None
+        else np.minimum(center, np.floor(max_shift).astype(int))
+    )
+    start = center - extent
+    slices = tuple(
+        slice(int(lo), int(hi + 1))
+        for lo, hi in zip(start, center + extent, strict=True)
+    )
+    allowed = correlation[slices]
+    peak = xp.max(allowed)
+    if not bool(xp.isfinite(peak)) or float(peak) <= 0:
+        return None
+    maxima = xp.stack(xp.nonzero(allowed == peak), axis=1)
+    return xp.mean(maxima, axis=0).astype(xp.float32) - xp.asarray(
+        extent, dtype=xp.float32
+    )
+
+
 def _refine_depth_candidate(
     fixed: Any,
     moving: Any,
@@ -546,25 +635,51 @@ def _refine_depth_candidate(
 ) -> tuple[Any, float]:
     """Search contextual depth samples at the measured lateral displacement.
 
-    Pearson correlation measures specimen agreement on common geometric support
-    for each integer Z correction. Cropping both inputs to the nominal thin
-    intersection before this search would remove the feature samples needed to
-    measure a correction. SSIM independently gates the selected match.
+    Pearson correlation of axial differences measures Z-varying specimen
+    agreement, excluding shared XY background that cannot constrain depth.
+    Adjacent samples must both have full geometric support. SSIM independently
+    gates the selected match on the original intensities.
+
+    Parameters
+    ----------
+    fixed : array-like
+        Reference volume with depth context.
+    moving : array-like
+        Moving volume with depth context.
+    masks : tuple of array-like
+        Reference and moving interpolation support.
+    nominal_z : int
+        Nominal depth displacement in pixels.
+    lateral_shift : sequence of float
+        Measured lateral displacement in pixels.
+    z_limit : int
+        Maximum depth search correction.
+    win_size : int
+        Requested SSIM window width.
+
+    Returns
+    -------
+    tuple[array-like, float]
+        Selected ZYX shift and its structural similarity.
     """
     lateral = tuple(round(value) for value in lateral_shift)
     best = None
     best_score = -math.inf
+    fixed_axial = xp.diff(fixed, axis=0)
+    moving_axial = xp.diff(moving, axis=0)
+    axial_masks = tuple((mask[:-1] > 0.999) & (mask[1:] > 0.999) for mask in masks)
     # Measure a small guard band as well: a peak beyond the requested limit
     # must be rejected by the caller rather than clamped onto the limit.
     for correction in range(-z_limit - 2, z_limit + 3):
         shift = (nominal_z + correction, *lateral)
         try:
-            a, b = _aligned_registration_views(fixed, moving, shift)
-            ma, mb = _aligned_registration_views(*masks, shift)
+            a, b = _aligned_registration_views(fixed_axial, moving_axial, shift)
+            ma, mb = _aligned_registration_views(*axial_masks, shift)
         except ValueError:
             continue
-        common = (ma > 0.999) & (mb > 0.999)
-        if int(xp.count_nonzero(xp.any(common, axis=(1, 2)))) < 3:
+        common = ma & mb
+        # Two supported adjacent differences require three original planes.
+        if int(xp.count_nonzero(xp.any(common, axis=(1, 2)))) < 2:
             continue
         a, b = a[common], b[common]
         if a.size < 3:
@@ -577,8 +692,8 @@ def _refine_depth_candidate(
         correlation = float(xp.sum(a * b) / denominator)
         if correlation > best_score:
             best_score, best = correlation, shift
-    # Smooth unrelated fields can have high SSIM simply because most samples
-    # are background. Require positive specimen contrast agreement as well.
+    # High intensity SSIM or a shared XY illumination pattern does not provide
+    # evidence for axial alignment. Require agreement of Z-varying features.
     if best is None or best_score < 0.3:
         return xp.asarray((nominal_z, *lateral_shift)), -math.inf
     # Preserve the fractional lateral measurement when checking similarity.
@@ -632,23 +747,6 @@ class _RegistrationDeviceBuffers:
         view = buffer[:required].reshape(contiguous.shape)
         view.set(contiguous)
         return view
-
-    def stage(self, fixed: np.ndarray, moving: np.ndarray) -> tuple[Any, Any]:
-        """Copy a host pair into reusable device allocations.
-
-        Parameters
-        ----------
-        fixed : np.ndarray
-            Reference overlap patch used for pairwise registration.
-        moving : np.ndarray
-            Neighbor overlap patch to align with the reference.
-
-        Returns
-        -------
-        tuple
-            Reusable device arrays populated with the fixed and moving overlap patches.
-        """
-        return self._stage_one(0, fixed), self._stage_one(1, moving)
 
 
 @njit(nogil=True)
@@ -830,33 +928,13 @@ def _partition_fusion_block(
         Spatial sub-blocks paired with the tiles contributing to each sub-block.
     """
     z0, z1, y0, y1, x0, x1 = bounds
-    common_shape = (
-        tuple(int(value) for value in tile_shapes)
-        if len(tile_shapes) == 3
-        and all(isinstance(value, (int, np.integer)) for value in tile_shapes)
-        else None
-    )
-
-    def shape_for(tile_index: int) -> tuple[int, int, int]:
-        """Read the source spatial dimensions for one contributing tile.
-
-        Parameters
-        ----------
-        tile_index : int
-            Index into the selected processed tile collection.
-
-        Returns
-        -------
-        tuple[int, int, int]
-            Tile dimensions in ZYX order.
-        """
-        if common_shape is not None:
-            return common_shape
-        return tuple(int(value) for value in tile_shapes[tile_index])
+    shapes = _registration_tile_shapes(
+        tile_shapes, max((index for index, _ in contributors), default=-1) + 1
+    ).astype(np.int64)
 
     cuts = [{z0, z1}, {y0, y1}, {x0, x1}]
     for tile_index, (oz, oy, ox) in contributors:
-        tile_z, tile_y, tile_x = shape_for(tile_index)
+        tile_z, tile_y, tile_x = shapes[tile_index]
         for axis_cuts, lo, hi, tile_lo, tile_length in (
             (cuts[0], z0, z1, oz, tile_z),
             (cuts[1], y0, y1, oy, tile_y),
@@ -879,11 +957,11 @@ def _partition_fusion_block(
                     (p, offset)
                     for p, offset in contributors
                     if offset[0] <= rz0
-                    and offset[0] + shape_for(p)[0] >= rz1
+                    and offset[0] + shapes[p][0] >= rz1
                     and offset[1] <= ry0
-                    and offset[1] + shape_for(p)[1] >= ry1
+                    and offset[1] + shapes[p][1] >= ry1
                     and offset[2] <= rx0
-                    and offset[2] + shape_for(p)[2] >= rx1
+                    and offset[2] + shapes[p][2] >= rx1
                 ]
                 if not region_contributors:
                     continue
@@ -928,6 +1006,46 @@ def _registration_tile_shapes(
     return shapes
 
 
+def _connected_tile_components(
+    tile_indices: Sequence[int], pairs: Iterable[tuple[int, int]]
+) -> list[list[int]]:
+    """Group tile indices by accepted links, including isolated tiles.
+
+    Parameters
+    ----------
+    tile_indices : sequence of int
+        Tile indices belonging to one graph or timepoint.
+    pairs : iterable of tuple[int, int]
+        Undirected links. Links outside the selected indices are ignored.
+
+    Returns
+    -------
+    list of list of int
+        Components in first-tile order, each with its first tile as anchor.
+    """
+    adjacency = {index: set() for index in tile_indices}
+    for left, right in pairs:
+        if left in adjacency and right in adjacency:
+            adjacency[left].add(right)
+            adjacency[right].add(left)
+    components = []
+    visited = set()
+    for start in adjacency:
+        if start in visited:
+            continue
+        component = []
+        frontier = [start]
+        visited.add(start)
+        while frontier:
+            current = frontier.pop()
+            component.append(current)
+            unseen = adjacency[current] - visited
+            visited.update(unseen)
+            frontier.extend(unseen)
+        components.append(component)
+    return components
+
+
 def _select_nearest_registration_pairs(
     positions_zyx: Sequence[Sequence[float]],
     tile_shape_zyx: Sequence[int] | Sequence[Sequence[int]],
@@ -964,84 +1082,24 @@ def _select_nearest_registration_pairs(
     tile_shapes = _registration_tile_shapes(tile_shape_zyx, len(positions))
 
     physical_shapes = tile_shapes * pixel_size
-    edges: list[tuple[float, int, int]] = []
-    for i in range(len(positions)):
-        for j in range(i + 1, len(positions)):
-            delta = positions[j] - positions[i]
-            overlap = np.logical_and(
-                positions[i] < positions[j] + physical_shapes[j],
-                positions[j] < positions[i] + physical_shapes[i],
-            )
-            if is_2d:
-                overlap[0] = True
-                delta = delta.copy()
-                delta[0] = 0.0
-            if np.all(overlap):
-                pair_scale = np.maximum(physical_shapes[i], physical_shapes[j])
-                distance = float(np.linalg.norm(delta / pair_scale))
-                edges.append((distance, i, j))
-
-    if not edges:
-        return []
-
-    parent = list(range(len(positions)))
-
-    def find(index: int) -> int:
-        """Find a tile component representative with path compression.
-
-        Parameters
-        ----------
-        index : int
-            Tile or registration-link index used by this calculation.
-
-        Returns
-        -------
-        int
-            Representative tile index of the connected component.
-        """
-        while parent[index] != index:
-            parent[index] = parent[parent[index]]
-            index = parent[index]
-        return index
-
-    def union(left: int, right: int) -> bool:
-        """Merge the connected components containing two tiles.
-
-        Parameters
-        ----------
-        left : int
-            First tile index whose connected component is merged.
-        right : int
-            Second tile index whose connected component is merged.
-
-        Returns
-        -------
-        bool
-            Updates the component parents in place.
-        """
-        left_root = find(left)
-        right_root = find(right)
-        if left_root == right_root:
-            return False
-        parent[right_root] = left_root
-        return True
-
-    for _, i, j in edges:
-        union(i, j)
-    component_by_node = [find(index) for index in range(len(positions))]
-
     edges_by_component: dict[int, list[tuple[float, int, int]]] = {}
-    nodes_by_component: dict[int, set[int]] = {}
-    for edge in edges:
-        _, i, j = edge
-        component = component_by_node[i]
-        edges_by_component.setdefault(component, []).append(edge)
-        nodes_by_component.setdefault(component, set()).update((i, j))
+    pairs = _select_registration_pairs(positions, tile_shapes, pixel_size, is_2d=is_2d)
+    components = _connected_tile_components(range(len(positions)), pairs)
+    component_by_node = {
+        node: index for index, component in enumerate(components) for node in component
+    }
+    for i, j in pairs:
+        delta = positions[j] - positions[i]
+        if is_2d:
+            delta[0] = 0.0
+        pair_scale = np.maximum(physical_shapes[i], physical_shapes[j])
+        distance = float(np.linalg.norm(delta / pair_scale))
+        edges_by_component.setdefault(component_by_node[i], []).append((distance, i, j))
 
     selected: list[tuple[int, int]] = []
     for component, component_edges in edges_by_component.items():
         component_edges.sort()
-        component_nodes = nodes_by_component[component]
+        component_nodes = components[component]
         local_parent = {node: node for node in component_nodes}
 
         def local_find(index: int) -> int:
@@ -1121,22 +1179,10 @@ def _fit_depth_gains(
         }
         for (left, right), values in grouped.items()
     ]
-    adjacency = [set() for _ in range(level_count)]
-    for left, right in grouped:
-        adjacency[left].add(right)
-        adjacency[right].add(left)
-    anchors = []
-    visited = set()
-    for level in range(level_count):
-        if level in visited:
-            continue
-        anchors.append(level)
-        frontier = [level]
-        visited.add(level)
-        while frontier:
-            unseen = adjacency[frontier.pop()] - visited
-            visited.update(unseen)
-            frontier.extend(unseen)
+    anchors = [
+        component[0]
+        for component in _connected_tile_components(range(level_count), grouped)
+    ]
     shifts = TileFusion._solve_global(links, level_count, anchors)
     return np.exp(shifts[:, 0])
 
@@ -1345,54 +1391,11 @@ def _select_registration_pairs(
 
 
 class TileFusion:
-    """
-    Register and fuse multi-tile OPM acquisitions into a global OME-NGFF Zarr v3 store.
+    """Register and fuse processed OPM tiles onto a common physical ZYX grid.
 
-    This implementation:
-    - registers tiles independently per timepoint,
-    - performs robust global shift optimization per timepoint (tile 0 anchored),
-    - builds a global fused coordinate system spanning all timepoints,
-    - fuses each timepoint into that common coordinate system,
-    - writes a Zarr v3 OME-NGFF (t, c, z, y, x) store including multiscales.
-
-    Parameters
-    ----------
-    root_path : str or pathlib.Path
-        Source acquisition, processed collection, or processing output
-        directory. The code discovers deskewed or projection data there;
-        deconvolved products are fallbacks when a non-deconvolved product is
-        unavailable.
-    blend_pixels : tuple[int, int, int], default=(20, 600, 400)
-        Feather ramp widths (bz, by, bx) used to build 1D weight profiles.
-    downsample_factors : tuple[int, int, int], default=(3, 5, 5)
-        Block-reduce factors (z, y, x) for registration patches.
-    ssim_window : int, default=15
-        SSIM window size for registration scoring.
-    threshold : float, default=0.7
-        Minimum SSIM score for accepting a pairwise link. Use 0.0 to accept all.
-    multiscale_factors : sequence[int], default=(2, 4, 8, 16, 32)
-        Downsampling factors for creating multiscale pyramid levels.
-    resolution_multiples : sequence[int | sequence[int]], default=((1,1,1), ..., (32,32,32))
-        Spatial scale multipliers recorded into NGFF metadata for each pyramid level.
-    max_workers : int or None, default=None
-        Maximum number of fusion blocks rendered concurrently. By default,
-        uses up to eight physical CPU cores so blocks can retain enough Z depth
-        for efficient source-chunk reads.
-    debug : bool, default=False
-        If True, emits debug logs.
-    channel_to_use : int, default=0
-        Channel index used for registration.
-    reverse_stage_y : bool, default=True
-        Reverse stage-derived Y for tile placement without flipping tile pixels.
-    reverse_stage_z : bool or None, default=None
-        Reverse physical stage Z into laboratory Z for tile placement. ``None``
-        applies the transform unless processed coordinates were already flipped.
-    multiscale_downsample : {"stride", "block_mean"}, default="stride"
-        Method for multiscale downsampling.
-    fusion_ram_fraction : float, default=0.4
-        Fraction of currently available host RAM available to fusion buffers.
-    max_in_flight_writes : int, default=2
-        Maximum number of TensorStore writes retained before applying backpressure.
+    Registration and robust global placement are solved independently for each
+    timepoint, with one fixed tile per connected component. Fusion writes a
+    shared TCZYX OME-NGFF volume and its multiscale pyramid.
     """
 
     def __init__(
@@ -1425,62 +1428,68 @@ class TileFusion:
         reverse_stage_z: bool | None = None,
         roi_selection: PhysicalRoi | None = None,
         normalize_depth_intensity: bool = True,
+        registration_retries: int = 2,
     ) -> None:
         """Initialize registration and fusion for a processed acquisition.
 
         Parameters
         ----------
-        root_path
-            Source acquisition, processed collection, or processing output
-            directory used to discover processed data.
-        blend_pixels
+        root_path : str or pathlib.Path
+            Source acquisition, processed collection, or output directory. Directory
+            discovery prefers deskewed volumes and deconvolved data; an explicit
+            processed-store path selects that store directly.
+        blend_pixels : tuple[int, int, int]
             Feathering width in ZYX voxels.
-        downsample_factors
+        downsample_factors : tuple[int, int, int]
             Registration downsampling factors in ZYX order.
-        ssim_window
+        ssim_window : int
             Structural-similarity window width.
-        threshold
+        threshold : float
             Minimum accepted pairwise registration score.
-        multiscale_factors
+        multiscale_factors : sequence of int
             Downsampling factors for pyramid levels.
-        resolution_multiples
+        resolution_multiples : sequence of int or sequence of int
             NGFF spatial scale multiples for pyramid levels.
-        max_workers
+        max_workers : int or None
             Maximum number of fusion blocks rendered concurrently.
-        debug
+        debug : bool
             Whether to emit diagnostic messages.
-        channel_to_use
+        channel_to_use : int
             Channel index used for registration.
-        multiscale_downsample
+        multiscale_downsample : str
             Pyramid downsampling method.
-        fusion_ram_fraction
+        fusion_ram_fraction : float
             Fraction of available host RAM allocated to fusion buffers.
-        max_in_flight_writes
+        max_in_flight_writes : int
             Maximum number of pending TensorStore writes.
-        chunk_shape_yx
+        chunk_shape_yx : tuple[int, int]
             Spatial output chunk shape.
-        optimization_rel_threshold
+        optimization_rel_threshold : float
             Relative residual threshold for registration outliers.
-        optimization_abs_threshold
+        optimization_abs_threshold : float
             Absolute residual threshold in effective registration sampling bins.
-        max_registration_shift_zyx
+        max_registration_shift_zyx : tuple[int, int, int] or None
             Maximum accepted registration correction in ZYX voxels. None
             infers a separate limit for each pair from stage spacing, tile
             overlap, voxel size, scan angle, and registration sampling.
-        reverse_stage_y
+        reverse_stage_y : bool
             Whether to reverse stage-derived image-Y placement. Tile pixel
             arrays are not modified.
-        reverse_stage_z
+        reverse_stage_z : bool or None
             Whether to convert physical stage Z into the opposite laboratory-Z
             placement coordinate. ``None`` detects whether processing already
             transformed the stored positions. Tile pixels and scan ordering are
             never modified.
-        roi_selection
+        roi_selection : PhysicalRoi or None
             Optional physical YX crop. Tile selection ignores Z so every stage-Z
             level intersecting the rectangle is retained.
-        normalize_depth_intensity
+        normalize_depth_intensity : bool
             Match depth-layer intensities using image-registered overlaps at
             the same stage XY. All XY tiles at one depth share the same gain.
+        registration_retries : int
+            Maximum automatic search expansions. Each expansion remeasures only
+            affected pairs and refits all global offsets. Explicit shift limits
+            are never expanded.
 
         Returns
         -------
@@ -1593,14 +1602,17 @@ class TileFusion:
                 for _ in range(collection_shape[0])
                 for position in collection.stage_positions_zxy
             ]
+            stage_origins = stage_positions_to_image_coordinates(
+                stage_positions,
+                reverse_y=self.reverse_stage_y,
+                reverse_z=self.reverse_stage_z,
+                opm_angle_deg=float(self.acquisition.angle_deg),
+            )
+            image_origins = np.tile(
+                np.asarray(collection.spatial_origins_zyx_um), (collection_shape[0], 1)
+            )
             self._tile_positions = [
-                tuple(position)
-                for position in stage_positions_to_image_coordinates(
-                    stage_positions,
-                    reverse_y=self.reverse_stage_y,
-                    reverse_z=self.reverse_stage_z,
-                    opm_angle_deg=float(self.acquisition.angle_deg),
-                )
+                tuple(position) for position in stage_origins + image_origins
             ]
             selected_positions: tuple[int, ...] = tuple(range(collection_shape[1]))
             if roi_selection is not None:
@@ -1692,6 +1704,10 @@ class TileFusion:
         self.optimization_rel_threshold = float(optimization_rel_threshold)
         self.optimization_abs_threshold = float(optimization_abs_threshold)
         self._automatic_registration_limits = max_registration_shift_zyx is None
+        if registration_retries < 0:
+            raise ValueError("registration_retries must be nonnegative")
+        self.registration_retries = int(registration_retries)
+        self._registration_retry_count = 0
         self._pair_registration_limits = {}
         self._is_2d = all(shape[0] == 1 for shape in self._tile_shapes)
         if self._automatic_registration_limits:
@@ -1733,8 +1749,13 @@ class TileFusion:
         self.max_registration_shift_zyx = tuple(
             int(value) for value in max_registration_shift_zyx
         )
+        self._initial_registration_shift_zyx = self.max_registration_shift_zyx
+        self._initial_pair_registration_limits = self._pair_registration_limits.copy()
         if self._variable_roi_tiles:
-            self._tile_support_zy = self._build_variable_roi_support_masks()
+            self._tile_support_zy = [
+                self._build_deskew_support_mask(record)
+                for record in self._roi_tile_records
+            ]
         else:
             self._deskew_support_zy = self._build_deskew_support_mask()
             self._tile_support_zy = [self._deskew_support_zy] * len(self._tile_shapes)
@@ -1744,7 +1765,6 @@ class TileFusion:
                 f"{int(self.channels) - 1}; got {self.channel_to_use}"
             )
 
-        self._update_profiles()
         self._tile_profiles = [
             (
                 self._make_1d_profile(shape[0], self._blend_pixels[0]),
@@ -1753,6 +1773,19 @@ class TileFusion:
             )
             for shape in self._tile_shapes
         ]
+        # Camera-X padding is absent detector support, not a dark measurement.
+        for index, (_z_profile, _y_profile, x_profile) in enumerate(
+            self._tile_profiles
+        ):
+            if self._variable_roi_tiles:
+                record = self._roi_tile_records[index]
+                valid_x = int(record["skewed_shape_syx"][2]) - int(
+                    record["deskew_crop_yx"][2]
+                )
+            else:
+                valid_x = int(self.acquisition.index_sizes["x"])
+            x_profile[max(0, valid_x) :] = 0
+        self.z_profile, self.y_profile, self.x_profile = self._tile_profiles[0]
         self._tile_channel_nonzero: dict[tuple[int, int], bool] = {}
         self._load_zero_channel_metadata()
 
@@ -1792,8 +1825,16 @@ class TileFusion:
         """
         self._debug = bool(flag)
 
-    def _build_deskew_support_mask(self) -> np.ndarray:
-        """Generate deskew interpolation coverage without reading image pixels.
+    def _build_deskew_support_mask(
+        self, roi_record: dict[str, Any] | None = None
+    ) -> np.ndarray:
+        """Generate full-tile or cropped-ROI coverage without reading image pixels.
+
+        Parameters
+        ----------
+        roi_record : dict[str, Any] or None
+            Recorded source dimensions and output crop bounds for one ROI tile.
+            None uses the full processed acquisition geometry.
 
         Returns
         -------
@@ -1801,7 +1842,7 @@ class TileFusion:
             Float32 ZY fractions of valid samples in each averaged Z bin.
             Zero denotes padding; one denotes complete interpolation coverage.
         """
-        if self._is_2d:
+        if self.acquisition.is_2d:
             # Projection processing does not deskew or pad its image plane.
             return np.ones((1, int(self.y_dim)), dtype=np.float32)
         raw_sizes = self.acquisition.index_sizes
@@ -1819,10 +1860,19 @@ class TileFusion:
         angle_deg = float(self.acquisition.angle_deg)
         scan_step_um = float(self.acquisition.scan_axis_step_um)
         raw_pixel_size_um = float(self.acquisition.pixel_size_um)
-        reconstruction = self.processing_state.run(self.data).get("reconstruction")
+        run = self.processing_state.run(self.data)
+        reconstruction = run.get("reconstruction")
         if reconstruction is not None:
             scan_count, raw_camera_y, _ = map(int, reconstruction["shape_syx"])
             scan_step_um = float(reconstruction["scan_axis_step_um"])
+        if roi_record is not None:
+            scan_count, raw_camera_y, _ = map(int, roi_record["skewed_shape_syx"])
+            scan_step_um = float(self.acquisition.scan_axis_step_um)
+            if "reconstruction_shape_syx" in roi_record:
+                scan_count, raw_camera_y, _ = map(
+                    int, roi_record["reconstruction_shape_syx"]
+                )
+                scan_step_um = float(reconstruction["scan_axis_step_um"])
         z_downsample = round(float(self._pixel_size[0]) / raw_pixel_size_um)
 
         support = orthogonal_deskew(
@@ -1834,70 +1884,28 @@ class TileFusion:
             theta=angle_deg,
             distance=scan_step_um,
             pixel_size=raw_pixel_size_um,
-            divisible_by=1,
+            divisible_by=1 if roi_record is None else 4,
             downsample_factor=z_downsample,
         )[..., 0]
+        configuration = run.get("configuration", {})
+        if roi_record is not None:
+            crop_y0, crop_y1 = map(int, roi_record["deskew_crop_yx"][:2])
+            support = support[:, crop_y0:crop_y1]
+        elif configuration.get("crop_after_deskew", False):
+            crop_y = int(np.ceil(raw_camera_y * np.cos(np.deg2rad(angle_deg))))
+            support = support[:, crop_y:-crop_y]
         full_response = 2048 * raw_pixel_size_um / scan_step_um
         support *= np.float32(z_downsample / full_response)
         np.rint(support, out=support)
         support /= np.float32(z_downsample)
+        if roi_record is not None:
+            return np.ascontiguousarray(support)
         padded_support = np.zeros(
             (int(self.z_dim), int(self.y_dim)),
             dtype=np.float32,
         )
         padded_support[:, : support.shape[1]] = support
         return padded_support
-
-    def _build_variable_roi_support_masks(self) -> list[np.ndarray]:
-        """Build cropped interpolation coverage for every variable ROI tile.
-
-        Returns
-        -------
-        list[np.ndarray]
-            Float32 ZY fractions of valid samples in each averaged Z bin,
-            ordered by cropped tile series.
-        """
-        angle_deg = float(self.acquisition.angle_deg)
-        scan_step_um = float(self.acquisition.scan_axis_step_um)
-        raw_pixel_size_um = float(self.acquisition.pixel_size_um)
-        z_downsample = round(float(self._pixel_size[0]) / raw_pixel_size_um)
-
-        masks: list[np.ndarray] = []
-        for record in self._roi_tile_records:
-            scan_count, camera_y, _camera_x = map(int, record["skewed_shape_syx"])
-            crop_y0, crop_y1, _crop_x0, _crop_x1 = map(int, record["deskew_crop_yx"])
-            support = orthogonal_deskew(
-                np.full(
-                    (scan_count, camera_y, 1),
-                    1024.0,
-                    dtype=np.float32,
-                ),
-                theta=angle_deg,
-                distance=scan_step_um,
-                pixel_size=raw_pixel_size_um,
-                divisible_by=4,
-                downsample_factor=z_downsample,
-            )[..., 0]
-            full_response = 2048 * raw_pixel_size_um / scan_step_um
-            support *= np.float32(z_downsample / full_response)
-            np.rint(support, out=support)
-            support /= np.float32(z_downsample)
-            support = support[:, crop_y0:crop_y1]
-            masks.append(np.ascontiguousarray(support))
-        return masks
-
-    def _update_profiles(self) -> None:
-        """Recompute 1D feather profiles from blend_pixels and current data shape.
-
-        Returns
-        -------
-        None
-            Populates `z_profile`, `y_profile`, and `x_profile` attributes.
-        """
-        bz, by, bx = self._blend_pixels
-        self.z_profile = self._make_1d_profile(int(self.z_dim), int(bz))
-        self.y_profile = self._make_1d_profile(int(self.y_dim), int(by))
-        self.x_profile = self._make_1d_profile(int(self.x_dim), int(bx))
 
     def _load_zero_channel_metadata(self) -> None:
         """Load completed and zero-channel decisions from processing state."""
@@ -1933,23 +1941,6 @@ class TileFusion:
             print(
                 f"Excluding {zero_count} zero tile/channel volumes from fusion weights."
             )
-
-    def _channel_has_signal(self, tile_index: int, channel_index: int) -> bool:
-        """Return processing's durable tile/channel signal decision.
-
-        Parameters
-        ----------
-        tile_index : int
-            Index into the selected processed tile collection.
-        channel_index : int
-            Acquisition channel index.
-
-        Returns
-        -------
-        bool
-            True unless this tile/channel was checkpointed as empty during processing.
-        """
-        return self._tile_channel_nonzero[(tile_index, channel_index)]
 
     @staticmethod
     def _make_1d_profile(length: int, blend: int) -> np.ndarray:
@@ -2099,6 +2090,7 @@ class TileFusion:
         allow_bounded_peak: bool = True,
         registration_axis: int | None = None,
         support_masks: tuple[Any, Any] | None = None,
+        shift_sampling: Sequence[int] | None = None,
     ) -> tuple[tuple[float, float, float], float]:
         """Register `g2` to `g1` and compute an SSIM score.
 
@@ -2134,6 +2126,10 @@ class TileFusion:
             Fixed and moving geometric support masks at registration sampling.
             Exclude padding and partially supported downsampling blocks from SSIM
             windows. None treats both patches as fully supported.
+        shift_sampling : sequence of int or None, default=None
+            Full-resolution pixels per sampled axis. When provided, compare
+            candidates on the full-resolution integer grid actually retained
+            by fusion, rather than scoring a fractional shift and later rounding.
 
         Returns
         -------
@@ -2161,6 +2157,17 @@ class TileFusion:
             if masks is not None:
                 masks = tuple(mask[0] for mask in masks)
 
+        # Histogram matching can turn a blank patch into the reference's
+        # brightest constant value. Reject it before changing its intensities.
+        if arr1.size == 0 or arr2.size == 0:
+            return (0.0, 0.0, 0.0), -math.inf
+        ranges = [(float(xp.min(arr)), float(xp.max(arr))) for arr in (arr1, arr2)]
+        # Constant patches contain no displacement information, including when
+        # both have the same nonzero background. An SSIM of one is not a link.
+        if any(low == high for low, high in ranges):
+            return (0.0, 0.0, 0.0), -math.inf
+
+        unmodified_moving = arr2
         arr2 = match_histograms(arr2, arr1)
         disambiguate = True
         if max_shift is not None:
@@ -2169,6 +2176,33 @@ class TileFusion:
                 2.0 * float(limit) < float(length)
                 for limit, length in zip(max_shift, arr1.shape, strict=False)
             )
+
+        def measured_phase_shift(
+            fixed: Any, moving: Any, *, resolve_alias: bool
+        ) -> Any:
+            """Discard the unresolved periodic shift returned after degeneracy."""
+            try:
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        "error",
+                        message="Could not determine real-space shift for periodic shift",
+                        category=UserWarning,
+                    )
+                    shift, _, _ = phase_cross_correlation(
+                        fixed,
+                        moving,
+                        disambiguate=resolve_alias,
+                        normalization="phase",
+                        upsample_factor=10,
+                        overlap_ratio=0.5,
+                    )
+            except UserWarning as error:
+                if str(error).startswith(
+                    "Could not determine real-space shift for periodic shift"
+                ) and "disambiguation is degenerate" in str(error):
+                    return None
+                raise
+            return xp.asarray(shift, dtype=xp.float32)
 
         def correlate(fixed: Any, moving: Any) -> Any:
             """Calculate phase correlation with the selected CPU or CUDA backend.
@@ -2183,45 +2217,71 @@ class TileFusion:
             Returns
             -------
             Any
-                Measured phase-correlation shift in registration pixels.
+                Measured shift, or None for zero energy or unresolved aliases.
             """
+            # An optional directional derivative may be all zero even when
+            # the intensity images contain useful features in other directions.
+            if not bool(xp.any(fixed)) or not bool(xp.any(moving)):
+                return None
             # CPU disambiguation can move identical, textureless crops to an
-            # equivalent correlation peak. Their measured correction is zero.
-            if not USING_GPU and np.array_equal(fixed, moving):
-                return np.zeros(fixed.ndim, dtype=np.float32)
-            shift, _, _ = phase_cross_correlation(
-                fixed,
-                moving,
-                disambiguate=disambiguate,
-                normalization="phase",
-                upsample_factor=10,
-                overlap_ratio=0.5,
-            )
-            result = xp.asarray(shift, dtype=xp.float32)
+            # equivalent peak. Preserve zero correction on both backends.
+            if bool(xp.array_equal(fixed, moving)):
+                return xp.zeros(fixed.ndim, dtype=xp.float32)
+            result = measured_phase_shift(fixed, moving, resolve_alias=disambiguate)
+            if result is None:
+                return None
             if (
                 not disambiguate
                 and max_shift is not None
                 and bool(xp.any(xp.abs(result) >= limits * 0.5))
             ):
-                shift, _, _ = phase_cross_correlation(
-                    fixed,
-                    moving,
-                    disambiguate=True,
-                    normalization="phase",
-                    upsample_factor=10,
-                    overlap_ratio=0.5,
-                )
-                result = xp.asarray(shift, dtype=xp.float32)
+                result = measured_phase_shift(fixed, moving, resolve_alias=True)
             return result
 
+        def retained_shift(candidate: Any) -> Any:
+            """Round candidate corrections onto the retained acquisition sampling.
+
+            Parameters
+            ----------
+            candidate : array-like
+                Registration displacement in reduced patch pixels.
+
+            Returns
+            -------
+            array-like
+                Correction snapped to the requested physical sampling.
+            """
+            if shift_sampling is not None:
+                sampling = xp.asarray(shift_sampling, dtype=xp.float32)
+                return xp.rint(candidate * sampling) / sampling
+            return candidate
+
         def score_shift(candidate: Any) -> float:
+            """Score a sampled candidate on its valid overlapping detector support.
+
+            Parameters
+            ----------
+            candidate : array-like
+                Registration displacement in reduced patch pixels.
+
+            Returns
+            -------
+            float
+                Structural similarity at the retained correction.
+            """
             return _registration_similarity(
-                arr1, arr2, candidate, win_size, masks, registration_axis
+                arr1,
+                arr2,
+                retained_shift(candidate),
+                win_size,
+                masks,
+                registration_axis,
             )
 
         shift_apply = correlate(arr1, arr2)
         if (
-            max_shift is not None
+            shift_apply is not None
+            and max_shift is not None
             and allow_bounded_peak
             and bool(xp.any(xp.abs(shift_apply) > limits))
         ):
@@ -2231,7 +2291,7 @@ class TileFusion:
                 max_shift,
             )
 
-        score = score_shift(shift_apply)
+        score = -math.inf if shift_apply is None else score_shift(shift_apply)
         if registration_axis is not None:
             axis = int(registration_axis)
             if not 0 <= axis < arr1.ndim:
@@ -2240,16 +2300,63 @@ class TileFusion:
                 sobel_filter(arr1, axis=axis),
                 sobel_filter(arr2, axis=axis),
             )
-            edge_is_allowed = max_shift is None or not bool(
-                xp.any(xp.abs(edge_shift) > limits)
+            edge_is_allowed = edge_shift is not None and (
+                max_shift is None or not bool(xp.any(xp.abs(edge_shift) > limits))
             )
             if edge_is_allowed and not bool(
-                xp.all(xp.rint(edge_shift) == xp.rint(shift_apply))
+                shift_apply is not None
+                and xp.all(retained_shift(edge_shift) == retained_shift(shift_apply))
             ):
                 edge_score = score_shift(edge_shift)
                 if edge_score > score:
                     shift_apply = edge_shift
                     score = edge_score
+
+        if shift_apply is None:
+            score = -math.inf
+
+        if masks is not None and registration_axis is not None:
+            # Periodic phase peaks can align crop edges instead of anatomy.
+            # Padfield's nonperiodic normalized correlation uses the known
+            # acquisition support for both centering and normalization. Keep
+            # original intensities for that calculation, and use the same SSIM
+            # gate as the other proposals. Thin/ambiguous Z still goes through
+            # the contextual axial-contrast checks in the caller.
+            tolerance = 4 * xp.finfo(xp.float32).eps
+            valid_masks = tuple(mask >= 1 - tolerance for mask in masks)
+            if all(bool(xp.any(mask)) for mask in valid_masks):
+                masked_shift = _masked_registration_peak(
+                    arr1,
+                    unmodified_moving,
+                    valid_masks,
+                    max_shift,
+                )
+                if (
+                    masked_shift is not None
+                    and bool(xp.all(xp.isfinite(masked_shift)))
+                    and (
+                        max_shift is None
+                        or bool(xp.all(xp.abs(masked_shift) <= limits))
+                    )
+                ):
+                    masked_score = score_shift(masked_shift)
+                    if masked_score > score:
+                        shift_apply, score = masked_shift, masked_score
+
+            if shift_apply is not None:
+                # Nominal stage placement is also a physically valid candidate.
+                # Do not manufacture a correction when a measured proposal
+                # reduces agreement between already aligned supported samples.
+                nominal = xp.zeros(arr1.ndim, dtype=xp.float32)
+                nominal_score = score_shift(nominal)
+                if nominal_score > score:
+                    shift_apply, score = nominal, nominal_score
+
+        if shift_apply is None:
+            return (0.0, 0.0, 0.0), -math.inf
+
+        if shift_sampling is not None:
+            shift_apply = retained_shift(shift_apply)
 
         if arr1.ndim == 2 and len(shift_apply) == 2:
             shift_ret = xp.concatenate(
@@ -2274,8 +2381,10 @@ class TileFusion:
         ssim_window: int | None = None,
         ch_idx: int = 0,
         threshold: float | None = None,
+        *,
+        pairs_to_register: set[tuple[int, int]] | None = None,
     ) -> None:
-        """Register and score all overlapping tile pairs independently per timepoint.
+        """Register overlapping pairs, optionally replacing only selected measurements.
 
         Parameters
         ----------
@@ -2288,6 +2397,10 @@ class TileFusion:
             Channel index used to extract patches.
         threshold : float or None, optional
             SSIM acceptance threshold. If None, uses `self.threshold`.
+        pairs_to_register : set of tuple of int or None
+            Global tile-index pairs to remeasure. None starts a fresh full pass;
+            a subset replaces only those pairs, preserving all other raw links,
+            including links previously rejected by global optimization.
 
         Returns
         -------
@@ -2308,7 +2421,30 @@ class TileFusion:
         sw = self.ssim_window if ssim_window is None else int(ssim_window)
         th = self.threshold if threshold is None else float(threshold)
 
-        self.pairwise_metrics.clear()
+        if pairs_to_register is None:
+            self.pairwise_metrics.clear()
+            self._rejected_registration_links = {}
+            self._registration_pair_sampling = {}
+        else:
+            if not pairs_to_register:
+                return
+            # Remove old measurements before retrying: a failed retry must not
+            # leave stale accepted or rejected data for the selected pair.
+            for pair in pairs_to_register:
+                self.pairwise_metrics.pop(pair, None)
+                getattr(self, "_rejected_registration_links", {}).pop(pair, None)
+                getattr(self, "_registration_pair_sampling", {}).pop(pair, None)
+            self._rejected_registration_links = getattr(
+                self, "_rejected_registration_links", {}
+            )
+            self._registration_pair_sampling = getattr(
+                self, "_registration_pair_sampling", {}
+            )
+        selected_tiles = (
+            None
+            if pairs_to_register is None
+            else {index for pair in pairs_to_register for index in pair}
+        )
 
         def overlap_bounds_1d(
             offset: int,
@@ -2367,6 +2503,10 @@ class TileFusion:
 
         with ThreadPoolExecutor(max_workers=read_workers) as executor:
             for t, tile_indices in enumerate(tile_groups):
+                if selected_tiles is not None and selected_tiles.isdisjoint(
+                    tile_indices
+                ):
+                    continue
                 positions = [self._tile_positions[index] for index in tile_indices]
                 tile_shapes = [all_tile_shapes[index] for index in tile_indices]
                 nearest_registration_pairs = set(
@@ -2397,9 +2537,15 @@ class TileFusion:
                 for i_pos, j_pos in registration_pairs:
                     i = tile_indices[i_pos]
                     j = tile_indices[j_pos]
-                    if not self._channel_has_signal(
-                        i, ch_idx
-                    ) or not self._channel_has_signal(j, ch_idx):
+                    if (
+                        pairs_to_register is not None
+                        and (i, j) not in pairs_to_register
+                    ):
+                        continue
+                    if (
+                        not self._tile_channel_nonzero[(i, ch_idx)]
+                        or not self._tile_channel_nonzero[(j, ch_idx)]
+                    ):
                         continue
 
                     phys = np.array(self._tile_positions[j]) - np.array(
@@ -2469,7 +2615,12 @@ class TileFusion:
                     context_z = None
                     if not self._is_2d and boundary_axis == 0:
                         max_z = getattr(self, "_pair_registration_limits", {}).get(
-                            (i, j), self.max_registration_shift_zyx
+                            (i, j),
+                            getattr(
+                                self,
+                                "_initial_registration_shift_zyx",
+                                self.max_registration_shift_zyx,
+                            ),
                         )[0]
                         if max_z > 0:
                             max_z += 2
@@ -2604,10 +2755,8 @@ class TileFusion:
                     else:
                         reduce_block = df_zyx_eff
                     if device_buffers is not None:
-                        staged_i, staged_j = device_buffers.stage(
-                            np.asarray(patch_i),
-                            np.asarray(patch_j),
-                        )
+                        staged_i = device_buffers._stage_one(0, np.asarray(patch_i))
+                        staged_j = device_buffers._stage_one(1, np.asarray(patch_j))
                     else:
                         staged_i = xp.asarray(patch_i)
                         staged_j = xp.asarray(patch_j)
@@ -2642,8 +2791,14 @@ class TileFusion:
                         support_masks.append(support)
 
                     max_shift = getattr(self, "_pair_registration_limits", {}).get(
-                        (i, j), self.max_registration_shift_zyx
+                        (i, j),
+                        getattr(
+                            self,
+                            "_initial_registration_shift_zyx",
+                            self.max_registration_shift_zyx,
+                        ),
                     )
+                    self._registration_pair_sampling[i, j] = df_zyx_eff
                     if self._is_2d:
                         max_shift_ds = (
                             max_shift[1] / df_zyx_eff[1],
@@ -2673,6 +2828,7 @@ class TileFusion:
                         allow_bounded_peak=not thin_z_overlap,
                         registration_axis=registration_axis,
                         support_masks=legacy_masks,
+                        shift_sampling=(df_zyx_eff[1:] if self._is_2d else df_zyx_eff),
                     )
                     if context_z is not None:
                         lateral_allowed = all(
@@ -2703,6 +2859,7 @@ class TileFusion:
                                 allow_bounded_peak=False,
                                 registration_axis=0,
                                 support_masks=tuple(support_masks),
+                                shift_sampling=df_zyx_eff,
                             )
                             if all(
                                 abs(value) <= limit
@@ -2751,6 +2908,11 @@ class TileFusion:
                         or abs(dx_s) > max_shift[2]
                     ):
                         rejected_shifts.append((dz_s, dy_s, dx_s))
+                        self._rejected_registration_links[i, j] = (
+                            (dz_s, dy_s, dx_s),
+                            max_shift,
+                            score,
+                        )
                         rejected_links.append(
                             (i, j, (dz_s, dy_s, dx_s), max_shift, score)
                         )
@@ -3022,7 +3184,7 @@ class TileFusion:
 
         Notes
         -----
-        - Every tile must have at least one accepted image-registration link.
+        - Isolated tiles retain their nominal stage placement.
         - Each connected component is anchored at one zero correction, preserving
           the stage-derived placement between components.
         """
@@ -3117,25 +3279,12 @@ class TileFusion:
             if not local_links:
                 continue
 
-            adjacency = [set() for _ in range(n_pos)]
-            for link in local_links:
-                left = int(link["i"])
-                right = int(link["j"])
-                adjacency[left].add(right)
-                adjacency[right].add(left)
-            fixed = []
-            visited: set[int] = set()
-            for start in range(n_pos):
-                if start in visited:
-                    continue
-                fixed.append(start)
-                visited.add(start)
-                frontier = [start]
-                while frontier:
-                    current = frontier.pop()
-                    unseen = adjacency[current] - visited
-                    visited.update(unseen)
-                    frontier.extend(unseen)
+            fixed = [
+                component[0]
+                for component in _connected_tile_components(
+                    range(n_pos), ((link["i"], link["j"]) for link in local_links)
+                )
+            ]
             if mode == "ONE_ROUND":
                 d_opt = self._solve_global(local_links, n_pos, fixed)
                 retained_links = local_links
@@ -3249,9 +3398,10 @@ class TileFusion:
                 ).mean(axis=(3, 5))
                 support = support.reshape(depth, height // 4, 4).all(axis=2)[:, :, None]
                 for channel in range(int(self.channels)):
-                    if not self._channel_has_signal(
-                        i, channel
-                    ) or not self._channel_has_signal(j, channel):
+                    if (
+                        not self._tile_channel_nonzero[(i, channel)]
+                        or not self._tile_channel_nonzero[(j, channel)]
+                    ):
                         continue
                     a, b = fixed[channel], moving[channel]
                     valid = (
@@ -3374,33 +3524,18 @@ class TileFusion:
             Connectivity diagnostics are printed without changing placements.
         """
         for time_index, tile_indices in enumerate(self._tiles_by_time):
-            parent = {index: index for index in tile_indices}
-
-            def find(index: int) -> int:
-                """Find a tile component representative with path compression.
-
-                This disjoint-set helper is consumed before the component loop advances.
-
-                Parameters
-                ----------
-                index : int
-                    Tile or registration-link index used by this calculation.
-
-                Returns
-                -------
-                int
-                    Representative tile index of the connected component.
-                """
-                while parent[index] != index:  # noqa: B023
-                    parent[index] = parent[parent[index]]  # noqa: B023
-                    index = parent[index]  # noqa: B023
-                return index
-
-            for left, right in getattr(
-                self, "optimized_pairwise_metrics", self.pairwise_metrics
-            ):
-                if left in parent and right in parent:
-                    parent[find(right)] = find(left)
+            component_by_tile = {
+                tile: index
+                for index, component in enumerate(
+                    _connected_tile_components(
+                        tile_indices,
+                        getattr(
+                            self, "optimized_pairwise_metrics", self.pairwise_metrics
+                        ),
+                    )
+                )
+                for tile in component
+            }
             overlapping = _select_registration_pairs(
                 [self._tile_positions[index] for index in tile_indices],
                 [self._tile_shapes[index] for index in tile_indices],
@@ -3410,11 +3545,16 @@ class TileFusion:
             disconnected = [
                 (tile_indices[left], tile_indices[right])
                 for left, right in overlapping
-                if find(tile_indices[left]) != find(tile_indices[right])
+                if component_by_tile[tile_indices[left]]
+                != component_by_tile[tile_indices[right]]
             ]
             if disconnected:
                 components = len(
-                    {find(index) for pair in disconnected for index in pair}
+                    {
+                        component_by_tile[index]
+                        for pair in disconnected
+                        for index in pair
+                    }
                 )
                 print(
                     f"Registration warning: overlapping tiles at time index "
@@ -3423,6 +3563,98 @@ class TileFusion:
                     "they are not mutually registered. Check the registration "
                     "channel, threshold, and --max-registration-shift-zyx."
                 )
+
+    def _expand_registration_limits(self) -> set[tuple[int, int]]:
+        """Expand rejected pair limits just past otherwise acceptable peaks.
+
+        Only offending pair/axis limits grow, to the absolute measured correction
+        plus five percent, with at least two pixels or one effective sampling bin
+        of margin. A peak on the depth search guard band remains provisional:
+        that pair must be remeasured before refitting the entire graph.
+
+        Returns
+        -------
+        set of tuple of int
+            Pairs whose limits increased and whose measurements must be replaced.
+        """
+        if not getattr(self, "_automatic_registration_limits", False):
+            return set()
+        expanded = set()
+        for pair, (correction, limits, score) in getattr(
+            self, "_rejected_registration_links", {}
+        ).items():
+            if not math.isfinite(score) or score < self.threshold:
+                continue
+            sampling = getattr(self, "_registration_pair_sampling", {}).get(
+                pair, self.downsample_factors
+            )
+            updated = list(self._pair_registration_limits.get(pair, limits))
+            for axis in range(3):
+                if limits[axis] > 0 and abs(correction[axis]) > limits[axis]:
+                    peak = abs(correction[axis])
+                    margin = max(2, sampling[axis], math.ceil(0.05 * peak))
+                    updated[axis] = max(updated[axis], int(peak + margin))
+            if tuple(updated) != self._pair_registration_limits.get(pair, limits):
+                self._pair_registration_limits[pair] = tuple(updated)
+                expanded.add(pair)
+        if not expanded:
+            return expanded
+        self.max_registration_shift_zyx = tuple(
+            max(
+                self.max_registration_shift_zyx[axis],
+                *(limits[axis] for limits in self._pair_registration_limits.values()),
+            )
+            for axis in range(3)
+        )
+        return expanded
+
+    def register_with_retries(self) -> None:
+        """Remeasure expanded pairs and refit the complete graph on every retry.
+
+        Compatible cached final measurements retain their effective search
+        envelopes. Fresh passes use the unchanged nominal stage positions;
+        global offsets are applied only after registration has finished.
+        """
+        recomputed = False
+        pairs_to_register = None
+        self._registration_retry_count = 0
+        try:
+            self.load_pairwise_metrics()
+        except ValueError:
+            recomputed = True
+        while True:
+            if recomputed:
+                self.refine_tile_positions_with_cross_correlation(
+                    downsample_factors=self.downsample_factors,
+                    ch_idx=self.channel_to_use,
+                    threshold=self.threshold,
+                    pairs_to_register=pairs_to_register,
+                )
+            self.optimize_shifts(
+                method="TWO_ROUND_ITERATIVE",
+                rel_thresh=self.optimization_rel_threshold,
+                abs_thresh=self.optimization_abs_threshold,
+            )
+            if (
+                not recomputed
+                or self._registration_retry_count >= self.registration_retries
+            ):
+                break
+            pairs_to_register = self._expand_registration_limits()
+            if not pairs_to_register:
+                break
+            self._registration_retry_count += 1
+            print(
+                f"Registration retry {self._registration_retry_count}/"
+                f"{self.registration_retries}: automatic maximum ZYX corrections "
+                f"increased to {self.max_registration_shift_zyx} pixels. "
+                f"Remeasuring {len(pairs_to_register)} expanded pairs and "
+                "refitting the global solution using all raw pairwise links "
+                "from nominal stage placement."
+            )
+        if recomputed:
+            self.save_pairwise_metrics()
+        self.report_registration_connectivity()
 
     def save_pairwise_metrics(self) -> None:
         """Persist pairwise links in the acquisition processing state."""
@@ -3434,6 +3666,16 @@ class TileFusion:
                 for (i, j), values in self.pairwise_metrics.items()
             },
         )
+        record = self.processing_state.registration(self.data)
+        record["effective_registration_limits"] = {
+            "maximum_zyx": list(self.max_registration_shift_zyx),
+            "pairs": {
+                f"{i},{j}": list(limits)
+                for (i, j), limits in self._pair_registration_limits.items()
+            },
+            "retries": self._registration_retry_count,
+        }
+        self.processing_state.save()
 
     def load_pairwise_metrics(self) -> None:
         """Load compatible pairwise links from processing state."""
@@ -3442,6 +3684,28 @@ class TileFusion:
             configuration=self._registration_cache_settings(),
         )
         raw_metrics = data["pairwise_metrics"]
+        effective = data.get("effective_registration_limits")
+        if not isinstance(effective, dict):
+            raise ValueError("Saved registration lacks effective retry limits")
+        try:
+            maximum = tuple(int(value) for value in effective["maximum_zyx"])
+            pairs = {
+                tuple(map(int, key.split(","))): tuple(int(value) for value in limits)
+                for key, limits in effective["pairs"].items()
+            }
+            retries = int(effective["retries"])
+            if (
+                len(maximum) != 3
+                or any(value < 0 for value in maximum)
+                or retries < 0
+                or any(
+                    len(pair) != 2 or len(limits) != 3 or min(limits) < 0
+                    for pair, limits in pairs.items()
+                )
+            ):
+                raise ValueError("Invalid effective registration limits")
+        except (KeyError, TypeError, AttributeError) as error:
+            raise ValueError("Invalid effective registration limits") from error
 
         metrics = {}
         invalid_count = self._count_invalid_pairwise_metrics(raw_metrics)
@@ -3466,6 +3730,9 @@ class TileFusion:
                 f"Processing state contains {invalid_count} invalid registration metrics"
             )
         self.pairwise_metrics = metrics
+        self.max_registration_shift_zyx = maximum
+        self._pair_registration_limits = pairs
+        self._registration_retry_count = retries
 
     def _registration_cache_settings(self) -> dict[str, Any]:
         """Return every setting that can change pairwise registration.
@@ -3482,16 +3749,22 @@ class TileFusion:
             "stage_z_to_image_y": "none-orthogonal-stage-placement-v3",
             "deskew_coverage": "normalize-valid-z-bin-samples-v1",
             "pair_selection": "all-thick-overlaps-nearest-thin-z-overlaps-v2",
-            "acceptance": "threshold-only-no-forced-bridges-v2",
-            "overlap_roi": "depth-context-lateral-fallback-pearson-z-refinement-v3",
+            "acceptance": "reject-constant-threshold-only-no-forced-bridges-v3",
+            "overlap_roi": "depth-context-lateral-fallback-axial-contrast-refinement-v4",
             "downsample": ("upstream-block-reduce-with-adaptive-zyx-ssim-support-v2"),
-            "phase_registration": (
-                "thin-z-full-reject-out-of-range-thick-bounded-peak-v7"
-            ),
-            "score": ("fractional-alignment-cucim-ssim-geometric-support-windows-v6"),
+            "phase_registration": ("phase-edge-and-masked-normalized-correlation-v10"),
+            "score": ("retained-full-resolution-grid-ssim-supported-window-v8"),
             "downsample_factors_zyx": list(self.downsample_factors),
             "ssim_window": self.ssim_window,
-            "max_registration_shift_zyx": list(self.max_registration_shift_zyx),
+            "max_registration_shift_zyx": list(
+                getattr(
+                    self,
+                    "_initial_registration_shift_zyx",
+                    self.max_registration_shift_zyx,
+                )
+            ),
+            "registration_retries": getattr(self, "registration_retries", 2),
+            "retry_policy": "selective-pairs-and-global-measured-peak-5pct-2px-bin-v3",
             "shift_limits_policy": (
                 "stage-overlap-contextual-depth-actual-support-per-pair-v3"
                 if getattr(self, "_automatic_registration_limits", False)
@@ -3500,7 +3773,9 @@ class TileFusion:
             "pair_shift_limits": {
                 f"{left},{right}": list(limits)
                 for (left, right), limits in getattr(
-                    self, "_pair_registration_limits", {}
+                    self,
+                    "_initial_pair_registration_limits",
+                    getattr(self, "_pair_registration_limits", {}),
                 ).items()
             },
             "threshold": self.threshold,
@@ -3513,10 +3788,7 @@ class TileFusion:
             "zero_registration_tiles": [
                 tile_index
                 for tile_index in range(len(self._tile_positions))
-                if not self._channel_has_signal(
-                    tile_index,
-                    self.channel_to_use,
-                )
+                if not self._tile_channel_nonzero[(tile_index, self.channel_to_use)]
             ],
         }
 
@@ -3592,9 +3864,14 @@ class TileFusion:
             min_y, max_y = float(roi_y0), float(roi_y1)
             min_x, max_x = float(roi_x0), float(roi_x1)
 
-        sz = int(np.ceil((max_z - min_z) / dz_um))
-        sy = int(np.ceil((max_y - min_y) / dy_um))
-        sx = int(np.ceil((max_x - min_x) / dx_um))
+        extents = np.asarray(
+            (max_z - min_z, max_y - min_y, max_x - min_x)
+        ) / np.asarray((dz_um, dy_um, dx_um))
+        nearest = np.rint(extents)
+        # Physical origins can be much larger than a pixel. Subtraction must
+        # not add a spurious output row at an otherwise exact grid boundary.
+        extents = np.where(np.abs(extents - nearest) <= 1e-7, nearest, extents)
+        sz, sy, sx = (int(value) for value in np.ceil(extents))
 
         self.unpadded_shape = (sz, sy, sx)
         self.offset_um = (float(min_z), float(min_y), float(min_x))
@@ -3868,7 +4145,7 @@ class TileFusion:
                 slice(rz0 - oz, rz1 - oz),
                 slice(ry0 - oy, ry1 - oy),
                 slice(rx0 - ox, rx1 - ox),
-                dtype=getattr(self, "output_dtype", np.dtype(np.uint16)),
+                dtype=None,
             )
             direct = self._cast_fusion_values(
                 self._scale_depth_source(
@@ -3951,7 +4228,7 @@ class TileFusion:
             channel_flags = [
                 np.asarray(
                     [
-                        self._channel_has_signal(p, channel_index)
+                        self._tile_channel_nonzero[(p, channel_index)]
                         for channel_index in range(int(self.channels))
                     ],
                     dtype=np.bool_,
@@ -4175,10 +4452,9 @@ class TileFusion:
                                 (tile_index, offset)
                                 for tile_index, offset in offsets_t
                                 if any(
-                                    self._channel_has_signal(
-                                        tile_index,
-                                        channel_index,
-                                    )
+                                    self._tile_channel_nonzero[
+                                        (tile_index, channel_index)
+                                    ]
                                     for channel_index in range(int(self.channels))
                                 )
                                 and offset[0] + tile_shapes[tile_index][0] > z0
@@ -4450,26 +4726,7 @@ class TileFusion:
                 dtype=np.float64,
             )
         else:
-            recomputed_metrics = False
-            try:
-                self.load_pairwise_metrics()
-            except ValueError:
-                self.refine_tile_positions_with_cross_correlation(
-                    downsample_factors=self.downsample_factors,
-                    ch_idx=self.channel_to_use,
-                    threshold=self.threshold,
-                )
-                recomputed_metrics = True
-
-            if recomputed_metrics:
-                self.save_pairwise_metrics()
-
-            self.optimize_shifts(
-                method="TWO_ROUND_ITERATIVE",
-                rel_thresh=self.optimization_rel_threshold,
-                abs_thresh=self.optimization_abs_threshold,
-            )
-            self.report_registration_connectivity()
+            self.register_with_retries()
 
         if self.normalize_depth_intensity:
             self.estimate_depth_intensity_gains()

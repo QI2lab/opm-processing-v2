@@ -1,39 +1,40 @@
 # export-rois
 
-Open a volume in napari, draw multiple XY rectangles, then close the viewer
-to export each rectangle as a lossless zlib-compressed OME-BigTIFF. Exports
-retain every Z plane, channel, and timepoint at level zero, with calibrated
-positions and available acquisition metadata.
+Select multiple XY rectangles on a deskewed maximum-Z preview, then reconstruct
+raw regions and export each as OME-Zarr. Full Z, all channels, and all timepoints
+are retained. Multiple positions are locally registered and fused. With
+deconvolution enabled, scan-grid refinement is inferred from the recorded scan
+step toward 0.4 micrometers, using the same rule as `process`.
 
 | Argument | Description |
 | --- | --- |
-| `ROOT_PATH` | Processed output directory or an OME-Zarr store directly. Supports full fused images and single-position collections. |
+| `ROOT_PATH` | Raw acquisition store, processed directory, or explicit maximum-Z preview. |
 
-Directory lookup prefers `*_fused.ome.zarr`, then
-`*_decon_deskewed.ome.zarr`, then `*_deskewed.ome.zarr`, excluding maximum-Z
-projections. Multiple matches require an explicit store path. Unfused
-collections must contain exactly one position.
+Preview lookup prefers `*_max_z_fused.ome.zarr`, then
+`*_max_z_decon_deskewed.ome.zarr`, then `*_max_z_deskewed.ome.zarr`.
+Unfused previews must contain exactly one position. Multiple matches require
+an explicit preview path. A processing journal linking to accessible raw data
+is required. Missing previews report a `uv run process` command to create one.
 
 | Option | Description |
 | --- | --- |
-| `--output PATH` | Destination directory; default `roi_exports` beside the selected store. |
-| `--workers INTEGER` | Compression workers; default 4, minimum 1. |
-| `--overwrite` | Replace existing exports; disabled by default. |
-| `--help` | Show installed arguments, options, and defaults. |
+| `--output PATH` | Destination; default `roi_exports` beside the preview. |
+| `--deconvolve / --no-deconvolve` | Enable RLGC before deskewing; default disabled. |
+| `--tiff` | Also export compressed OME-BigTIFF; retain final OME-Zarr. |
+| `--flatfield-correction` | Reuse or estimate illumination correction. |
+| `--save-float32` | Preserve fractional intensities; default uint16. |
+| `--z-downsample-level INTEGER` | Output Z binning factor; default 1. |
+| `--registration-channel INTEGER` | Zero-based local registration channel; default 0. |
+| `--decon-psf-paths PATH` | Channel-ordered measured PSFs; repeat per channel. Otherwise use recorded optical calibration. |
+| `--decon-crop-scan INTEGER` | Retained reconstruction scan planes per chunk; default automatic. |
+| `--decon-gpu-id INTEGER` | CUDA device; default 0. |
+| `--decon-verbose INTEGER` | Reconstruction verbosity; default 1. |
+| `--resume / --no-resume` | Default: reuse saved selections and compatible checkpoints. Disable to redraw and restart. |
+| `--workers INTEGER` | TIFF compression workers; default 4. |
 
 ```bash
-uv run export-rois "/path/to/processed"
-uv run export-rois "/path/to/sample_decon_deskewed.ome.zarr" --output "/path/to/crops"
+uv run export-rois "/path/to/processed" --deconvolve --tiff
 ```
 
-Napari starts with a full-Z thick-slice maximum projection. Right-click the
-Z slider to adjust thickness, inspect timepoints, and draw axis-aligned
-rectangles in `export ROIs`. Display settings affect inspection; exports
-always include the full depth, all channels, and all timepoints.
-
-Outputs are `<stem>_roi_001.ome.tiff`, `<stem>_roi_002.ome.tiff`, and so on,
-in shape order. Closing without rectangles writes nothing. Rerunning requires
-drawing new selections; existing files require `--overwrite` to replace.
-
-See the [ROI export guide](../../guides/roi.md#export-rois-from-a-fused-volume-or-single-position-timelapse)
-for the drawing workflow and metadata details.
+See the [ROI guide](../../guides/roi.md) for selection, output layout, metadata,
+and resume behavior.

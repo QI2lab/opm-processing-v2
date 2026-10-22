@@ -35,10 +35,10 @@ projection. See [fusion](../guides/fusion.md) for registration and depth gains.
 
 ## View or export
 
-View the registered projection without creating an ROI:
+Select multiple ROIs in napari and reconstruct them from raw data:
 
 ```bash
-uv run display "/path/to/acquisition" --no-roi
+uv run export-rois "/path/to/acquisition" --deconvolve
 ```
 
 Export the highest-resolution fused volume and maximum-Z projection:

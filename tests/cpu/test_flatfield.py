@@ -1,93 +1,26 @@
-"""Ground-truth integration test for illumination correction."""
-
-from pathlib import Path
+"""Illumination correction units against known detector response."""
 
 import numpy as np
 import pytest
+import tensorstore as ts
 
 from opm_processing.imageprocessing.camera import (
     camera_correct,
     illumination_correct,
-    qi2lab_stage_scan_camera_gain,
 )
 from opm_processing.imageprocessing.flatfield import (
-    _flatfield_tile_indices,
-    _stage_z_groups,
+    _flatfield_sample_indices,
+    _separable_residual_calibration,
     estimate_illuminations,
 )
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("output_flatfield", (False, True))
-def test_processing_uses_existing_flatfield_with_separate_output(
-    opm_v2_projection_zarr,
-    tmp_path: Path,
-    output_flatfield: bool,
-) -> None:
-    """Verify source reuse and output precedence through saved pixel values.
-
-    Parameters
-    ----------
-    opm_v2_projection_zarr : OpmV2ProjectionFixture
-        Simulated acquisition with camera calibration and raw images on disk.
-    tmp_path : pathlib.Path
-        Temporary directory containing the acquisition and processed output.
-    output_flatfield : bool
-        Write an output-side field that must take precedence over the source field.
-
-    Returns
-    -------
-    None
-        Reopened processed intensities match the selected calibration field.
-    """
-    from opm_processing.dataio.acquisition import acquisition_stem
-    from opm_processing.dataio.position_collection import open_position_collection
-    from opm_processing.process import process, write_flatfield
-
-    acquisition = opm_v2_projection_zarr
-    output_dir = tmp_path / "processed"
-    output_dir.mkdir()
-    filename = f"{acquisition_stem(acquisition.path)}_flatfield.ome.tif"
-    field_shape = (1, acquisition.raw_data.shape[2], *acquisition.raw_data.shape[-2:])
-    source_field = np.full(field_shape, 2.0, dtype=np.float32)
-    selected_field = source_field
-    write_flatfield(
-        acquisition.path.parent / filename, source_field, acquisition.pixel_size_um
-    )
-    if output_flatfield:
-        selected_field = np.full(field_shape, 1.25, dtype=np.float32)
-        write_flatfield(
-            output_dir / filename, selected_field, acquisition.pixel_size_um
-        )
-
-    process(
-        root_path=acquisition.path,
-        output=output_dir,
-        flatfield_correction=True,
-        deconvolve=False,
-        save_float32=True,
-        write_fused_max_projection_tiff=False,
-    )
-    saved = (
-        open_position_collection(
-            output_dir / f"{acquisition_stem(acquisition.path)}_projection.ome.zarr"
-        )
-        .arrays[0]
-        .read()
-        .result()
-    )
-    calibrated = (
-        acquisition.raw_data[:, 0].astype(np.float32) - acquisition.camera_offset
-    ) * acquisition.camera_conversion
-    expected = (calibrated / selected_field[0])[:, :, np.newaxis]
-    np.testing.assert_allclose(saved, expected, rtol=1e-6)
 
 
 @pytest.mark.unit
 def test_stage_z_groups_use_repeated_xy_depth_not_absolute_tilted_z():
     """Repeated XY visits define depth despite coverslip-dependent absolute Z."""
-    levels, groups = _stage_z_groups(
-        6,
+    from opm_processing.imageprocessing.coordinates import stage_z_level_indices
+
+    indices = stage_z_level_indices(
         np.asarray(
             [
                 [10.0, 0.0, 0.0],
@@ -100,33 +33,37 @@ def test_stage_z_groups_use_repeated_xy_depth_not_absolute_tilted_z():
         ),
     )
 
-    assert levels == (0.0, 1.0, 2.0)
-    assert groups == ((0, 1), (2, 3), (4, 5))
+    np.testing.assert_array_equal(indices, (0, 0, 1, 1, 2, 2))
 
 
 @pytest.mark.unit
 def test_flatfield_tiles_are_evenly_subsampled_within_each_depth():
     """Large depth levels use a bounded, deterministic span of tiles."""
-    selected = _flatfield_tile_indices(tuple(range(100)), max_tiles_per_level=8)
+    samples = _flatfield_sample_indices(tuple(range(100)), 12, max_tiles_per_level=8)
+    selected = [position for position, _planes in samples]
 
     assert len(selected) == 8
     assert selected[0] == 0
     assert selected[-1] == 99
     assert len(set(selected)) == 8
     assert set(np.diff(selected)) <= {14, 15}
+    assert samples == _flatfield_sample_indices(
+        tuple(range(100)), 12, max_tiles_per_level=8
+    )
+    for _position, planes in samples:
+        assert len(planes) == len(set(planes)) == 10
+        assert 0 <= min(planes) <= max(planes) < 12
 
 
 @pytest.mark.unit
-def test_signal_selection_excludes_empty_channels_and_positions(
-    tensorstore_dataset,
-):
+def test_signal_selection_excludes_empty_channels_and_positions():
     """The full-volume TPC mask limits each channel before tile subsampling."""
     from opm_processing import process as process_module
 
     raw = np.full((1, 4, 2, 3, 4, 8), 100, dtype=np.uint16)
     raw[0, 0, 0, :, :, :4] = 130
     raw[0, 2, 0, :, :, :4] = 130
-    datastore = tensorstore_dataset(raw)
+    datastore = ts.array(raw)
     signal_decisions = process_module.build_illumination_signal_decisions(
         datastore,
         np.zeros(4, dtype=np.int64),
@@ -134,7 +71,7 @@ def test_signal_selection_excludes_empty_channels_and_positions(
         camera_conversion=1.0,
         threshold=20.0,
         min_signal_fraction=0.01,
-        apply_stage_scan_gain=False,
+        detector_gain_x=None,
     )
 
     assert signal_decisions is not None
@@ -145,21 +82,19 @@ def test_signal_selection_excludes_empty_channels_and_positions(
 
 
 @pytest.mark.unit
-def test_illumination_signal_check_stops_after_32_nonempty_candidates(
-    tensorstore_dataset,
-):
+def test_illumination_signal_check_stops_after_32_nonempty_candidates():
     """Dense acquisitions avoid a full-position signal pre-scan."""
     from opm_processing import process as process_module
 
     raw = np.full((1, 40, 1, 2, 3, 4), 130, dtype=np.uint16)
     decisions = process_module.build_illumination_signal_decisions(
-        tensorstore_dataset(raw),
+        ts.array(raw),
         np.zeros(40, dtype=np.int64),
         camera_offset=100.0,
         camera_conversion=1.0,
         threshold=20.0,
         min_signal_fraction=0.01,
-        apply_stage_scan_gain=False,
+        detector_gain_x=None,
     )
 
     assert decisions is not None
@@ -179,19 +114,9 @@ def test_illumination_signal_check_stops_after_32_nonempty_candidates(
 
 
 @pytest.mark.unit
-def test_qi2lab_stage_camera_gain_has_fixed_unity_baseline():
-    """The saved camera line profile changes only the measured detector trough."""
-    gain = qi2lab_stage_scan_camera_gain()
-
-    assert gain.shape == (1900,)
-    np.testing.assert_array_equal(gain[:1046], 1.0)
-    np.testing.assert_array_equal(gain[1104:], 1.0)
-    assert np.argmin(gain) == 1079
-    assert gain[1079] == np.float32(0.717388)
-
-
-@pytest.mark.unit
-def test_processing_contract_uses_uint16_raw_float32_intermediates_and_final_cast():
+def test_processing_contract_uses_uint16_raw_float32_intermediates_and_final_cast(
+    camera_gain_profile,
+):
     """Camera, nonlinear gain, illumination, and output boundaries are explicit."""
     from opm_processing.process import format_processed_output
 
@@ -200,13 +125,15 @@ def test_processing_contract_uses_uint16_raw_float32_intermediates_and_final_cas
         raw,
         100.0,
         1.0,
-        apply_stage_scan_gain=True,
+        detector_gain_x=camera_gain_profile,
     )
     assert camera_corrected.dtype == np.float32
-    np.testing.assert_allclose(camera_corrected[..., 100], 10.0)
+    np.testing.assert_allclose(
+        camera_corrected[..., 100], 10.0 / camera_gain_profile[100]
+    )
     np.testing.assert_allclose(
         camera_corrected[..., 1079],
-        10.0 / qi2lab_stage_scan_camera_gain()[1079],
+        10.0 / camera_gain_profile[1079],
     )
 
     illumination = np.full((3, 1900), 2.0, dtype=np.float32)
@@ -222,232 +149,86 @@ def test_processing_contract_uses_uint16_raw_float32_intermediates_and_final_cas
     np.testing.assert_array_equal(floats, boundary)
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("channels", [1, 3])
-def test_shared_flatfield_round_trips_and_is_reused_at_multiple_depths(
-    tmp_path: Path, tensorstore_dataset, channels
-):
-    """The saved maximum field is reused unchanged for every stage depth."""
-    from opm_processing.process import (
-        load_or_estimate_flatfield,
-        read_current_flatfield,
-        write_flatfield,
-    )
-
-    path = tmp_path / "flatfield.ome.tif"
-    flatfields = np.linspace(0.5, 1.5, channels * 8 * 12, dtype=np.float32).reshape(
-        1, channels, 8, 12
-    )
-    write_flatfield(path, flatfields, 0.115)
-    actual = read_current_flatfield(path, flatfields.shape)
-    assert actual is not None
-    np.testing.assert_array_equal(actual, flatfields)
-    actual = load_or_estimate_flatfield(
-        path,
-        tensorstore_dataset(np.zeros((1, 2, channels, 4, 8, 12), dtype=np.uint16)),
-        100,
-        0.25,
-        0.115,
-        np.asarray(((10, 20, 30), (0, 20, 30))),
-        apply_stage_scan_gain=False,
-        signal_threshold=None,
-        minimum_signal_fraction=0.01,
-        signal_mask=None,
-    )
-    np.testing.assert_array_equal(actual, flatfields)
-
-
-@pytest.mark.integration
-def test_old_per_depth_flatfield_is_not_reused(tmp_path):
-    from tifffile import imwrite
-
-    from opm_processing.process import read_current_flatfield
-
-    path = tmp_path / "old-flatfield.ome.tif"
-    imwrite(
-        path,
-        np.ones((2, 1, 8, 12), dtype=np.float32),
-        photometric="minisblack",
-        metadata={"axes": "ZCYX"},
-        software="opm-processing/basicpy-stage-depth-camera-contract-v10",
-    )
-    assert read_current_flatfield(path, (1, 1, 8, 12)) is None
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("scan_planes", [1, 4])
-def test_processing_applies_the_same_field_at_every_depth(
-    tmp_path, acquisition_factory, scan_planes
-):
-    """Planar and deskewed outputs use the same channel field across Z and T."""
-    from opm_processing.dataio.position_collection import open_position_collection
-    from opm_processing.process import process, write_flatfield
-
-    rng = np.random.default_rng(3)
-    raw = rng.integers(200, 500, (2, 2, 2, scan_planes, 8, 12), dtype=np.uint16)
-    acquisition = acquisition_factory(
-        raw, stage_positions_zxy=((10, 20, 30), (0, 20, 30))
-    )
-    flatfields = np.ones((1, 2, 8, 12), dtype=np.float32)
-    flatfields[0, 0] = 2
-    flatfields[0, 1] = 1.25
-    write_flatfield(tmp_path / "sample_flatfield.ome.tif", flatfields, 0.115)
-    for correction, directory in ((False, "baseline"), (True, "corrected")):
-        process(
-            root_path=acquisition.path,
-            output=tmp_path / directory,
-            flatfield_correction=correction,
-            deconvolve=False,
-            save_float32=True,
-            z_downsample_level=1,
-            max_projection=False,
-            create_fused_max_projection=False,
-            write_fused_max_projection_tiff=False,
-        )
-    suffix = "2d" if scan_planes == 1 else "deskewed"
-    baseline = open_position_collection(
-        tmp_path / "baseline" / f"sample_{suffix}.ome.zarr"
-    )
-    corrected = open_position_collection(
-        tmp_path / "corrected" / f"sample_{suffix}.ome.zarr"
-    )
-    for position in range(2):
-        expected = baseline.arrays[position].read().result()
-        actual = corrected.arrays[position].read().result()
-        for channel in range(2):
-            np.testing.assert_allclose(
-                actual[:, channel],
-                expected[:, channel] / flatfields[0, channel, 0, 0],
-                rtol=1e-6,
-                atol=1e-6,
-            )
-
-
 @pytest.mark.unit
-def test_flatfield_sample_loading_applies_detector_calibration(
-    tensorstore_dataset,
+@pytest.mark.parametrize("decision", (None, -1), ids=("all", "unchecked-excluded"))
+@pytest.mark.parametrize("topology", ("single", "tiles", "depths"))
+@pytest.mark.parametrize("storage", (False, True), ids=("array", "store"))
+def test_fit_samples_preserve_calibration_and_depth_groups(
+    illumination_fit_case, topology, decision
 ):
-    """The estimator's loader must preserve each channel's calibrated pixels."""
-    from opm_processing.imageprocessing.flatfield import _camera_corrected_images
-
-    for value in (110, 120):
-        raw = np.full((3, 4, 1900), value, dtype=np.uint16)
-        raw[:, 0, 0] = 90
-        actual = _camera_corrected_images(
-            tensorstore_dataset(raw),
-            camera_offset=100.0,
-            camera_conversion=0.5,
-            apply_stage_scan_gain=True,
-        )
-        assert actual.dtype == np.float32
-        np.testing.assert_array_equal(actual[:, 0, 0], 0)
-        np.testing.assert_array_equal(actual[:, 1:, :1046], (value - 100) * 0.5)
-        np.testing.assert_allclose(actual[..., 1079], (value - 100) * 0.5 / 0.717388)
-        np.testing.assert_array_equal(actual[..., 1104:], (value - 100) * 0.5)
-
-
-@pytest.mark.unit
-def test_shared_field_recovers_maximum_of_known_depth_illuminations(
-    tensorstore_dataset, depth_illumination
-):
-    """The real BaSiC solver recovers the maximum envelope of depth fields."""
-    case = depth_illumination
-    estimated = estimate_illuminations(
-        tensorstore_dataset(case.raw[None, :, None]),
-        camera_offset=100.0,
-        camera_conversion=0.25,
-        stage_positions_zxy=np.asarray(((10, 20, 30), (0, 20, 30))),
-    )
-    assert estimated.shape == (1, 1, case.height, case.width)
-    assert np.all(np.isfinite(estimated))
-    assert np.all(estimated > 0)
-    expected = np.max(case.fields, axis=0)
-    assert np.corrcoef(estimated[0, 0].ravel(), expected.ravel())[0, 1] > 0.95
-    assert np.mean(np.abs(estimated[0, 0] - expected)) < 0.05
-
-
-@pytest.mark.unit
-def test_empty_depths_do_not_floor_the_shared_field(
-    tensorstore_dataset, depth_illumination
-):
-    """An excluded depth cannot raise valid dim pixels to unity in the maximum."""
-    case = depth_illumination
-    raw = np.stack((case.raw, case.raw), axis=1)[None]
-    estimated = estimate_illuminations(
-        tensorstore_dataset(raw),
-        camera_offset=100,
-        camera_conversion=0.25,
-        stage_positions_zxy=np.asarray(((10, 20, 30), (0, 20, 30))),
-        signal_mask=np.asarray([[[True, False], [False, False]]]),
-    )
-    assert estimated.shape == (1, 2, case.height, case.width)
-    assert np.corrcoef(estimated[0, 0].ravel(), case.fields[0].ravel())[0, 1] > 0.95
-    assert estimated[0, 0].min() < 0.8
-    np.testing.assert_array_equal(estimated[0, 1], 1.0)
-
-
-@pytest.mark.unit
-def test_flatfield_correction_recovers_multitile_multichannel_truth(tiled_illumination):
-    """Recover known rectangular illumination fields from a tiled scan."""
-    case = tiled_illumination
-    estimated = estimate_illuminations(
+    """Keep time-zero photon units and odd detector dimensions through fit preparation."""
+    case = illumination_fit_case
+    mask = None
+    selected = np.arange(len(case.levels))
+    if decision is not None:
+        mask = np.ones(case.raw.shape[:3], np.int8)
+        if len(selected) > 1:
+            mask[0, 1] = decision
+            selected = selected[selected != 1]
+        else:
+            mask[1] = decision  # Later times are not used for estimation.
+    actual = estimate_illuminations(
         case.datastore,
-        case.camera_offset,
-        case.camera_conversion,
-        stage_positions_zxy=case.stage_positions,
-        apply_stage_scan_gain=False,
-        signal_mask=None,
-    )[0]
+        100,
+        0.5,
+        case.coordinates,
+        detector_gain_x=case.gain,
+        signal_mask=mask,
+    )
+    expected_levels = [
+        np.median(case.levels[selected, channel], axis=1)
+        if topology == "tiles"
+        else case.levels[position, channel]
+        for position in (selected if topology == "depths" else (0,))
+        for channel in range(2)
+    ]
+    for images, levels in zip(case.calls, expected_levels, strict=True):
+        np.testing.assert_allclose(
+            images,
+            np.broadcast_to(levels[:, None, None], images.shape),
+            rtol=4 * np.finfo(np.float32).eps,
+            atol=0,
+        )
+    assert actual.shape == ((2, 5, 7) if case.coordinates is None else (1, 2, 5, 7))
+    np.testing.assert_allclose(actual, 1, rtol=4 * np.finfo(np.float32).eps, atol=0)
 
-    camera_corrected = (
-        case.raw.astype(np.float32) - case.camera_offset
-    ) * case.camera_conversion
-    corrected = camera_corrected / estimated[np.newaxis, :, np.newaxis, :, :]
-    for channel in range(case.channels):
-        truth = case.specimen[:, channel]
-        before = camera_corrected[:, channel]
-        after = corrected[:, channel]
-        scale = np.median(truth, axis=(-2, -1)) / np.median(
-            after,
-            axis=(-2, -1),
-        )
-        after = after * scale[..., np.newaxis, np.newaxis]
-        before_error = np.mean(np.abs(before - truth)) / np.mean(truth)
-        after_error = np.mean(np.abs(after - truth)) / np.mean(truth)
 
-        assert after_error < 0.35 * before_error
-        assert (
-            np.corrcoef(
-                estimated[channel].ravel(),
-                case.illuminations[channel].ravel(),
-            )[0, 1]
-            > 0.95
+@pytest.mark.unit
+@pytest.mark.parametrize("level", (100, 110), ids=("empty", "one-image"))
+def test_empty_or_insufficient_samples_are_handled_before_fitting(level):
+    """Empty channels use unity; a single informative image cannot constrain a fit."""
+    raw = np.full((1, 1, 1, 1, 5, 7), level, np.uint16)
+    if level == 100:
+        np.testing.assert_array_equal(
+            estimate_illuminations(raw, 100, 1), np.ones((1, 5, 7))
         )
-        before_gain = np.median(before / truth, axis=(0, 1, 2))
-        after_gain = np.median(after / truth, axis=(0, 1, 2))
-        before_stripe_error = abs(
-            before_gain[case.detector_x]
-            - np.median(
-                np.concatenate(
-                    (
-                        before_gain[case.detector_x - 12 : case.detector_x - 7],
-                        before_gain[case.detector_x + 8 : case.detector_x + 13],
-                    )
-                )
-            )
-        )
-        after_stripe_error = abs(
-            after_gain[case.detector_x]
-            - np.median(
-                np.concatenate(
-                    (
-                        after_gain[case.detector_x - 12 : case.detector_x - 7],
-                        after_gain[case.detector_x + 8 : case.detector_x + 13],
-                    )
-                )
-            )
-        )
-        assert after_stripe_error < 0.4 * before_stripe_error, (
-            f"channel {channel}: stripe error changed from "
-            f"{before_stripe_error:.6f} to {after_stripe_error:.6f}"
+    else:
+        with pytest.raises(ValueError, match="at least two nonempty"):
+            estimate_illuminations(raw, 100, 1)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "option,value",
+    [
+        ("camera_conversion", 0),
+        ("camera_offset", np.nan),
+        ("stage_positions_zxy", np.zeros((2, 3))),
+        ("signal_mask", np.ones((1, 1, 2))),
+    ],
+)
+def test_invalid_illumination_calibration_is_rejected(option, value):
+    """Reject inconsistent acquisition metadata before loading samples or fitting."""
+    options = {"camera_offset": 100, "camera_conversion": 1, option: value}
+    with pytest.raises(ValueError):
+        estimate_illuminations(np.full((1, 1, 1, 3, 5, 7), 120, np.uint16), **options)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("level", (0, -1, np.nan))
+def test_nonpositive_or_nonfinite_fits_are_rejected(level):
+    """Prevent unusable fitted fields from entering residual calibration."""
+    with pytest.raises(ValueError, match="invalid illumination field"):
+        _separable_residual_calibration(
+            np.full((5, 7), level, np.float32), np.ones((3, 5, 7), np.float32)
         )

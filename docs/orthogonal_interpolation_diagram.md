@@ -31,31 +31,17 @@ k_j = floor(v_j / p) and β_j = v_j / p − k_j. Interpolate within that plane:
 
     L_j = (1 − β_j) I_j[k_j] + β_j I_j[k_j + 1].
 
-The existing production core combines the two values as
+The production core combines the two values as
 
-    I_out = (p / Δs) (L_i + L_(i+1)).
+    w_i = d_(i+1) / (d_i + d_(i+1))
+    w_(i+1) = d_i / (d_i + d_(i+1))
+    I_out = (2p / Δs) (w_i L_i + w_(i+1) L_(i+1)).
 
-This expression deliberately preserves the implementation's intensity scale;
-the sum is not replaced with distance-weighted interpolation between planes.
-For constant input, the core's gain is 2p/Δs before optional Z averaging.
+Here d_i and d_(i+1) are the perpendicular distances from the output point to
+the two camera planes. Their weights sum to one and linearly interpolate between
+the perpendicular projections. The supported 30-degree photon-volume gain
+remains 2p/Δs before optional Z averaging.
 All four samples retain the same camera-column index u = X. Only the YZ
 geometry requires interpolation. Origins are omitted for clarity; the diagram
 uses 30° and illustrative spacing, not a particular acquisition's parameters.
 Boundary handling, padding and optional output-Z averaging are omitted.
-
-The drawing script checks that both Q points lie on their camera planes and
-that P−Q is perpendicular to the camera-row direction. A numerical four-sample
-example is evaluated by the actual `orthogonal_deskew` function with Z
-downsampling disabled. The expected value is 19.5213548685; the float32 result
-is 19.5213546753. The two untouched camera columns remain exactly zero.
-These are diagram-consistency checks, not changes to the production algorithm.
-
-Exports are PDF, editable-text SVG and 600-dpi PNG under
-`diagnostics/orthogonal_interpolation_labeled`. The numerical check is saved
-as `geometry_check.json`.
-
-```powershell
-uv run --no-sync --with matplotlib python -m scripts.plot_orthogonal_interpolation --output diagnostics/orthogonal_interpolation_labeled
-```
-
-Spatial axes are labeled in ?m; the numerical example uses illustrative p = 1 ?m and ?s = 3 ?m. The bottom key identifies camera planes and their pixels, orthogonal projection paths, other lab-grid points, and target P. Scan displacement s is explicitly labeled along lab Y.

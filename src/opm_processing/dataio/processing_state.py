@@ -42,7 +42,7 @@ def processing_state_path(output_root: Path, acquisition_stem: str) -> Path:
     return root / f"{acquisition_stem}.processing.json"
 
 
-def _json_value(value: Any) -> Any:
+def convert_metadata(value: Any) -> Any:
     """Return a deterministic JSON-compatible representation.
 
     Parameters
@@ -53,16 +53,18 @@ def _json_value(value: Any) -> Any:
     Returns
     -------
     Any
-        Deterministic JSON-compatible values used in the journal and resume fingerprint.
+        Deterministic JSON-compatible attributes, journal values and resume settings.
     """
     if isinstance(value, Path):
         return str(value.expanduser().resolve())
     if isinstance(value, dict):
-        return {str(key): _json_value(item) for key, item in value.items()}
+        return {str(key): convert_metadata(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
-        return [_json_value(item) for item in value]
+        return [convert_metadata(item) for item in value]
     if isinstance(value, set):
-        return [_json_value(item) for item in sorted(value)]
+        return [convert_metadata(item) for item in sorted(value)]
+    if hasattr(value, "tolist"):
+        return value.tolist()
     if hasattr(value, "item"):
         return value.item()
     return value
@@ -98,7 +100,7 @@ def _configuration_fingerprint(configuration: dict[str, Any]) -> str:
         SHA-256 digest of the canonical output-affecting configuration.
     """
     encoded = json.dumps(
-        _json_value(configuration),
+        convert_metadata(configuration),
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
@@ -245,7 +247,7 @@ class ProcessingState:
             "path": key,
             "configuration_sha256": _configuration_fingerprint(configuration),
         }
-        series = [_json_value(item) for item in roi_series]
+        series = [convert_metadata(item) for item in roi_series]
         outputs = self.document["outputs"]
         existing = outputs.get(key)
         if existing is not None and not overwrite:
@@ -257,7 +259,7 @@ class ProcessingState:
             # The fingerprint establishes exact compatibility before backfilling
             # self-contained export evidence for an older resumable journal.
             if "configuration" not in existing or "dataset_id" not in existing:
-                existing["configuration"] = _json_value(configuration)
+                existing["configuration"] = convert_metadata(configuration)
                 existing.setdefault("dataset_id", str(uuid4()))
                 self.save()
             return
@@ -265,7 +267,7 @@ class ProcessingState:
             **expected,
             "completed_tiles": [],
             "zero_channels": [],
-            "configuration": _json_value(configuration),
+            "configuration": convert_metadata(configuration),
             "dataset_id": str(uuid4()),
         }
         if series:
@@ -273,7 +275,7 @@ class ProcessingState:
         if "reconstruction" in configuration:
             # Fusion needs the effective deskew input geometry when a solver
             # reconstructs additional scan planes. Keep raw metadata intact.
-            record["reconstruction"] = _json_value(configuration["reconstruction"])
+            record["reconstruction"] = convert_metadata(configuration["reconstruction"])
         outputs[key] = record
         self.document["registration"].pop(key, None)
         self.save()
@@ -464,7 +466,7 @@ class ProcessingState:
         self.run(output_path)
         self.document["registration"][key] = {
             "configuration_sha256": _configuration_fingerprint(configuration),
-            "pairwise_metrics": _json_value(pairwise_metrics),
+            "pairwise_metrics": convert_metadata(pairwise_metrics),
         }
         self.save()
 
@@ -528,7 +530,7 @@ class ProcessingState:
                 if previous is not record:
                     previous.pop("fused_path")
         record["fused_path"] = fused_key
-        record["tiles"] = [_json_value(tile) for tile in tiles]
+        record["tiles"] = [convert_metadata(tile) for tile in tiles]
         self.save()
 
     def set_registered_max_projection(
@@ -609,7 +611,7 @@ class ProcessingState:
         try:
             with temporary.open("w", encoding="utf-8", newline="\n") as stream:
                 json.dump(
-                    _json_value(self.document),
+                    convert_metadata(self.document),
                     stream,
                     indent=2,
                     sort_keys=True,

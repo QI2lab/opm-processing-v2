@@ -37,7 +37,7 @@ def hardware_volume_interval(
     acquired_planes : int or None
         Original acquired count, including discarded planes; never processed Z size.
     plane_period_s : float or None
-        Hardware trigger period in seconds, independently of camera exposure.
+        Hardware period in seconds per scan position, including acquired channels.
 
     Returns
     -------

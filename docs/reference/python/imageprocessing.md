@@ -11,6 +11,8 @@ source-documented functions.
 
 ::: opm_processing.imageprocessing.camera.illumination_correct
 
+::: opm_processing.imageprocessing.flatfield.estimate_illuminations
+
 ## Geometry and interpolation
 
 ::: opm_processing.imageprocessing.coordinates.stage_positions_to_image_coordinates
@@ -20,6 +22,8 @@ source-documented functions.
 ::: opm_processing.imageprocessing.opmtools.orthogonal_deskew
 
 ## PSFs and RLGC
+
+::: opm_processing.imageprocessing.opmpsf.integrate_camera_pixels
 
 ::: opm_processing.imageprocessing.opmpsf.generate_skewed_psf
 

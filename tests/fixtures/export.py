@@ -5,52 +5,49 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-import zarr
 from ome_types import from_xml, to_xml
 from ome_types.model import AnnotationRef, CommentAnnotation
 from yaozarrs import open_group, v05
 
-from opm_processing.dataio.position_collection import create_position_collection
+from opm_processing.dataio.position_collection import (
+    create_position_collection,
+    update_group_attributes,
+)
 from opm_processing.dataio.processing_state import ProcessingState
 
 
 @pytest.fixture
-def fused_export(tmp_path, source_xml, fused_store_factory):
-    """Persist a two-channel object, depth projection and calibrated provenance.
-
-    Parameters
-    ----------
-    tmp_path : pathlib.Path
-        Temporary acquisition and processed image directory.
-    source_xml : bool
-        Test parameter selecting rich OME metadata or NGFF-only acquisition.
-    fused_store_factory
-        Shared writer for calibrated root images and their pyramids.
-
-    Returns
-    -------
-    types.SimpleNamespace
-        Known pixels, image paths, calibration, source OME and processing state.
-    """
+def fused_export(tmp_path, source_xml, fused_store_factory, simulated_camera):
+    """Persist a two-channel object, depth projection and calibrated provenance."""
     dtype = np.uint16
-    z, y, x = np.mgrid[:3, :515, :529]
-    object_pixels = 900 * np.exp(
-        -((z - 1) ** 2 + ((y - 251) / 45) ** 2 + ((x - 287) / 39) ** 2)
-    )
-    # Add known emitters at TIFF tile boundaries and at both partial-tile edges.
-    object_pixels[:, 511:514, 510:516] += 233
-    object_pixels[:, -1, -1] = (7, 11, 17)
-    truth = np.stack(
+    from opm_processing.imageprocessing.camera import camera_correct
+    from tests.simulation.camera import digitize
+
+    observed = simulated_camera((3, 515, 529), geometry="cartesian")
+    camera = observed.microscope.camera
+    raw_frames = np.stack(
         [
-            np.stack([object_pixels, object_pixels * 2.3]),
-            np.stack([object_pixels * 0.7, object_pixels * 1.4]),
+            np.stack(
+                [
+                    digitize(
+                        observed.expectation * exposure,
+                        camera,
+                        seed=10 * time + channel,
+                    )
+                    for channel, exposure in enumerate(exposures)
+                ]
+            )
+            for time, exposures in enumerate(((1.0, 2.3), (0.7, 1.4)))
         ]
+    )
+    truth = camera_correct(
+        raw_frames, camera.offset_adu, camera.electrons_per_adu
     ).astype(dtype)
     projection = truth.max(axis=2, keepdims=True)
     raw_path = tmp_path / "sample.ome.zarr"
     raw = create_position_collection(
         raw_path,
-        (2, 1, 2, 3, 5, 7),
+        (2, 1, 2, 3, 515, 529),
         (0.4, 0.115, 0.115),
         channels=("488nm", "637nm"),
         dtype=dtype,
@@ -71,8 +68,7 @@ def fused_export(tmp_path, source_xml, fused_store_factory):
             }
         },
     )
-    raw.arrays[0].write(truth[..., :5, :7]).result()
-    raw_group = zarr.open_group(raw_path, mode="a")["0"]
+    raw.arrays[0].write(raw_frames).result()
     image_metadata = (
         open_group(raw_path)["0"]
         .ome_metadata()
@@ -91,7 +87,10 @@ def fused_export(tmp_path, source_xml, fused_store_factory):
             }
         )
     )
-    raw_group.attrs["ome"] = image_metadata.model_dump(mode="json", exclude_none=True)
+    update_group_attributes(
+        raw_path / "0",
+        {"ome": image_metadata.model_dump(mode="json", exclude_none=True)},
+    )
     companion = raw_path / "OME/METADATA.ome.xml"
     source_ome = from_xml(companion.read_text(encoding="utf-8"))
     if source_xml:
@@ -99,7 +98,9 @@ def fused_export(tmp_path, source_xml, fused_store_factory):
             2026, 10, 5, 19, 12, 32, tzinfo=UTC
         )
         source_ome.images[0].pixels.time_increment = 8.5
-        source_ome.images[0].pixels.channels[0].emission_wavelength = 525
+        source_ome.images[0].pixels.channels[0].emission_wavelength = (
+            observed.microscope.wavelength_um * 1000
+        )
         source_ome.structured_annotations.comment_annotations.append(
             CommentAnnotation(id="Annotation:sample", value="Simulated specimen μ")
         )
@@ -112,11 +113,11 @@ def fused_export(tmp_path, source_xml, fused_store_factory):
 
     fused_path = tmp_path / "sample_fused.ome.zarr"
     projection_path = tmp_path / "sample_max_z_fused.ome.zarr"
-    spacing = (0.23, 0.115, 0.119)
+    spacing = (0.4, 0.115, 0.115)
     origin = (-40.5, 20.25, -11.75)
     for path, data, z_origin in (
         (fused_path, truth, origin[0]),
-        (projection_path, projection, origin[0] + 0.23),
+        (projection_path, projection, origin[0] + spacing[0]),
     ):
         fused_store_factory(
             data,
@@ -127,7 +128,7 @@ def fused_export(tmp_path, source_xml, fused_store_factory):
             attributes={"specimen": "Simulated α"},
         )
         # Coarse pixels deliberately differ so exporting the wrong scale fails.
-        zarr.open_group(path, mode="r+")["1"][:] = 0
+        open_group(path)["1"].to_tensorstore().write(0).result()
     processed = tmp_path / "sample_decon_deskewed.ome.zarr"
     state = ProcessingState.create(tmp_path / "sample.processing.json", raw_path)
     state.initialize_run(processed, configuration={"deconvolve": True}, overwrite=True)

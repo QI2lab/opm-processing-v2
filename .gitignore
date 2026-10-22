@@ -121,7 +121,7 @@ src/cucim
 # Local audit notes, experiment reports, and diagnostic outputs
 /diagnostics/
 /AUDIT_*.md
-/docs/*_audit.md
+/docs/**/*audit*.md
 # Temporary diagnostic runs and generated stitching reports
 /.tmp/
 /stitching_*_diagnostic.json
@@ -133,3 +133,5 @@ src/cucim
 uv.lock
 
 /.test-*
+# Locally supplied reference papers
+/tests/reference/papers/

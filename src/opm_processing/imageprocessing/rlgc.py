@@ -1,24 +1,72 @@
-"""
-Richardson-Lucy Gradient Consensus (RLGC) deconvolution (Manton-style core).
+"""Richardson–Lucy deconvolution with gradient consensus (RLGC).
 
-Original idea for Gradient Consensus deconvolution:
-James Manton and Andrew York, https://zenodo.org/records/10278919
+References
+----------
+James Manton's original RLGC implementation (2023), developed with Andrew York,
+Jan Becker and Craig Russell: https://github.com/jdmanton/rlgc .
+Andrew York, Gradient Consensus (2023): https://doi.org/10.5281/zenodo.10278919 .
+The later shared RLGC notebook is available at
+https://colab.research.google.com/drive/1mfVNSCaYHz1g56g92xBkIoa8190XNJpJ .
 
-The multiplicative update and gradient consensus follow the local
-expansion-processing implementation. OPM uses geometry-specific padding,
-data-derived initialization and same-split stopping. Validation is recorded
-in docs/deconvolution_optimization_audit.md. That local implementation cites:
-https://colab.research.google.com/drive/1mfVNSCaYHz1g56g92xBkIoa8190XNJpJ
+Yiming Liu and Sjoerd Stallinga (2026), "Application of gradient-consensus
+Richardson–Lucy deconvolution to noisy undersampled brightfield microscopy
+data", Biomedical Optics Express 17, 2999: https://doi.org/10.1364/BOE.597710 .
+Associated MATLAB code: https://gitlab.tudelft.nl/imphys/ci/upsample-gc-rl ,
+gc_deconv.m at revision 0340af0d7a4c5d92a97a1b443dfedb367dfb9f3d.
+
+OPM adaptations
+---------------
+The algorithm follows gc_deconv.m, including its read-noise compensation.
+Initialize with constant mean(J). Split J+sigma^2 using do_binosplit.m's rounding,
+binomial/Gaussian split and uniform remainder; subtract sigma^2/2 from each half
+and clip independently at zero. The full and half ratios use sigma^2 in both
+numerators and the predicted-image denominator, exactly as in gc_deconv.m.
+Blur (u1-1)*(u2-1), with no intensity weighting. Negative consensus rejects an
+update and zero permits it. Compute the full RL ratio directly from J, as in
+MATLAB; clipped halves need not sum to J and must not define that full ratio.
+
+Default KL stopping follows gc_deconv.m with use_KL=1: compute normalized
+D(prediction || split) for each fresh half, and stop when BOTH scores exceed
+their preceding-iteration scores. As in MATLAB, retain the current estimate;
+do not roll back an iteration. Score Ax on the acquired-pixel grid, including
+detector response, rather than compare differently sized object and data grids.
+Native reflected padding is excluded from KL scores because it is not acquired.
+This is MATLAB's measurement-space convention; the paper's equations (6)-(7)
+write the object estimate instead. Its 1e-4 pseudocount is retained. The existing
+accepted-fraction and maximum-relative-change thresholds remain 0.001; callers
+can disable KL stopping with use_kl=False. No PSNR-derived threshold is used.
+
+Camera gain and offset are calibrated before reconstruction. read_noise is RMS
+in those calibrated input units; zero selects the photon-only reference branch.
+Processing supplies the explicitly configured camera RMS read noise. This is the
+reference's shifted-count approximation, not a new camera-likelihood algorithm.
+The split implementation keeps
+MATLAB's signed rounding remainder and Gaussian approximation at rounded counts
+of 150 or higher, including its out-of-range fallback. CuPy and MATLAB random
+generators differ, so the same numeric seed does not imply identical halves.
+
+OPM-specific differences are the 3D oblique PSF, conjugate-OTF adjoint, optional
+detector response with sensitivity normalization, and symmetric image halos.
+Convergence metrics include the padded native volume, while KL uses acquired
+pixels only. GPU execution uses float32, efficient FFT dimensions and cached
+workspaces; negative FFT roundoff in the nonnegative full RL multiplier is
+clipped at zero. Scan chunking has allocation fallback. The acquired-plane
+operator uses zero extension and scan-plane selection,
+rather than MATLAB's 2D pixel averaging. These geometric/execution adaptations
+are not a claim of identical boundary conditions or bitwise MATLAB results.
+
+FFT tiles use overlap-save with the PSF support at every convolution. They share
+one object, initialization, count split and stopping decision. GPU-memory fallback
+can keep this global state in host RAM and transfer only haloed FFT tiles. NumPy
+and CuPy random generators follow the same split distribution but differ bitwise.
 """
 
 import gc
 import logging
-import timeit
 from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
-from tqdm import tqdm
 
 from opm_processing.cuda import preload_cuda_libraries
 
@@ -41,6 +89,60 @@ filter_update = ElementwiseKernel(
 )
 
 
+Array = np.ndarray | cp.ndarray
+
+_fft_cache_3d: dict[tuple[int, int, int, int], cp.ndarray] = {}
+
+GC_UPDATED_FRACTION_LIMIT = 0.001
+GC_RELATIVE_CHANGE_LIMIT = 0.001
+
+
+def _gc_stopping_metrics(
+    previous: cp.ndarray,
+    recon: cp.ndarray,
+    consensus: cp.ndarray,
+    limit: float,
+    max_delta: float,
+) -> tuple[float, float, str | None]:
+    """Evaluate gc_deconv.m's stopping conditions for native and sparse solvers.
+
+    Reference: gc_deconv.m, revision 0340af0d7a4c5d92a97a1b443dfedb367dfb9f3d,
+    stopping metrics and final OR condition. Siemens_rdnoise_plot.m supplies
+    limit1=limit2=0.001. Negative consensus values reject updates; zero accepts.
+    The strict inequalities and 1e-12 denominator floor are from that code.
+
+    Parameters
+    ----------
+    previous : array-like
+        Object estimate before the current iteration.
+    recon : array-like
+        Current nonnegative object estimate.
+    consensus : array-like
+        Consensus field; nonnegative entries permit an update.
+    limit : float
+        Minimum accepted-update fraction.
+    max_delta : float
+        Minimum maximum-absolute change relative to the current peak.
+
+    Returns
+    -------
+    tuple[float, float, str or None]
+        Accepted fraction, relative change and selected stopping reason.
+    """
+    xp = cp.get_array_module(recon)
+    fraction = float(recon.size - xp.count_nonzero(consensus < 0)) / recon.size
+    denominator = xp.maximum(xp.max(recon), 1e-12)
+    delta = float(xp.max(xp.abs(recon - previous)) / denominator)
+    reason = (
+        "consensus_fraction"
+        if fraction < limit
+        else "relative_change"
+        if delta < max_delta
+        else None
+    )
+    return fraction, delta, reason
+
+
 def clear_rlgc_caches(clear_memory_pool: bool = False) -> None:
     """Clear cached FFT resources used by RLGC helper functions.
 
@@ -54,6 +156,7 @@ def clear_rlgc_caches(clear_memory_pool: bool = False) -> None:
     -------
     None
     """
+    _fft_cache_3d.clear()
     try:
         cp.fft.config.get_plan_cache().clear()
     except Exception:
@@ -72,7 +175,8 @@ def clear_rlgc_caches(clear_memory_pool: bool = False) -> None:
 
 
 def next_gpu_fft_size(x: int) -> int:
-    """Return the smallest cuFFT-friendly size at least as large as ``x``.
+    """
+    Return the smallest FFT-friendly size >= ``x`` with prime factors in {2, 3}.
 
     Parameters
     ----------
@@ -82,16 +186,17 @@ def next_gpu_fft_size(x: int) -> int:
     Returns
     -------
     int
-        Next length whose prime factors are in 2, 3, 5, and 7.
+        Next 2-3-smooth length >= ``x``.
     """
     if x <= 1:
         return 1
     n = x
     while True:
         m = n
-        for factor in (2, 3, 5, 7):
-            while (m % factor) == 0:
-                m //= factor
+        while (m % 2) == 0:
+            m //= 2
+        while (m % 3) == 0:
+            m //= 3
         if m == 1:
             return n
         n += 1
@@ -161,32 +266,6 @@ def _linear_fft_pad_width(
     return pad_scan, pad_y, pad_x
 
 
-def remove_padding_zyx(
-    padded_image: cp.ndarray | np.ndarray,
-    pad_width: tuple[tuple[int, int], tuple[int, int], tuple[int, int]],
-) -> cp.ndarray | np.ndarray:
-    """Remove reflected boundary and FFT padding from a reconstructed volume.
-
-    Parameters
-    ----------
-    padded_image : cupy.ndarray or numpy.ndarray
-        Padded image in Z, Y, X order.
-    pad_width : tuple[tuple[int, int], tuple[int, int], tuple[int, int]]
-        Reflected boundary and FFT padding widths for each axis.
-
-    Returns
-    -------
-    cupy.ndarray or numpy.ndarray
-        View of the input with padding removed.
-    """
-    slices = []
-    for axis, (pad_before, pad_after) in enumerate(pad_width):
-        start = pad_before
-        stop = padded_image.shape[axis] - pad_after if pad_after > 0 else None
-        slices.append(slice(start, stop))
-    return padded_image[tuple(slices)]
-
-
 def pad_psf(
     psf_temp: cp.ndarray,
     image_shape: tuple[int, int, int],
@@ -231,10 +310,12 @@ def pad_psf(
 def fft_conv(
     image: cp.ndarray, H: cp.ndarray, shape: tuple[int, int, int]
 ) -> cp.ndarray:
-    """Convolve using the transform output as the frequency workspace.
+    """
+    Linear convolution via FFT with cached buffers (no clipping).
 
-    This computes ``irfftn(rfftn(image) * H, s=shape)`` without an additional
-    frequency buffer or copy. CuPy reuses FFT plans. No clipping is applied.
+    This computes ``irfftn(rfftn(image) * H, s=shape)`` with preallocated
+    work buffers. No clipping is applied here-this matches the reference
+    implementation used to compute predictions, ratios and consensus.
 
     Parameters
     ----------
@@ -250,9 +331,17 @@ def fft_conv(
     cupy.ndarray
         Convolved array in object space (float32).
     """
-    spectrum = cp.fft.rfftn(image)
-    spectrum *= H
-    return cp.fft.irfftn(spectrum, s=shape).astype(cp.float32, copy=False)
+    device_id = int(cp.cuda.Device().id)
+    cache_key = (device_id, *shape)
+    if cache_key not in _fft_cache_3d:
+        z, y, x = shape
+        freq_shape = (z, y, x // 2 + 1)
+        _fft_cache_3d[cache_key] = cp.empty(freq_shape, dtype=cp.complex64)
+
+    fft_buf = _fft_cache_3d[cache_key]
+    fft_buf[...] = cp.fft.rfftn(image)
+    fft_buf[...] *= H
+    return cp.fft.irfftn(fft_buf, s=shape).astype(cp.float32, copy=False)
 
 
 def _observed_region_slices(
@@ -302,113 +391,48 @@ def _kl_div_into(
         Float32 sum of directed prediction-to-observation KLD terms, represented
         as a Python float. NaN terms are zeroed as in the reference.
     """
+    xp = cp.get_array_module(p)
     probability_p = p + 1e-4
     probability_q = q + 1e-4
-    probability_p = probability_p / cp.sum(probability_p)
-    probability_q = probability_q / cp.sum(probability_q)
-    scratch[...] = probability_p * (cp.log(probability_p) - cp.log(probability_q))
-    scratch[cp.isnan(scratch)] = 0
-    return float(cp.sum(scratch))
+    probability_p = probability_p / xp.sum(probability_p)
+    probability_q = probability_q / xp.sum(probability_q)
+    scratch[...] = probability_p * (xp.log(probability_p) - xp.log(probability_q))
+    scratch[xp.isnan(scratch)] = 0
+    return float(xp.sum(scratch))
 
 
-def split_kl_changes(
+def split_kl_scores(
     predicted: cp.ndarray,
-    previous_prediction: cp.ndarray,
     split1: cp.ndarray,
     split2: cp.ndarray,
     scratch: cp.ndarray,
 ) -> tuple[float, float]:
-    """Compare two predictions against the same complementary observations.
+    """MATLAB's normalized D(Ax || half), evaluated on acquired pixels.
 
-    Compute D(split || predicted) - D(split || previous_prediction) for each
-    half. The split entropy cancels, so shared prediction logs are evaluated
-    once. Positive changes indicate a worse estimate. Normalizations and
-    weighted reductions use float64; the logarithm workspace remains float32.
-    Negative FFT roundoff is clipped only for this stopping statistic.
+    Store these two scores and compare with the preceding iteration's scores,
+    as gc_deconv.m does. The new halves are fresh draws, not held-out data.
+    Clip negative FFT roundoff only for this statistic; predictions used in
+    the multiplicative update are unchanged.
 
     Parameters
     ----------
-    predicted : cupy.ndarray
-        Current nonnegative prediction on the measured grid.
-    previous_prediction : cupy.ndarray
-        Previous prediction on the same grid.
-    split1 : cupy.ndarray
-        First fresh photon-count half.
-    split2 : cupy.ndarray
-        Complementary fresh photon-count half.
-    scratch : cupy.ndarray
-        Float32 workspace with the same shape as the predictions.
+    predicted : array-like
+        Predicted intensities at acquired pixels.
+    split1 : array-like
+        First measured half image in the same geometry.
+    split2 : array-like
+        Second measured half image in the same geometry.
+    scratch : array-like
+        Reusable workspace matching the acquired-pixel shape.
 
     Returns
     -------
     tuple[float, float]
-        Changes in normalized observation-to-prediction KLD for both halves.
+        Normalized prediction-to-half KL divergences.
     """
-    current = cp.maximum(predicted, 0) + 1e-4
-    previous = cp.maximum(previous_prediction, 0) + 1e-4
-    new_mass = cp.sum(current, dtype=cp.float64)
-    old_mass = cp.sum(previous, dtype=cp.float64)
-    scratch[...] = cp.log(previous / current) + cp.log(new_mass / old_mass)
-    return tuple(
-        float(
-            cp.sum((split + 1e-4) * scratch, dtype=cp.float64)
-            / cp.sum(split + 1e-4, dtype=cp.float64)
-        )
-        for split in (split1, split2)
-    )
-
-
-def _child_log_prefix(base_prefix: str, suffix: str) -> str:
-    """Append one structured suffix to an RLGC log prefix.
-
-    Parameters
-    ----------
-    base_prefix : str
-        Existing structured log prefix, or an empty string.
-    suffix : str
-        Suffix to append as a separate token.
-
-    Returns
-    -------
-    str
-        Combined log prefix. If ``base_prefix`` is empty, returns ``suffix``.
-    """
-    return suffix if not base_prefix else f"{base_prefix} {suffix}"
-
-
-def _resolve_tiled_axis_geometry(
-    requested_crop: int,
-    image_size: int,
-    psf_support: int,
-    axis_name: str,
-) -> tuple[int, int]:
-    """Resolve retained crop size and discarded processing halo for one axis.
-
-    Parameters
-    ----------
-    requested_crop : int
-        Requested retained crop size along the axis.
-    image_size : int
-        Full image size along the axis.
-    psf_support : int
-        PSF support length along the axis.
-    axis_name : str
-        Name used in validation error messages.
-
-    Returns
-    -------
-    tuple[int, int]
-        Retained tile size and hidden processing halo for the axis.
-    """
-    if requested_crop <= 0:
-        raise ValueError(f"{axis_name} must be greater than 0 for tiled 3D RLGC.")
-
-    retained_size = min(int(requested_crop), int(image_size))
-    if retained_size >= image_size:
-        return retained_size, 0
-
-    tile_pad = int(psf_support)
-    return retained_size, tile_pad
+    xp = cp.get_array_module(predicted)
+    predicted = xp.maximum(predicted, 0)
+    return tuple(_kl_div_into(predicted, half, scratch) for half in (split1, split2))
 
 
 def determine_rlgc_crop_scan(
@@ -460,10 +484,8 @@ def determine_rlgc_crop_scan(
     free_bytes, _ = cp.cuda.runtime.memGetInfo()
     memory_budget = int(free_bytes * memory_fraction)
 
-    # An isolated-pool measurement on the 219x243x490 workload peaked at
-    # 24.2 float32-equivalent buffers per padded voxel. Use 26 before applying
-    # memory_fraction to cover object state, OTFs, FFT workspaces, retained
-    # predictions, normalization and binomial/reduction temporaries.
+    # Reserve optical state, OTFs, FFT workspaces, split/reduction temporaries
+    # and optional detector-response buffers, before memory_fraction is applied.
     estimated_bytes_per_voxel = 26 * np.dtype(np.float32).itemsize
     scan_size, camera_y, camera_x = (int(size) for size in image_shape)
     pad_y = _axis_linear_fft_padding(camera_y, psf_shape[1])
@@ -523,364 +545,632 @@ class RlgcChunkState:
             )
         return self.crop_scan
 
-    def remember_successful_crop(self, crop_scan: int) -> None:
-        """Retain a successful fallback crop for all later solver calls.
 
-        Parameters
-        ----------
-        crop_scan : int
-            Retained scan-plane count used for chunked deconvolution.
-        """
-        self.crop_scan = int(crop_scan)
+def _split_observed_counts(
+    observed: cp.ndarray, rng: cp.random.Generator
+) -> cp.ndarray:
+    """Return do_binosplit.m's first, unclipped half for psplit=0.5.
 
-
-def _axis_retained_bounds(retained_size: int, image_size: int) -> list[tuple[int, int]]:
-    """Build non-overlapping retained tile bounds that exactly cover one axis.
+    MATLAB rounds halfway away from zero. Below rounded count 150 it uses a
+    binomial draw; otherwise it uses a Gaussian with mean n/2 and variance n/4,
+    replacing out-of-range draws by n/2. Every pixel also receives U*(J-n),
+    U uniform on [0,1), including negative rounding remainders. Both dummy
+    distributions and the uniform draw are generated every call, as in MATLAB.
+    The caller forms J-first BEFORE independently clipping the two halves.
 
     Parameters
     ----------
-    retained_size : int
-        Number of output samples retained from each tile along the axis.
-    image_size : int
-        Full image size along the axis.
+    observed : array-like
+        Nonnegative counts including the read-noise variance shift, when used.
+    rng : numpy.random.Generator or cupy.random.Generator
+        Random generator on the same backend as observed.
 
     Returns
     -------
-    list[tuple[int, int]]
-        Inclusive-exclusive retained bounds covering ``[0, image_size)``.
+    array-like
+        Unclipped first half, including the signed fractional remainder.
     """
-    if retained_size <= 0:
-        raise ValueError("retained_size must be greater than 0.")
-    bounds = []
-    start = 0
-    while start < image_size:
-        stop = min(start + retained_size, image_size)
-        bounds.append((start, stop))
-        start = stop
-    return bounds
+    xp = cp.get_array_module(observed)
+    whole = xp.floor(observed)
+    counts = (whole + (observed - whole >= 0.5)).astype(xp.int64)
+    high_counts = counts >= 150
+    low_n = xp.where(high_counts, 1, counts)
+    first_low = rng.binomial(low_n, p=0.5).astype(xp.float32)
+    high_n = xp.where(high_counts, counts, 1).astype(xp.float32)
+    first_high = high_n * 0.5 + xp.sqrt(high_n * 0.25) * rng.standard_normal(
+        observed.shape, dtype=xp.float32
+    )
+    first_high = xp.where(
+        (first_high >= high_n) | (first_high < 0), high_n * 0.5, first_high
+    )
+    first = xp.where(high_counts, first_high, first_low)
+    return first + rng.random(observed.shape, dtype=xp.float32) * (
+        observed - counts.astype(xp.float32)
+    )
 
 
-def central_psf_plane(psf: np.ndarray) -> np.ndarray:
-    """Return a normalized 2D central plane from a 2D or skewed 3D PSF.
+def _read_noise_variance(read_noise: float) -> np.float32:
+    """Convert calibrated RMS noise to the variance used by gc_deconv.m.
 
     Parameters
     ----------
-    psf : numpy.ndarray
-        A YX PSF or a skewed ZYX PSF. For an even Z extent, index ``Z // 2``
-        is used consistently with the PSF-centering convention in this module.
+    read_noise : float
+        RMS read noise in calibrated image units.
+
+    Returns
+    -------
+    float
+        Variance used in the MATLAB shifted-count approximation.
+
+    Raises
+    ------
+    ValueError
+        RMS noise is negative, nonfinite or not representable.
+    """
+    sigma = float(read_noise)
+    if not np.isfinite(sigma) or sigma < 0 or sigma > np.sqrt(np.finfo(np.float32).max):
+        raise ValueError("read_noise must be finite, nonnegative and representable")
+    return np.float32(sigma * sigma)
+
+
+def _split_calibrated_counts(
+    observed: cp.ndarray, rng: cp.random.Generator, variance: np.float32
+) -> tuple[cp.ndarray, cp.ndarray]:
+    """Apply gc_deconv.m's shifted split, half-variance subtraction and clipping.
+
+    Parameters
+    ----------
+    observed : array-like
+        Nonnegative calibrated detector estimates.
+    rng : numpy.random.Generator or cupy.random.Generator
+        Backend-compatible split generator.
+    variance : float
+        Read-noise variance in squared calibrated units.
+
+    Returns
+    -------
+    tuple of array-like
+        Two independently clipped, variance-corrected half images.
+    """
+    xp = cp.get_array_module(observed)
+    shifted = observed if variance == 0 else observed + variance
+    first = _split_observed_counts(shifted, rng)
+    second = shifted - first
+    return xp.maximum(first - 0.5 * variance, 0), xp.maximum(second - 0.5 * variance, 0)
+
+
+def _calibrated_observations(image: np.ndarray) -> np.ndarray:
+    """Retain finite nonnegative calibrated estimates without quantization loss.
+
+    Parameters
+    ----------
+    image : array-like
+        Calibrated detector values before solver preparation.
 
     Returns
     -------
     numpy.ndarray
-        Nonnegative, unit-sum float32 PSF in YX order.
+        Finite, nonnegative float32 observations.
     """
-    psf_array = np.asarray(psf, dtype=np.float32)
-    if psf_array.ndim == 3:
-        psf_array = psf_array[psf_array.shape[0] // 2]
-    elif psf_array.ndim != 2:
-        raise ValueError(f"Expected a 2D or 3D PSF, got shape {psf_array.shape}")
-    if not np.all(np.isfinite(psf_array)):
-        raise ValueError("PSF values must be finite")
-    psf_array = np.maximum(psf_array, 0)
-    psf_sum = float(np.sum(psf_array, dtype=np.float64))
-    if not psf_sum > 0:
-        raise ValueError("The central PSF plane must contain positive signal")
-    return (psf_array / psf_sum).astype(np.float32, copy=False)
+    observed = np.asarray(image, dtype=np.float32)
+    if not np.isfinite(observed).all():
+        raise ValueError("Camera-calibrated counts must be finite")
+    return np.maximum(observed, 0)
 
 
-def _split_observed_counts(
-    observed: cp.ndarray,
-    rng: cp.random.Generator,
-    *,
-    assign_fractional_remainder: bool = True,
-) -> cp.ndarray:
-    """Draw a binomial half, optionally assigning fractional weighted counts.
-
-    Whole counts follow the usual binomial split. Assign each fractional
-    remainder entirely to either half with equal probability, instead of
-    always putting it in the second half. The complementary half is
-    ``observed - result``, preserving the measured data. For fractional data
-    this is a weighted-count approximation, not an exact Poisson noise model.
-    Integer-only inputs retain the original binomial samples and RNG sequence.
-    Both native and undersampled RLGC use weighted residual assignment.
+def _detector_response(
+    response: np.ndarray | None, image_shape: tuple[int, ...]
+) -> np.ndarray | None:
+    """Validate a positive detector-YX response, retaining compact storage.
 
     Parameters
     ----------
-    observed : cp.ndarray
-        Nonnegative measured photon counts split into independent observations.
-    rng : cp.random.Generator
-        Random generator used for reproducible count splitting.
-    assign_fractional_remainder : bool, default=True
-        Randomly assign fractional weighted counts to either half. If False,
-        return only integer binomial draws; the complementary half contains
-        every fractional remainder, matching the local reference.
+    response : array-like or None
+        Positive detector-YX response; None selects uniform sensitivity.
+    image_shape : tuple of int
+        Acquired image dimensions ending in YX.
 
     Returns
     -------
-    cupy.ndarray
-        One random float32 count split; subtract it from observed to obtain the other split.
+    numpy.ndarray or None
+        Validated compact detector response, or None.
     """
-    counts = observed.astype(cp.int64)
-    split = rng.binomial(counts, p=0.5).astype(cp.float32)
-    if not assign_fractional_remainder:
-        return split
-    remainder = observed - counts.astype(cp.float32)
-    if bool(cp.any(remainder)):
-        remainder *= rng.random(observed.shape, dtype=cp.float32) < 0.5
-        split += remainder
-    return split
+    if response is None:
+        return None
+    field = np.asarray(response, dtype=np.float32)
+    if field.ndim == 3 and field.shape[0] == 1:
+        field = field[0]
+    field = np.broadcast_to(field, image_shape[-2:])
+    if not np.isfinite(field).all() or np.any(field <= 0):
+        raise ValueError("Detector response must be finite and strictly positive")
+    return None if np.all(field == 1) else field
 
 
-def rlgc(
+class _Convolution:
+    """One periodic convolution, optionally evaluated by exact overlap-save tiles.
+
+    Only FFT workspace is tiled. The object, random split, consensus and stopping
+    decision remain global, so a chunk boundary is never an optical boundary.
+    """
+
+    def __init__(
+        self,
+        psf: np.ndarray,
+        shape: tuple[int, int, int],
+        crop_scan: int | None = None,
+        normalize: bool = True,
+    ) -> None:
+        """Prepare the optical transfer function and optional FFT tiles.
+
+        Parameters
+        ----------
+        psf : numpy.ndarray
+            Centered optical kernel in scan-YX order.
+        shape : tuple of int
+            Periodic computational grid dimensions.
+        crop_scan : int or None
+            Retained scan planes per FFT tile; None uses the full grid.
+        normalize : bool
+            Normalize the kernel to unit mass before transforming.
+        """
+        self.shape = tuple(shape)
+        self.crop_scan = shape[0] if crop_scan is None else int(crop_scan)
+        if self.crop_scan < 1:
+            raise ValueError("crop_scan must be positive")
+        self.radius = psf.shape[0] // 2
+        self.tile_shape = (
+            (
+                next_gpu_fft_size(min(self.crop_scan, shape[0]) + 2 * self.radius),
+                *shape[1:],
+            )
+            if self.crop_scan < shape[0]
+            else self.shape
+        )
+        self.otf = cp.fft.rfftn(
+            pad_psf(cp.asarray(psf), self.tile_shape, normalize=normalize)
+        )
+
+    def __call__(self, values: Array, *, adjoint: bool = False) -> Array:
+        """Convolve a global estimate using shared GPU FFT workspace.
+
+        Parameters
+        ----------
+        values : array-like
+            Object-grid values on the host or GPU.
+        adjoint : bool
+            Conjugate the transfer function to apply the adjoint.
+
+        Returns
+        -------
+        array-like
+            Convolution on the same backend and grid as values.
+        """
+        xp = cp.get_array_module(values)
+        otf = self.otf.conj() if adjoint else self.otf
+        if self.tile_shape == self.shape:
+            result = fft_conv(cp.asarray(values), otf, self.shape)
+            return result if xp is cp else cp.asnumpy(result)
+        result = xp.empty_like(values)
+        for start in range(0, self.shape[0], self.crop_scan):
+            stop = min(start + self.crop_scan, self.shape[0])
+            indices = xp.arange(start - self.radius, stop + self.radius) % self.shape[0]
+            padded = cp.zeros(self.tile_shape, dtype=cp.float32)
+            padded[: indices.size] = cp.asarray(values[indices])
+            blurred = fft_conv(padded, otf, self.tile_shape)[
+                self.radius : self.radius + stop - start
+            ]
+            result[start:stop] = blurred if xp is cp else cp.asnumpy(blurred)
+        return result
+
+
+def _iterate_rlgc(
+    observed: Array,
+    shape: tuple[int, int, int],
+    forward: Callable,
+    adjoint: Callable,
+    smooth: Callable,
+    region: tuple[slice, slice, slice],
+    *,
+    gradient_consensus: bool,
+    max_iterations: int | None,
+    limit: float,
+    max_delta: float,
+    rng_seed: int | None,
+    use_kl: bool,
+    read_noise: float,
+    initial_estimate: np.ndarray | None,
+    logger: logging.Logger | None,
+    log_prefix: str,
+    callback: Callable | None,
+) -> Array:
+    """Iterate RL/RLGC independently of geometry and FFT tiling.
+
+    Parameters
+    ----------
+    observed : array-like
+        Calibrated measurements on the acquired grid.
+    shape : tuple of int
+        Full reconstruction dimensions in scan-YX order.
+    forward : callable
+        Map object estimates to acquired detector intensities.
+    adjoint : callable
+        Apply the exact adjoint of the supplied forward operator.
+    smooth : callable
+        Apply the optical smoothing used by the consensus gate.
+    region : tuple of slice
+        Unpadded acquired-pixel region used for KL and stopping metrics.
+    gradient_consensus : bool
+        Use the reference GC gate and split-image stopping when True.
+    max_iterations : int or None
+        Optional iteration safety cap; None leaves GC stopping uncapped.
+    limit : float
+        Minimum accepted-update fraction.
+    max_delta : float
+        Minimum maximum-absolute relative object change.
+    rng_seed : int or None
+        Seed for fresh half-image splits.
+    use_kl : bool
+        Enable the reference two-half KL stopping comparison.
+    read_noise : float
+        RMS read noise in calibrated observation units.
+    initial_estimate : numpy.ndarray or None
+        Initial object; None selects the constant mean observation.
+    logger : logging.Logger or None
+        Destination for solver diagnostics.
+    log_prefix : str
+        Context prepended to diagnostic messages.
+    callback : callable or None
+        Observer receiving the iteration index and completed estimate.
+
+    Returns
+    -------
+    array-like
+        Final nonnegative reconstruction on the selected backend.
+    """
+    xp = cp.get_array_module(observed)
+    variance = _read_noise_variance(read_noise)
+    sensitivity = xp.maximum(adjoint(xp.ones_like(observed)), xp.float32(1e-12))
+    recon = (
+        xp.full(shape, xp.mean(observed), dtype=xp.float32)
+        if initial_estimate is None
+        else xp.asarray(initial_estimate).copy()
+    )
+    rng = xp.random.default_rng(rng_seed) if gradient_consensus else None
+    use_kl = bool(use_kl and gradient_consensus)
+    scratch = xp.empty(observed[region].shape, dtype=xp.float32) if use_kl else None
+    previous_kl = (np.inf, np.inf)
+    completed = 0
+    reason = "max_iterations"
+    while max_iterations is None or completed < max_iterations:
+        predicted = forward(recon)
+        if gradient_consensus:
+            split1, split2 = _split_calibrated_counts(observed, rng, variance)
+            if use_kl:
+                scores = split_kl_scores(
+                    predicted[region], split1[region], split2[region], scratch
+                )
+                if scores[0] > previous_kl[0] and scores[1] > previous_kl[1]:
+                    reason = "split_kl"
+                    break
+                previous_kl = scores
+            denominator = xp.maximum(predicted + variance, xp.float32(1e-12))
+            half1 = adjoint(2 * (split1 + variance) / denominator) / sensitivity
+            half2 = adjoint(2 * (split2 + variance) / denominator) / sensitivity
+            consensus = smooth((half1 - 1) * (half2 - 1), sensitivity)
+            ratio = adjoint((observed + variance) / denominator) / sensitivity
+            xp.maximum(ratio, 0, out=ratio)
+            updated = (
+                filter_update(recon, ratio, consensus)
+                if xp is cp
+                else np.where(consensus < 0, recon, recon * ratio)
+            )
+            fraction, delta, reason = _gc_stopping_metrics(
+                recon, updated, consensus, limit, max_delta
+            )
+        else:
+            ratio = (
+                adjoint(observed / xp.maximum(predicted, xp.float32(1e-12)))
+                / sensitivity
+            )
+            xp.maximum(ratio, 0, out=ratio)
+            updated = recon * ratio
+            fraction = 1.0
+            delta = float(
+                xp.max(xp.abs(updated - recon)) / xp.maximum(xp.max(updated), 1e-12)
+            )
+            reason = "relative_change" if delta < max_delta else None
+        recon = updated
+        completed += 1
+        if callback is not None:
+            callback(completed, recon)
+        if logger is not None:
+            logger.info(
+                "%siteration=%d updated_fraction=%.6g max_relative_delta=%.6g",
+                log_prefix,
+                completed,
+                fraction,
+                delta,
+            )
+        if reason is not None:
+            break
+    else:
+        reason = "max_iterations"
+    if logger is not None:
+        label = {"consensus_fraction": "limit", "relative_change": "max_delta"}.get(
+            reason, reason
+        )
+        logger.info("%sstop=%s iterations=%d", log_prefix, label, completed)
+    return recon
+
+
+def _rlgc_once(
     image: np.ndarray,
     psf: np.ndarray,
     gpu_id: int = 0,
     safe_mode: bool = True,
-    limit: float = 0.001,
-    max_delta: float = 0.001,
+    limit: float = GC_UPDATED_FRACTION_LIMIT,
+    max_delta: float = GC_RELATIVE_CHANGE_LIMIT,
     pad_yx: bool = True,
     rng_seed: int | None = 42,
     normalize_psf: bool = True,
     release_memory: bool = True,
     logger: logging.Logger | None = None,
     log_prefix: str = "",
-    max_iterations: int = 100,
+    max_iterations: int | None = None,
+    detector_response: np.ndarray | None = None,
+    use_kl: bool = True,
+    read_noise: float = 0.0,
+    *,
+    scan_upsample_factor: int = 1,
+    boundary: str = "reflect",
+    crop_scan: int | None = None,
+    gradient_consensus: bool = True,
+    initial_estimate: np.ndarray | None = None,
+    callback: Callable | None = None,
+    storage: str = "gpu",
 ) -> np.ndarray:
-    """
-    Richardson-Lucy Gradient Consensus deconvolution.
-
-    The multiplicative update and consensus sign rule follow the local
-    expansion-processing reference. Initialization backprojects the measured
-    image. Stopping compares successive predictions against the same fresh
-    split, preventing changes in the split itself from triggering rollback.
-    Fractional counts are split without favoring either half.
-
-    OPM retains per-axis PSF halos and 2/3/5/7-smooth FFT padding. Symmetric
-    input padding is applied once; padded values participate in the loop.
+    """Deconvolve calibrated data with the MATLAB RLGC update and stopping rules.
 
     Parameters
     ----------
-    image : numpy.ndarray
-        2D or 3D image to be deconvolved. 2D input is treated as a single-z
-        stack internally.
-    psf : numpy.ndarray
-        2D or 3D point-spread function. This PSF is padded and transformed on
-        the GPU to form the forward and adjoint OTFs internally.
-    gpu_id : int, default=0
-        Which GPU to use.
-    safe_mode : bool, default=True
-        Compare observation-to-prediction KLD against the same fresh halves.
-        If True, stop when either half worsens; otherwise require both halves.
-    limit : float, default=0.001
-        Minimum fraction of pixels that must be updated per iteration before
-        early stopping is triggered.
-    max_delta : float, default=0.001
-        Maximum allowed relative update magnitude before early stopping is
-        triggered.
-    pad_yx : bool, default=True
-        If True, pad Y/X by the PSF support and expand them to FFT-friendly
-        sizes. Z is always padded by the PSF support. Padding is removed before
-        returning the result.
-    rng_seed : int or None, default=42
-        Seed for the per-iteration 50:50 data split. Set to None for
-        nondeterministic splits.
-    normalize_psf : bool, default=True
-        If True, normalize the PSF to unit sum before deconvolution. Set False
-        only for diagnostics that intentionally preserve PSF scale.
-    release_memory : bool, default=True
-        If True, release GPU memory pools after each call. Set False when
-        calling in tight loops to avoid allocator thrashing.
-    logger : logging.Logger or None, default=None
-        Optional logger for per-iteration RLGC diagnostics.
-    log_prefix : str, default=""
-        Structured prefix prepended to every emitted log line.
-    max_iterations : int, default=100
-        Upper bound on consensus updates when stochastic stopping has not fired.
+    image, psf : numpy.ndarray
+        Nonnegative calibrated 2D/3D measurements and a centered, odd-sized PSF.
+        The PSF must already be sampled on the requested reconstruction grid.
+    read_noise : float
+        RMS noise in the calibrated measurement units; zero is ideal photon data.
+    scan_upsample_factor : int
+        Acquired scan spacing divided by reconstructed scan spacing. Missing
+        planes are unobserved, not zero-valued measurements. Requires zero
+        boundary extension when greater than one.
+    boundary : {"reflect", "zero"}
+        Symmetric acquisition padding, or a zero-extended object with exact
+        convolution transpose and acquired-plane sensitivity normalization.
+    crop_scan : int or None
+        Maximum retained scan planes per FFT tile. Overlap-save evaluates the
+        same global operator; splits and stopping never run independently by tile.
+    limit, max_delta : float
+        Reference accepted-voxel fraction and maximum-relative-change thresholds.
+    max_iterations : int or None
+        Optional safety cap. None uses reference GC stopping without a cap.
+        Ordinary RL requires an explicit cap or a positive max_delta.
+    rng_seed : int or None
+        Seed for the reference random halves, shared across all FFT tiles.
+    detector_response : numpy.ndarray or None
+        Positive YX sensitivity in the measurement operator, not input division.
+    use_kl : bool
+        Enable the reference both-halves prediction-to-split KL stopping rule.
+    gradient_consensus : bool
+        False selects ordinary RL for controlled comparisons using the same optics.
+    initial_estimate : numpy.ndarray or None
+        Positive reconstruction-grid initialization. None uses mean observations.
+    callback : callable or None
+        Receives each completed iteration number and its device array. Copy any
+        state that must outlive the callback; it does not control convergence.
+    storage : str
+        Backend for reconstruction state, gpu or host; FFTs always execute on CUDA.
+    gpu_id, safe_mode, pad_yx, normalize_psf, release_memory, logger, log_prefix
+        Device, compatibility, padding, normalization and execution diagnostics.
+        safe_mode is retained for compatibility; KL always requires both halves.
 
     Returns
     -------
     numpy.ndarray
-        Deconvolved 3D image (float32). A 2D input is returned as a single-z
-        stack.
+        Float32 reconstruction. A 2D input retains the legacy singleton-Z output.
     """
-    cp.cuda.Device(gpu_id).use()
-    logging_enabled = logger is not None and logger.isEnabledFor(logging.INFO)
-    log_tag = f"{log_prefix} " if log_prefix else ""
-    solver_start_time = timeit.default_timer() if logging_enabled else None
-    cleanup_memory_pool = bool(release_memory)
-
+    image = np.asarray(image, dtype=np.float32)
+    psf = np.asarray(psf, dtype=np.float32)
+    if image.ndim == 2:
+        image = image[None]
+    if psf.ndim == 2:
+        psf = psf[None]
+    for name, array in (("image", image), ("psf", psf)):
+        if array.ndim != 3 or not array.size or not np.isfinite(array).all():
+            raise ValueError(f"{name} must be a finite nonempty 2D or 3D array")
+    if (
+        np.any(psf < 0)
+        or psf.sum(dtype=np.float64) <= 0
+        or any(n % 2 == 0 for n in psf.shape)
+    ):
+        raise ValueError("psf must be nonnegative with positive sum and odd dimensions")
+    for name, value in (
+        ("scan_upsample_factor", scan_upsample_factor),
+        ("max_iterations", max_iterations),
+        ("crop_scan", crop_scan),
+    ):
+        if value is not None and (
+            isinstance(value, bool)
+            or not isinstance(value, (int, np.integer))
+            or value < 1
+        ):
+            raise ValueError(f"{name} must be a positive integer")
+    if boundary not in ("reflect", "zero") or (
+        boundary == "reflect" and scan_upsample_factor != 1
+    ):
+        raise ValueError("scan upsampling requires boundary='zero'")
+    if (
+        not np.isfinite(limit)
+        or limit < 0
+        or not np.isfinite(max_delta)
+        or max_delta < 0
+    ):
+        raise ValueError("Convergence thresholds must be finite and nonnegative")
+    if not gradient_consensus and max_iterations is None and max_delta == 0:
+        raise ValueError("Ordinary RL requires a bound or relative-change threshold")
+    if storage not in ("gpu", "host"):
+        raise ValueError("storage must be gpu or host")
+    xp = cp if storage == "gpu" else np
+    response = _detector_response(detector_response, image.shape)
+    image = _calibrated_observations(image)
+    factor = int(scan_upsample_factor)
+    fine_shape = ((image.shape[0] - 1) * factor + 1, *image.shape[1:])
     try:
-        rng = cp.random.default_rng(rng_seed)
-
-        if psf.ndim == 2:
-            psf = np.expand_dims(psf, axis=0)
-        if image.ndim == 2:
-            image = np.expand_dims(image, axis=0)
-
-        pad_width = _linear_fft_pad_width(
-            tuple(int(v) for v in image.shape),
-            tuple(int(v) for v in psf.shape),
-            pad_yx=pad_yx,
-        )
-        image_gpu_np = np.pad(image, pad_width, mode="symmetric")
-        image_gpu = cp.asarray(image_gpu_np, dtype=cp.float32)
-        del image_gpu_np
-        psf_gpu = pad_psf(
-            cp.asarray(psf, dtype=cp.float32), image_gpu.shape, normalize=normalize_psf
-        )
-
-        otf = cp.fft.rfftn(psf_gpu)
-        otfT = cp.conjugate(otf)
-        otfotfT = otf * otfT
-        del psf_gpu
-
-        num_z = image_gpu.shape[0]
-        num_y = image_gpu.shape[1]
-        num_x = image_gpu.shape[2]
-        num_pixels = num_z * num_y * num_x
-        num_iters = 0
-        recon = cp.maximum(fft_conv(image_gpu, otfT, image_gpu.shape), 0)
-        recon = cp.maximum(recon, cp.max(recon) * cp.float32(1e-7))
-        previous_recon = recon
-        previous_prediction = None
-        kld_scratch = cp.empty_like(image_gpu)
-
-        if logging_enabled:
-            logger.info(
-                "%ssolver_started image_shape=%s padded_shape=%s psf_shape=%s initialization=backprojection stopping=same_split safe_mode=%s pad_yx=%s",
-                log_tag,
-                tuple(int(v) for v in image.shape),
-                tuple(int(v) for v in image_gpu.shape),
-                tuple(int(v) for v in psf.shape),
-                safe_mode,
-                pad_yx,
+        with cp.cuda.Device(gpu_id):
+            pads = _linear_fft_pad_width(fine_shape, psf.shape, pad_yx=pad_yx)
+            padded_shape = tuple(
+                n + sum(p) for n, p in zip(fine_shape, pads, strict=True)
             )
+            core = _observed_region_slices(padded_shape, pads)
+            convolve = _Convolution(psf, padded_shape, crop_scan, normalize_psf)
+            field = None if response is None else xp.asarray(response)
+            reflected = boundary == "reflect"
+            if reflected:
+                observed = xp.asarray(np.pad(image, pads, mode="symmetric"))
+                if response is not None:
+                    field = xp.asarray(np.pad(response, pads[-2:], mode="symmetric"))
+                shape = padded_shape
+                region = core
+            else:
+                observed = xp.asarray(image)
+                shape = fine_shape
+                region = np.s_[:, :, :]
 
-        while num_iters < max_iterations:
-            iter_start_time = timeit.default_timer() if logging_enabled else None
+            def blur(values: Array, adjoint: bool = False) -> Array:
+                """Convolve on the selected reflected or zero-extended object grid.
 
-            split1 = _split_observed_counts(image_gpu, rng)
-            split2 = image_gpu - split1
+                Parameters
+                ----------
+                values : array-like
+                    Object-grid values before acquired-plane selection.
+                adjoint : bool
+                    Apply the conjugate optical transfer function when True.
 
-            Hu = fft_conv(recon, otf, image_gpu.shape)
+                Returns
+                -------
+                array-like
+                    Convolution on the selected reconstruction grid.
+                """
+                if reflected:
+                    return convolve(values, adjoint=adjoint)
+                padded = xp.zeros(padded_shape, dtype=xp.float32)
+                padded[core] = values
+                return convolve(padded, adjoint=adjoint)[core].copy()
 
-            if logging_enabled:
-                kldim = _kl_div_into(Hu, image_gpu, kld_scratch)
-            kld1 = kld2 = -np.inf
-            if previous_prediction is not None:
-                kld1, kld2 = split_kl_changes(
-                    Hu, previous_prediction, split1, split2, kld_scratch
-                )
-            should_restore = (
-                (kld1 > 0 or kld2 > 0) if safe_mode else (kld1 > 0 and kld2 > 0)
-            )
-            if should_restore:
-                recon[...] = previous_recon
-                if logging_enabled:
-                    logger.info(
-                        "%sstop=restore_previous_recon best_iteration=%d elapsed_s=%.2f safe_mode=%s kld_image=%.6f kld_split1_change=%.6f kld_split2_change=%.6f",
-                        log_tag,
-                        max(num_iters - 1, 0),
-                        timeit.default_timer() - solver_start_time,
-                        safe_mode,
-                        float(kldim),
-                        float(kld1),
-                        float(kld2),
+            def forward(estimate: Array) -> Array:
+                """Predict acquired detector intensities from the object estimate.
+
+                Parameters
+                ----------
+                estimate : array-like
+                    Nonnegative reconstruction on the object grid.
+
+                Returns
+                -------
+                array-like
+                    Blurred, sampled and response-weighted detector prediction.
+                """
+                result = blur(estimate)
+                if not reflected:
+                    result = result[::factor].copy()
+                return result if field is None else result * field
+
+            def adjoint(values: Array) -> Array:
+                """Backproject acquired values through the exact optical adjoint.
+
+                Parameters
+                ----------
+                values : array-like
+                    Values on the acquired detector grid.
+
+                Returns
+                -------
+                array-like
+                    Sensitivity-weighted backprojection on the object grid.
+                """
+                weighted = values if field is None else values * field
+                if reflected:
+                    return blur(weighted, adjoint=True)
+                scattered = xp.zeros(fine_shape, dtype=xp.float32)
+                scattered[::factor] = weighted
+                return blur(scattered, adjoint=True)
+
+            def smooth(product: Array, sensitivity: Array) -> Array:
+                """Apply optical consensus smoothing for the selected geometry.
+
+                Parameters
+                ----------
+                product : array-like
+                    Product of the two relative half-image update directions.
+                sensitivity : array-like
+                    Adjoint image of unit detector values.
+
+                Returns
+                -------
+                array-like
+                    Smoothed consensus field on the object grid.
+                """
+                if field is None:
+                    if reflected:
+                        if xp is cp and convolve.tile_shape == convolve.shape:
+                            return fft_conv(
+                                product,
+                                convolve.otf * convolve.otf.conj(),
+                                padded_shape,
+                            )
+                    else:
+                        # Retain padded H*H smoothing: cropping between these
+                        # convolutions would change the operator at the boundary.
+                        padded = xp.zeros(padded_shape, dtype=xp.float32)
+                        padded[core] = product
+                        if xp is cp and convolve.tile_shape == convolve.shape:
+                            return fft_conv(
+                                padded, convolve.otf * convolve.otf.conj(), padded_shape
+                            )[core].copy()
+                        return convolve(convolve(padded), adjoint=True)[core].copy()
+                return adjoint(forward(product)) / sensitivity
+
+            if initial_estimate is not None:
+                initial_estimate = np.asarray(initial_estimate, dtype=np.float32)
+                if (
+                    initial_estimate.shape != shape
+                    or not np.isfinite(initial_estimate).all()
+                    or np.any(initial_estimate <= 0)
+                ):
+                    raise ValueError(
+                        "initial_estimate must be finite, positive and match the reconstruction grid"
                     )
-                break
-
-            HTratio1 = fft_conv(
-                cp.divide(split1, 0.5 * (Hu + 1e-12), dtype=cp.float32),
-                otfT,
-                image_gpu.shape,
+            recon = _iterate_rlgc(
+                observed,
+                shape,
+                forward,
+                adjoint,
+                smooth,
+                region,
+                gradient_consensus=gradient_consensus,
+                max_iterations=max_iterations,
+                limit=limit,
+                max_delta=max_delta,
+                rng_seed=rng_seed,
+                use_kl=use_kl,
+                read_noise=read_noise,
+                initial_estimate=initial_estimate,
+                logger=logger,
+                log_prefix=log_prefix,
+                callback=callback,
             )
-            del split1
-            HTratio2 = fft_conv(
-                cp.divide(split2, 0.5 * (Hu + 1e-12), dtype=cp.float32),
-                otfT,
-                image_gpu.shape,
-            )
-            del split2
-            HTratio = cp.float32(0.5) * (HTratio1 + HTratio2)
-            previous_prediction = Hu
-
-            consensus_map = fft_conv(
-                (HTratio1 - 1) * (HTratio2 - 1), otfotfT, recon.shape
-            )
-
-            previous_recon = recon
-            recon = filter_update(recon, HTratio, consensus_map)
-
-            num_updated = num_pixels - cp.sum(consensus_map < 0)
-            recon_max = cp.maximum(cp.max(recon), cp.float32(1e-12))
-            updated_fraction = float(num_updated) / float(num_pixels)
-            max_relative_delta = float(
-                cp.max(cp.abs(recon - previous_recon) / recon_max)
-            )
-            num_iters += 1
-            if logging_enabled:
-                min_HTratio = cp.min(HTratio)
-                max_HTratio = cp.max(HTratio)
-                logger.info(
-                    "%siteration=%03d elapsed_s=%.2f kld_image=%.6f kld_split1_change=%.6f kld_split2_change=%.6f update_min=%.3f update_max=%.3f updated_fraction=%.5f max_relative_delta=%.5f",
-                    log_tag,
-                    num_iters,
-                    timeit.default_timer() - iter_start_time,
-                    float(kldim),
-                    float(kld1),
-                    float(kld2),
-                    float(min_HTratio),
-                    float(max_HTratio),
-                    updated_fraction,
-                    max_relative_delta,
-                )
-
-            del HTratio, HTratio1, HTratio2, consensus_map
-
-            if updated_fraction < limit:
-                if logging_enabled:
-                    logger.info(
-                        "%sstop=limit iteration=%03d updated_fraction=%.5f limit=%.5f",
-                        log_tag,
-                        num_iters,
-                        updated_fraction,
-                        limit,
-                    )
-                break
-
-            if max_relative_delta < max_delta:
-                if logging_enabled:
-                    logger.info(
-                        "%sstop=max_delta iteration=%03d max_relative_delta=%.5f threshold=%.5f",
-                        log_tag,
-                        num_iters,
-                        max_relative_delta,
-                        max_delta,
-                    )
-                break
-
-        else:
-            if logging_enabled:
-                logger.info("%sstop=max_iterations iterations=%d", log_tag, num_iters)
-
-        recon = remove_padding_zyx(recon, pad_width)
-        recon_cpu = cp.asnumpy(recon).astype(np.float32)
-
-        if logging_enabled:
-            logger.info(
-                "%ssolver_completed iterations=%d elapsed_s=%.2f output_shape=%s",
-                log_tag,
-                num_iters,
-                timeit.default_timer() - solver_start_time,
-                tuple(int(v) for v in recon_cpu.shape),
-            )
-        return recon_cpu
-    except Exception:
-        cleanup_memory_pool = True
-        raise
+            result = recon[core] if boundary == "reflect" else recon
+            return cp.asnumpy(result) if xp is cp else result.copy()
     finally:
-        if cleanup_memory_pool:
-            cp.cuda.Stream.null.synchronize()
+        if release_memory:
             clear_rlgc_caches(clear_memory_pool=True)
 
 
@@ -906,191 +1196,14 @@ def _is_gpu_memory_error(exc: BaseException) -> bool:
     return "out of memory" in message or "oom" in message
 
 
-def _chunked_rlgc_once(
-    image: np.ndarray,
-    psf: np.ndarray,
-    gpu_id: int = 0,
-    crop_scan: int = 128,
-    safe_mode: bool = True,
-    limit: float = 0.001,
-    max_delta: float = 0.001,
-    rng_seed: int | None = 42,
-    normalize_psf: bool = True,
-    verbose: int = 1,
-    release_memory: bool = True,
-    logger: logging.Logger | None = None,
-    log_prefix: str = "",
-) -> np.ndarray:
-    """Run one chunked RLGC attempt without GPU-memory fallback retries.
-
-    This function performs either full-frame RLGC or scan-axis tiling for the
-    requested crop size. Every tile keeps the full camera Y and X extents.
-
-    Parameters
-    ----------
-    image : numpy.ndarray
-        2D or 3D image to deconvolve.
-    psf : numpy.ndarray
-        2D or 3D point-spread function.
-    gpu_id : int, default=0
-        CUDA device ID to use.
-    crop_scan : int, default=128
-        Retained tile size along the scan axis (axis 0 of normalized ZYX).
-    safe_mode : bool, default=True
-        Compare observation-to-prediction KLD against the same fresh halves.
-        If True, stop when either half worsens; otherwise require both halves.
-    limit : float, default=0.001
-        Minimum fraction of pixels updated per iteration before early stopping.
-    max_delta : float, default=0.001
-        Stop when the largest relative update falls below this threshold.
-    rng_seed : int or None, default=42
-        Seed for the per-iteration 50:50 data split.
-    normalize_psf : bool, default=True
-        If True, normalize the padded PSF to unit sum before deconvolution.
-    verbose : int, default=1
-        If at least 1, show a progress bar over scan-axis tiles.
-    release_memory : bool, default=True
-        If True, release CuPy memory pools and FFT caches before returning.
-    logger : logging.Logger or None, default=None
-        Optional logger for route and per-iteration diagnostics.
-    log_prefix : str, default=""
-        Structured prefix prepended to emitted log lines.
-
-    Returns
-    -------
-    numpy.ndarray
-        Deconvolved image as float32.
-    """
-    cp.cuda.Device(gpu_id).use()
-    if crop_scan <= 0:
-        raise ValueError("crop_scan must be greater than 0.")
-
-    image_arr = np.asarray(image)
-    original_ndim = image_arr.ndim
-    if original_ndim == 2:
-        image_work = image_arr[np.newaxis, ...]
-    elif original_ndim == 3:
-        image_work = image_arr
-    else:
-        raise ValueError(f"Expected a 2D or 3D image, got shape {image_arr.shape}")
-
-    psf_arr = np.asarray(psf)
-    if psf_arr.ndim not in (2, 3):
-        raise ValueError(f"Expected a 2D or 3D PSF, got shape {psf_arr.shape}")
-    psf_shape = psf_arr.shape if psf_arr.ndim == 3 else (1, *psf_arr.shape)
-
-    # Full-frame path if tiling not needed
-    if crop_scan >= image_work.shape[0]:
-        if logger is not None and logger.isEnabledFor(logging.INFO):
-            logger.info(
-                "%spath=3d_fullframe image_shape=%s psf_shape=%s",
-                f"{log_prefix} " if log_prefix else "",
-                tuple(int(v) for v in image_arr.shape),
-                tuple(int(v) for v in psf_shape),
-            )
-        output = rlgc(
-            image_arr,
-            psf,
-            gpu_id,
-            safe_mode=safe_mode,
-            limit=limit,
-            max_delta=max_delta,
-            pad_yx=True,
-            rng_seed=rng_seed,
-            normalize_psf=normalize_psf,
-            release_memory=False,
-            logger=logger,
-            log_prefix=_child_log_prefix(log_prefix, "path=3d_fullframe"),
-        )
-        if original_ndim == 2 and output.ndim == 3 and output.shape[0] == 1:
-            output = np.squeeze(output, axis=0)
-
-    # Scan-axis tiled deconvolution with discarded processing halos. The scan
-    # axis is axis 0 in the normalized ZYX volume; camera Y and X remain intact.
-    # The halo is wider than a single convolution radius because RLGC is
-    # iterative, so boundary influence can propagate farther than one PSF
-    # half-width.
-    else:
-        full_shape = image_work.shape
-        retained_scan, tile_pad_scan = _resolve_tiled_axis_geometry(
-            crop_scan,
-            full_shape[0],
-            int(psf_shape[-3]),
-            "crop_scan",
-        )
-        output = np.zeros_like(image_work, dtype=np.float32)
-
-        retained_bounds_scan = _axis_retained_bounds(retained_scan, full_shape[0])
-        num_tiles = len(retained_bounds_scan)
-
-        if logger is not None and logger.isEnabledFor(logging.INFO):
-            logger.info(
-                "%spath=3d_tiled image_shape=%s psf_shape=%s retained_shape=%s processing_halo=%s num_tiles=%d",
-                f"{log_prefix} " if log_prefix else "",
-                tuple(int(v) for v in image_work.shape),
-                tuple(int(v) for v in psf_shape),
-                (retained_scan, full_shape[1], full_shape[2]),
-                (tile_pad_scan, 0, 0),
-                num_tiles,
-            )
-
-        if verbose >= 1 and num_tiles > 1:
-            iterator = tqdm(
-                enumerate(retained_bounds_scan),
-                desc="Decon chunks",
-                total=num_tiles,
-                leave=False,
-                unit="chunk",
-            )
-        else:
-            iterator = enumerate(retained_bounds_scan)
-
-        for tile_idx, (scan_dest_start, scan_dest_stop) in iterator:
-            scan_crop_start = max(scan_dest_start - tile_pad_scan, 0)
-            scan_crop_stop = min(scan_dest_stop + tile_pad_scan, full_shape[0])
-
-            crop = image_work[scan_crop_start:scan_crop_stop, :, :]
-            crop_array = rlgc(
-                crop,
-                psf,
-                gpu_id,
-                safe_mode=safe_mode,
-                limit=limit,
-                max_delta=max_delta,
-                rng_seed=None if rng_seed is None else rng_seed + tile_idx,
-                normalize_psf=normalize_psf,
-                release_memory=False,
-                logger=logger,
-                log_prefix=_child_log_prefix(
-                    log_prefix, f"path=3d_tiled tile={tile_idx:04d}"
-                ),
-            )
-
-            scan_source_start = scan_dest_start - scan_crop_start
-            scan_source_stop = scan_source_start + (scan_dest_stop - scan_dest_start)
-            crop_sub = crop_array[scan_source_start:scan_source_stop, :, :]
-            output[scan_dest_start:scan_dest_stop, :, :] = crop_sub
-
-        del crop_sub
-        gc.collect()
-
-        if original_ndim == 2:
-            output = np.squeeze(output, axis=0)
-
-    if release_memory:
-        clear_rlgc_caches(clear_memory_pool=True)
-
-    return output
-
-
-def chunked_rlgc(
+def rlgc(
     image: np.ndarray,
     psf: np.ndarray,
     gpu_id: int = 0,
     crop_scan: int | None = None,
     safe_mode: bool = True,
-    limit: float = 0.001,
-    max_delta: float = 0.001,
+    limit: float = GC_UPDATED_FRACTION_LIMIT,
+    max_delta: float = GC_RELATIVE_CHANGE_LIMIT,
     rng_seed: int | None = 42,
     normalize_psf: bool = True,
     verbose: int = 1,
@@ -1099,8 +1212,11 @@ def chunked_rlgc(
     log_prefix: str = "",
     on_successful_crop_scan: Callable[[int], None] | None = None,
     fallback_step_scan: int | None = None,
+    detector_response: np.ndarray | None = None,
+    read_noise: float = 0.0,
+    **solver_options: object,
 ) -> np.ndarray:
-    """Scan-axis chunked RLGC deconvolution with automatic fallback.
+    """Deconvolve calibrated data with the single RLGC engine and FFT tiling.
 
     The solver first attempts the requested ``crop_scan``. If CUDA memory
     allocation fails, it retries with smaller scan-axis chunks. Every solver
@@ -1121,15 +1237,15 @@ def chunked_rlgc(
         current free GPU memory and this PSF. Values at least as large as the
         scan-axis length select full-frame processing.
     safe_mode : bool, default=True
-        Compare observation-to-prediction KLD against the same fresh halves.
-        If True, stop when either half worsens; otherwise require both halves.
+        Retained for compatibility. The reference KL rule always requires both
+        halves to worsen; this wrapper option has no effect.
     limit : float, default=0.001
         Minimum fraction of pixels updated per iteration before early stopping.
     max_delta : float, default=0.001
         Stop when the largest relative update falls below this threshold.
     rng_seed : int or None, default=42
-        Seed for the per-iteration 50:50 data split. Tiled calls offset this
-        seed by tile index.
+        Seed for the per-iteration 50:50 data split. Every FFT tile shares the global
+        split and convergence history.
     normalize_psf : bool, default=True
         If True, normalize the padded PSF to unit sum before deconvolution.
     verbose : int, default=1
@@ -1145,6 +1261,22 @@ def chunked_rlgc(
     fallback_step_scan : int or None, default=None
         Number of retained scan planes removed after each allocation failure.
         If None, reduce the current crop by one quarter.
+    detector_response : numpy.ndarray or None
+        Positive detector-YX illumination and gain response retained for every
+        scan chunk. Supply camera-calibrated counts without dividing by it.
+
+    read_noise : float, default=0
+        RMS read noise in the same calibrated units as image. Zero selects
+        the photon-only branch; processing supplies the camera calibration.
+
+    solver_options : keyword arguments
+        Numerical parameters forwarded to the single engine: ``use_kl`` enables
+        reference KL stopping; ``max_iterations`` is an optional safety cap;
+        ``scan_upsample_factor`` and ``boundary="zero"`` select acquired-plane
+        reconstruction; ``initial_estimate`` overrides mean-data initialization;
+        ``gradient_consensus=False`` selects ordinary RL. ``callback`` observes
+        completed iterates. ``storage`` chooses GPU or host state; FFTs use CUDA
+        in both cases. ``pad_yx`` controls symmetric camera-axis padding.
 
     Returns
     -------
@@ -1159,12 +1291,22 @@ def chunked_rlgc(
     else:
         raise ValueError(f"Expected a 2D or 3D image, got shape {image_arr.shape}")
 
+    if (image_arr.ndim == 2 or image_arr.shape[0] == 1) and solver_options.get(
+        "boundary", "reflect"
+    ) == "reflect":
+        psf = np.asarray(psf)
+        if psf.ndim == 3:
+            psf = psf[psf.shape[0] // 2]
+    original_ndim = image_arr.ndim
+    image_scan = (image_scan - 1) * int(
+        solver_options.get("scan_upsample_factor", 1)
+    ) + 1
     if crop_scan is None:
         if image_arr.ndim == 2:
             crop_scan = 1
         else:
             crop_scan = determine_rlgc_crop_scan(
-                tuple(int(size) for size in image_arr.shape),
+                (image_scan, *image_arr.shape[-2:]),
                 [tuple(int(size) for size in np.asarray(psf).shape)],
                 gpu_id=gpu_id,
             )
@@ -1172,6 +1314,9 @@ def chunked_rlgc(
         raise ValueError("fallback_step_scan must be at least 1")
     min_crop_scan = 1
     attempted_crop_scan = min(int(crop_scan), int(image_scan))
+    solver_options.setdefault(
+        "storage", "host" if attempted_crop_scan < image_scan else "gpu"
+    )
 
     while True:
         try:
@@ -1182,20 +1327,24 @@ def chunked_rlgc(
                     attempted_crop_scan,
                     crop_scan,
                 )
-            output = _chunked_rlgc_once(
+            output = _rlgc_once(
                 image=image_arr,
                 psf=psf,
                 gpu_id=gpu_id,
-                crop_scan=attempted_crop_scan,
+                crop_scan=None
+                if attempted_crop_scan >= image_scan
+                else attempted_crop_scan,
                 safe_mode=safe_mode,
                 limit=limit,
                 max_delta=max_delta,
                 rng_seed=rng_seed,
                 normalize_psf=normalize_psf,
-                verbose=verbose,
                 release_memory=release_memory,
                 logger=logger,
                 log_prefix=log_prefix,
+                detector_response=detector_response,
+                read_noise=read_noise,
+                **solver_options,
             )
             if on_successful_crop_scan is not None:
                 on_successful_crop_scan(attempted_crop_scan)
@@ -1206,13 +1355,17 @@ def chunked_rlgc(
                     attempted_crop_scan,
                     crop_scan,
                 )
-            return output
+            return output[0] if original_ndim == 2 else output
         except Exception as exc:
             if not _is_gpu_memory_error(exc):
                 raise
 
             clear_rlgc_caches(clear_memory_pool=True)
+            already_on_host = solver_options["storage"] == "host"
+            solver_options["storage"] = "host"
             if attempted_crop_scan == min_crop_scan:
+                if not already_on_host:
+                    continue
                 raise RuntimeError(
                     "RLGC failed due to GPU memory constraints even at the "
                     f"minimum scan-axis crop size {attempted_crop_scan}."
@@ -1232,84 +1385,3 @@ def chunked_rlgc(
                     next_crop_scan,
                 )
             attempted_crop_scan = next_crop_scan
-
-
-def rlgc_2d(
-    image: np.ndarray,
-    skewed_psf: np.ndarray,
-    gpu_id: int = 0,
-    safe_mode: bool = True,
-    limit: float = 0.001,
-    max_delta: float = 0.001,
-    rng_seed: int | None = 42,
-    verbose: int = 1,
-    release_memory: bool = True,
-    logger: logging.Logger | None = None,
-    log_prefix: str = "",
-) -> np.ndarray:
-    """Deconvolve one acquired YX image using the central plane of its PSF.
-
-    Non-spatial dimensions such as time, stage position, and channel must be
-    iterated by the caller. A singleton Z dimension is accepted and restored
-    on return so storage code can retain explicit TCZYX axes.
-
-    Parameters
-    ----------
-    image : numpy.ndarray
-        A YX image or singleton-Z ZYX image.
-    skewed_psf : numpy.ndarray
-        A YX PSF or skewed ZYX PSF. Only its central Z plane is used.
-    gpu_id : int
-        CUDA device index used for reconstruction or memory estimation.
-    safe_mode : bool
-        Roll back consensus iterations when either split likelihood worsens.
-    limit : float, default=0.001
-        Stop when the fraction of voxels receiving consensus updates falls below this value.
-    max_delta : float, default=0.001
-        Stop when the maximum relative reconstruction change falls below this value.
-    rng_seed : int | None
-        Seed for independent count splitting; None uses an unseeded generator.
-    verbose : int
-        Deconvolution diagnostic verbosity.
-    release_memory : bool
-        Clear shared FFT caches and unused GPU allocations on completion.
-    logger : logging.Logger | None
-        Optional logger for iteration diagnostics.
-    log_prefix : str
-        Text prepended to deconvolution diagnostics for this tile or channel.
-
-    Returns
-    -------
-    numpy.ndarray
-        Float32 deconvolution with the same rank as ``image``.
-    """
-    image_array = np.asarray(image)
-    restore_z = image_array.ndim == 3 and image_array.shape[0] == 1
-    if restore_z:
-        image_yx = image_array[0]
-    elif image_array.ndim == 2:
-        image_yx = image_array
-    else:
-        raise ValueError(
-            "2D RLGC expects a YX image or singleton-Z ZYX image; "
-            f"got shape {image_array.shape}"
-        )
-
-    psf_yx = central_psf_plane(skewed_psf)
-    result = chunked_rlgc(
-        image=image_yx,
-        psf=psf_yx,
-        gpu_id=gpu_id,
-        crop_scan=1,
-        safe_mode=safe_mode,
-        limit=limit,
-        max_delta=max_delta,
-        rng_seed=rng_seed,
-        normalize_psf=False,
-        verbose=verbose,
-        release_memory=release_memory,
-        logger=logger,
-        log_prefix=_child_log_prefix(log_prefix, "path=2d_central_psf"),
-    )
-    result = np.asarray(result, dtype=np.float32)
-    return result[np.newaxis] if restore_z else result

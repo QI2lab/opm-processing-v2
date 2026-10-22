@@ -53,16 +53,21 @@ def find_sequences(root: Path) -> list[list[Path]]:
     return sequences
 
 
-def image_nv12(frame: np.ndarray) -> tuple[np.ndarray, int, int]:
+def image_nv12(
+    frame: np.ndarray, *, minimum_shape: tuple[int, int] = (2, 2)
+) -> tuple[np.ndarray, int, int]:
     """Map grayscale or RGB display pixels to BT.709 limited-range NV12.
 
     Neutral chroma preserves grayscale. Black padding gives even dimensions
-    and a minimum 128-pixel extent for small test or cropped canvases.
+    and satisfies the selected encoder's reported minimum dimensions.
 
     Parameters
     ----------
     frame : np.ndarray
         Uint8 grayscale or RGB projection image.
+    minimum_shape : tuple[int, int]
+        Minimum height and width, normally read from the encoder capabilities.
+        The default is one 2-by-2 NV12 chroma block.
 
     Returns
     -------
@@ -74,7 +79,10 @@ def image_nv12(frame: np.ndarray) -> tuple[np.ndarray, int, int]:
     ):
         raise ValueError("Video input must be uint8 grayscale or RGB projection TIFFs.")
     h, w = frame.shape[:2]
-    height, width = max(128, h + h % 2), max(128, w + w % 2)
+    height, width = (
+        max(size, minimum) + max(size, minimum) % 2
+        for size, minimum in zip((h, w), minimum_shape, strict=True)
+    )
     nv12 = np.full((height * 3 // 2, width), 128, dtype=np.uint8)
     nv12[:height] = 16
     if frame.ndim == 2:
@@ -107,7 +115,7 @@ def encode_sequence(
     gop_seconds: float = 2,
     encoder_options: dict[str, Any] | None = None,
 ) -> Path:
-    """Encode one ordered sequence and atomically publish a fast-start H.264 MP4.
+    """Encode one ordered sequence and atomically publish a fast-start MP4.
 
     Parameters
     ----------
@@ -135,8 +143,6 @@ def encode_sequence(
     Path
         MP4 destination after successful encoding and atomic publication.
     """
-    import PyNvVideoCodec as nvc
-
     if not frames:
         raise ValueError("No frames to encode.")
     if codec not in ("h264", "hevc") or rate_control not in ("cbr", "vbr"):
@@ -158,7 +164,12 @@ def encode_sequence(
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
     first = tifffile.imread(frames[0])
-    _, width, height = image_nv12(first)
+    import PyNvVideoCodec as nvc
+
+    capabilities = nvc.GetEncoderCaps(gpu, codec)
+    minimum_shape = (capabilities["height_min"], capabilities["width_min"])
+    _, width, height = image_nv12(first, minimum_shape=minimum_shape)
+
     # No B frames: raw elementary packets can be remuxed with monotonically
     # increasing timestamps without inventing presentation/decode reordering.
     encoder = nvc.CreateEncoder(
@@ -193,7 +204,7 @@ def encode_sequence(
                 frame = first if index == 0 else tifffile.imread(path)
                 if frame.shape != first.shape:
                     raise ValueError(f"Frame dimensions changed at {path}")
-                nv12, _, _ = image_nv12(frame)
+                nv12, _, _ = image_nv12(frame, minimum_shape=minimum_shape)
                 for packet in encoder.Encode(nv12):
                     stream.write(packet["data"])
             for packet in encoder.EndEncode():
@@ -268,7 +279,7 @@ def encode_projections(
         str, typer.Option(help="cbr or vbr; both retain the configured bitrate target.")
     ] = "cbr",
 ) -> None:
-    """Write one high-quality H.264 MP4 beside each projection TIFF sequence.
+    """Write one MP4 beside each projection TIFF sequence.
 
     Parameters
     ----------

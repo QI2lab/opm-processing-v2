@@ -46,7 +46,18 @@ app = typer.Typer(pretty_exceptions_enable=False)
 
 
 def export_source_stem(source: Path) -> str:
-    """Return the acquisition basename of a fused or processed image store."""
+    """Return the acquisition basename of a fused or processed image store.
+
+    Parameters
+    ----------
+    source : pathlib.Path
+        Processed OME-Zarr source path.
+
+    Returns
+    -------
+    str
+        Acquisition basename with its processing suffix removed.
+    """
     for suffix in (
         "_decon_deskewed.ome.zarr",
         "_deskewed.ome.zarr",
@@ -59,7 +70,23 @@ def export_source_stem(source: Path) -> str:
 
 
 def resolve_export_image(source: Path) -> Path:
-    """Resolve a root image or the sole image in a position collection."""
+    """Resolve a root image or the sole image in a position collection.
+
+    Parameters
+    ----------
+    source : pathlib.Path
+        Root image or single-position collection.
+
+    Returns
+    -------
+    pathlib.Path
+        Resolved TCZYX image group.
+
+    Raises
+    ------
+    ValueError
+        The collection has multiple positions or unsupported image axes.
+    """
     root = open_group(source)
     if isinstance(root.ome_metadata(), v05.Bf2Raw):
         series = root["OME"].ome_metadata().series
@@ -427,7 +454,18 @@ def export_fused(
 
 
 def load_export_metadata(image_store: Path) -> tuple[OME, dict[str, str]]:
-    """Load the shared acquisition template and processing provenance."""
+    """Load the shared acquisition template and processing provenance.
+
+    Parameters
+    ----------
+    image_store : pathlib.Path
+        Processed OME-Zarr store with optional acquisition and journal companions.
+
+    Returns
+    -------
+    tuple[OME, dict[str, str]]
+        OME template and serialized source and processing provenance.
+    """
     stem = export_source_stem(image_store)
     template = OME(creator="opm-processing-v2")
     provenance = {}

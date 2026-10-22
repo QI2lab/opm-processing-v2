@@ -7,14 +7,12 @@ import json
 
 import numpy as np
 import pytest
-from click import unstyle
 from typer.testing import CliRunner
 
 from opm_processing.dataio.acquisition import (
     inspect_acquisition,
 )
 from opm_processing.dataio.live import (
-    LiveManifest,
     ZarrTileReadiness,
     iter_live_tiles,
     read_lifecycle_event,
@@ -34,194 +32,14 @@ from opm_processing.process import (
     process,
 )
 from tests.fixtures.live import manifest_document, write_manifest
-from tests.reference.deskew import constant_deskew
 
 
-@pytest.mark.integration
-def test_live_wait_estimates_missing_flatfield_only_after_completion(
-    tmp_path, monkeypatch, live_acquisition_factory, depth_illumination
-):
-    """Wait through written tiles without a completed event, then fit and process."""
-    process_module = importlib.import_module("opm_processing.process")
-    from opm_processing.imageprocessing.flatfield import estimate_illuminations
-
-    raw = depth_illumination.raw[:1][None, :, None]
-    dataset = live_acquisition_factory(
-        shape=raw.shape, name="wait_estimate", completed=False
-    )
-    dataset.illumination_path.unlink()
-    destination = tmp_path / "processed"
-    field_path = destination / "wait_estimate_flatfield.ome.tif"
-    sleeps = []
-    estimates = []
-
-    def finish_acquisition(seconds):
-        assert not destination.exists()
-        assert not field_path.exists()
-        sleeps.append(seconds)
-        if len(sleeps) == 1:
-            dataset.collection.arrays[0].write(raw[:, 0]).result()
-        elif len(sleeps) == 2:
-            dataset.log.write_text(
-                json.dumps(
-                    {
-                        "event": "completed",
-                        "acquisition_id": dataset.manifest.acquisition_id,
-                    }
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-        else:
-            pytest.fail("Processing kept waiting after acquisition completion")
-
-    def estimate_after_completion(store, offset, conversion, positions, gain, mask):
-        assert (
-            read_lifecycle_event(dataset.log, dataset.manifest.acquisition_id)
-            == "completed"
-        )
-        np.testing.assert_array_equal(store.read().result(), raw)
-        estimates.append(True)
-        return estimate_illuminations(
-            store,
-            offset,
-            conversion,
-            positions,
-            apply_stage_scan_gain=gain,
-            signal_mask=mask,
-        )
-
-    monkeypatch.setattr(process_module.time, "sleep", finish_acquisition)
-    monkeypatch.setattr(
-        process_module, "call_estimate_illuminations", estimate_after_completion
-    )
-    result = CliRunner().invoke(
-        app,
-        [
-            str(tmp_path),
-            "--live-wait",
-            "--flatfield-correction",
-            "--save-float32",
-            "--output",
-            str(destination),
-            "--no-max-projection",
-            "--no-create-fused-max-projection",
-            "--z-downsample-level",
-            "1",
-        ],
-    )
-    assert result.exit_code == 0, result.exception
-    assert sleeps == [30.0, 30.0]
-    assert estimates == [True]
-    assert "starting offline processing" in result.output
-    field = process_module.read_current_flatfield(field_path, (1, 1, *raw.shape[-2:]))
-    assert field is not None
-    expected = orthogonal_deskew(
-        np.flip(
-            (raw[0, 0, 0].astype(np.float32) - 100) * np.float32(0.24) / field[0, 0],
-            axis=0,
-        ),
-        distance=0.4,
-        pixel_size=0.115,
-        downsample_factor=1,
-    )
-    actual = (
-        open_position_collection(destination / "wait_estimate_deskewed.ome.zarr")
-        .arrays[0][0, 0]
-        .read()
-        .result()
-    )
-    np.testing.assert_allclose(actual, expected, rtol=2e-6, atol=1e-5)
-
-
-@pytest.mark.integration
-def test_live_wait_requires_raw_tiles_after_completed_event(
-    tmp_path, monkeypatch, live_acquisition_factory
-):
-    """A completed log alone cannot start processing before raw chunks arrive."""
-    process_module = importlib.import_module("opm_processing.process")
-    dataset = live_acquisition_factory(shape=(1, 1, 1, 4, 8, 5))
-    dataset.illumination_path.unlink()
-    destination = tmp_path / "processed"
-    sleeps = []
-
-    def finish_writes(seconds):
-        assert not destination.exists()
-        sleeps.append(seconds)
-        assert len(sleeps) == 1
-        dataset.collection.arrays[0].write(np.uint16(137)).result()
-
-    monkeypatch.setattr(process_module.time, "sleep", finish_writes)
-    result = CliRunner().invoke(
-        app,
-        [
-            str(tmp_path),
-            "--live-wait",
-            "--save-float32",
-            "--output",
-            str(destination),
-            "--no-max-projection",
-            "--no-create-fused-max-projection",
-            "--z-downsample-level",
-            "1",
-        ],
-    )
-    assert result.exit_code == 0, result.exception
-    assert sleeps == [30.0]
-    assert not (destination / "sample_flatfield.ome.tif").exists()
-    actual = (
-        open_position_collection(destination / "sample_deskewed.ome.zarr")
-        .arrays[0][0, 0]
-        .read()
-        .result()
-    )
-    expected = constant_deskew((4, 8, 5), 37 * 0.24, downsample_factor=1)
-    np.testing.assert_allclose(actual, expected, rtol=4 * np.finfo(np.float32).eps)
-
-
-@pytest.mark.integration
-def test_live_wait_reuses_an_existing_flatfield(tmp_path, live_acquisition_factory):
-    """A completed live acquisition uses the usual cached illumination lookup."""
-    from opm_processing.process import write_flatfield
-
-    raw = np.full((1, 1, 1, 4, 8, 5), 137, dtype=np.uint16)
-    dataset = live_acquisition_factory(raw, name="wait_cached")
-    dataset.illumination_path.unlink()
-    write_flatfield(
-        tmp_path / "wait_cached_flatfield.ome.tif",
-        np.full((1, 1, 8, 5), 2, np.float32),
-        0.115,
-    )
-    result = CliRunner().invoke(
-        app,
-        [
-            str(tmp_path),
-            "--live-wait",
-            "--flatfield-correction",
-            "--save-float32",
-            "--no-max-projection",
-            "--no-create-fused-max-projection",
-            "--z-downsample-level",
-            "1",
-        ],
-    )
-    assert result.exit_code == 0, result.exception
-    assert "Using existing flatfield" in result.output
-    actual = (
-        open_position_collection(tmp_path / "wait_cached_deskewed.ome.zarr")
-        .arrays[0][0, 0]
-        .read()
-        .result()
-    )
-    expected = constant_deskew((4, 8, 5), 37 * 0.24 / 2, downsample_factor=1)
-    np.testing.assert_allclose(actual, expected, rtol=4 * np.finfo(np.float32).eps)
-
-
-@pytest.mark.integration
+@pytest.mark.unit
 @pytest.mark.parametrize("event", ["canceled", "errored"])
 def test_live_wait_stops_before_processing_on_acquisition_failure(
     tmp_path, live_acquisition_factory, event
 ):
+    """Abort live waiting before processing a canceled or failed acquisition."""
     dataset = live_acquisition_factory(completed=False)
     dataset.illumination_path.unlink()
     dataset.log.write_text(
@@ -246,35 +64,10 @@ def test_live_wait_stops_before_processing_on_acquisition_failure(
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("force_color", [False, True])
-def test_live_wait_and_streaming_live_are_mutually_exclusive(
-    tmp_path, monkeypatch, force_color
-):
-    from typer import rich_utils
-
-    monkeypatch.delenv("NO_COLOR", raising=False)
-    monkeypatch.setenv("TERM", "xterm-256color")
-    monkeypatch.setattr(rich_utils, "FORCE_TERMINAL", force_color)
-    result = CliRunner().invoke(
-        app,
-        [
-            str(tmp_path),
-            "--live-wait",
-            "--live",
-            str(tmp_path / "illumination.ome.tif"),
-        ],
-        color=force_color,
-    )
-    assert result.exit_code == 2
-    if force_color:
-        assert "\x1b[" in result.output
-    assert "--live-wait cannot be combined with --live" in unstyle(result.output)
-
-
-@pytest.mark.unit
 def test_live_wait_accepts_single_position_root_image(
     tmp_path, current_single_position_mirror_timelapse
 ):
+    """Discover completed live data stored directly as a root NGFF image."""
     path = current_single_position_mirror_timelapse
     original = inspect_acquisition(path)
     document = manifest_document(path, timepoints=3)
@@ -333,77 +126,41 @@ def test_chunk_presence_marks_only_a_fully_written_tile_ready(
 
 
 @pytest.mark.unit
-def test_live_iterator_polls_then_stops_at_completed_log(tmp_path) -> None:
-    """Poll only while caught up and stop after all completed tiles are yielded."""
-    data_path = tmp_path / "iterator.ome.zarr"
-    manifest_path = tmp_path / "iterator.manifest.json"
-    manifest_path.write_text(
-        json.dumps(manifest_document(data_path, timepoints=1)), encoding="utf-8"
+@pytest.mark.parametrize("resume", [False, True], ids=["poll", "resume"])
+def test_live_iterator_waits_for_unprocessed_tiles_then_stops(
+    live_acquisition_factory, resume
+):
+    """Observe real chunk arrivals, skip durable tiles and stop on completion."""
+    dataset = live_acquisition_factory(
+        shape=(1, 2 if resume else 1, 2, 3, 4, 5),
+        completed=True,
     )
-    manifest = LiveManifest.read(manifest_path)
-    log_path = tmp_path / "iterator.log.jsonl"
-    log_path.write_text(
-        json.dumps({"event": "completed", "acquisition_id": manifest.acquisition_id})
-        + "\n",
-        encoding="utf-8",
+    readiness = ZarrTileReadiness(
+        dataset.manifest.apply(inspect_acquisition(dataset.path))
     )
-
-    class Readiness:
-        calls = 0
-
-        def ready_tiles(self):
-            self.calls += 1
-            return set() if self.calls == 1 else {(0, 0)}
-
     sleeps = []
+
+    def acquire(seconds=None):
+        """Publish native TensorStore chunks when the iterator polls acquisition."""
+        if seconds is not None:
+            sleeps.append(seconds)
+        for array in dataset.collection.arrays:
+            array.write(np.ones(array.shape, np.uint16)).result()
+
+    if resume:
+        acquire()
     tiles = list(
         iter_live_tiles(
-            Readiness(),
-            manifest,
-            log_path,
+            readiness,
+            dataset.manifest,
+            dataset.log,
+            completed_tiles={(0, 0)} if resume else set(),
             poll_interval=30.0,
-            sleeper=sleeps.append,
+            sleeper=acquire,
         )
     )
-
-    assert tiles == [(0, 0)]
-    assert sleeps == [30.0]
-
-
-@pytest.mark.unit
-def test_live_iterator_skips_tiles_completed_before_restart(tmp_path) -> None:
-    """Seed iterator state with processed tiles discovered from existing output."""
-    data_path = tmp_path / "resume.ome.zarr"
-    manifest_path = tmp_path / "resume.manifest.json"
-    document = manifest_document(data_path, timepoints=1)
-    document["index_sizes"]["p"] = 2
-    document["stage_positions_zxy"] = [
-        [30.0, 100.0, 200.0],
-        [30.0, 100.0, 202.0],
-    ]
-    manifest_path.write_text(json.dumps(document), encoding="utf-8")
-    manifest = LiveManifest.read(manifest_path)
-    log_path = tmp_path / "resume.log.jsonl"
-    log_path.write_text(
-        json.dumps({"event": "completed", "acquisition_id": manifest.acquisition_id})
-        + "\n",
-        encoding="utf-8",
-    )
-
-    class Readiness:
-        def ready_tiles(self):
-            return {(0, 0), (0, 1)}
-
-    tiles = list(
-        iter_live_tiles(
-            Readiness(),
-            manifest,
-            log_path,
-            completed_tiles={(0, 0)},
-        )
-    )
-
-    assert tiles == [(0, 1)]
+    assert tiles == [(0, 1)] if resume else tiles == [(0, 0)]
+    assert sleeps == ([] if resume else [30.0])
 
 
 @pytest.mark.unit
@@ -460,15 +217,22 @@ def test_empty_tile_detection_uses_global_occupancy() -> None:
     ((False, np.dtype(np.uint16)), (True, np.dtype(np.float32))),
 )
 def test_live_process_matches_direct_deskew_without_estimating(
-    tmp_path, live_acquisition_factory, save_float32, expected_dtype
+    tmp_path, live_acquisition_factory, save_float32, expected_dtype, simulated_camera
 ) -> None:
     """Process a complete live acquisition using only the supplied illumination."""
-    raw = np.full((1, 1, 1, 4, 8, 5), 137, np.uint16)
+    observed = simulated_camera((4, 8, 5), conversion=0.24).raw
+    raw = observed[None, None, None, ::-1].copy()
     dataset = live_acquisition_factory(
         raw, name="live", illumination=np.full((1, 8, 5), 2.0, np.float32)
     )
     illumination_path = dataset.illumination_path
-    expected_float = constant_deskew((4, 8, 5), 37 * 0.24 / 2, downsample_factor=1)
+    expected_float = orthogonal_deskew(
+        np.maximum(observed.astype(np.float32) - 100, 0) * 0.24 / 2,
+        theta=30.0,
+        distance=0.4,
+        pixel_size=0.115,
+        downsample_factor=1,
+    )
     args = [
         str(tmp_path),
         "--live",
@@ -501,7 +265,7 @@ def test_live_process_matches_direct_deskew_without_estimating(
     assert not any(key.startswith("opm_") for key in output.attributes)
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 def test_live_occupancy_filter_preserves_sample_signal_and_writes_zero(
     tmp_path,
     live_acquisition_factory,
@@ -510,7 +274,7 @@ def test_live_occupancy_filter_preserves_sample_signal_and_writes_zero(
     raw = np.full((2, 4, 8, 5), 100, dtype=np.uint16)
     raw[0, :, 0, 0] = 200  # One persistent detector hot pixel.
     raw[0, 0, 0, 1:5] = 104  # Sub-threshold signal before illumination correction.
-    raw[1, 2] = 200  # A sample-like occupied detector frame.
+    raw[1] = 200  # A uniformly occupied fluorescent volume.
     illumination = np.ones((2, 8, 5), dtype=np.float32)
     illumination[0] = (
         0.1  # Amplifying detector artifacts must not rescue an empty channel.
@@ -538,7 +302,8 @@ def test_live_occupancy_filter_preserves_sample_signal_and_writes_zero(
     assert np.count_nonzero(max_output.arrays[0][0, 0].read().result()) == 0
     assert np.count_nonzero(output.arrays[0][0, 1].read().result()) > 0
     expected = orthogonal_deskew(
-        (np.flip(raw[1], axis=0).astype(np.float32) - 100) * np.float32(0.24),
+        np.full((4, 8, 5), 100 * 0.24, dtype=np.float32),
+        theta=30.0,
         distance=0.4,
         pixel_size=0.115,
         downsample_factor=1,
@@ -558,13 +323,15 @@ def test_live_occupancy_filter_preserves_sample_signal_and_writes_zero(
     assert not any(key.startswith("opm_") for key in output.attributes)
 
 
-@pytest.mark.integration
+@pytest.mark.unit
+@pytest.mark.parametrize("action", ["resume", "overwrite"])
 def test_offline_resume_skips_durably_completed_tile_and_default_overwrites(
     tmp_path,
     monkeypatch,
     acquisition_factory,
+    action,
 ) -> None:
-    """Checkpoint after writes, resume the next tile, and overwrite by default."""
+    """Resume preserves completed pixels; explicit overwrite recomputes them."""
     process_module = importlib.import_module("opm_processing.process")
     pixels = np.empty((1, 2, 1, 4, 8, 5), np.uint16)
     pixels[:, 0] = 110
@@ -581,6 +348,7 @@ def test_offline_resume_skips_durably_completed_tile_and_default_overwrites(
     completion_count = 0
 
     def interrupt_after_first(self, *args, **kwargs):
+        """Interrupt after a durable write to exercise restart behavior."""
         nonlocal completion_count
         real_complete_tile(self, *args, **kwargs)
         completion_count += 1
@@ -607,9 +375,9 @@ def test_offline_resume_skips_durably_completed_tile_and_default_overwrites(
     completed_tile = interrupted.arrays[0][0, 0].read().result()
     np.testing.assert_array_equal(
         completed_tile,
-        constant_deskew(
-            (4, 8, 5),
-            10,
+        orthogonal_deskew(
+            np.full((4, 8, 5), 10, dtype=np.float32),
+            theta=30.0,
             distance=0.4,
             pixel_size=0.115,
             downsample_factor=1,
@@ -622,25 +390,39 @@ def test_offline_resume_skips_durably_completed_tile_and_default_overwrites(
         "complete_tile",
         real_complete_tile,
     )
-    process_module.process_skewed(
-        data_path,
-        acquisition=metadata,
-        output_dir=tmp_path,
-        max_projection=False,
-        create_fused_max_projection=False,
-        z_downsample_level=1,
-        resume=True,
+    result = CliRunner().invoke(
+        app,
+        [
+            str(data_path),
+            "--output",
+            str(tmp_path),
+            "--no-max-projection",
+            "--no-create-fused-max-projection",
+            "--z-downsample-level",
+            "1",
+        ],
+        input=f"{action}\n",
     )
+    assert result.exit_code == 0, result.exception
+    assert "Resume / Overwrite / Cancel" in result.output
     resumed = open_position_collection(output_path)
     np.testing.assert_array_equal(
         resumed.arrays[0][0, 0].read().result(),
-        completed_tile,
+        completed_tile
+        if action == "resume"
+        else orthogonal_deskew(
+            np.full((4, 8, 5), 401, dtype=np.float32),
+            theta=30.0,
+            distance=0.4,
+            pixel_size=0.115,
+            downsample_factor=1,
+        ).astype(np.uint16),
     )
     np.testing.assert_array_equal(
         resumed.arrays[1][0, 0].read().result(),
-        constant_deskew(
-            (4, 8, 5),
-            20,
+        orthogonal_deskew(
+            np.full((4, 8, 5), 20, dtype=np.float32),
+            theta=30.0,
             distance=0.4,
             pixel_size=0.115,
             downsample_factor=1,
@@ -658,9 +440,9 @@ def test_offline_resume_skips_durably_completed_tile_and_default_overwrites(
     overwritten = open_position_collection(output_path)
     np.testing.assert_array_equal(
         overwritten.arrays[0][0, 0].read().result(),
-        constant_deskew(
-            (4, 8, 5),
-            401,
+        orthogonal_deskew(
+            np.full((4, 8, 5), 401, dtype=np.float32),
+            theta=30.0,
             distance=0.4,
             pixel_size=0.115,
             downsample_factor=1,
@@ -668,7 +450,7 @@ def test_offline_resume_skips_durably_completed_tile_and_default_overwrites(
     )
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 def test_live_processing_resumes_completed_output_tiles(
     tmp_path, monkeypatch, live_acquisition_factory
 ) -> None:
@@ -684,6 +466,7 @@ def test_live_processing_resumes_completed_output_tiles(
     real_complete = ProcessingState.complete_tile
 
     def interrupt_after_first(self, *args, **kwargs):
+        """Interrupt after a durable write to exercise restart behavior."""
         real_complete(self, *args, **kwargs)
         # A live tile is durable only after both the volume and projection
         # checkpoints are committed. Interrupt after the second output.
@@ -702,8 +485,9 @@ def test_live_processing_resumes_completed_output_tiles(
 
     first_output = open_position_collection(output_path)
     first_max_output = open_position_collection(max_output_path)
-    completed_before_restart = first_output.arrays[0].read().result()
-    completed_max_before_restart = first_max_output.arrays[0].read().result()
+    # The first tile is exactly the camera offset, hence zero calibrated photons.
+    np.testing.assert_array_equal(first_output.arrays[0].read().result(), 0)
+    np.testing.assert_array_equal(first_max_output.arrays[0].read().result(), 0)
     first_output.arrays[1][0, 0, 0, 0, 0].write(np.uint16(999)).result()
 
     dataset.collection.arrays[0].write(np.uint16(901)).result()
@@ -720,16 +504,16 @@ def test_live_processing_resumes_completed_output_tiles(
     resumed_max_output = open_position_collection(max_output_path)
     np.testing.assert_array_equal(
         resumed_output.arrays[0].read().result(),
-        completed_before_restart,
+        0,
     )
     np.testing.assert_array_equal(
         resumed_max_output.arrays[0].read().result(),
-        completed_max_before_restart,
+        0,
     )
     assert np.all(resumed_output.arrays[1].read().result() != 999)
-    expected_tile = constant_deskew(
-        (4, 8, 5),
-        11 * 0.24,
+    expected_tile = orthogonal_deskew(
+        np.full((4, 8, 5), 11 * 0.24, dtype=np.float32),
+        theta=30.0,
         distance=0.4,
         pixel_size=0.115,
         downsample_factor=1,

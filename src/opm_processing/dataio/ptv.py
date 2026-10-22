@@ -6,7 +6,6 @@ the PTV contract. Publishing metadata does not process or rewrite pixel arrays.
 """
 
 import copy
-import json
 import math
 from dataclasses import dataclass
 from itertools import pairwise
@@ -16,6 +15,7 @@ from typing import Any
 from ome_types import from_xml
 from yaozarrs import open_group
 
+from opm_processing.dataio.position_collection import update_group_attributes
 from opm_processing.dataio.timing import hardware_volume_interval, read_time_interval
 
 _LENGTH_TO_UM = {
@@ -39,6 +39,18 @@ class ProcessedSnapshot:
 
 
 def _image_paths(root: Any) -> list[str]:
+    """Resolve explicit image paths from the declared OME layout.
+
+    Parameters
+    ----------
+    root : ZarrGroup
+        Opened root image or position collection.
+
+    Returns
+    -------
+    list of str
+        Image group paths in stored series order.
+    """
     metadata = root.ome_metadata()
     if hasattr(metadata, "multiscales"):
         return [""]
@@ -46,6 +58,20 @@ def _image_paths(root: Any) -> list[str]:
 
 
 def _contract(root: Any, manifest: dict[str, Any]) -> dict[str, Any]:
+    """Validate self-contained PTV provenance and hardware timing.
+
+    Parameters
+    ----------
+    root : ZarrGroup
+        Opened processed OME-Zarr root.
+    manifest : dict
+        Recorded PTV acquisition and processing contract.
+
+    Returns
+    -------
+    dict
+        Validated producer hardware timing.
+    """
     if not isinstance(manifest, dict) or manifest.get("schema_version") != 1:
         raise ValueError("Missing supported self-contained opm_processing.ptv metadata")
     for name in ("dataset_id", "producer_version"):
@@ -92,6 +118,26 @@ def _contract(root: Any, manifest: dict[str, Any]) -> dict[str, Any]:
 def _snapshot(
     path: Path, root: Any, manifest: dict[str, Any], series: int, channel: int
 ) -> ProcessedSnapshot:
+    """Open a selected processed image using its authoritative metadata.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        Processed OME-Zarr root path.
+    root : ZarrGroup
+        Opened root group.
+    manifest : dict
+        Validated self-contained PTV manifest.
+    series : int
+        Stored series index.
+    channel : int
+        Stored channel index.
+
+    Returns
+    -------
+    ProcessedSnapshot
+        Selected array handle and copied physical provenance.
+    """
     timing = _contract(root, manifest)
     if (
         type(series) is not int
@@ -318,19 +364,9 @@ def publish_ptv_metadata(path: str | Path, manifest: dict[str, Any]) -> None:
     for series, image in enumerate(manifest["images"]):
         for channel in range(max(1, len(image["volume_status_by_channel"]))):
             _snapshot(path, root, manifest, series, channel)
-    target = path / "zarr.json"
-    original = target.read_bytes()
-    document = json.loads(original)
-    document["attributes"].setdefault("opm_processing", {})["ptv"] = manifest
-    encoded = (json.dumps(document, indent=2, allow_nan=False) + "\n").encode("utf-8")
-    partial = target.with_name(target.name + ".ptv.partial")
-    partial.write_bytes(encoded)
-    if target.read_bytes() != original:
-        partial.unlink()
-        raise RuntimeError(
-            "Output metadata changed concurrently during PTV publication"
-        )
-    partial.replace(target)
+    processing = copy.deepcopy(root.attrs.get("opm_processing", {}))
+    processing["ptv"] = manifest
+    update_group_attributes(path, {"opm_processing": processing})
 
 
 def publish_processing_state_ptv(path: str | Path, state: Any) -> None:
@@ -440,10 +476,8 @@ def mark_ptv_tile(
     zero_channels : tuple of int
         Deliberately zeroed processing channels, recorded as invalid.
     """
-    target = Path(path) / "zarr.json"
-    original = target.read_bytes()
-    document = json.loads(original)
-    manifest = document["attributes"]["opm_processing"]["ptv"]
+    processing = copy.deepcopy(open_group(path).attrs["opm_processing"])
+    manifest = processing["ptv"]
     matched = False
     for image in manifest["images"]:
         if (
@@ -459,11 +493,4 @@ def mark_ptv_tile(
         raise ValueError(
             "Completed tile does not correspond to the processed PTV mapping"
         )
-    partial = target.with_name(target.name + ".ptv.partial")
-    partial.write_text(
-        json.dumps(document, indent=2, allow_nan=False) + "\n", encoding="utf-8"
-    )
-    if target.read_bytes() != original:
-        partial.unlink()
-        raise RuntimeError("Output metadata changed concurrently during PTV checkpoint")
-    partial.replace(target)
+    update_group_attributes(path, {"opm_processing": processing})

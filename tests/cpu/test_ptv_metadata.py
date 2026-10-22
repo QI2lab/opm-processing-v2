@@ -1,66 +1,23 @@
 """Self-contained processed PTV metadata through genuine producer writers."""
 
 import copy
-import json
 
 import pytest
 from yaozarrs import open_group
 
-from opm_processing.dataio.position_collection import create_position_collection
+from opm_processing.dataio.position_collection import update_group_attributes
 from opm_processing.dataio.ptv import publish_ptv_metadata, read_processed_snapshot
+from tests.fixtures.storage import ptv_manifest
+
+pytestmark = pytest.mark.unit
 
 
-def manifest(image_paths=("0",)):
-    """Return explicit synthetic processing provenance, without implied calibration."""
-    return {
-        "schema_version": 1,
-        "dataset_id": "synthetic-processed",
-        "producer_version": "0.3.0",
-        "product_kind": "deconvolved_deskewed",
-        "processing_history": [{"operation": "synthetic_processed_fixture"}],
-        "registration": {"applied": False, "coordinate_frame": "stored_processed"},
-        "calibration": {"gain_offset_applied": False, "uncertainty_validated": False},
-        "images": [
-            {
-                "path": name,
-                "source_indices": [0, 1, 3],
-                "volume_status_by_channel": [["valid", "invalid", "incomplete"]],
-            }
-            for name in image_paths
-        ],
-    }
-
-
-def collection(tmp_path):
-    """Allocate a tiny actual processed writer output; no numerical processing runs."""
-    path = tmp_path / "processed.ome.zarr"
-    create_position_collection(
-        path,
-        (3, 1, 1, 7, 12, 14),
-        (0.23, 0.115, 0.15),
-        spatial_offset_um=(-2.1, 3.2, -4.3),
-        time_interval_s=0.085,
-        multiscale_factors_yx=(2,),
-        channels=["beads"],
-        attributes={
-            "opm_processing": {
-                "timing": {
-                    "schema_version": 1,
-                    "n_acquired_planes": 17,
-                    "dt_plane_s": 0.005,
-                    "dt_volume_s": 0.085,
-                    "source": "synthetic_trigger",
-                }
-            }
-        },
-    )
-    return path
-
-
-@pytest.mark.integration
-def test_actual_writer_roundtrip_retains_geometry_ids_status_and_hardware(tmp_path):
-    path = collection(tmp_path)
-    publish_ptv_metadata(path, manifest())
+def test_actual_writer_roundtrip_retains_geometry_ids_status_and_hardware(
+    ptv_collection,
+):
+    """Retain geometry, identifiers, volume validity and hardware timing."""
+    path = ptv_collection
+    publish_ptv_metadata(path, ptv_manifest())
     snapshot = read_processed_snapshot(path)
     metadata = snapshot.metadata
     assert snapshot.array.shape == (3, 1, 7, 12, 14)
@@ -70,26 +27,22 @@ def test_actual_writer_roundtrip_retains_geometry_ids_status_and_hardware(tmp_pa
     assert metadata["timing"]["n_acquired_planes"] == 17
     assert metadata["source_indices"] == [0, 1, 3]
     assert metadata["volume_status"] == ["valid", "invalid", "incomplete"]
-    assert metadata["processing_history"] == manifest()["processing_history"]
+    assert metadata["processing_history"] == ptv_manifest()["processing_history"]
     assert metadata["stored_ngff"]["channel_name"] == "beads"
     assert "opm_processing" in open_group(path).attrs
 
 
-@pytest.mark.integration
-def test_highest_resolution_resolved_without_literal_array_path(tmp_path):
-    path = collection(tmp_path)
-    metadata_path = path / "0/zarr.json"
-    values = json.loads(metadata_path.read_text(encoding="utf-8"))
-    values["attributes"]["ome"]["multiscales"][0]["datasets"][0]["path"] = (
-        "native-resolution"
-    )
+def test_highest_resolution_resolved_without_literal_array_path(ptv_collection):
+    """Resolve the declared highest-resolution dataset without a path convention."""
+    path = ptv_collection
+    values = dict(open_group(path / "0").attrs)
+    values["ome"]["multiscales"][0]["datasets"][0]["path"] = "native-resolution"
     (path / "0/0").rename(path / "0/native-resolution")
-    metadata_path.write_text(json.dumps(values), encoding="utf-8")
-    publish_ptv_metadata(path, manifest())
+    update_group_attributes(path / "0", values)
+    publish_ptv_metadata(path, ptv_manifest())
     assert read_processed_snapshot(path).metadata["array_path"] == "0/native-resolution"
 
 
-@pytest.mark.integration
 @pytest.mark.parametrize(
     "problem",
     [
@@ -102,12 +55,12 @@ def test_highest_resolution_resolved_without_literal_array_path(tmp_path):
         "raw_kind",
     ],
 )
-def test_metadata_traps_are_rejected_before_reader_defaults(tmp_path, problem):
-    path = collection(tmp_path)
-    contract = manifest()
-    metadata_path = path / "0/zarr.json"
-    values = json.loads(metadata_path.read_text(encoding="utf-8"))
-    scale = values["attributes"]["ome"]["multiscales"][0]
+def test_metadata_traps_are_rejected_before_reader_defaults(ptv_collection, problem):
+    """Reject contradictory metadata before any reader fallback can conceal it."""
+    path = ptv_collection
+    contract = ptv_manifest()
+    values = dict(open_group(path / "0").attrs)
+    scale = values["ome"]["multiscales"][0]
     if problem == "missing_unit":
         scale["axes"][2].pop("unit")
     elif problem == "missing_translation":
@@ -128,16 +81,16 @@ def test_metadata_traps_are_rejected_before_reader_defaults(tmp_path, problem):
         contract["product_kind"] = "max_z_deskewed"
     else:
         contract["product_kind"] = "raw_scan"
-    metadata_path.write_text(json.dumps(values), encoding="utf-8")
+    update_group_attributes(path / "0", values)
     with pytest.raises(ValueError):
         publish_ptv_metadata(path, contract)
     assert "ptv" not in open_group(path).attrs["opm_processing"]
 
 
-@pytest.mark.integration
 def test_physical_unit_conversion_and_self_contained_fused_layout(
-    tmp_path, fusion_operator
+    tmp_path, fusion_operator, ptv_collection
 ):
+    """Convert physical units and read self-contained fused image metadata."""
     from opm_processing.imageprocessing.tilefusion import TileFusion
 
     path = tmp_path / "fused.ome.zarr"
@@ -156,11 +109,10 @@ def test_physical_unit_conversion_and_self_contained_fused_layout(
         chunk_x=4,
     )
     operator._prepare_fused_image(path, z_slices_per_write=2)
-    document_path = path / "zarr.json"
-    values = json.loads(document_path.read_text(encoding="utf-8"))
-    timing = open_group(collection(tmp_path)).attrs["opm_processing"]["timing"]
-    values["attributes"]["opm_processing"] = {"timing": timing}
-    scale = values["attributes"]["ome"]["multiscales"][0]
+    values = dict(open_group(path).attrs)
+    timing = open_group(ptv_collection).attrs["opm_processing"]["timing"]
+    values["opm_processing"] = {"timing": timing}
+    scale = values["ome"]["multiscales"][0]
     scale["axes"][0]["unit"] = "millisecond"
     for axis in scale["axes"][2:]:
         axis["unit"] = "nanometer"
@@ -172,8 +124,8 @@ def test_physical_unit_conversion_and_self_contained_fused_layout(
         dataset["coordinateTransformations"][1]["translation"][2:] = [
             v * 1000 for v in dataset["coordinateTransformations"][1]["translation"][2:]
         ]
-    document_path.write_text(json.dumps(values), encoding="utf-8")
-    contract = copy.deepcopy(manifest(("",)))
+    update_group_attributes(path, values)
+    contract = copy.deepcopy(ptv_manifest(("",)))
     contract["product_kind"] = "fused_volume"
     publish_ptv_metadata(path, contract)
     result = read_processed_snapshot(path)
@@ -183,12 +135,14 @@ def test_physical_unit_conversion_and_self_contained_fused_layout(
     assert result.metadata["stored_ngff"]["time_unit"] == "millisecond"
 
 
-@pytest.mark.integration
-def test_durable_journal_export_distinguishes_unwritten_zeroed_and_valid(tmp_path):
+def test_durable_journal_export_distinguishes_unwritten_zeroed_and_valid(
+    tmp_path, ptv_collection
+):
+    """Distinguish unwritten, deliberately zeroed and valid processed volumes."""
     from opm_processing.dataio.processing_state import ProcessingState
     from opm_processing.dataio.ptv import mark_ptv_tile, publish_processing_state_ptv
 
-    path = collection(tmp_path)
+    path = ptv_collection
     state = ProcessingState.create(
         tmp_path / "processing.json", tmp_path / "raw.ome.zarr"
     )
@@ -217,17 +171,16 @@ def test_durable_journal_export_distinguishes_unwritten_zeroed_and_valid(tmp_pat
     assert read_processed_snapshot(path).metadata == snapshot.metadata
 
 
-@pytest.mark.integration
 @pytest.mark.parametrize("contradict", [False, True])
 def test_explicit_timestamps_use_hardware_cadence_with_source_gaps(
-    tmp_path, contradict
+    ptv_collection, contradict
 ):
-    path = collection(tmp_path)
-    target = path / "zarr.json"
-    document = json.loads(target.read_text(encoding="utf-8"))
-    document["attributes"]["opm_processing"]["timing"]["clock_precision_s"] = 1e-6
-    target.write_text(json.dumps(document), encoding="utf-8")
-    contract = manifest()
+    """Preserve hardware timestamps across missing source volume indices."""
+    path = ptv_collection
+    processing = copy.deepcopy(open_group(path).attrs["opm_processing"])
+    processing["timing"]["clock_precision_s"] = 1e-6
+    update_group_attributes(path, {"opm_processing": processing})
+    contract = ptv_manifest()
     contract["images"][0]["stored_timestamps_s"] = [
         4.0,
         4.085,

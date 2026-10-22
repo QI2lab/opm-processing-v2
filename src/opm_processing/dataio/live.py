@@ -8,7 +8,9 @@ import time
 from dataclasses import dataclass, replace
 from itertools import product
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+
+from yaozarrs import open_group
 
 from opm_processing.dataio.acquisition import (
     AcquisitionMetadata,
@@ -228,8 +230,12 @@ class ZarrTileReadiness:
             Inspected filesystem-backed TCZYX acquisition series.
         """
         self.acquisition = acquisition
+        root = open_group(acquisition.path)
         self._arrays = tuple(
-            LiveArrayChunks.read(acquisition.path / relative_path)
+            LiveArrayChunks.from_metadata(
+                acquisition.path / relative_path,
+                root[relative_path].metadata,
+            )
             for relative_path in acquisition.array_paths
         )
 
@@ -281,45 +287,36 @@ class LiveArrayChunks:
     separator: str
 
     @classmethod
-    def read(
-        cls,
-        path: Path,
-        *,
-        require_frame_chunks: bool = True,
-    ) -> LiveArrayChunks:
-        """Read a position array's dimensions and raw chunk-key layout.
+    def from_metadata(cls, path: Path, metadata: Any) -> LiveArrayChunks:
+        """Use yaozarrs metadata to determine the raw chunk-key layout.
 
         Parameters
         ----------
         path : Path
             Position array directory containing zarr.json.
-        require_frame_chunks : bool
-            Require separate T/C/Z frame chunks for live raw-data reads.
+        metadata : Any
+            Array metadata opened through yaozarrs at the acquisition root,
+            avoiding reads of large per-position frame journals.
 
         Returns
         -------
         LiveArrayChunks
             Layout used to enumerate every chunk needed for a complete tile.
         """
-        metadata_path = path / "zarr.json"
-        with metadata_path.open(encoding="utf-8") as stream:
-            metadata = json.load(stream)
-        shape = tuple(int(value) for value in metadata["shape"])
+        shape = tuple(int(value) for value in metadata.shape)
         chunk_shape = tuple(
-            int(value)
-            for value in metadata["chunk_grid"]["configuration"]["chunk_shape"]
+            int(value) for value in metadata.chunk_grid["configuration"]["chunk_shape"]
         )
-        if require_frame_chunks and chunk_shape[:3] != (1, 1, 1):
+        if chunk_shape[:3] != (1, 1, 1):
             raise ValueError(
                 "Live processing requires one-frame chunks along T, C, and Z; "
                 f"got {chunk_shape} at {path}"
             )
         if any(
-            codec.get("name") == "sharding_indexed"
-            for codec in metadata.get("codecs", ())
+            codec.get("name") == "sharding_indexed" for codec in metadata.codecs or ()
         ):
             raise ValueError(f"Live processing does not support sharded arrays: {path}")
-        encoding_document = metadata.get("chunk_key_encoding", {})
+        encoding_document = metadata.chunk_key_encoding
         encoding = str(encoding_document.get("name", "default"))
         default_separator = "/" if encoding == "default" else "."
         separator = str(
@@ -353,30 +350,13 @@ class LiveArrayChunks:
             range(chunk_counts[3]),
             range(chunk_counts[4]),
         )
+        prefix = ("c",) if self.encoding == "default" else ()
         return all(
-            self._chunk_path(coordinates).is_file()
+            (
+                self.path / self.separator.join(map(str, (*prefix, *coordinates)))
+            ).is_file()
             for coordinates in product(*coordinate_ranges)
         )
-
-    def _chunk_path(self, coordinates: tuple[int, ...]) -> Path:
-        """Encode one TCZYX chunk coordinate as its on-disk path.
-
-        Parameters
-        ----------
-        coordinates : tuple[int, ...]
-            Chunk-grid indices in TCZYX order.
-
-        Returns
-        -------
-        Path
-            File path for the array's Zarr chunk-key encoding.
-        """
-        components = [str(value) for value in coordinates]
-        if self.encoding == "default":
-            components.insert(0, "c")
-        if self.separator == "/":
-            return self.path.joinpath(*components)
-        return self.path / self.separator.join(components)
 
 
 def iter_live_tiles(

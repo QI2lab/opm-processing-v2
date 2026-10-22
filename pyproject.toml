@@ -36,6 +36,7 @@ dependencies = [
     "numpy",
     "ome-types[lxml]",
     "tensorstore",
+    "zarr>=3",
     "typer>=0.15,<1",
     "yaozarrs[io,write-tensorstore] @ git+https://github.com/dpshepherd/yaozarrs.git@7eebe750654f71fbb0e722aeabdff8b47d12c1b5",
 ]
@@ -47,7 +48,7 @@ processing = [
     "basicpy @ git+https://github.com/QI2lab/BaSiCPy.git@main",
     "cmap",
     "imagecodecs",
-    "napari[all]",
+    "napari[pyqt]",
     "napari-ome-zarr>=0.9.0",
     "napari-plugin-engine",
     "numba",
@@ -62,7 +63,6 @@ processing = [
     "torch==2.9.0; sys_platform == 'win32'",
     "torch; sys_platform != 'win32'",
     "tqdm",
-    "zarr>3.0.8",
     "napari-animation>=0.0.10",
     "pynvvideocodec>=2.2.3 ; sys_platform == 'linux' or sys_platform == 'win32'",
     "imageio-ffmpeg>=0.6",
@@ -108,6 +108,7 @@ dev = [
     "prek==0.5.5",
     "rich",  # https://github.com/Textualize/rich
     "ruff==0.16.6",
+    "pyfakefs==6.2.0",
 ]
 
 [project.urls]
@@ -120,10 +121,7 @@ documentation = "https://qi2lab.github.io/opm-processing-v2/"
 # same as console_scripts entry point
 [project.scripts]
 process = "opm_processing.process:main"
-process-ROI = "opm_processing.process_roi:main"
 inspect-opm = "opm_processing.dataio.acquisition:main"
-convert-timelapse = "opm_processing.dataio.convert_timelapse_data:app"
-display = "opm_processing.display:main"
 export-projections = "opm_processing.export_projections:main"
 encode-projections = "opm_processing.encode_projections:main"
 export-ome-tiff = "opm_processing.export_ome_tiff:main"
@@ -141,7 +139,8 @@ src = ["src"]
 [tool.ruff.lint]
 allowed-confusables = ["µ", "α", "−", "×", "–", "′"]
 select = ["E", "W", "F", "D", "I", "UP", "C4", "B", "A001", "ANN", "RUF", "TC", "TID"]
-ignore = ["ANN401", "D401", "E402", "E501"]
+extend-select = ["D417"]
+ignore = ["ANN401", "E402", "E501"]
 
 [tool.ruff.lint.flake8-tidy-imports]
 ban-relative-imports = "all"
@@ -150,7 +149,7 @@ ban-relative-imports = "all"
 runtime-evaluated-decorators = ["app.command"]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**/*.py" = ["D", "ANN"]
+"tests/**/*.py" = ["ANN"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "numpy"
@@ -163,16 +162,18 @@ docstring-code-format = true
 [tool.pytest.ini_options]
 minversion = "7.0"
 testpaths = ["tests"]
-addopts = "-p no:zarr"
+addopts = "--strict-markers -p no:cacheprovider -p fakefs"
 markers = [
     "unit: isolated numerical or decision behavior with an independent expected result",
-    "integration: simulated image objects processed from real disk inputs to verified disk outputs",
+    "integration: interacting processing and storage components with independently checked outputs",
     "cpu: correctness tests using CPU execution, suitable for GitHub-hosted runners",
     "gpu: correctness tests that execute CUDA code on a real NVIDIA GPU",
 ]
 filterwarnings = [
     "error",
     "ignore:CUDA path could not be detected.*:UserWarning:cupy._environment",
+    # cuCIM's vendored padding still assigns ndarray.shape under NumPy 2.5.
+    "ignore:Setting the shape on a NumPy array has been deprecated.*:DeprecationWarning:cucim.skimage._vendored.pad",
     "ignore::pydantic.warnings.PydanticDeprecatedSince20",
 ]
 

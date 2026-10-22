@@ -27,6 +27,10 @@ estimating illumination or processing images. See the
 
 `--deconvolve` uses GPU RLGC; channel-ordered PSFs can be supplied with repeated
 `--decon-psf-paths` options. Otherwise theoretical PSFs are generated.
+With deconvolution, camera-calibrated detector estimates retain their precision
+during splitting, and flatfield and detector-gain responses enter the solver's
+measurement model. Without deconvolution, correction still divides the
+calibrated floating-point image by these responses before deskewing.
 
 The default saved pixels are clipped uint16 values. `--save-float32` retains
 fractional calibrated intensities. `--z-downsample-level` controls the integer
@@ -35,14 +39,20 @@ conventions are described in [methods](../methods/deskew.md).
 
 ## Physical time axis
 
-When the raw acquisition records `opm_v2.timing.n_acquired_planes` and
-`opm_v2.timing.dt_plane_s`, processing writes their product as the OME-NGFF T
-scale with unit `second`. The count includes acquired planes discarded during
-processing; deskewed Z size and camera exposure do not determine the cadence.
+Processing reads the actual hardware camera exposure from per-frame
+`exposure_time` (seconds), or legacy `exposure_ms` (milliseconds), and rounds
+each exposure to two decimal places in milliseconds. For this acquisition
+system, the rounded exposure defines the hardware frame period. The volume
+interval is the original acquired scan-plane count multiplied by the sum of
+these periods across stored camera channels. Simultaneous wavelengths stored
+in one image count as one camera channel. Discarded acquired planes are included;
+deskewed Z size does not affect timing. Software timestamps (`delta_t`,
+`runner_time_ms`, and `ElapsedTime-ms`) and file-writing delays are ignored.
+The resulting OME-NGFF T scale has unit `second`.
 The same scale is preserved in projections, mosaics, and every pyramid level.
 Position collections also record the OME-XML time increment in seconds.
 
-For legacy acquisitions without a hardware-period field, supply the confirmed
+For legacy acquisitions without recorded hardware exposures, supply the confirmed
 period explicitly:
 
 ```bash
@@ -70,9 +80,26 @@ uv run process "/path/to/acquisition" --deconvolve --output "/path/to/processed"
 ```
 
 Resume uses the processing journal beside the outputs and requires compatible
-settings. Durably completed tiles are reused. Without `--resume`, the selected
-output run is overwritten. Keep the journal with its image stores; see the
-[data reference](../reference/data.md).
+settings. Durably completed tiles are reused. If you omit `--resume` and a
+partial output is found, `process` offers **Resume / Overwrite / Cancel** before
+starting processing or changing the outputs. Enter `resume` (or `r`) to keep
+completed tiles, `overwrite` (or `o`) to restart the selected output run, or
+`cancel` (or `c`) to stop. Cancel is the default: pressing Enter or closing the
+input stream stops the command. Choices are case-insensitive. Pass `--resume`
+explicitly for unattended restarts.
+
+The perpendicular-distance orthogonal interpolation update changes the saved
+pixels. Runs produced with the earlier equal-plane weights must be regenerated;
+their interpolation settings are incompatible with `--resume`. Use the existing
+overwrite choice to restart a partial run with the new interpolation.
+
+The check uses the previous run's selected timepoints and positions, its
+completion journal, and the presence of position metadata. It also prompts
+when an existing output has no readable completion journal. Confirming resume
+still requires compatible settings and readable image metadata; it does not
+repair damaged output. Completed output runs retain the existing overwrite
+behavior when `--resume` is omitted. Keep the journal with its image stores;
+see the [data reference](../reference/data.md).
 
 ## Produce a registered mosaic
 
@@ -83,4 +110,4 @@ to subsequent commands.
 
 The [process reference](../reference/cli/process.md) lists options. Experimental
 scan upsampling and its limitations are described in the
-[deconvolution methods](../methods/deconvolution.md#sub-sampled-acquisitions).
+[deconvolution methods](../methods/deconvolution.md#sparse-scans).

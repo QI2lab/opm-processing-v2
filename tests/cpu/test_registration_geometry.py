@@ -12,8 +12,87 @@ from opm_processing.imageprocessing.tilefusion import (
     _ssim,
 )
 
+pytestmark = pytest.mark.unit
 
-@pytest.mark.unit
+
+@pytest.mark.parametrize("sampling", [(1, 1, 1), (1, 2, 2)])
+def test_orthogonal_camera_pairs_recover_known_stage_errors(
+    orthogonal_registration_pair,
+    sampling,
+):
+    """Recover prescribed stage errors from independently formed oblique images."""
+    from skimage.measure import block_reduce
+
+    pair = orthogonal_registration_pair
+    fixed, moving = (
+        block_reduce(image, sampling, np.mean) for image in (pair.fixed, pair.moving)
+    )
+    masks = tuple(block_reduce(mask, sampling, np.min) for mask in pair.masks)
+    shift, score = TileFusion.register_and_score(
+        fixed,
+        moving,
+        3,
+        max_shift=np.array((2, 4, 4)) / sampling,
+        registration_axis=pair.axis,
+        shift_sampling=sampling,
+        support_masks=masks,
+    )
+    assert np.isfinite(score)
+    np.testing.assert_array_equal(np.rint(np.asarray(shift) * sampling), pair.expected)
+
+
+@pytest.mark.parametrize("shape", [(17, 19), (7, 17, 19)])
+@pytest.mark.parametrize(
+    ("blank_side", "level"),
+    [
+        ("fixed", 0),
+        ("moving", 0),
+        ("both", 0),
+        ("fixed", 100),
+        ("moving", 100),
+        ("both", 100),
+    ],
+)
+def test_empty_or_uninformative_overlap_is_rejected_before_histogram_matching(
+    shape, blank_side, level
+):
+    """Reject empty or featureless overlaps before histogram matching."""
+    rng = np.random.default_rng(292)
+    fixed = rng.uniform(100, 1000, shape).astype(np.float32)
+    moving = fixed.copy()
+    if blank_side in ("fixed", "both"):
+        fixed.fill(level)
+    if blank_side in ("moving", "both"):
+        moving.fill(level)
+
+    shift, score = TileFusion.register_and_score(fixed, moving, 3)
+    np.testing.assert_array_equal(shift, (0, 0, 0))
+    assert score == -np.inf
+
+
+@pytest.mark.parametrize("ramp_in_fixed", [False, True])
+def test_zero_energy_directional_edges_keep_valid_intensity_registration(
+    ramp_in_fixed,
+):
+    """Retain valid intensity registration when directional edges have zero energy."""
+    rng = np.random.default_rng(293)
+    fixed = np.broadcast_to(rng.uniform(100, 1000, (25, 31)), (7, 25, 31)).copy()
+    moving = np.roll(fixed, 3, axis=2).astype(np.float32)
+    if ramp_in_fixed:
+        fixed += 2 * np.arange(7)[:, None, None]
+    fixed = fixed.astype(np.float32)
+    shift, score = TileFusion.register_and_score(
+        fixed, moving, 3, max_shift=(2, 4, 8), registration_axis=0
+    )
+    # The moving image is invariant in Z, so the ramp case cannot constrain a
+    # unique Z displacement. Its textured XY plane still has a known shift.
+    np.testing.assert_allclose(shift[1:], (0, -3), atol=0.1)
+    assert abs(shift[0]) <= 2
+    if not ramp_in_fixed:
+        assert shift[0] == pytest.approx(0, abs=0.1)
+    assert score > 0.99
+
+
 def test_stage_grid_allows_depth_footprint_drift_and_preserves_overlap():
     # Independent dimensions and spacing from the failed four-depth stage scan.
     """Check geometric drift bounds against independent stage-grid dimensions."""
@@ -48,7 +127,6 @@ def test_stage_grid_allows_depth_footprint_drift_and_preserves_overlap():
     assert reordered[3, 7] == depth_limits
 
 
-@pytest.mark.unit
 def test_projection_limits_ignore_depth_and_disjoint_tiles():
     """Exclude inactive Z corrections and nonoverlapping projection pairs."""
     limits = _infer_registration_limits(
@@ -62,7 +140,6 @@ def test_projection_limits_ignore_depth_and_disjoint_tiles():
     assert limits == {(0, 1): (0, 10, 10)}
 
 
-@pytest.mark.unit
 def test_variable_roi_limits_use_intersection_not_common_shape():
     """Bound corrections using the physical intersection of differently sized tiles."""
     limits = _infer_registration_limits(
@@ -76,7 +153,6 @@ def test_variable_roi_limits_use_intersection_not_common_shape():
     assert limits[0, 1] == (6, 5, 10)
 
 
-@pytest.mark.unit
 def test_geometry_is_invariant_to_physical_unit_conversion():
     """Preserve pixel correction limits under a micrometer-to-nanometer conversion."""
     positions = np.asarray([(0, 0, 0), (10, 60, 5)])
@@ -90,7 +166,6 @@ def test_geometry_is_invariant_to_physical_unit_conversion():
     assert actual == scaled
 
 
-@pytest.mark.unit
 def test_no_registration_limits_for_missing_or_disjoint_tiles():
     """Return no search bounds when there are no physically overlapping tiles."""
     assert _infer_registration_limits([], [], (1, 1, 1), (1, 1, 1), 30) == {}
@@ -106,49 +181,15 @@ def test_no_registration_limits_for_missing_or_disjoint_tiles():
     )
 
 
-@pytest.mark.unit
 @pytest.mark.parametrize("drift", (180, 270))
 def test_inferred_depth_limits_recover_or_reject_measured_drift(
-    tensorstore_dataset, fusion_operator, drift
+    registration_pair, shifted_slab_pair, drift
 ):
     # A fixed random specimen sampled by two slabs with an independently
     # imposed Y displacement, including one outside the geometric allowance.
     """Recover a known slab displacement and reject drift beyond geometric bounds."""
-    rng = np.random.default_rng(51)
-    truth = gaussian_filter(rng.uniform(0, 1000, (115, 512 + drift, 64)), (1, 2, 2))
-    truth = np.rint(truth).astype(np.uint16)
-    volumes = (truth[:64, drift:], truth[51:, :512])
-    fusion = fusion_operator(
-        TileFusion,
-        _tile_support_zy=[np.ones(volume.shape[:2], np.float32) for volume in volumes],
-        downsample_factors=(3, 2, 2),
-        ssim_window=15,
-        threshold=0.7,
-        pairwise_metrics={},
-        position_dim=2,
-        time_dim=1,
-    )
-    fusion.z_dim, fusion.y_dim, fusion.x_dim = volumes[0].shape
-    fusion._pixel_size = (0.23, 0.115, 0.115)
-    fusion._tile_positions = [(0, 0, 0), (51 * 0.23, 0, 0)]
-    fusion._tile_shapes = [volumes[0].shape] * 2
-    fusion._tiles_by_time = ((0, 1),)
-    fusion._tile_time_indices = [0, 0]
-    fusion._is_2d = False
-    fusion._max_workers = 1
-    fusion._pair_registration_limits = _infer_registration_limits(
-        fusion._tile_positions,
-        fusion._tile_shapes,
-        fusion._pixel_size,
-        fusion.downsample_factors,
-        30,
-    )
-    fusion.max_registration_shift_zyx = fusion._pair_registration_limits[0, 1]
-    fusion._debug = False
-    fusion._tile_channel_nonzero = {(0, 0): True, (1, 0): True}
-    fusion.position_arrays = tuple(
-        tensorstore_dataset(volume[None, None]) for volume in volumes
-    )
+    pair = shifted_slab_pair((64, 512, 64), 51, (0, -drift, 0))
+    fusion = registration_pair(pair.volumes, pair.positions)
     fusion.refine_tile_positions_with_cross_correlation()
     if drift == 180:
         assert set(fusion.pairwise_metrics) == {(0, 1)}
@@ -159,56 +200,23 @@ def test_inferred_depth_limits_recover_or_reject_measured_drift(
         assert fusion.pairwise_metrics == {}
 
 
-@pytest.mark.unit
 @pytest.mark.parametrize("reverse", (False, True))
 @pytest.mark.parametrize("z_limit", (None, 6))
 @pytest.mark.parametrize("depth_error", (7, 11))
 def test_context_recovers_depth_error_beyond_half_overlap(
-    tensorstore_dataset, fusion_operator, reverse, z_limit, depth_error
+    registration_pair, shifted_slab_pair, reverse, z_limit, depth_error
 ):
     """Recover Z errors from a thirteen-plane nominal intersection.
 
     Both signs preserve the specimen's Z direction. An explicit six-pixel
     limit rejects the measured correction instead of clamping it.
     """
-    rng = np.random.default_rng(20261009)
-    true_step = 51 - depth_error
-    truth = gaussian_filter(rng.uniform(0, 1000, (64 + true_step, 240, 160)), (1, 2, 2))
-    volumes = [truth[:64, 40:, :152], truth[true_step:, :200, 8:]]
-    positions = [(0, 0, 0), (51 * 0.23, 0, 0)]
+    pair = shifted_slab_pair((64, 200, 152), 51, (-depth_error, -40, 8), seed=20261009)
+    volumes, positions = list(pair.volumes), pair.positions
     if reverse:
         volumes.reverse()
         positions.reverse()
-    fusion = fusion_operator(
-        TileFusion,
-        _tile_support_zy=[np.ones(volume.shape[:2], np.float32) for volume in volumes],
-        downsample_factors=(3, 2, 2),
-        ssim_window=15,
-        threshold=0.7,
-        pairwise_metrics={},
-        position_dim=2,
-        time_dim=1,
-        _pixel_size=(0.23, 0.115, 0.115),
-        _tile_positions=positions,
-        _tile_shapes=[volume.shape for volume in volumes],
-        _tiles_by_time=((0, 1),),
-        _tile_time_indices=[0, 0],
-        _is_2d=False,
-        _max_workers=1,
-        _debug=False,
-        _tile_channel_nonzero={(0, 0): True, (1, 0): True},
-        position_arrays=tuple(
-            tensorstore_dataset(volume[None, None]) for volume in volumes
-        ),
-    )
-    fusion.z_dim, fusion.y_dim, fusion.x_dim = volumes[0].shape
-    fusion._pair_registration_limits = _infer_registration_limits(
-        positions,
-        fusion._tile_shapes,
-        fusion._pixel_size,
-        fusion.downsample_factors,
-        30,
-    )
+    fusion = registration_pair(volumes, positions)
     if z_limit is not None:
         fusion._pair_registration_limits[0, 1] = (z_limit, 100, 100)
     fusion.max_registration_shift_zyx = fusion._pair_registration_limits[0, 1]
@@ -222,16 +230,9 @@ def test_context_recovers_depth_error_beyond_half_overlap(
         np.testing.assert_allclose(fusion.global_offsets[1], expected, atol=1)
 
 
-@pytest.mark.unit
 @pytest.mark.parametrize("offsets", ((0.5, -1.3), (0.5, -1.3, 2.4), (1, -2, 3)))
 def test_aligned_registration_views_preserve_fractional_translation(offsets):
-    """Recover an analytic intensity ramp without rounding shifts or scoring padding.
-
-    Parameters
-    ----------
-    offsets : tuple of float
-        Applied moving-image correction in two or three array dimensions.
-    """
+    """Recover an analytic intensity ramp without rounding shifts or scoring padding."""
     shape = (11, 13, 17)[-len(offsets) :]
     coordinates = np.indices(shape, dtype=np.float32)
     slopes = np.arange(1, len(offsets) + 1, dtype=np.float32)
@@ -248,7 +249,6 @@ def test_aligned_registration_views_preserve_fractional_translation(offsets):
     assert bool(np.allclose(reference, aligned, atol=2e-5, rtol=0))
 
 
-@pytest.mark.unit
 @pytest.mark.parametrize("uniform", (True, False))
 def test_context_rejects_background_without_matching_specimen(uniform):
     """Similar background levels must not manufacture a depth match."""
@@ -262,19 +262,26 @@ def test_context_rejects_background_without_matching_specimen(uniform):
     assert not np.isfinite(score)
 
 
-@pytest.mark.unit
-@pytest.mark.parametrize("stripe", (False, True))
-def test_identical_low_texture_crops_preserve_zero_displacement(stripe):
-    """Identical uniform or line objects have zero measured displacement.
+@pytest.mark.parametrize("noise", [0.0, 0.3])
+def test_high_ssim_shared_xy_background_cannot_establish_a_z_registration(noise):
+    """Shared shading can have almost perfect SSIM without shared axial features."""
+    rng = np.random.default_rng(297)
+    background = gaussian_filter(rng.uniform(100, 1000, (48, 40)), 2)
+    fixed = np.broadcast_to(background, (48, 48, 40)).copy()
+    moving = fixed.copy()
+    fixed += rng.normal(0, noise, fixed.shape)
+    moving += rng.normal(0, noise, moving.shape)
+    fixed, moving = fixed.astype(np.float32), moving.astype(np.float32)
+    assert _ssim(fixed, moving, 7) > 0.99
+    masks = (np.ones_like(fixed), np.ones_like(moving))
+    _shift, score = _refine_depth_candidate(fixed, moving, masks, -20, (0, 0), 13, 7)
+    assert score == -np.inf
 
-    Parameters
-    ----------
-    stripe : bool
-        Add an X-localized fluorescent line with constant Z and Y intensity.
-    """
+
+def test_identical_line_crops_preserve_zero_displacement():
+    """Identical line objects have a valid zero correction along their contrast."""
     specimen = np.full((6, 4, 16), 100, dtype=np.float32)
-    if stripe:
-        specimen[..., 6] += 500
+    specimen[..., 6] += 500
     shift, score = TileFusion.register_and_score(
         specimen, specimen.copy(), 3, max_shift=(3, 2, 8)
     )
@@ -282,7 +289,6 @@ def test_identical_low_texture_crops_preserve_zero_displacement(stripe):
     assert score == pytest.approx(1, abs=1e-6)
 
 
-@pytest.mark.unit
 def test_similarity_scores_common_geometric_support_and_rejects_unrelated_signal():
     """Exclude opposing wedge padding while retaining an independent mismatch check."""
     rng = np.random.default_rng(38)
@@ -300,17 +306,9 @@ def test_similarity_scores_common_geometric_support_and_rejects_unrelated_signal
     assert _ssim(fixed, unrelated, 7, valid_mask=common) < 0.7
 
 
-@pytest.mark.unit
 @pytest.mark.parametrize("unrelated", (False, True))
 def test_thin_depth_registration_scores_only_common_planes(unrelated):
-    """Use matched XY samples when geometric gaps prevent a 3D SSIM window.
-
-    Parameters
-    ----------
-    unrelated : bool
-        Replace the second observed field with independent signal to check
-        that projecting common planes does not manufacture a good match.
-    """
+    """Use matched XY samples when geometric gaps prevent a 3D SSIM window."""
     rng = np.random.default_rng(83)
     truth = gaussian_filter(rng.uniform(0, 1000, (5, 45, 37)), (0, 1, 1))
     support = np.zeros(truth.shape, bool)
