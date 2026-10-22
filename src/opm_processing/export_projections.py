@@ -23,11 +23,11 @@ if TYPE_CHECKING:
 
 app = typer.Typer(pretty_exceptions_enable=False)
 
-SUFFIX = "_decon_deskewed.ome.zarr"
+SUFFIX = "_deskewed.ome.zarr"
 
 
 def find_datasets(path: Path) -> list[Path]:
-    """Resolve the full deconvolved/deskewed store directly within an acquisition root.
+    """Resolve full deskewed data, preferring deconvolution when available.
 
     Parameters
     ----------
@@ -37,7 +37,7 @@ def find_datasets(path: Path) -> list[Path]:
     Returns
     -------
     list[Path]
-        Single full deconvolved/deskewed store selected for projection export.
+        Single full deskewed store selected for projection export.
     """
     path = path.expanduser().resolve()
 
@@ -49,8 +49,20 @@ def find_datasets(path: Path) -> list[Path]:
     datasets = sorted(
         p
         for p in path.glob(f"*{SUFFIX}")
-        if p.is_dir() and not p.name.endswith("_max_z" + SUFFIX)
+        if p.is_dir()
+        and not p.name.endswith(("_max_z" + SUFFIX, "_max_z_decon" + SUFFIX))
     )
+    deconvolved = {
+        p.name.removesuffix("_decon" + SUFFIX)
+        for p in datasets
+        if p.name.endswith("_decon" + SUFFIX)
+    }
+    datasets = [
+        p
+        for p in datasets
+        if p.name.endswith("_decon" + SUFFIX)
+        or p.name.removesuffix(SUFFIX) not in deconvolved
+    ]
 
     if not datasets:
         raise ValueError(f"No full deconvolved/deskewed OME-Zarr stores in {path}")
@@ -104,29 +116,29 @@ def acquisition_for(path: Path, override: Path | None = None) -> AcquisitionMeta
 
 
 def volume_interval_ms(acquisition: AcquisitionMetadata) -> float:
-    """Compute scan planes times exposure times channels (sum unequal exposures).
+    """Read the recorded hardware volume interval in milliseconds.
 
     Parameters
     ----------
-    acquisition
-        Inspected acquisition dimensions, stage geometry, and camera calibration.
+    acquisition : AcquisitionMetadata
+        Acquisition carrying the original plane count and hardware plane period.
 
     Returns
     -------
     float
-        Acquired scan-plane count times the sum of channel exposures, in milliseconds.
+        Original acquired-plane count times its hardware period, in milliseconds.
+
+    Raises
+    ------
+    ValueError
+        Hardware timing is missing. Exposure times cannot determine scan cadence.
     """
-    exposures = [c.exposure_ms for c in acquisition.channels]
-
-    if not exposures or any(
-        e is None or not np.isfinite(e) or e <= 0 for e in exposures
-    ):
+    interval = acquisition.volume_interval_s
+    if interval is None:
         raise ValueError(
-            "Acquisition metadata must contain a positive exposure for every channel."
+            "Projection timestamps require recorded hardware volume timing"
         )
-
-    planes = acquisition.scan_position_count
-    return planes * sum(exposures)
+    return 1000 * interval
 
 
 def timestamp(milliseconds: float) -> str:
@@ -621,7 +633,24 @@ def export_dataset(
     if depth_color:
         depth_palette(1, depth_colormap)  # Validate before writing any frames.
 
-    interval = volume_interval_ms(acquisition)
+    interval_s = collection.time_interval_s
+    acquired_interval_s = acquisition.volume_interval_s
+    if (
+        interval_s is not None
+        and acquired_interval_s is not None
+        and not np.isclose(
+            interval_s,
+            acquired_interval_s,
+            rtol=1e-12,
+            atol=0,
+        )
+    ):
+        raise ValueError(
+            "Processed NGFF time scale disagrees with acquisition hardware timing"
+        )
+    interval = (
+        1000 * interval_s if interval_s is not None else volume_interval_ms(acquisition)
+    )
 
     stem = dataset.name.removesuffix(".ome.zarr")
 

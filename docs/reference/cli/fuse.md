@@ -8,6 +8,7 @@ prefers deconvolved, deskewed data.
 | --- | --- |
 | `--registration-channel VALUE` | Select the zero-based registration channel; default 0. |
 | `--max-registration-shift-zyx Z Y X` | Override correction limits inferred from stage positions and scan geometry. |
+| `--registration-retries VALUE` | Remeasure pairs with expanded automatic limits and refit the entire graph; default 2, 0 disables. Explicit shift limits stay fixed. |
 | `--registration-threshold VALUE` | Minimum overlap similarity; default 0.7. |
 | `--blend-pixels Z Y X` | Set edge blending widths; default 20 600 400. |
 | `--downsample-factors Z Y X` | Set registration sampling factors; default 3 5 5. |

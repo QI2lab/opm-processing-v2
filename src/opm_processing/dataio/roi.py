@@ -9,8 +9,9 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from yaozarrs import open_group
+from yaozarrs import open_group, v05
 
+from opm_processing.dataio.acquisition import inspect_acquisition
 from opm_processing.dataio.ngff import round_spatial, round_spatial_values
 from opm_processing.dataio.position_collection import open_position_collection
 from opm_processing.dataio.processing_state import (
@@ -19,6 +20,11 @@ from opm_processing.dataio.processing_state import (
 )
 
 ROI_SCHEMA = "opm-processing-roi-v1"
+ROI_PREVIEW_SUFFIXES = (
+    "_max_z_fused.ome.zarr",
+    "_max_z_decon_deskewed.ome.zarr",
+    "_max_z_deskewed.ome.zarr",
+)
 
 
 def _registered_projection_context(
@@ -93,22 +99,116 @@ def _registered_tile_footprints(path: Path) -> tuple[dict[str, Any], ...]:
     return tuple(footprints)
 
 
-def validate_registered_max_projection(path: str | Path) -> Path:
-    """Require an ROI canvas projected from registered full-volume fusion.
+def projection_tile_footprints(path: str | Path) -> tuple[dict[str, Any], ...]:
+    """Read the raw-tile placement represented by a maximum-Z preview.
 
     Parameters
     ----------
     path : str | Path
-        Registered maximum-Z fusion image selected as the processing ROI canvas.
+        Registered or stage-placed fused preview, or single-position projection.
 
     Returns
     -------
-    Path
-        Absolute registered maximum-Z image path after checking its processing association.
+    tuple of dict
+        Per-timepoint source footprints and uncropped raw-volume origins.
     """
     source = Path(path).expanduser().resolve()
-    _registered_tile_footprints(source)
-    return source
+    suffixes = ROI_PREVIEW_SUFFIXES
+    suffix = next((item for item in suffixes if source.name.endswith(item)), None)
+    if suffix is None:
+        raise ValueError("ROI selection requires a deskewed maximum-Z preview")
+    stem = source.name.removesuffix(suffix)
+    state = ProcessingState.read(processing_state_path(source.parent, stem))
+    preview = open_group(source)
+    projection = preview.attrs.get("opm_processing_projection", {})
+    registrations = [
+        record
+        for record in state.document["registration"].values()
+        if record.get("max_projection_path") == source.name
+    ]
+    if registrations and projection.get("placement") != "stage":
+        footprints = _registered_tile_footprints(source)
+        processed = state.registered_output_for_max_projection(source)
+        collection = open_position_collection(processed)
+        return tuple(
+            {
+                **tile,
+                "raw_origin_zyx_um": list(
+                    round_spatial_values(
+                        np.asarray(tile["origin_zyx_um"])
+                        - np.asarray(
+                            collection.spatial_origins_zyx_um[
+                                int(tile["position_index"])
+                            ]
+                        )
+                    )
+                ),
+            }
+            for tile in footprints
+        )
+
+    from opm_processing.imageprocessing.coordinates import (
+        stage_positions_to_image_coordinates,
+    )
+
+    acquisition = inspect_acquisition(Path(state.document["source"]["path"]))
+    if suffix == suffixes[0]:
+        candidates = (
+            [Path(projection["source_collection"])]
+            if projection.get("source_collection")
+            else [source.parent / f"{stem}{label}" for label in suffixes[1:]]
+        )
+        candidates = [candidate for candidate in candidates if candidate.is_dir()]
+        if len(candidates) != 1:
+            raise ValueError(
+                "Stage-placed preview has ambiguous source collections. Recreate it with process so its source is recorded."
+            )
+        collection_path = candidates[0]
+    else:
+        collection_path = source
+    collection = open_position_collection(collection_path)
+    if suffix != suffixes[0] and len(collection.arrays) != 1:
+        raise ValueError(
+            "Multi-position ROI selection requires a fused maximum-Z preview"
+        )
+    full_path = collection_path.with_name(
+        collection_path.name.replace("_max_z_", "_", 1)
+    )
+    full = open_position_collection(full_path)
+    stage_origins = stage_positions_to_image_coordinates(
+        collection.stage_positions_zxy,
+        reverse_z=not acquisition.stage_axis_flips_xyz[2],
+    )
+    fused = isinstance(preview.ome_metadata(), v05.Image)
+    footprints = []
+    for position, (array, stage, offset) in enumerate(
+        zip(collection.arrays, stage_origins, full.spatial_origins_zyx_um, strict=True)
+    ):
+        # Stage-fused projections place the cropped image at the stage origin;
+        # an ordinary collection displays its NGFF local image coordinates.
+        placed = np.asarray(stage) if fused else np.asarray(stage) + offset
+        raw_origin = placed - np.asarray(offset)
+        dy, dx = collection.voxel_size_um[-2:]
+        for time in range(int(array.shape[0])):
+            footprints.append(
+                {
+                    "time_index": time,
+                    "position_index": position,
+                    "origin_zyx_um": list(round_spatial_values(placed)),
+                    "raw_origin_zyx_um": list(round_spatial_values(raw_origin)),
+                    "bounds_yx_um": list(
+                        round_spatial_values(
+                            (
+                                placed[1],
+                                placed[1] + array.shape[-2] * dy,
+                                placed[2],
+                                placed[2] + array.shape[-1] * dx,
+                            )
+                        )
+                    ),
+                }
+            )
+    return tuple(footprints)
 
 
 @dataclass(frozen=True)
@@ -130,7 +230,7 @@ class PhysicalRoi:
 
     @classmethod
     def read(cls, path: str | Path) -> PhysicalRoi:
-        """Read the physical ROI exported by display.
+        """Read a saved physical ROI selection.
 
         Parameters
         ----------
@@ -367,6 +467,9 @@ def _level_zero_grid(path: Path) -> tuple[tuple[float, float], tuple[float, floa
     """
     root = open_group(path)
     metadata = root.ome_metadata()
+    collection = isinstance(metadata, v05.Bf2Raw)
+    if collection:
+        metadata = root[root["OME"].ome_metadata().series[0]].ome_metadata()
     dataset = metadata.multiscales[0].datasets[0]
     scale = dataset.scale_transform.scale
     translation = (
@@ -375,7 +478,13 @@ def _level_zero_grid(path: Path) -> tuple[tuple[float, float], tuple[float, floa
         else dataset.translation_transform.translation
     )
     return (
-        round_spatial_values(translation[-2:]),
+        (
+            round_spatial_values(
+                projection_tile_footprints(path)[0]["origin_zyx_um"][-2:]
+            )
+            if collection
+            else round_spatial_values(translation[-2:])
+        ),
         round_spatial_values(scale[-2:]),
     )
 
@@ -419,7 +528,11 @@ def align_bounds_to_grid(
             Grid index with near-integer floating-point noise removed.
         """
         nearest = round(value)
-        return float(nearest) if math.isclose(value, nearest, abs_tol=1e-7) else value
+        return (
+            float(nearest)
+            if math.isclose(value, nearest, rel_tol=0, abs_tol=1e-7)
+            else value
+        )
 
     iy0 = math.floor(snap_grid_index((y0 - oy) / sy))
     iy1 = math.ceil(snap_grid_index((y1 - oy) / sy))
@@ -484,7 +597,7 @@ def roi_from_world_rectangle(
     PhysicalRoi
         Pixel-aligned physical ROI and source registered tile footprints.
     """
-    source = validate_registered_max_projection(source_path)
+    source = Path(source_path).expanduser().resolve()
     vertices = np.asarray(vertices_world, dtype=np.float64)
     if vertices.ndim != 2 or vertices.shape[0] < 2 or vertices.shape[1] < 2:
         raise ValueError("ROI rectangle vertices must have shape (n, ndim>=2)")
@@ -501,7 +614,7 @@ def roi_from_world_rectangle(
         origin,
         spacing,
     )
-    footprints = list(_registered_tile_footprints(source))
+    footprints = list(projection_tile_footprints(source))
     selected_footprints = intersecting_tile_footprints(aligned_bounds, footprints)
     selected = tuple(
         sorted({int(item["position_index"]) for item in selected_footprints})

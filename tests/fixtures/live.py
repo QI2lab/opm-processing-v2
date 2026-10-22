@@ -15,26 +15,14 @@ from opm_processing.dataio.live import (
     LiveManifest,
 )
 from opm_processing.dataio.position_collection import create_position_collection
+from opm_processing.imageprocessing.opmtools import orthogonal_deskew
 
 if TYPE_CHECKING:
     from pathlib import Path
 
 
 def manifest_document(data_path: Path, *, timepoints: int = 2) -> dict:
-    """Describe a calibrated two-channel stage acquisition before any frames arrive.
-
-    Parameters
-    ----------
-    data_path : pathlib.Path
-        Planned OME-Zarr location recorded relative to its sidecar.
-    timepoints : int
-        Planned acquisition time count.
-
-    Returns
-    -------
-    dict
-        Controller plan with known stage geometry, channels and camera calibration.
-    """
+    """Describe a calibrated two-channel stage acquisition before any frames arrive."""
     return {
         "schema": LIVE_MANIFEST_SCHEMA,
         "schema_version": "1.0",
@@ -78,22 +66,7 @@ def manifest_document(data_path: Path, *, timepoints: int = 2) -> dict:
 def write_manifest(
     data_path: Path, *, timepoints: int = 2, document: dict | None = None
 ) -> LiveManifest:
-    """Persist a live acquisition plan and reopen it through the real reader.
-
-    Parameters
-    ----------
-    data_path : pathlib.Path
-        Planned OME-Zarr acquisition path.
-    timepoints : int
-        Time count when using the standard two-channel stage plan.
-    document : dict or None
-        Explicit physical plan; otherwise use the common manifest configuration.
-
-    Returns
-    -------
-    LiveManifest
-        Acquisition plan read from its persisted sidecar.
-    """
+    """Persist a live acquisition plan and reopen it through the real reader."""
     sidecars = SimpleNamespace(
         manifest=data_path.with_name(
             data_path.name.removesuffix(".ome.zarr") + ".manifest.json"
@@ -115,18 +88,7 @@ def write_manifest(
 
 @pytest.fixture
 def live_acquisition_factory(tmp_path):
-    """Return a writer for complete or partially acquired live camera objects.
-
-    Parameters
-    ----------
-    tmp_path : pathlib.Path
-        Isolated directory for the camera store and controller sidecars.
-
-    Returns
-    -------
-    callable
-        Writer accepting a known camera object or an incomplete acquisition plan.
-    """
+    """Return a writer for complete or partially acquired live camera objects."""
 
     def create(
         raw_data=None,
@@ -138,30 +100,7 @@ def live_acquisition_factory(tmp_path):
         completed=True,
         illumination=None,
     ):
-        """Persist a stage scan, lifecycle plan and measured illumination field.
-
-        Parameters
-        ----------
-        raw_data : numpy.ndarray or None
-            TPCZYX camera object; None leaves chunks unwritten for readiness tests.
-        name : str
-            Acquisition basename in the temporary directory.
-        shape : tuple of int
-            Planned TPCZYX dimensions when pixels are not yet available.
-        stage_positions : sequence or None
-            Recorded ZXY stage coordinates; defaults to separated lateral fields.
-        chunks : tuple of int or None
-            TCZYX storage chunk shape; defaults to one complete detector frame.
-        completed : bool
-            Append the controller's completed acquisition event.
-        illumination : numpy.ndarray or None
-            Known CYX sensitivity field; None writes uniform unity sensitivity.
-
-        Returns
-        -------
-        types.SimpleNamespace
-            Acquisition, collection, manifest, lifecycle log and illumination paths.
-        """
+        """Persist a stage scan, lifecycle plan and measured illumination field."""
         if raw_data is not None:
             shape = raw_data.shape
         data_path = tmp_path / f"{name}.ome.zarr"
@@ -217,3 +156,75 @@ def live_acquisition_factory(tmp_path):
         )
 
     return create
+
+
+@pytest.fixture(params=["estimate", "pending-chunks", "cached"])
+def live_wait_case(
+    request, tmp_path, live_acquisition_factory, monkeypatch, simulated_camera
+):
+    """Share camera input and controlled completion for offline live-wait decisions."""
+    from opm_processing import process as processing
+
+    kind = request.param
+    shape = (
+        1,
+        1,
+        1,
+        12 if kind == "estimate" else 4,
+        8,
+        16 if kind == "estimate" else 5,
+    )
+    raw = (
+        simulated_camera(shape[-3:], conversion=0.24).raw[None, None, None, ::-1].copy()
+    )
+    dataset = live_acquisition_factory(
+        raw if kind == "cached" else None, shape=shape, completed=kind != "estimate"
+    )
+    dataset.illumination_path.unlink()
+    destination = tmp_path / "processed"
+    field_path = tmp_path / "sample_flatfield.ome.tif"
+    if kind == "cached":
+        processing.write_flatfield(
+            field_path, np.full((1, 1, *shape[-2:]), 2, np.float32), 0.115
+        )
+    sleeps = []
+
+    def finish(seconds):
+        """Write the acquisition completion event during the wait callback."""
+        assert not destination.exists()
+        assert not (destination / field_path.name).exists()
+        sleeps.append(seconds)
+        if len(sleeps) == 1:
+            dataset.collection.arrays[0].write(raw[:, 0]).result()
+            assert kind != "cached"
+        elif len(sleeps) == 2 and kind == "estimate":
+            dataset.log.write_text(
+                json.dumps(
+                    {
+                        "event": "completed",
+                        "acquisition_id": dataset.manifest.acquisition_id,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+        else:
+            pytest.fail("Processing kept waiting after acquisition completion")
+
+    monkeypatch.setattr(processing.time, "sleep", finish)
+    calibrated = np.maximum(raw[0, 0, 0, ::-1].astype(np.float32) - 100, 0) * 0.24
+    return SimpleNamespace(
+        kind=kind,
+        dataset=dataset,
+        raw=raw,
+        destination=destination,
+        sleeps=sleeps,
+        expected=orthogonal_deskew(
+            calibrated / (2 if kind == "cached" else 1),
+            theta=30.0,
+            distance=0.4,
+            pixel_size=0.115,
+            downsample_factor=1,
+        ),
+        field_path=field_path if kind == "cached" else destination / field_path.name,
+    )

@@ -1,6 +1,6 @@
-"""Physical projection units and simulated disk-to-disk export tests."""
+"""Physical projection and export units with isolated file structures."""
 
-from types import SimpleNamespace
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -42,18 +42,28 @@ def test_physical_sphere_projections_and_scale():
 
 
 @pytest.mark.unit
-def test_acquired_volume_timing():
-    """Use acquired scan counts and all channel exposures, with millisecond labels."""
-    acquisition = SimpleNamespace(
-        scan_position_count=25, channels=[SimpleNamespace(exposure_ms=10)] * 3
+@pytest.mark.parametrize("planes, period", [(25, 0.03), (21, 0.005), (None, None)])
+def test_acquired_volume_timing(acquisition_metadata, planes, period):
+    """Hardware cadence is independent of exposure, channels and processed Z size."""
+    acquisition = replace(
+        acquisition_metadata,
+        acquired_plane_count=planes,
+        plane_period_s=period,
     )
-    assert exporter.volume_interval_ms(acquisition) == 750
+    if planes is None:
+        with pytest.raises(ValueError, match="hardware volume timing"):
+            exporter.volume_interval_ms(acquisition)
+    else:
+        assert exporter.volume_interval_ms(acquisition) == pytest.approx(
+            1000 * planes * period
+        )
     assert exporter.timestamp(80 * 750 + 123) == "01:00:123"
 
 
-@pytest.mark.integration
+@pytest.mark.unit
+@pytest.mark.parametrize("stored_timing", [False, True])
 def test_disk_export_preserves_brightness_and_separates_series(
-    tmp_path, position_store_factory
+    tmp_path, position_store_factory, acquisition_metadata, stored_timing
 ):
     """Known linear intensities retain the same mapping over time in each series."""
     first = np.linspace(0, 100, 10 * 48 * 64).reshape(10, 48, 64)
@@ -63,10 +73,13 @@ def test_disk_export_preserves_brightness_and_separates_series(
         name="sample_decon_deskewed",
         voxel_size_um=(0.1, 0.1, 0.1),
         channels=("488", "637"),
+        time_interval_s=0.5 if stored_timing else None,
     )
     source_path = collection.path
-    acquisition = SimpleNamespace(
-        scan_position_count=25, channels=[SimpleNamespace(exposure_ms=10)] * 2
+    acquisition = replace(
+        acquisition_metadata,
+        acquired_plane_count=None if stored_timing else 25,
+        plane_period_s=None if stored_timing else 0.02,
     )
     exporter.export_dataset(source_path, tmp_path, acquisition, 1)
     files = sorted(tmp_path.rglob("*.tiff"))

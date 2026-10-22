@@ -6,8 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from yaozarrs import open_group, v05
-from yaozarrs.write.v05 import prepare_image
+from yaozarrs import open_group
 
 from opm_processing.dataio.position_collection import (
     create_position_collection,
@@ -16,6 +15,7 @@ from opm_processing.dataio.position_collection import (
 )
 from opm_processing.dataio.roi import (
     PhysicalRoi,
+    align_bounds_to_grid,
     roi_from_image_pixel_rectangle,
     roi_from_world_rectangle,
     world_roi_to_skewed_bounds,
@@ -25,44 +25,16 @@ from opm_processing.imageprocessing.tilefusion import TileFusion
 
 @pytest.mark.unit
 def test_napari_world_rectangle_round_trips_grid_and_all_z(
-    record_registration, tmp_path: Path
+    record_registration, fused_store_factory, tmp_path: Path
 ) -> None:
     """Save a pyramid-independent ROI plus every overlapping stage-Z level."""
     source = tmp_path / "sample_max_z_fused.ome.zarr"
-    image = v05.Image(
-        multiscales=[
-            v05.Multiscale(
-                name="preview",
-                axes=[
-                    {"name": "t", "type": "time"},
-                    {"name": "c", "type": "channel"},
-                    {"name": "z", "type": "space", "unit": "micrometer"},
-                    {"name": "y", "type": "space", "unit": "micrometer"},
-                    {"name": "x", "type": "space", "unit": "micrometer"},
-                ],
-                datasets=[
-                    v05.Dataset(
-                        path="0",
-                        coordinateTransformations=[
-                            v05.ScaleTransformation(scale=[1, 1, 1, 0.5, 0.25]),
-                            v05.TranslationTransformation(
-                                translation=[0, 0, 3, 10, 20]
-                            ),
-                        ],
-                    )
-                ],
-            )
-        ]
+    fused_store_factory(
+        np.zeros((1, 1, 1, 8, 8), np.uint16),
+        name="sample_max_z_fused",
+        spacing=(1, 0.5, 0.25),
+        origin=(3, 10, 20),
     )
-    _, arrays = prepare_image(
-        source,
-        image,
-        ((1, 1, 1, 8, 8), np.uint16),
-        extra_attributes={},
-        writer="tensorstore",
-        overwrite=True,
-    )
-    arrays["0"].write(np.zeros((1, 1, 1, 8, 8), dtype=np.uint16)).result()
     tiles = [
         {"time_index": 0, "position_index": 2, "origin_zyx_um": [0, 10, 20]},
         {"time_index": 0, "position_index": 5, "origin_zyx_um": [4, 10, 20]},
@@ -98,44 +70,17 @@ def test_napari_world_rectangle_round_trips_grid_and_all_z(
 @pytest.mark.unit
 def test_napari_image_pixels_are_converted_to_ngff_physical_coordinates(
     record_registration,
+    fused_store_factory,
     tmp_path: Path,
 ) -> None:
     """Apply NGFF translation after mapping the Shapes layer to Image data."""
     source = tmp_path / "sample_max_z_fused.ome.zarr"
-    image = v05.Image(
-        multiscales=[
-            v05.Multiscale(
-                name="preview",
-                axes=[
-                    {"name": "t", "type": "time"},
-                    {"name": "c", "type": "channel"},
-                    {"name": "z", "type": "space", "unit": "micrometer"},
-                    {"name": "y", "type": "space", "unit": "micrometer"},
-                    {"name": "x", "type": "space", "unit": "micrometer"},
-                ],
-                datasets=[
-                    v05.Dataset(
-                        path="0",
-                        coordinateTransformations=[
-                            v05.ScaleTransformation(scale=[1, 1, 1, 0.115, 0.115]),
-                            v05.TranslationTransformation(
-                                translation=[0, 0, 0, -8192.189, 213.58]
-                            ),
-                        ],
-                    )
-                ],
-            )
-        ]
+    fused_store_factory(
+        np.zeros((1, 1, 1, 5000, 5000), np.uint16),
+        name="sample_max_z_fused",
+        spacing=(1, 0.115, 0.115),
+        origin=(0, -8192.189, 213.58),
     )
-    _, arrays = prepare_image(
-        source,
-        image,
-        ((1, 1, 1, 5000, 5000), np.uint16),
-        extra_attributes={},
-        writer="tensorstore",
-        overwrite=True,
-    )
-    arrays["0"][0, 0, 0, 0, 0].write(0).result()
     processed_path = tmp_path / "sample_projection.ome.zarr"
     create_position_collection(
         processed_path,
@@ -216,7 +161,7 @@ def test_registered_tile_origin_is_selected_per_timepoint() -> None:
     assert roi.tile_origin_yx_um(1, 4, (99.0, 99.0)) == (11.0, 32.0)
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 def test_roi_fusion_keeps_multiple_stage_z_levels_and_crops_only_yx(
     record_registration,
     tmp_path: Path,
@@ -295,7 +240,7 @@ def test_roi_fusion_keeps_multiple_stage_z_levels_and_crops_only_yx(
     np.testing.assert_array_equal(written.read().result()[..., :6, :5, :4], expected)
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 def test_variable_roi_tiles_are_stored_cropped_and_reopened(
     record_registration,
     tmp_path: Path,
@@ -399,3 +344,16 @@ def test_variable_roi_tiles_are_stored_cropped_and_reopened(
     expected[..., 2:4, 2:4] = 20
     expected[:, :, 0] = 0
     np.testing.assert_array_equal(fused, expected)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("index", [0, 100_000])
+@pytest.mark.parametrize("epsilon", [1e-10, 1e-5])
+def test_outward_roi_rounding_has_an_absolute_pixel_tolerance(index, epsilon):
+    """A large image index must not erase a real fractional-pixel intersection."""
+    origin, pitch = -8000.0, 0.115
+    bounds = origin + pitch * np.array([index + 10 - epsilon, index + 12 + epsilon])
+    expected = (10, 12) if epsilon < 1e-7 else (9, 13)
+    aligned = align_bounds_to_grid((*bounds, *bounds), (origin, origin), (pitch, pitch))
+    expected = origin + pitch * (index + np.tile(expected, 2))
+    np.testing.assert_allclose(aligned, expected, atol=1e-10, rtol=0)

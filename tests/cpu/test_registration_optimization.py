@@ -5,8 +5,9 @@ import pytest
 
 from opm_processing.imageprocessing.tilefusion import TileFusion
 
+pytestmark = pytest.mark.unit
 
-@pytest.mark.unit
+
 @pytest.mark.parametrize("method", ["TWO_ROUND", "TWO_ROUND_ITERATIVE"])
 def test_cycle_rejection_preserves_depth_links_and_component_anchors(
     fusion_operator, method
@@ -32,7 +33,6 @@ def test_cycle_rejection_preserves_depth_links_and_component_anchors(
     assert (0, 1) in fusion.pairwise_metrics  # Keep raw measurements for cache reuse.
 
 
-@pytest.mark.unit
 def test_depth_measurement_weights_reflect_registration_sampling():
     """Match the analytic weighted solution for unequal registration resolutions."""
     links = [

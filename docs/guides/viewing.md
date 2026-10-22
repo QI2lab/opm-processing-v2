@@ -2,15 +2,15 @@
 
 ## napari
 
+Use `export-rois` to select rectangles on a deskewed maximum-Z preview and
+process their raw regions after closing napari:
+
 ```bash
-uv run display "/path/to/processed" --to-display fused-full --no-roi
+uv run export-rois "/path/to/processed" --deconvolve
 ```
 
-Choose `full`, `max-z`, `fused-full`, or `fused-max-z`. Full and per-tile
-maximum-Z modes display processed position collections. Fused modes display
-the registered output. `--time-range` and `--pos-range` select visible ranges.
-ROI drawing is enabled by default and requires the registered fused maximum-Z
-image; see [ROI selection](roi.md).
+For viewing alone, open OME-Zarr outputs through napari's installed OME-Zarr
+reader. See [ROI processing](roi.md) for preview preparation and export options.
 
 ## Fiji
 
@@ -47,6 +47,6 @@ viewer workflow from a standard ImageJ hyperstack.
 | Disconnected registration groups | Check overlap signal, channel selection, and correction limits. |
 | Visible depth seams | Review registered placement, depth gains, and geometric support. |
 | Resume rejects the run | Use the original settings and matching journal, or explicitly restart. |
-| ROI cannot open | Run `fuse` to create the registered maximum-Z image first. |
+| ROI cannot open | Create a maximum-Z preview with `process` and retain its raw source and journal. |
 | CUDA registration unavailable | Check GPU installation; `--require-gpu` reports failure instead of falling back. |
 | Movie encoding fails | Check NVENC support and the installed NVIDIA driver. |

@@ -1,44 +1,75 @@
-# Selecting and processing an ROI
+# Interactive ROI processing and export
 
-First create a registered maximum-Z projection with [fuse](fusion.md). ROI
-selection uses its calibrated world coordinates.
+`export-rois` opens an existing deskewed maximum-Z preview in napari. Draw
+multiple XY rectangles and close napari to reconstruct the corresponding raw
+regions. Each ROI retains full Z, every channel, and every timepoint.
 
-## Draw a rectangle
+## Prepare a preview
 
-```bash
-uv run display "/path/to/processed"
-```
-
-Draw one rectangle in the napari `processing ROI` layer and close the viewer
-to save it. The default destination is `<stem>_roi.json` beside the data.
-`--roi-output PATH` selects another destination. ROI mode requires
-`fused-max-z`; use `--no-roi` for other display modes.
-
-## Process the selected raw region
+Create the preview first; the ROI command does not create one automatically:
 
 ```bash
-uv run process-ROI "/path/to/processed"
+uv run process "/path/to/acquisition" --no-deconvolve
 ```
 
-The command resolves the raw acquisition through the processing journal,
-reads the saved ROI, processes its raw-data regions, and fuses the cropped
-tiles. Keep the source acquisition accessible. Deconvolution and resume are
-enabled by default; output goes to `<stem>_roi` in the input directory.
+For multiple positions, processing creates a stage-placed maximum-Z mosaic.
+If you have already run `fuse`, its registered maximum-Z projection is used
+instead. A single-position timelapse can use its per-position maximum-Z store;
+napari retains the time slider.
 
-Supply the raw acquisition, ROI, and destination explicitly when needed:
+Keep the raw acquisition, preview source collection, and processing journal accessible. The preview,
+recorded camera calibration, scan geometry, and tile placements determine
+which raw data correspond to each rectangle.
+
+## Select and process
 
 ```bash
-uv run process-ROI "/path/to/raw.ome.zarr" "/path/to/selection_roi.json" --output "/path/to/roi-output"
+uv run export-rois "/path/to/processed"
 ```
 
-## Resume or restart
+You can also pass the raw acquisition store or the exact preview path:
 
-Rerun the same command after interruption. Compatible completed tile/channel
-checkpoints are reused; unfinished writes are processed again. Use
-`--no-resume` to overwrite the ROI output. `--crop-after-deskew` is inapplicable
-because this workflow already writes the selected physical crop.
+```bash
+uv run export-rois "/path/to/sample_max_z_fused.ome.zarr" --deconvolve --registration-channel 1
+uv run export-rois "/path/to/sample_max_z_deskewed.ome.zarr" --deconvolve --tiff
+```
 
-To restrict fusion of existing processed tiles without reprocessing the raw
-data, use `fuse --roi PATH`. See the
-[display](../reference/cli/display.md) and
-[process-ROI](../reference/cli/process-roi.md) references.
+1. Inspect channels and, for timelapses, move the time slider.
+2. In the `export ROIs` Shapes layer, draw any number of axis-aligned rectangles.
+   Move, resize, or delete rectangles using napari's Shapes tools.
+3. Close napari. Selections are saved before processing starts.
+
+Selections refer to the full-resolution grid regardless of the displayed
+pyramid level. Every rectangle applies to all timepoints; the displayed
+channel and timepoint do not restrict the output. Closing without rectangles
+creates no exports.
+
+Raw data are camera-calibrated, optionally deconvolved with RLGC, and
+orthogonally deskewed. Multi-position ROIs retain overlap for a fresh local
+registration and fusion, including when the preview was already registered.
+The final image is cropped to the requested physical XY bounds. Single-position
+ROIs are assembled across time without measuring pairwise registration links.
+`--flatfield-correction` enables the same illumination handling as `process`.
+Deconvolution is disabled unless `--deconvolve` is supplied.
+
+## Outputs and resume
+
+The default destination is `roi_exports` beside the preview. Use `--output`
+to choose another directory. Each `roi_001`, `roi_002`, ... subdirectory contains
+its saved ROI, processing checkpoints, processed tiles, final
+`<stem>_fused.ome.zarr`, and maximum-Z projection. The final OME-Zarr uses NGFF
+v0.5 and retains global spatial coordinates and recorded temporal calibration.
+The default Z binning factor is one; `--z-downsample-level` changes it explicitly.
+
+`--tiff` additionally writes `<stem>_roi_001.ome.tiff` in each ROI directory.
+These are lossless zlib-compressed OME-BigTIFF files with global origins,
+per-plane positions, channel metadata, and processing provenance. OME-Zarr
+outputs are retained.
+
+Rerun the same command to reuse saved selections and compatible completed
+checkpoints without reopening napari. Local registration checkpoints belong to
+the ROI run; preview registration is never used as the final ROI solution.
+Use `--no-resume` to draw new rectangles and restart processing. An incompatible
+configuration is rejected during resume.
+
+See the [command reference](../reference/cli/export-rois.md) for options.

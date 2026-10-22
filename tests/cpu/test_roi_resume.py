@@ -1,11 +1,10 @@
 """Interrupted ROI processing must retain only durably completed channels."""
 
 import importlib
-from dataclasses import replace
 
 import numpy as np
 import pytest
-from typer.testing import CliRunner
+import tensorstore as ts
 
 from opm_processing import process_roi as roi_command
 from opm_processing.dataio.position_collection import (
@@ -24,17 +23,13 @@ def test_roi_resumes_at_last_durable_channel(roi_run, monkeypatch, interruption)
     run = roi_run
     output = run.output_dir / "sample_deskewed.ome.zarr"
     state_path = run.output_dir / "sample.processing.json"
-    reference_dir = run.output_dir.parent / "reference"
-    roi_command.process_roi(
-        run.source, run.roi_path, output=reference_dir, deconvolve=False
-    )
-    reference = open_position_collection(reference_dir / "sample_deskewed.ome.zarr")
-    expected = [array.read().result() for array in reference.arrays]
+    expected = run.expected_tiles
     real_complete = ProcessingState.complete_channel
     real_write = run.process.write_checkpointed_roi_channel
     stop_key = (0, 2, 2) if interruption == "after_final_channel" else (0, 2, 0)
 
     def checkpoint(self, path, time, position, channel, **kwargs):
+        """Record a channel checkpoint only after the associated pixels are durable."""
         key = (time, position, channel)
         if key == stop_key and interruption == "before_checkpoint":
             raise KeyboardInterrupt
@@ -43,25 +38,19 @@ def test_roi_resumes_at_last_durable_channel(roi_run, monkeypatch, interruption)
             raise KeyboardInterrupt
 
     def failing_write(target, value, state, path, key, **kwargs):
+        """Inject a partial write failure before the channel checkpoint."""
         if key == stop_key:
-
-            class FailedTarget:
-                def write(self, value):
-                    # Leave a partially written channel, then fail its write future.
-                    target[0].write(value[0]).result()
-                    return self
-
-                def result(self):
-                    raise OSError("interrupted channel write")
-
-            return real_write(FailedTarget(), value, state, path, key, **kwargs)
+            # Leave a partial channel and fail the write future before checkpointing.
+            target[0].write(value[0]).result()
+            readonly = ts.open(target.spec(), read=True, write=False).result()
+            return real_write(readonly, value, state, path, key, **kwargs)
         return real_write(target, value, state, path, key, **kwargs)
 
     if interruption == "during_write":
         monkeypatch.setattr(
             run.process, "write_checkpointed_roi_channel", failing_write
         )
-        expected_error = OSError
+        expected_error = ValueError
     else:
         monkeypatch.setattr(ProcessingState, "complete_channel", checkpoint)
         expected_error = KeyboardInterrupt
@@ -102,6 +91,7 @@ def test_empty_roi_channel_is_checkpointed_and_skipped(roi_run, monkeypatch):
     real_complete = ProcessingState.complete_channel
 
     def stop_after_empty(self, *args, **kwargs):
+        """Interrupt after recording a deliberately empty channel."""
         real_complete(self, *args, **kwargs)
         raise KeyboardInterrupt
 
@@ -138,37 +128,24 @@ def test_empty_roi_channel_is_checkpointed_and_skipped(roi_run, monkeypatch):
 
 
 @pytest.mark.integration
-def test_roi_no_resume_overwrites_completed_channels(roi_run):
-    """Explicit restart recomputes data instead of using previous checkpoints."""
-    run = roi_run
-    roi_command.process_roi(run.source, run.roi_path, deconvolve=False)
-    run.raw.arrays[1].write(np.uint16(901)).result()
-    roi_command.process_roi(run.source, run.roi_path, resume=False, deconvolve=False)
-    output = open_position_collection(run.output_dir / "sample_deskewed.ome.zarr")
-    np.testing.assert_array_equal(
-        output.arrays[1].read().result(), run.expected_tiles[1]
-    )
-    changed = output.arrays[0].read().result()
-    np.testing.assert_array_equal(changed, run.overwritten_tile)
-
-
-@pytest.mark.integration
 @pytest.mark.parametrize(
     "flag, expected", ((None, True), ("--resume", True), ("--no-resume", False))
 )
-def test_roi_cli_resumes_by_default(roi_run, flag, expected):
+def test_roi_processing_resumes_by_default(roi_run, flag, expected):
     """CLI resume preserves saved pixels; explicit restart replaces them."""
     run = roi_run
-    args = [str(run.source), "--no-deconvolve"] + ([] if flag is None else [flag])
-    first = CliRunner().invoke(roi_command.app, args)
-    assert first.exit_code == 0, first.output
+    options = {} if flag is None else {"resume": expected}
+    roi_command.process_roi(run.source, run.roi_path, deconvolve=False, **options)
     output_path = run.output_dir / "sample_deskewed.ome.zarr"
     before = open_position_collection(output_path).arrays[0].read().result()
     np.testing.assert_array_equal(before, run.expected_tiles[0])
     run.raw.arrays[1].write(np.uint16(901)).result()
-    second = CliRunner().invoke(roi_command.app, args)
-    assert second.exit_code == 0, second.output
+    roi_command.process_roi(run.source, run.roi_path, deconvolve=False, **options)
     after = open_position_collection(output_path).arrays[0].read().result()
+    np.testing.assert_array_equal(
+        open_position_collection(output_path).arrays[1].read().result(),
+        run.expected_tiles[1],
+    )
     if expected:
         np.testing.assert_array_equal(after, before)
     else:
@@ -200,14 +177,11 @@ def test_recreated_output_does_not_reuse_stale_checkpoints(tmp_path):
     assert reopened.completed_tiles(output) == set()
 
 
-@pytest.mark.integration
-def test_roi_command_fuses_selected_tiles_and_projects_pixels(tmp_path):
+@pytest.mark.unit
+def test_roi_command_fuses_selected_tiles_and_projects_pixels(
+    tmp_path, acquisition_factory
+):
     """Recover a known line through real ROI processing, fusion and projection.
-
-    Parameters
-    ----------
-    tmp_path
-        Directory for the simulated acquisition, physical ROI and saved images.
 
     Notes
     -----
@@ -216,13 +190,8 @@ def test_roi_command_fuses_selected_tiles_and_projects_pixels(tmp_path):
     known to be two. Fusion must preserve that gain even at half-filled Z bins.
     No metadata, reconstruction, registration or storage boundary is mocked.
     """
-    from opm_processing.dataio.acquisition import ChannelMetadata
     from opm_processing.dataio.position_collection import open_image_array
     from opm_processing.dataio.roi import PhysicalRoi
-    from tests.fixtures.acquisition import (
-        simulated_acquisition_metadata,
-        write_simulated_acquisition,
-    )
 
     shape = (1, 2, 3, 64, 64, 32)
     specimen = np.full(shape[-3:], 100.0)
@@ -232,20 +201,14 @@ def test_roi_command_fuses_selected_tiles_and_projects_pixels(tmp_path):
         specimen[None, None, None] * spectral_gains[None, None, :, None, None, None],
         shape,
     ).astype(np.uint16)
-    metadata = replace(
-        simulated_acquisition_metadata(tmp_path / "sample.ome.zarr", "mirror", shape),
-        channels=tuple(
-            ChannelMetadata(index, f"{wavelength}nm", wavelength, 10, None)
-            for index, wavelength in enumerate((488, 561, 637))
-        ),
-        array_paths=("0/0", "1/0"),
+    dataset = acquisition_factory(
+        raw,
         stage_positions_zxy=((0, 0, 0), (0, 0, 0)),
         scan_axis_step_um=1.0,
         pixel_size_um=1.0,
         camera_offset=0.0,
         camera_conversion=1.0,
     )
-    write_simulated_acquisition(metadata, raw)
     roi = PhysicalRoi(
         bounds_yx_um=(56.0, 60.0, 4.0, 20.0),
         source_path=tmp_path / "sample_max_z_fused.ome.zarr",
@@ -264,7 +227,7 @@ def test_roi_command_fuses_selected_tiles_and_projects_pixels(tmp_path):
     )
     roi_path = roi.write(tmp_path / "sample_roi.json")
     roi_command.process_roi(
-        metadata.path,
+        dataset.path,
         roi_path,
         deconvolve=False,
         flatfield_correction=False,

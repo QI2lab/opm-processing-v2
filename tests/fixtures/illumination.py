@@ -1,94 +1,129 @@
-"""Known depth-dependent illumination and detector stripes for BaSiC recovery."""
+"""Known detector fields and shared camera/storage boundaries for illumination tests."""
 
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import tensorstore as ts
 
 
 @pytest.fixture
-def depth_illumination():
-    """Simulate known fluorescence multiplied by physical illumination and camera gain.
-
-    Returns
-    -------
-    types.SimpleNamespace
-        Ground fluorescence, detector sensitivity and quantized camera data.
-        Geometry, spectral channels and camera calibration are fixed together.
-    """
-    rng = np.random.default_rng(37)
-    height, width = 32, 64
-    yy, xx = np.meshgrid(
-        np.linspace(-1, 1, height), np.linspace(-1, 1, width), indexing="ij"
-    )
-    fields = np.stack((1 + 0.25 * xx + 0.1 * yy, 1 - 0.2 * xx + 0.15 * yy))
-    specimen = rng.uniform(750, 1250, (2, 12, height, width))
-    raw = np.rint(specimen * fields[:, None] / 0.25 + 100).astype(np.uint16)
-    return SimpleNamespace(
-        fields=fields, height=height, raw=raw, specimen=specimen, width=width
-    )
-
-
-@pytest.fixture
-def tiled_illumination(
-    tensorstore_dataset,
-):
-    """Simulate known fluorescence multiplied by physical illumination and camera gain.
-
-    Parameters
-    ----------
-    tensorstore_dataset : callable
-        Shared dataset double holding simulated raw camera pixels.
-
-    Returns
-    -------
-    types.SimpleNamespace
-        Ground fluorescence, detector sensitivity and quantized camera data.
-        Geometry, spectral channels and camera calibration are fixed together.
-    """
-    rng = np.random.default_rng(7)
-    positions, channels, scan_planes = 6, 2, 12
-    height, width = 64, 128
-    camera_offset = 100.0
-    camera_conversion = 0.25
-
-    yy = np.linspace(-1.0, 1.0, height, dtype=np.float32)[:, np.newaxis]
-    xx = np.linspace(-1.0, 1.0, width, dtype=np.float32)[np.newaxis, :]
-    illuminations = np.stack(
-        (
-            1.0 + 0.28 * yy + 0.12 * xx + 0.08 * yy * xx,
-            1.0 - 0.22 * yy + 0.16 * xx - 0.06 * yy * xx,
+def illumination_observations(request):
+    """Prescribe post-integration intensities, illumination and camera quantization."""
+    kind = request.param
+    tiled = kind == "tiles"
+    positions, channels = (6, 2) if tiled else (2, 2 if kind == "masked" else 1)
+    height, width = (64, 128) if tiled else (32, 64)
+    y = np.linspace(-1, 1, height, dtype=np.float32)[:, None]
+    x = np.linspace(-1, 1, width, dtype=np.float32)[None, :]
+    if tiled:
+        fields = np.stack(
+            (
+                1 + 0.28 * y + 0.12 * x + 0.08 * y * x,
+                1 - 0.22 * y + 0.16 * x - 0.06 * y * x,
+            )
         )
+        detector_x = 78
+        stripe = 1 - 0.12 * np.exp(-0.5 * ((np.arange(width) - detector_x) / 3) ** 2)
+        fields *= stripe[None, None]
+        fields /= fields.mean(axis=(1, 2), keepdims=True)
+        fields = np.broadcast_to(fields[None], (positions, channels, height, width))
+    else:
+        fields = np.stack((1 + 0.25 * x + 0.1 * y, 1 - 0.2 * x + 0.15 * y))
+        fields = np.repeat(fields[:, None], channels, axis=1)
+        detector_x = None
+    offset, conversion, source = 100.0, 0.25, 1000.0
+    specimen = np.random.default_rng(7 if tiled else 37).uniform(
+        0.75 * source, 1.25 * source, (positions, channels, 12, height, width)
     )
-    detector_x = 78
-    detector_distance = (np.arange(width, dtype=np.float32) - detector_x) / 3.0
-    detector_stripe = 1.0 - 0.12 * np.exp(-0.5 * detector_distance**2)
-    illuminations *= detector_stripe[np.newaxis, np.newaxis, :]
-    illuminations /= illuminations.mean(axis=(1, 2), keepdims=True)
+    from tests.simulation.camera import Camera, digitize
 
-    specimen = rng.uniform(
-        750,
-        1250,
-        size=(positions, channels, scan_planes, height, width),
-    ).astype(np.float32)
-    raw = np.rint(
-        specimen * illuminations[np.newaxis, :, np.newaxis, :, :] / camera_conversion
-        + camera_offset
-    ).astype(np.uint16)
-    datastore = tensorstore_dataset(raw[np.newaxis, ...])
-    stage_positions = np.zeros((positions, 3))
-    stage_positions[:, 1] = np.arange(positions) * 100.0
-
+    raw = digitize(
+        specimen * fields[:, :, None],
+        Camera(
+            read_noise_e=1.6,
+            electrons_per_adu=conversion,
+            offset_adu=offset,
+            bit_depth=16,
+        ),
+        seed=71,
+    )[None]
+    coordinates = np.zeros((positions, 3))
+    coordinates[:, 1] = np.arange(positions) * 100 if tiled else 20
+    coordinates[:, 0] = np.arange(positions) * 10
+    mask = np.asarray([[[True, False], [False, False]]]) if kind == "masked" else None
+    expected = np.ones((channels, height, width), np.float32)
+    for channel in range(channels):
+        eligible = np.ones(positions, bool) if mask is None else mask[0, :, channel]
+        if eligible.any():
+            expected[channel] = fields[eligible, channel].max(axis=0)
     return SimpleNamespace(
-        camera_conversion=camera_conversion,
-        camera_offset=camera_offset,
-        channels=channels,
-        datastore=datastore,
+        datastore=ts.array(raw),
+        offset=offset,
+        conversion=conversion,
+        coordinates=coordinates,
+        mask=mask,
+        expected=expected,
+        source=source,
         detector_x=detector_x,
-        height=height,
-        illuminations=illuminations,
-        raw=raw,
-        specimen=specimen,
-        stage_positions=stage_positions,
-        width=width,
     )
+
+
+@pytest.fixture
+def illumination_fit_case(monkeypatch, topology, storage):
+    """Observe calibrated samples while the installed BaSiCPy performs the fit."""
+    from opm_processing.imageprocessing import flatfield
+
+    positions = 1 if topology == "single" else 3
+    gain = np.linspace(0.5, 2, 7, dtype=np.float32)
+    levels = (
+        8
+        + 16 * np.arange(positions)[:, None, None]
+        + 32 * np.arange(2)[None, :, None]
+        + 8 * np.arange(3)[None, None]
+    )
+    raw = np.broadcast_to(
+        100 + levels[..., None, None] * gain / 0.5, (positions, 2, 3, 5, 7)
+    ).astype(np.uint16)
+    raw = np.stack((raw, raw + 1000))
+    coordinates = None if topology == "single" else np.zeros((positions, 3))
+    if topology == "tiles":
+        coordinates[:, 1] = np.arange(positions)
+    calls = []
+    fit = flatfield.BaSiC.fit
+
+    def observe_fit(solver, images, *args, **kwargs):
+        """Record the calibrated images and execute the installed optimizer."""
+        if isinstance(images, np.ndarray):
+            calls.append(images.copy())
+        return fit(solver, images, *args, **kwargs)
+
+    monkeypatch.setattr(flatfield.BaSiC, "fit", observe_fit)
+    return SimpleNamespace(
+        datastore=ts.array(raw) if storage else raw,
+        coordinates=coordinates,
+        levels=levels,
+        gain=gain,
+        calls=calls,
+        raw=raw,
+    )
+
+
+@pytest.fixture
+def constant_illumination_acquisition(acquisition_factory, scan_planes):
+    """Persist known constant photon fields over time, position and channel."""
+    photons = 20 + 4 * np.arange(8).reshape(2, 2, 2)
+    shape = (*photons.shape, scan_planes, 8, 12)
+    raw = np.broadcast_to(100 + photons[..., None, None, None] / 0.25, shape).astype(
+        np.uint16
+    )
+    dataset = acquisition_factory(
+        raw,
+        stage_positions_zxy=((10, 20, 30), (0, 20, 30)),
+        camera_offset=100,
+        camera_conversion=0.25,
+    )
+    fields = np.broadcast_to(
+        np.array([2, 1.25], np.float32)[None, :, None, None], (1, 2, 8, 12)
+    ).copy()
+    return SimpleNamespace(dataset=dataset, photons=photons, fields=fields)

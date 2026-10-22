@@ -1,1 +1,1 @@
-"""GPU unit and disk-to-disk integration tests."""
+"""GPU numerical and storage-boundary unit tests."""

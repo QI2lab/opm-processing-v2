@@ -9,6 +9,8 @@ import numpy as np
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    from yaozarrs import v05
+
 SPATIAL_DECIMALS = 3
 
 
@@ -107,3 +109,69 @@ def downsample_yx(
     if np.issubdtype(array.dtype, np.integer):
         reduced = np.rint(reduced)
     return reduced.astype(array.dtype, copy=False)
+
+
+def pyramid_yx_sampling(multiscale: v05.Multiscale) -> tuple[tuple[int, ...], str]:
+    """Recover YX reduction factors and sampling from recorded grid coordinates.
+
+    Parameters
+    ----------
+    multiscale : yaozarrs.v05.Multiscale
+        Pyramid with equal integer reductions of the final YX axes.
+
+    Returns
+    -------
+    factors : tuple of int
+        Reduction at each level relative to level zero.
+    method : str
+        ``stride`` for aligned sample origins or ``block_mean`` for block centers.
+
+    Raises
+    ------
+    ValueError
+        Scale factors or origins disagree with either supported sampling method.
+    """
+    datasets = multiscale.datasets
+    base_scale = np.asarray(datasets[0].scale_transform.scale[-2:], dtype=float)
+    base_origin = np.asarray(
+        datasets[0].translation_transform.translation[-2:]
+        if datasets[0].translation_transform is not None
+        else (0, 0),
+        dtype=float,
+    )
+    tolerance = 10**-SPATIAL_DECIMALS
+    factors, methods = [], set()
+    for dataset in datasets:
+        scale = np.asarray(dataset.scale_transform.scale[-2:], dtype=float)
+        factor = np.rint(scale / base_scale).astype(int)
+        if (
+            np.any(factor < 1)
+            or factor[0] != factor[1]
+            or not np.allclose(scale, factor * base_scale, atol=tolerance, rtol=0)
+        ):
+            raise ValueError("Pyramids require equal integer YX scale factors")
+        factor = int(factor[0])
+        factors.append(factor)
+        origin = np.asarray(
+            dataset.translation_transform.translation[-2:]
+            if dataset.translation_transform is not None
+            else (0, 0),
+            dtype=float,
+        )
+        if np.allclose(origin, base_origin, atol=tolerance, rtol=0):
+            if factor != 1:
+                methods.add("stride")
+        elif np.allclose(
+            origin,
+            base_origin + 0.5 * (factor - 1) * base_scale,
+            atol=tolerance,
+            rtol=0,
+        ):
+            methods.add("block_mean")
+        else:
+            raise ValueError(
+                "Pyramid origins do not match stride or block-mean sampling"
+            )
+    if len(methods) > 1:
+        raise ValueError("Pyramid levels disagree on YX sampling")
+    return tuple(factors), next(iter(methods), "stride")

@@ -16,10 +16,9 @@ units, returned values, and meaningful algorithm conventions. Keep helpers and
 state limited to what the calculation needs. The controlled acquisition format
 is the input contract; support additional formats only when explicitly required.
 
-Core processing belongs in `src/opm_processing`. Simulations, experiments, and
-figure generators belong in `scripts/`, with a clear opening docstring and module
-imports. Generated reports, figures, and temporary acquisitions belong under
-ignored `diagnostics/` or pytest temporary directories.
+Core processing belongs in `src/opm_processing`. Simulation setup, forward models, configurations, and comparison figure generators
+belong under `tests/`. `scripts/` contains only a usage example. Generated outputs
+belong under ignored `diagnostics/` or pytest temporary directories.
 
 ## Validate changes
 
@@ -29,8 +28,9 @@ uv run pytest --strict-markers
 git diff --check
 ```
 
-Tests must be numerical unit tests or simulated disk-to-disk integration tests.
-Use the [testing guide](testing.md) for CUDA selection and physical acceptance.
+Use only unit and integration tests, with shared fixtures and installed storage
+backends in isolated temporary directories.
+Use the [testing guide](testing.md) for CPU and CUDA commands.
 Run performance measurements outside pytest and record the conditions and
 comparison baseline in ignored `diagnostics/`. Deskew, fusion, and deconvolution
 optimizations must retain their stated geometry and numerical behavior.

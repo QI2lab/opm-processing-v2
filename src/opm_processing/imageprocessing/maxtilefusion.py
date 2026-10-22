@@ -16,6 +16,7 @@ from yaozarrs.write.v05 import prepare_image
 
 from opm_processing.dataio.ngff import (
     downsample_yx,
+    pyramid_yx_sampling,
     round_spatial,
     round_spatial_values,
     round_tczyx_transform,
@@ -24,6 +25,7 @@ from opm_processing.dataio.processing_state import (
     ProcessingState,
     processing_state_path,
 )
+from opm_processing.dataio.timing import time_axis
 from opm_processing.imageprocessing.coordinates import (
     stage_positions_to_image_coordinates,
 )
@@ -66,10 +68,23 @@ def regenerate_fused_max_projection(
     source_root = open_group(fused_path)
     source_metadata = source_root.ome_metadata()
     source_multiscale = source_metadata.multiscales[0]
+    base_dataset = source_multiscale.datasets[0]
+    base = source_root[base_dataset.path].to_tensorstore()
+    base_scale = np.asarray(base_dataset.scale_transform.scale, dtype=np.float64)
+    base_origin = np.asarray(
+        base_dataset.translation_transform.translation
+        if base_dataset.translation_transform is not None
+        else [0] * 5,
+        dtype=np.float64,
+    )
+    projection_z = base_origin[2] + 0.5 * (base.shape[2] - 1) * base_scale[2]
+    reduction_factors, downsample = pyramid_yx_sampling(source_multiscale)
     projection_datasets = []
     projection_specs = []
     levels = []
-    for source_dataset in source_multiscale.datasets:
+    for source_dataset, factor in zip(
+        source_multiscale.datasets, reduction_factors, strict=True
+    ):
         source = source_root[source_dataset.path].to_tensorstore()
         time_dim, channel_dim, z_dim, y_dim, x_dim = (
             int(value) for value in source.shape
@@ -77,7 +92,9 @@ def regenerate_fused_max_projection(
 
         scale = np.asarray(source_dataset.scale_transform.scale, dtype=np.float64)
         translation = np.asarray(
-            source_dataset.translation_transform.translation,
+            source_dataset.translation_transform.translation
+            if source_dataset.translation_transform is not None
+            else [0] * 5,
             dtype=np.float64,
         )
         output_scale = np.asarray(round_tczyx_transform(scale), dtype=np.float64)
@@ -85,7 +102,7 @@ def regenerate_fused_max_projection(
             round_tczyx_transform(translation),
             dtype=np.float64,
         )
-        projection_translation[2] += 0.5 * (z_dim - 1) * output_scale[2]
+        projection_translation[2] = projection_z
         projection_datasets.append(
             v05.Dataset(
                 path=source_dataset.path,
@@ -115,6 +132,8 @@ def regenerate_fused_max_projection(
                 "chunk_y": chunk_y,
                 "chunk_x": chunk_x,
                 "z_step": min(z_dim, max(16, source_chunks[-3])),
+                "factor": factor,
+                "downsample": downsample,
             }
         )
 
@@ -191,6 +210,28 @@ def regenerate_fused_max_projection(
         level = levels[level_index]
         source = level["source"]
         output = arrays[level["path"]]
+        if level_index:
+            # Reduce the full-depth projection, never a Z-subsampled volume.
+            factor = level["factor"]
+            projection = (
+                arrays[base_dataset.path][
+                    time_index,
+                    channel_index,
+                    0,
+                    y_start * factor : min(y_stop * factor, base.shape[-2]),
+                    x_start * factor : min(x_stop * factor, base.shape[-1]),
+                ]
+                .read()
+                .result()
+            )
+            output[
+                time_index,
+                channel_index,
+                0,
+                y_start:y_stop,
+                x_start:x_stop,
+            ].write(downsample_yx(projection, factor, level["downsample"])).result()
+            return
         z_dim = int(level["shape"][2])
         z_step = int(level["z_step"])
         projection = None
@@ -269,12 +310,13 @@ def regenerate_fused_max_projection(
                                     return_when=FIRST_COMPLETED,
                                 )
                                 collect(done)
-        while pending:
-            done, pending = wait(
-                pending,
-                return_when=FIRST_COMPLETED,
-            )
-            collect(done)
+            # Finish the full-resolution projection before its pyramid reads it.
+            while pending:
+                done, pending = wait(
+                    pending,
+                    return_when=FIRST_COMPLETED,
+                )
+                collect(done)
     progress.close()
     processing_state.set_registered_max_projection(
         processed_path,
@@ -284,34 +326,12 @@ def regenerate_fused_max_projection(
 
 
 class MaxTileFusion:
-    """
-    A class for fusing multiple overlapping image tiles stored in a TensorStore dataset.
-
-    Parameters
-    ----------
-    tensorstore_path : str or Path
-        Path to the input TensorStore dataset.
-    tile_positions : list of tuple of float
-        List of physical YX or ZYX stage coordinates representing tile positions.
-    output_path : Path
-        Path to the output TensorStore dataset.
-    pixel_size : tuple of float
-        Pixel size in physical units, supplied as either (y, x) or (z, y, x).
-    reverse_stage_y : bool, default=True
-        Reverse the stage-derived Y placement coordinate without flipping tile
-        pixels. OPM stage motion is opposite image Y.
-    reverse_stage_z : bool, default=True
-        Convert physical stage Z into the opposite laboratory-Z placement
-        coordinate. This does not affect the projection's XY placement.
-    pad_yx : list of int, default  = [0, 0].
-        Padding in y and x dimensions already applied to the dataset
-    time_range: list of int, default = None
-    """
+    """Blend stage-placed projection tiles into a bounded-memory NGFF pyramid."""
 
     def __init__(
         self,
-        ts_dataset: str | Path,
-        tile_positions: list[float, float],
+        ts_dataset: Sequence[ts.TensorStore],
+        tile_positions: Sequence[Sequence[float]],
         output_path: str | Path,
         pixel_size: Sequence[float],
         spatial_offset_z_um: float = 0.0,
@@ -324,42 +344,49 @@ class MaxTileFusion:
         reverse_stage_y: bool = True,
         reverse_stage_z: bool = True,
         opm_angle_deg: float | None = None,
+        time_interval_s: float | None = None,
+        source_collection: str | Path | None = None,
     ) -> None:
         """Initialize maximum-projection fusion with a bounded source chunk cache.
 
         Parameters
         ----------
-        ts_dataset
+        ts_dataset : sequence of tensorstore.TensorStore
             Per-position TensorStore arrays to fuse.
-        tile_positions
+        tile_positions : sequence of sequence of float
             Physical YX or ZYX position of each tile. Z does not change XY placement.
-        output_path
+        output_path : str or pathlib.Path
             Destination for the fused image.
-        pixel_size
+        pixel_size : sequence of float
             Physical YX or ZYX pixel spacing.
-        spatial_offset_z_um
+        spatial_offset_z_um : float
             Physical Z coordinate represented by the singleton projection plane.
-        source_position_indices
+        source_position_indices : sequence of int or None
             Original acquisition position index for each input tile.
-        pad_yx
+        pad_yx : sequence of int
             Existing YX padding to remove from each tile.
-        time_range
+        time_range : tuple[int, int] or None
             Optional half-open time range to fuse.
-        blend_pixels
+        blend_pixels : tuple[int, int]
             Feathering width along Y and X.
-        chunk_size
+        chunk_size : int
             Spatial output chunk size.
-        padding_multiple
+        padding_multiple : int
             Multiple to which the fused shape is padded.
-        reverse_stage_y
+        reverse_stage_y : bool
             Whether to reverse the stage-derived image-Y placement coordinate.
             Tile pixel arrays are not modified.
-        reverse_stage_z
+        reverse_stage_z : bool
             Whether to reverse physical stage Z for laboratory-coordinate
             placement. Tile pixels and the acquired scan axis are not modified.
-        opm_angle_deg
+        opm_angle_deg : float or None
             Retained for compatibility. Deskewed tile placement is independent
             of the OPM angle.
+        time_interval_s : float or None
+            Physical snapshot interval in seconds, preserved in the fused output.
+        source_collection : str or pathlib.Path or None
+            Source projection collection, recorded to identify the preview's
+            tile geometry when multiple processed collections exist.
 
         Returns
         -------
@@ -367,6 +394,8 @@ class MaxTileFusion:
             No value is returned.
         """
         self.pad_y = pad_yx[0]
+        time_axis(time_interval_s)
+        self.time_interval_s = time_interval_s
         self.pad_x = pad_yx[1]
 
         source_context = ts.Context(
@@ -404,6 +433,11 @@ class MaxTileFusion:
             int(value) for value in source_position_indices
         )
         self.output_path = Path(output_path)
+        self.source_collection = (
+            None
+            if source_collection is None
+            else str(Path(source_collection).resolve())
+        )
         pixel_size = tuple(float(value) for value in pixel_size)
         if len(pixel_size) == 2:
             self.z_pixel_size = 1.0
@@ -539,8 +573,15 @@ class MaxTileFusion:
             factor for factor in (1, 2, 4, 8, 16, 32) if factor <= min(self.fused_shape)
         )
         self.multiscale_factors_yx = factors
+        interval_s = getattr(self, "time_interval_s", None)
+        t_axis, t_scale = time_axis(interval_s)
+        t_origin = (
+            0
+            if self.time_range is None or interval_s is None
+            else self.time_range[0] * t_scale
+        )
         axes = [
-            {"name": "t", "type": "time"},
+            t_axis,
             {"name": "c", "type": "channel"},
             {"name": "z", "type": "space", "unit": "micrometer"},
             {"name": "y", "type": "space", "unit": "micrometer"},
@@ -556,7 +597,7 @@ class MaxTileFusion:
                         v05.ScaleTransformation(
                             scale=round_tczyx_transform(
                                 (
-                                    1,
+                                    t_scale,
                                     1,
                                     self.z_pixel_size,
                                     self.pixel_size[0] * factor,
@@ -567,7 +608,7 @@ class MaxTileFusion:
                         v05.TranslationTransformation(
                             translation=round_tczyx_transform(
                                 (
-                                    0,
+                                    t_origin,
                                     0,
                                     self.spatial_offset_z_um,
                                     self.offset[0],
@@ -603,7 +644,13 @@ class MaxTileFusion:
             self.output_path,
             image,
             specs,
-            extra_attributes={},
+            extra_attributes={
+                "opm_processing_projection": {
+                    "placement": "stage",
+                    "source_collection": self.source_collection,
+                    "source_position_indices": list(self.source_position_indices),
+                }
+            },
             chunks=(1, 1, 1, self.chunk_size, self.chunk_size),
             writer="tensorstore",
             overwrite=True,
