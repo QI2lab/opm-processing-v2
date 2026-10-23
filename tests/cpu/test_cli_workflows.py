@@ -29,11 +29,12 @@ def test_inspection_and_exports_process_simulated_acquisition(
     options = cli_export_options
     metadata = case.dataset.metadata
     source = case.dataset.path.parent
-    manifest = json.loads(
+    report = json.loads(
         invoke_cli(
             "inspect-opm", source if options["depth_color"] else case.dataset.path
         ).output
     )
+    manifest = report["raw"]
     assert manifest["shape"] == list(case.dataset.raw_data.shape)
     assert manifest["scan_axis_step_um"] == metadata.scan_axis_step_um
     assert manifest["camera_offset"] == metadata.camera_offset

@@ -10,7 +10,7 @@ stop. Supply tuple options as separate values, such as
 
 | Command | Purpose |
 | --- | --- |
-| [inspect-opm](inspect-opm.md) | Print acquisition metadata. |
+| [inspect-opm](inspect-opm.md) | Report raw/processed dimensions, physical sizes and camera timing. |
 | [process](process.md) | Calibrate, deconvolve, and deskew an acquisition. |
 | [fuse](fuse.md) | Register and blend processed tiles. |
 | [export-ome-tiff](export-ome-tiff.md) | Write fused images as compressed OME-BigTIFF. |

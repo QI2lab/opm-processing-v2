@@ -604,6 +604,74 @@ def processing_options():
     }
 
 
+@pytest.fixture(params=("mirror", "stage"))
+def inspection_case(
+    request,
+    simulated_camera,
+    acquisition_factory,
+    processing_options,
+    selection,
+    small_cpu_kernels,
+):
+    """Prepare CLI inputs from a simulated object and real deskew processing.
+
+    Parameters
+    ----------
+    request : pytest.FixtureRequest
+        Mirror or stage scan mode.
+    simulated_camera : callable
+        Shared physical forward model for a known fluorescent object.
+    acquisition_factory : callable
+        Native writer for calibrated opm-v2 acquisition metadata and pixels.
+    processing_options : dict
+        Shared settings preserving the laboratory output grid.
+    selection : str
+        Raw, directory, processed, custom-name or unavailable-source scenario.
+    small_cpu_kernels : None
+        Production CPU kernels configured for these small simulated volumes.
+
+    Returns
+    -------
+    types.SimpleNamespace
+        Simulated acquisition, actual processed collection and CLI input path.
+    """
+    from opm_processing.dataio.acquisition import acquisition_stem
+    from opm_processing.dataio.processing_state import ProcessingState
+    from opm_processing.process import process
+
+    observed = simulated_camera((16, 32, 32))
+    pixels = np.broadcast_to(observed.raw, (1, 2, 1, *observed.raw.shape)).copy()
+    if request.param == "stage":
+        pixels = pixels[:, :, :, ::-1].copy()
+    case = acquisition_factory(
+        pixels,
+        name="inspection",
+        mode=request.param,
+        acquired_plane_count=pixels.shape[3],
+        plane_period_s=0.01,
+    )
+    path = case.path
+    output = path.parent / f"{acquisition_stem(path)}_deskewed.ome.zarr"
+    collection = None
+    if selection != "raw-only":
+        process(path, **processing_options)
+        if selection == "custom-processed":
+            output = output.rename(path.parent / "custom-output.ome.zarr")
+            state = ProcessingState.create(path.parent / "custom.processing.json", path)
+            state.initialize_run(output, configuration={}, overwrite=True)
+        collection = open_position_collection(output)
+    if selection == "processed-only":
+        path.rename(path.parent / "offline-raw")
+    selected = (
+        path.parent
+        if selection == "directory"
+        else output
+        if "processed" in selection
+        else path
+    )
+    return SimpleNamespace(case=case, collection=collection, selected=selected)
+
+
 @pytest.fixture
 def calibrated_mirror_timelapse(
     current_single_position_mirror_timelapse, simulated_camera

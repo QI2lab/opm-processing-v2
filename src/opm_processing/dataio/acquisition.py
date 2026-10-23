@@ -1061,18 +1061,25 @@ def open_acquisition_datastore(
     return ts.stack(arrays, axis=1)
 
 
-@app.command(help="Print a metadata-only acquisition manifest as JSON.")
+@app.command(
+    help="Print raw acquisition and processed laboratory-image metadata as JSON."
+)
 def inspect_command(
-    path: Annotated[Path, typer.Argument(help="Zarr store or containing directory")],
+    path: Annotated[
+        Path,
+        typer.Argument(help="Raw or processed Zarr store, or acquisition directory"),
+    ],
 ) -> None:
-    """Print a metadata-only acquisition manifest as JSON.
+    """Print raw acquisition and processed laboratory-image metadata as JSON.
 
     Parameters
     ----------
     path : pathlib.Path
-        Acquisition OME-Zarr store or its containing directory.
+        Raw or processed OME-Zarr store, or its acquisition directory.
     """
-    typer.echo(json.dumps(inspect_acquisition(path).to_dict(), indent=2))
+    from opm_processing.dataio.inspection import inspect_dataset
+
+    typer.echo(json.dumps(inspect_dataset(path), indent=2, allow_nan=False))
 
 
 def main() -> None:
