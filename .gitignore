@@ -130,3 +130,7 @@ src/cucim
 /.agents/
 
 uv.lock
+tests/reference/papers/41467_2026_74615_MOESM1_ESM.pdf
+tests/reference/papers/gradient-consensus-readnoise.pdf
+tests/reference/papers/s41467-026-74615-7.pdf
+tests/reference/papers/sciadv.adr8004_sm.pdf

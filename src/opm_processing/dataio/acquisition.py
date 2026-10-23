@@ -893,14 +893,18 @@ def open_acquisition_datastore(
 
 
 def main() -> None:
-    """Print a metadata-only acquisition manifest as JSON."""
+    """Print raw acquisition and processed laboratory-image metadata as JSON."""
     import argparse
     import json
 
+    from opm_processing.dataio.inspection import inspect_dataset
+
     parser = argparse.ArgumentParser(description=main.__doc__)
-    parser.add_argument("path", type=Path, help="Zarr store or containing directory")
+    parser.add_argument(
+        "path", type=Path, help="Raw or processed Zarr store, or acquisition directory"
+    )
     arguments = parser.parse_args()
-    print(json.dumps(inspect_acquisition(arguments.path).to_dict(), indent=2))
+    print(json.dumps(inspect_dataset(arguments.path), indent=2, allow_nan=False))
 
 
 if __name__ == "__main__":

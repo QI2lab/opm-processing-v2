@@ -686,3 +686,48 @@ def processing_options():
         "create_fused_max_projection": False,
         "z_downsample_level": 1,
     }
+
+
+@pytest.fixture
+def inspection_case(opm_v2_tiled_ground_truth_zarr, processing_options, selection):
+    """Prepare CLI inputs from a simulated object and real deskew processing.
+
+    Parameters
+    ----------
+    opm_v2_tiled_ground_truth_zarr : OpmV2TiledGroundTruthFixture
+        Known laboratory object sampled through oblique camera planes.
+    processing_options : dict
+        Shared settings preserving the laboratory output grid.
+    selection : str
+        Raw, directory, processed, custom-name or unavailable-source scenario.
+
+    Returns
+    -------
+    types.SimpleNamespace
+        Simulated acquisition, actual processed collection and CLI input path.
+    """
+    from opm_processing.dataio.acquisition import acquisition_stem
+    from opm_processing.dataio.processing_state import ProcessingState
+    from opm_processing.process import process
+
+    case = opm_v2_tiled_ground_truth_zarr
+    path = case.path
+    output = path.parent / f"{acquisition_stem(path)}_deskewed.ome.zarr"
+    collection = None
+    if selection != "raw-only":
+        process(path, **processing_options)
+        if selection == "custom-processed":
+            output = output.rename(path.parent / "custom-output.ome.zarr")
+            state = ProcessingState.create(path.parent / "custom.processing.json", path)
+            state.initialize_run(output, configuration={}, overwrite=True)
+        collection = open_position_collection(output)
+    if selection == "processed-only":
+        path.rename(path.parent / "offline-raw")
+    selected = (
+        path.parent
+        if selection == "directory"
+        else output
+        if "processed" in selection
+        else path
+    )
+    return SimpleNamespace(case=case, collection=collection, selected=selected)
