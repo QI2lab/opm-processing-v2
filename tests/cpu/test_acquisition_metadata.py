@@ -1,4 +1,4 @@
-"""Metadata-only coverage for the current opm-v2 OME-Zarr writer layout."""
+"""Acquisition metadata units and native storage/processing integration."""
 
 from __future__ import annotations
 
@@ -7,19 +7,17 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
-from tifffile import imread
 from yaozarrs import open_group, v05
 
 from opm_processing.dataio.acquisition import (
     inspect_acquisition,
     open_acquisition_datastore,
 )
-from opm_processing.dataio.convert_timelapse_data import convert_timelapse
 from opm_processing.dataio.position_collection import (
     create_position_collection,
     open_position_collection,
+    update_group_attributes,
 )
-from opm_processing.imageprocessing.opmtools import orthogonal_deskew
 from opm_processing.process import process
 
 if TYPE_CHECKING:
@@ -27,8 +25,60 @@ if TYPE_CHECKING:
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    ("attributes", "expected"),
+    [
+        ({"known_values": np.arange(3)}, {"known_values": [0, 1, 2]}),
+        (
+            {"gain": np.float32(0.25), "indices": (1, 2), "selected": {2, 1}},
+            {"gain": 0.25, "indices": [1, 2], "selected": [1, 2]},
+        ),
+        (float("nan"), None),
+    ],
+)
+def test_native_attribute_updates_preserve_known_pixels_and_ngff(
+    acquisition_factory, attributes, expected
+):
+    """Update attributes without changing analytical pixel values or NGFF geometry."""
+    values = np.arange(3 * 4 * 5, dtype=np.uint16).reshape(1, 1, 1, 3, 4, 5)
+    dataset = acquisition_factory(values)
+    original = dict(open_group(dataset.path).attrs)
+    if expected is not None:
+        update_group_attributes(dataset.path, {"specimen": attributes})
+        assert open_group(dataset.path).attrs["specimen"] == expected
+    else:
+        with pytest.raises(ValueError, match="JSON"):
+            update_group_attributes(dataset.path, {"specimen": attributes})
+    root = open_group(dataset.path)
+    for key, value in original.items():
+        assert root.attrs[key] == value
+    np.testing.assert_array_equal(
+        open_acquisition_datastore(dataset.path).read().result(), values
+    )
+
+
+@pytest.mark.unit
+def test_scan_metadata_retains_all_physical_scan_planes(
+    scan_camera_acquisition,
+):
+    """Retain every physical scan plane after metadata-directed crop and reversal."""
+    fixture = scan_camera_acquisition
+    acquisition = inspect_acquisition(fixture.path)
+    start = acquisition.excess_scan_start_positions or acquisition.excess_scan_positions
+    end = acquisition.excess_scan_end_positions
+    assert fixture.raw_data.shape[-3] - start - end == 16
+    raw = open_acquisition_datastore(acquisition)[0, 0, 0].read().result()
+    ordered = raw[::-1] if acquisition.scan_axis_reversed else raw
+    useful = ordered[start : ordered.shape[0] - end]
+    assert useful.shape == (16, 32, 32)
+    np.testing.assert_array_equal(useful, fixture.expected)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("downsample", ["stride", "block_mean"])
 def test_position_collection_multiscales_round_spatial_metadata(
     tmp_path: Path,
+    downsample,
 ) -> None:
     """Round NGFF spacing/origins and preserve block-center coordinates."""
     path = tmp_path / "rounded_projection.ome.zarr"
@@ -39,13 +89,13 @@ def test_position_collection_multiscales_round_spatial_metadata(
         stage_positions=((1.23456, 2.34567, 3.45678),),
         spatial_offset_um=(4.56789, 5.67891, 6.78912),
         multiscale_factors_yx=(2, 4),
+        multiscale_downsample=downsample,
     )
 
     assert collection.multiscale_factors_yx == (1, 2, 4)
+    reduction = np.ceil if downsample == "stride" else np.floor
     assert [tuple(level[0].shape) for level in collection.multiscale_arrays] == [
-        (1, 1, 1, 17, 21),
-        (1, 1, 1, 9, 11),
-        (1, 1, 1, 5, 6),
+        (1, 1, 1, int(reduction(17 / f)), int(reduction(21 / f))) for f in (1, 2, 4)
     ]
     reopened = open_group(path)
     metadata = reopened["0"].ome_metadata()
@@ -66,7 +116,18 @@ def test_position_collection_multiscales_round_spatial_metadata(
     ):
         assert dataset.scale_transform.scale == scale
         assert dataset.translation_transform is not None
-        assert dataset.translation_transform.translation == translation
+        expected_origin = np.asarray(translation)
+        if downsample == "block_mean":
+            factor = scale[-1] / expected_scales[0][-1]
+            expected_origin[-2:] += (
+                0.5 * (factor - 1) * np.array(expected_scales[0][-2:])
+            )
+        np.testing.assert_allclose(
+            dataset.translation_transform.translation,
+            expected_origin,
+            rtol=0,
+            atol=0.0005 + 1e-12,
+        )
 
     assert "stage_positions" not in reopened.attrs
     assert "opm_multiscale_downsample" not in reopened.attrs
@@ -76,6 +137,7 @@ def test_position_collection_multiscales_round_spatial_metadata(
     assert reopened_collection.spatial_origins_zyx_um == ((4.568, 5.679, 6.789),)
     opened_collection = open_position_collection(path)
     assert opened_collection.multiscale_factors_yx == (1, 2, 4)
+    assert opened_collection.multiscale_downsample == downsample
 
 
 @pytest.mark.unit
@@ -171,82 +233,20 @@ def test_single_position_root_image_opens_as_virtual_tpczyx(
 
 
 @pytest.mark.integration
-def test_single_position_mirror_timelapse_processes_every_timepoint(
-    current_single_position_mirror_timelapse: Path,
-) -> None:
-    """Deskew every timepoint from a one-position root Image acquisition."""
-    path = current_single_position_mirror_timelapse
-    process(
-        root_path=path,
-        max_projection=False,
-        z_downsample_level=1,
+@pytest.mark.parametrize("save_float32", [False, True])
+def test_single_position_mirror_timelapse_preserves_calibrated_fluorescence(
+    calibrated_mirror_timelapse, processing_options, save_float32
+):
+    """Reopen all timepoints and compare with the analytical 30-degree Jacobian."""
+    run = calibrated_mirror_timelapse
+    process(root_path=run.path, save_float32=save_float32, **processing_options)
+    output = open_position_collection(
+        run.path.parent / "single_mirror_deskewed.ome.zarr"
     )
-
-    output = open_position_collection(path.parent / "single_mirror_deskewed.ome.zarr")
     assert output.shape[:3] == (3, 1, 1)
-    for time_index in range(3):
-        raw = (
-            np.arange(3 * 4 * 5 * 6, dtype=np.uint16).reshape(3, 4, 5, 6)[time_index]
-            + 200
-        )
-        expected = orthogonal_deskew(
-            (raw.astype(np.float32) - 100) * np.float32(0.25),
-            distance=0.4,
-            pixel_size=0.115,
-            downsample_factor=1,
-        ).astype(np.uint16)
-        np.testing.assert_array_equal(
-            output.arrays[0][time_index, 0].read().result(), expected
-        )
-    assert not (path.parent / "single_mirror_max_z_deskewed.ome.zarr").exists()
-    assert not (path.parent / "single_mirror_max_z_fused.ome.zarr").exists()
-
-
-@pytest.mark.integration
-def test_single_position_mirror_timelapse_can_save_float32(
-    current_single_position_mirror_timelapse: Path,
-) -> None:
-    """Preserve fractional calibrated values for the reported acquisition layout."""
-    path = current_single_position_mirror_timelapse
-    process(
-        root_path=path,
-        save_float32=True,
-        max_projection=False,
-        create_fused_max_projection=False,
-        z_downsample_level=1,
-    )
-
-    output = open_position_collection(path.parent / "single_mirror_deskewed.ome.zarr")
-    values = np.asarray(output.arrays[0][0, 0].read().result())
-    assert values.dtype == np.float32
-    raw = np.arange(4 * 5 * 6, dtype=np.uint16).reshape(4, 5, 6) + 200
-    expected = orthogonal_deskew(
-        (raw.astype(np.float32) - 100) * np.float32(0.25),
-        distance=0.4,
-        pixel_size=0.115,
-        downsample_factor=1,
-    )
-    np.testing.assert_array_equal(values, expected)
+    dtype = np.float32 if save_float32 else np.uint16
+    for time, expected in enumerate(run.expected):
+        actual = output.arrays[0][time, 0].read().result()
+        assert actual.dtype == dtype
+        np.testing.assert_allclose(actual, expected.astype(dtype), rtol=2e-6, atol=1e-5)
     assert not any(key.startswith("opm_") for key in output.attributes)
-
-
-@pytest.mark.integration
-def test_timelapse_converter_accepts_current_collection(
-    current_opm_v2_stage_scan: Path,
-) -> None:
-    """Converted TIFF pixels must exactly match the requested source data."""
-    output_dir = current_opm_v2_stage_scan.parent / "converted"
-    written = convert_timelapse(
-        current_opm_v2_stage_scan.parent,
-        output_dir=output_dir,
-        time_range=(0, 1),
-        stage_range=(0, 1),
-        scan_range=(0, 1),
-        create_tiff=True,
-    )
-
-    assert written == [output_dir / "pos_0_scan_0.tiff"]
-    converted = imread(written[0])
-    yy, xx = np.mgrid[:4, :5]
-    expected = np.stack((2 * yy + xx, 100 + 2 * yy + xx))[np.newaxis, ...]
-    np.testing.assert_array_equal(converted, expected)

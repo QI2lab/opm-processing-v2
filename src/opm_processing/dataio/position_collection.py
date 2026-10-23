@@ -1,10 +1,10 @@
 """Read and write multi-position OME-Zarr collections with yaozarrs."""
 
-from __future__ import annotations
-
+import json
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import numpy as np
 from ome_types import from_xml, to_xml
@@ -22,35 +22,42 @@ from yaozarrs.write.v05 import Bf2RawBuilder
 
 from opm_processing.dataio.acquisition import inspect_acquisition
 from opm_processing.dataio.ngff import (
+    pyramid_yx_sampling,
     round_spatial,
     round_spatial_values,
     round_tczyx_transform,
 )
+from opm_processing.dataio.processing_state import convert_metadata
+from opm_processing.dataio.timing import read_time_interval, time_axis
 
-if TYPE_CHECKING:
-    from collections.abc import Sequence
 
-
-def convert_metadata(obj: Any) -> Any:
-    """Convert NumPy arrays in collection attributes into JSON-compatible lists.
+def update_group_attributes(path: str | Path, attributes: dict[str, Any]) -> None:
+    """Update group attributes with Zarr's public attribute API.
 
     Parameters
     ----------
-    obj : Any
-        Attribute value, including nested dictionaries and lists.
+    path : str or pathlib.Path
+        Existing Zarr v3 group; missing groups are never created.
+    attributes : dict
+        Top-level attribute values to replace, preserving all other metadata
+        and pixels. NumPy arrays are converted using the shared metadata encoder.
 
-    Returns
-    -------
-    Any
-        Value with NumPy arrays converted to lists; other values are preserved.
+    Raises
+    ------
+    ValueError
+        The group is not Zarr v3 or attribute values are not JSON serializable.
     """
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
-    if isinstance(obj, dict):
-        return {key: convert_metadata(value) for key, value in obj.items()}
-    if isinstance(obj, list):
-        return [convert_metadata(value) for value in obj]
-    return obj
+    import zarr
+
+    values = convert_metadata(attributes)
+    json.dumps(values, allow_nan=False)
+    group = zarr.open_group(
+        str(Path(path).expanduser().resolve()),
+        mode="r+",
+        zarr_format=3,
+        use_consolidated=False,
+    )
+    group.attrs.update(values)
 
 
 @dataclass(frozen=True)
@@ -67,6 +74,7 @@ class PositionCollection:
     stage_positions_zxy: tuple[tuple[float, float, float], ...] = ()
     channel_names: tuple[str, ...] = ()
     spatial_origins_zyx_um: tuple[tuple[float, float, float], ...] = ()
+    time_interval_s: float | None = None
 
     @property
     def shape(self) -> tuple[int, ...]:
@@ -95,6 +103,7 @@ def create_position_collection(
     multiscale_factors_yx: Sequence[int] = (),
     multiscale_downsample: str = "stride",
     spatial_offset_um: Sequence[float] = (0.0, 0.0, 0.0),
+    time_interval_s: float | None = None,
 ) -> PositionCollection:
     """Create a Bf2Raw collection with one TCZYX image per position.
 
@@ -124,12 +133,15 @@ def create_position_collection(
         Pyramid sampling method: stride or block_mean.
     spatial_offset_um : Sequence[float]
         Image origin in ZYX order, in micrometers.
+    time_interval_s : float or None
+        Physical snapshot interval in seconds; None leaves time unitless.
 
     Returns
     -------
     PositionCollection
         Ordered array handles and physical metadata for the collection.
     """
+    t_axis, t_scale = time_axis(time_interval_s)
     if multiscale_downsample not in ("stride", "block_mean"):
         raise ValueError('multiscale_downsample must be "stride" or "block_mean"')
 
@@ -150,11 +162,13 @@ def create_position_collection(
 
     root_attributes = convert_metadata(attributes or {})
     ome_xml = _build_ome_xml(
-        shape=(t, positions, c, z, y, x),
+        shapes_tczyx=[(t, c, z, y, x)] * positions,
         dtype=np.dtype(dtype),
         voxel_size_um=voxel_size_um,
-        stage_positions=rounded_stage_positions,
+        origins_zyx_um=rounded_stage_positions,
         channels=channels,
+        time_interval_s=time_interval_s,
+        name_prefix="Position",
     )
     builder = Bf2RawBuilder(
         output_path,
@@ -165,7 +179,7 @@ def create_position_collection(
         extra_attributes=root_attributes,
     )
     axes = [
-        {"name": "t", "type": "time"},
+        t_axis,
         {"name": "c", "type": "channel"},
         {"name": "z", "type": "space", "unit": "micrometer"},
         {"name": "y", "type": "space", "unit": "micrometer"},
@@ -176,7 +190,7 @@ def create_position_collection(
     for level, factor in enumerate(factors):
         scale = round_tczyx_transform(
             (
-                1,
+                t_scale,
                 1,
                 voxel_size_um[0],
                 voxel_size_um[1] * factor,
@@ -241,6 +255,7 @@ def create_position_collection(
         stage_positions_zxy=rounded_stage_positions or (),
         channel_names=tuple(channels or (f"channel-{index}" for index in range(c))),
         spatial_origins_zyx_um=origins,
+        time_interval_s=time_interval_s,
     )
 
 
@@ -255,6 +270,7 @@ def create_variable_position_collection(
     attributes: dict[str, Any] | None = None,
     chunks: tuple[int, ...] | str | None = "auto",
     overwrite: bool = True,
+    time_interval_s: float | None = None,
 ) -> PositionCollection:
     """Create a Bf2Raw collection whose cropped series have different shapes.
 
@@ -281,24 +297,29 @@ def create_variable_position_collection(
         TCZYX chunk dimensions or the automatic chunk policy.
     overwrite : bool
         Whether an existing destination may be replaced.
+    time_interval_s : float or None
+        Physical snapshot interval in seconds; None leaves time unitless.
 
     Returns
     -------
     PositionCollection
         Ordered cropped tile handles and their physical origins.
     """
+    t_axis, t_scale = time_axis(time_interval_s)
     shapes = tuple(tuple(int(value) for value in shape) for shape in shapes_tczyx)
     origins = tuple(round_spatial_values(origin) for origin in spatial_origins_zyx_um)
 
     voxel_size = round_spatial_values(voxel_size_um)
     output_dtype = np.dtype(dtype)
     root_attributes = convert_metadata(attributes or {})
-    ome_xml = _build_variable_ome_xml(
+    ome_xml = _build_ome_xml(
         shapes,
         output_dtype,
         voxel_size,
         origins,
         channels,
+        time_interval_s,
+        name_prefix="ROI tile",
     )
     builder = Bf2RawBuilder(
         output_path,
@@ -309,13 +330,13 @@ def create_variable_position_collection(
         extra_attributes=root_attributes,
     )
     axes = [
-        {"name": "t", "type": "time"},
+        t_axis,
         {"name": "c", "type": "channel"},
         {"name": "z", "type": "space", "unit": "micrometer"},
         {"name": "y", "type": "space", "unit": "micrometer"},
         {"name": "x", "type": "space", "unit": "micrometer"},
     ]
-    scale = round_tczyx_transform((1, 1, *voxel_size))
+    scale = round_tczyx_transform((t_scale, 1, *voxel_size))
     for series, (shape, origin) in enumerate(zip(shapes, origins, strict=False)):
         image = v05.Image(
             multiscales=[
@@ -350,17 +371,21 @@ def create_variable_position_collection(
             channels or (f"channel-{index}" for index in range(int(shapes[0][1])))
         ),
         spatial_origins_zyx_um=origins,
+        time_interval_s=time_interval_s,
     )
 
 
-def _build_variable_ome_xml(
+def _build_ome_xml(
     shapes_tczyx: Sequence[Sequence[int]],
     dtype: np.dtype,
     voxel_size_um: Sequence[float],
-    origins_zyx_um: Sequence[Sequence[float]],
+    origins_zyx_um: Sequence[Sequence[float]] | None,
     channels: Sequence[str] | None,
+    time_interval_s: float | None = None,
+    *,
+    name_prefix: str,
 ) -> str:
-    """Build OME-XML for independently shaped and positioned ROI tiles.
+    """Build validated OME-XML for uniform collections or independently shaped ROIs.
 
     Parameters
     ----------
@@ -370,15 +395,20 @@ def _build_variable_ome_xml(
         Pixel dtype shared by the series.
     voxel_size_um : Sequence[float]
         ZYX voxel spacing in micrometers.
-    origins_zyx_um : Sequence[Sequence[float]]
-        Per-series ZYX physical origins in micrometers.
+    origins_zyx_um : Sequence[Sequence[float]] or None
+        Per-series ZYX physical origins, or None when stage positions are unknown.
     channels : Sequence[str] | None
         Ordered channel names, or generated channel-N labels.
+    time_interval_s : float or None
+        Recorded interval between volumes in seconds; None leaves timing unknown.
+
+    name_prefix : str
+        Image and stage-label prefix, such as Position or ROI tile.
 
     Returns
     -------
     str
-        OME-XML with one image and stage label per cropped tile.
+        OME-XML describing every series with its optional physical stage label.
     """
     channel_count = int(shapes_tczyx[0][1])
     channel_names = list(
@@ -391,24 +421,28 @@ def _build_variable_ome_xml(
         "complex128": "double-complex",
     }.get(dtype.name, dtype.name)
     images = []
-    for series, (shape, origin) in enumerate(
-        zip(shapes_tczyx, origins_zyx_um, strict=False)
-    ):
+    for series, shape in enumerate(shapes_tczyx):
         t, c, z, y, x = (int(value) for value in shape)
-        origin_z, origin_y, origin_x = (round_spatial(value) for value in origin)
+        name = f"{name_prefix} {series}"
+        stage_label = None
+        if origins_zyx_um is not None:
+            origin_z, origin_y, origin_x = (
+                round_spatial(value) for value in origins_zyx_um[series]
+            )
+            stage_label = StageLabel(
+                name=name,
+                x=origin_x,
+                x_unit=UnitsLength.MICROMETER,
+                y=origin_y,
+                y_unit=UnitsLength.MICROMETER,
+                z=origin_z,
+                z_unit=UnitsLength.MICROMETER,
+            )
         images.append(
             Image(
                 id=f"Image:{series}",
-                name=f"ROI tile {series}",
-                stage_label=StageLabel(
-                    name=f"ROI tile {series}",
-                    x=origin_x,
-                    x_unit=UnitsLength.MICROMETER,
-                    y=origin_y,
-                    y_unit=UnitsLength.MICROMETER,
-                    z=origin_z,
-                    z_unit=UnitsLength.MICROMETER,
-                ),
+                name=name,
+                stage_label=stage_label,
                 pixels=Pixels(
                     id=f"Pixels:{series}",
                     dimension_order="XYZCT",
@@ -418,101 +452,14 @@ def _build_variable_ome_xml(
                     size_z=z,
                     size_c=c,
                     size_t=t,
+                    time_increment=time_interval_s,
+                    time_increment_unit="s",
                     physical_size_x=round_spatial(voxel_size_um[2]),
                     physical_size_y=round_spatial(voxel_size_um[1]),
                     physical_size_z=round_spatial(voxel_size_um[0]),
                     channels=[
                         Channel(
                             id=f"Channel:{series}:{channel}",
-                            name=name,
-                            samples_per_pixel=1,
-                        )
-                        for channel, name in enumerate(channel_names)
-                    ],
-                    metadata_only=MetadataOnly(),
-                ),
-            )
-        )
-    ome_xml = to_xml(
-        OME(images=images, creator="opm-processing-v2"),
-        include_namespace=True,
-        validate=True,
-    )
-    return ome_xml.replace(UnitsLength.MICROMETER.value, "&#181;m")
-
-
-def _build_ome_xml(
-    shape: tuple[int, int, int, int, int, int],
-    dtype: np.dtype,
-    voxel_size_um: Sequence[float],
-    stage_positions: Sequence[Sequence[float]] | None,
-    channels: Sequence[str] | None,
-) -> str:
-    """Build a validated OME-XML companion for a Bf2Raw collection.
-
-    Parameters
-    ----------
-    shape : tuple[int, int, int, int, int, int]
-        Logical collection dimensions in TPCZYX order.
-    dtype : np.dtype
-        Pixel dtype stored in each series.
-    voxel_size_um : Sequence[float]
-        Physical voxel spacing in ZYX order, in micrometers.
-    stage_positions : Sequence[Sequence[float]] | None
-        Per-position stage coordinates in the acquisition ordering, or no stage labels.
-    channels : Sequence[str] | None
-        Ordered channel names; omitted names become channel-N.
-
-    Returns
-    -------
-    str
-        Serialized OME-XML describing every position.
-    """
-    t, positions, c, z, y, x = shape
-    channel_names = list(channels or (f"channel-{index}" for index in range(c)))
-    ome_pixel_type = {
-        "float32": "float",
-        "float64": "double",
-        "complex64": "complex",
-        "complex128": "double-complex",
-    }.get(dtype.name, dtype.name)
-
-    images = []
-    for position in range(positions):
-        stage_label = None
-        if stage_positions is not None:
-            stage_z, stage_y, stage_x = (
-                round_spatial(value) for value in stage_positions[position]
-            )
-            stage_label = StageLabel(
-                name=f"Position {position}",
-                x=stage_x,
-                x_unit=UnitsLength.MICROMETER,
-                y=stage_y,
-                y_unit=UnitsLength.MICROMETER,
-                z=stage_z,
-                z_unit=UnitsLength.MICROMETER,
-            )
-        images.append(
-            Image(
-                id=f"Image:{position}",
-                name=f"Position {position}",
-                stage_label=stage_label,
-                pixels=Pixels(
-                    id=f"Pixels:{position}",
-                    dimension_order="XYZCT",
-                    type=ome_pixel_type,
-                    size_x=x,
-                    size_y=y,
-                    size_z=z,
-                    size_c=c,
-                    size_t=t,
-                    physical_size_x=round_spatial(voxel_size_um[2]),
-                    physical_size_y=round_spatial(voxel_size_um[1]),
-                    physical_size_z=round_spatial(voxel_size_um[0]),
-                    channels=[
-                        Channel(
-                            id=f"Channel:{position}:{channel}",
                             name=name,
                             samples_per_pixel=1,
                         )
@@ -553,37 +500,59 @@ def open_position_collection(path: str | Path) -> PositionCollection:
     )
     arrays = []
     series_levels = []
+    time_intervals = []
     spatial_origins = []
+    voxel_sizes = []
     factors: tuple[int, ...] | None = None
+    downsample = None
     for name in series_metadata.series:
         image_group = root[name]
         image_metadata = image_group.ome_metadata()
+        time_intervals.append(read_time_interval(image_metadata.multiscales[0]))
         datasets = image_metadata.multiscales[0].datasets
         level_arrays = tuple(
             image_group[dataset.path].to_tensorstore() for dataset in datasets
         )
-        if factors is None:
-            factors = tuple(
-                round(
-                    dataset.scale_transform.scale[-1]
-                    / datasets[0].scale_transform.scale[-1]
+        sampling_factors, sampling_method = pyramid_yx_sampling(
+            image_metadata.multiscales[0]
+        )
+        if factors is not None and (
+            factors != sampling_factors or downsample != sampling_method
+        ):
+            raise ValueError("Position series disagree on pyramid sampling")
+        factors, downsample = sampling_factors, sampling_method
+        spatial_axes = image_metadata.multiscales[0].axes[-3:]
+        units_to_um = {"micrometer": 1.0, "nanometer": 0.001, "millimeter": 1000.0}
+        if [axis.name for axis in spatial_axes] != list("zyx") or any(
+            axis.unit not in units_to_um for axis in spatial_axes
+        ):
+            raise ValueError("Position series require calibrated NGFF ZYX spatial axes")
+        voxel_sizes.append(
+            tuple(
+                float(value) * units_to_um[axis.unit]
+                for value, axis in zip(
+                    datasets[0].scale_transform.scale[-3:], spatial_axes, strict=True
                 )
-                for dataset in datasets
             )
+        )
         arrays.append(level_arrays[0])
         series_levels.append(level_arrays)
         translation = datasets[0].translation_transform
         spatial_origins.append(
             tuple(
-                float(value)
-                for value in (
+                float(value) * units_to_um[axis.unit]
+                for value, axis in zip(
                     (0.0, 0.0, 0.0)
                     if translation is None
-                    else translation.translation[-3:]
+                    else translation.translation[-3:],
+                    spatial_axes,
+                    strict=True,
                 )
             )
         )
     arrays = tuple(arrays)
+    if any(value != time_intervals[0] for value in time_intervals):
+        raise ValueError("Position series disagree on physical time scale")
     attributes = {key: value for key, value in root.attrs.items() if key != "ome"}
 
     if "opm_v2" in root.attrs:
@@ -598,11 +567,9 @@ def open_position_collection(path: str | Path) -> PositionCollection:
         for level in range(len(series_levels[0]))
     )
     first_pixels = ome.images[0].pixels
-    voxel_size_um = (
-        float(first_pixels.physical_size_z or 1.0),
-        float(first_pixels.physical_size_y or 1.0),
-        float(first_pixels.physical_size_x or 1.0),
-    )
+    voxel_size_um = voxel_sizes[0]
+    if any(value != voxel_size_um for value in voxel_sizes):
+        raise ValueError("Position series disagree on physical voxel spacing")
     channel_names = tuple(
         channel.name or f"channel-{index}"
         for index, channel in enumerate(first_pixels.channels)
@@ -622,11 +589,12 @@ def open_position_collection(path: str | Path) -> PositionCollection:
         attributes=attributes,
         multiscale_arrays=multiscale_arrays,
         multiscale_factors_yx=factors or (1,),
-        multiscale_downsample="stride",
+        multiscale_downsample=downsample,
         voxel_size_um=voxel_size_um,
         stage_positions_zxy=stage_positions,
         channel_names=channel_names,
         spatial_origins_zyx_um=tuple(spatial_origins),
+        time_interval_s=time_intervals[0],
     )
 
 

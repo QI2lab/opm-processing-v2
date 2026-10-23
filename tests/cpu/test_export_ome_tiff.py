@@ -1,4 +1,4 @@
-"""Simulated disk-to-disk OME-BigTIFF exports with pixel and metadata truth."""
+"""OME-BigTIFF export units with isolated temporary files and known pixel metadata."""
 
 import json
 
@@ -11,23 +11,14 @@ from yaozarrs import open_group, v05
 
 from opm_processing.export_ome_tiff import app
 
+pytestmark = pytest.mark.integration
 
-@pytest.mark.integration
+
 @pytest.mark.parametrize("source_xml,workers", [(True, 1), (False, 3)])
 def test_fused_pair_roundtrip_pixels_and_metadata(
     tmp_path, fused_export, source_xml, workers
 ):
-    """Preserve a calibrated fluorescent object, channel settings, and provenance.
-
-    Parameters
-    ----------
-    tmp_path : pathlib.Path
-        Isolated on-disk acquisition and export directory.
-    source_xml : bool
-        Include a rich source OME companion, or use acquisition NGFF alone.
-    workers : int
-        Serial or threaded TIFF compression worker count.
-    """
+    """Preserve a calibrated fluorescent object, channel settings, and provenance."""
     destination = tmp_path / "exports"
     runner = CliRunner()
     result = runner.invoke(
@@ -88,7 +79,11 @@ def test_fused_pair_roundtrip_pixels_and_metadata(
                     image.acquisition_date
                     == fused_export.source_ome.images[0].acquisition_date
                 )
-                assert pixels.channels[0].emission_wavelength == 525
+                assert pixels.channels[0].emission_wavelength == (
+                    fused_export.source_ome.images[0]
+                    .pixels.channels[0]
+                    .emission_wavelength
+                )
                 assert pixels.time_increment == 8.5
                 assert (
                     exported.structured_annotations.comment_annotations[0].value
@@ -97,7 +92,7 @@ def test_fused_pair_roundtrip_pixels_and_metadata(
             z_origin = (
                 fused_export.origin[0]
                 if expected.shape[2] == 3
-                else fused_export.origin[0] + 0.23
+                else fused_export.origin[0] + fused_export.spacing[0]
             )
             assert image.stage_label.z == z_origin
             for index, plane in enumerate(pixels.planes):
@@ -192,25 +187,32 @@ def test_fused_pair_roundtrip_pixels_and_metadata(
     assert not list(destination.glob("*.tmp"))
 
 
-@pytest.mark.integration
-def test_standalone_planar_fused_pair(tmp_path, fused_store_factory):
+def test_standalone_planar_fused_pair(tmp_path, fused_store_factory, simulated_camera):
     """A portable singleton TCZ image retains NGFF channels and calibrated time."""
-    y, x = np.mgrid[:17, :19]
-    truth = (100 * ((y - 8) ** 2 + (x - 9) ** 2 < 16)).astype(np.uint16)[
-        None, None, None
-    ]
+    from opm_processing.imageprocessing.camera import camera_correct
+
+    observed = simulated_camera((1, 17, 19), geometry="cartesian")
+    microscope = observed.microscope
+    spacing = (
+        microscope.scan_step_um,
+        microscope.pixel_size_um,
+        microscope.pixel_size_um,
+    )
+    truth = camera_correct(
+        observed.raw, microscope.camera.offset_adu, microscope.camera.electrons_per_adu
+    ).astype(np.uint16)[None, None]
     for name in ("sample_fused", "sample_max_z_fused"):
         fused_store_factory(
             truth,
             name=name,
-            spacing=(0.3, 0.2, 0.2),
+            spacing=spacing,
             time_step_s=3.5,
             time_origin_s=9.75,
             chunks=(1, 1, 1, 17, 19),
             omero=v05.Omero(
                 channels=[
                     v05.OmeroChannel(
-                        label="fluorescent disk",
+                        label="simulated points",
                         color="00FF00",
                         window=v05.OmeroWindow(start=0, end=100, min=0, max=100),
                     )
@@ -225,7 +227,12 @@ def test_standalone_planar_fused_pair(tmp_path, fused_store_factory):
             assert tif.is_bigtiff and tif.is_ome
             pixels = from_xml(tif.ome_metadata, validate=True).images[0].pixels
             assert pixels.size_t == pixels.size_c == pixels.size_z == 1
-            assert pixels.channels[0].name == "fluorescent disk"
+            assert pixels.channels[0].name == "simulated points"
+            assert (
+                pixels.physical_size_z,
+                pixels.physical_size_y,
+                pixels.physical_size_x,
+            ) == spacing
             assert pixels.time_increment == 3.5
             assert pixels.planes[0].position_z == 0
             assert pixels.planes[0].delta_t == 9.75

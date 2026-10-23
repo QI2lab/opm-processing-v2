@@ -1,8 +1,10 @@
 # export-projections
 
 Export annotated XY/XZ/YZ projection TIFFs per timepoint, channel, and position.
-Accepts the directory containing one full deconvolved, deskewed store. Saves
-8-bit display images under `projection_frames` beside the store.
+Accepts the directory containing one full deskewed store; the deconvolved version
+is preferred when both versions of that acquisition exist. Saves
+8-bit display images under `projection_frames` beside the store. Timestamps require
+the processed NGFF time scale or recorded hardware volume timing.
 
 | Option | Description |
 | --- | --- |

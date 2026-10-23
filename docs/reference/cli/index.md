@@ -13,9 +13,7 @@ stop. Supply tuple options as separate values, such as
 | [inspect-opm](inspect-opm.md) | Report raw/processed dimensions, physical sizes and camera timing. |
 | [process](process.md) | Calibrate, deconvolve, and deskew an acquisition. |
 | [fuse](fuse.md) | Register and blend processed tiles. |
-| [display](display.md) | View processed images and select an ROI. |
-| [process-ROI](process-roi.md) | Process and fuse a selected raw-data region. |
 | [export-ome-tiff](export-ome-tiff.md) | Write fused images as compressed OME-BigTIFF. |
+| [export-rois](export-rois.md) | Select multiple ROIs and reconstruct raw regions into OME-Zarr and optional TIFF. |
 | [export-projections](export-projections.md) | Write annotated projections and optional movies. |
 | [encode-projections](encode-projections.md) | Encode existing projection TIFF sequences. |
-| [convert-timelapse](convert-timelapse.md) | Export raw scan-plane timelapses. |

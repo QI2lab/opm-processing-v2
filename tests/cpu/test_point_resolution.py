@@ -1,67 +1,47 @@
-"""CPU checks of two-point profile measurements against known emitter geometry."""
+"""Two-point profile checks against prescribed physical emitter geometry."""
 
 import numpy as np
 import pytest
 
-from tests.reference.point_sources import two_point_profile
+from tests.simulation.metrics import two_point_profile
+
+pytestmark = pytest.mark.unit
 
 
-@pytest.mark.unit
 @pytest.mark.parametrize(
-    "offset, separation", (((0, 0, 3), 0.69), ((3, 0, 0), 1.2), ((0, 3, 0), 0.69))
+    "point_profile_case",
+    [
+        ("pair", (0, 0, 3), 0.69),
+        ("pair", (3, 0, 0), 1.2),
+        ("pair", (0, 3, 0), 0.69),
+        ("single", (0, 0, 3), 0.69),
+        ("flat", (0, 0, 3), 0.69),
+        ("adjacent", (0, 0, 0.5), 0.115),
+    ],
+    indirect=True,
+    ids=["camera-x", "scan", "camera-y", "single-point", "flat-field", "adjacent"],
 )
-def test_two_point_measurements_match_known_positions(offset, separation):
-    """Recover exact separation and an empty valley for two discrete emitters.
-
-    Parameters
-    ----------
-    offset : tuple of int
-        Known displacement from the midpoint in acquisition indices.
-    separation : float
-        Independently known laboratory separation in micrometers.
-    """
-    volume = np.zeros((17, 17, 17), np.float64)
-    center = np.array((8, 8, 8))
-    volume[tuple(center - offset)] = 100
-    volume[tuple(center + offset)] = 200
-    measured = two_point_profile(volume, center, offset)
-    assert measured["true_separation_um"] == pytest.approx(separation)
-    assert measured["peak_separation_um"] == pytest.approx(separation)
-    np.testing.assert_allclose(
-        measured["peak_positions_um"], (-separation / 2, separation / 2), atol=1e-12
-    )
-    assert measured["valley_depth"] == 1
-
-
-@pytest.mark.unit
-@pytest.mark.parametrize("constant", (False, True), ids=("single-point", "flat-field"))
-def test_two_point_measurement_does_not_split_one_peak(constant):
-    """Return no pair measurement for a single emitter or a uniform profile.
-
-    Parameters
-    ----------
-    constant : bool
-        Use a uniform field instead of a single central emitter.
-    """
-    volume = np.full((17, 17, 17), float(constant), np.float64)
-    volume[8, 8, 8] = 1
-    measured = two_point_profile(volume, (8, 8, 8), (0, 0, 3))
-    assert measured["peak_positions_um"] is None
-    assert measured["peak_separation_um"] is None
-    assert measured["valley_depth"] is None
-
-
-@pytest.mark.unit
-def test_adjacent_points_use_their_half_pixel_midpoint():
-    """Sample adjacent emitters about their true midpoint without inventing a dip."""
-    volume = np.zeros((17, 17, 17), np.float64)
-    volume[8, 8, 8:10] = 100
-    measured = two_point_profile(volume, (8, 8, 8.5), (0, 0, 0.5))
-    assert measured["true_separation_um"] == pytest.approx(0.115)
-    np.testing.assert_allclose(
-        measured["distance_um"], np.linspace(-0.115, 0.115, 9), atol=1e-12
-    )
-    np.testing.assert_allclose(
-        measured["profile"], (50, 75, 100, 100, 100, 100, 100, 75, 50)
-    )
-    assert measured["peak_positions_um"] is None
+def test_point_profile_resolves_only_distinct_emitters(point_profile_case):
+    """Measure physical pair spacing without inventing a dip in unresolved data."""
+    case = point_profile_case
+    measured = two_point_profile(case.volume, case.center, case.offset, case.microscope)
+    assert measured["true_separation_um"] == pytest.approx(case.separation)
+    if case.pattern == "pair":
+        assert measured["peak_separation_um"] == pytest.approx(case.separation)
+        np.testing.assert_allclose(
+            measured["peak_positions_um"],
+            (-case.separation / 2, case.separation / 2),
+            atol=1e-12,
+        )
+        assert measured["valley_depth"] == 1
+    else:
+        assert measured["peak_positions_um"] is None
+        assert measured["peak_separation_um"] is None
+        assert measured["valley_depth"] is None
+    if case.pattern == "adjacent":
+        np.testing.assert_allclose(
+            measured["distance_um"], np.linspace(-0.115, 0.115, 9), atol=1e-12
+        )
+        np.testing.assert_allclose(
+            measured["profile"], (50, 75, 100, 100, 100, 100, 100, 75, 50)
+        )

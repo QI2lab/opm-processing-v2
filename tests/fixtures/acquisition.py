@@ -5,22 +5,19 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
+from typing import Literal
 
 import numpy as np
 import pytest
-import zarr
-from yaozarrs import DimSpec, v05
+from yaozarrs import DimSpec, open_group, v05
 from yaozarrs.write.v05 import prepare_image
 
 from opm_processing.dataio.acquisition import AcquisitionMetadata, ChannelMetadata
 from opm_processing.dataio.position_collection import (
     create_position_collection,
     open_position_collection,
+    update_group_attributes,
 )
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 
 @dataclass(frozen=True)
@@ -64,38 +61,15 @@ def opm_v2_frame_metadata(
     camera_conversion: float,
     runner_time_ms: float,
     hardware_triggered: bool | None = None,
+    exposure_ms: float | None = 10.0,
     additional_event_metadata: dict | None = None,
+    frame_format: Literal["mda_event", "event_index"] = "mda_event",
 ) -> dict:
-    """Build one upstream-compatible ``FrameMetaV1`` dictionary.
-
-    Parameters
-    ----------
-    index : dict
-        Logical time, position, channel and optional scan indices.
-    daq_metadata, opm_metadata, stage_metadata : dict
-        Acquisition controller settings, optical geometry and physical stage pose.
-    camera_shape_yx : tuple of int
-        Detector row and column counts.
-    pixel_size_um : float
-        Detector pitch in micrometers.
-    camera_offset, camera_conversion : float
-        Offset in ADU and calibrated photon conversion.
-    runner_time_ms : float
-        Acquisition runner timestamp in milliseconds.
-    hardware_triggered : bool or None
-        Recorded trigger mode; None omits the optional field.
-    additional_event_metadata : dict or None
-        Additional upstream controller metadata attached to this frame.
-
-    Returns
-    -------
-    dict
-        Physical frame metadata containing its logical acquisition index.
-    """
+    """Build an upstream frame record in either supported metadata format."""
     event_metadata = {
         "DAQ": daq_metadata,
         "Camera": {
-            "exposure_ms": 10.0,
+            "exposure_ms": exposure_ms,
             "camera_center_x": 128,
             "camera_center_y": 128,
             "camera_crop_x": camera_shape_yx[1],
@@ -107,16 +81,26 @@ def opm_v2_frame_metadata(
         "Stage": stage_metadata,
         **(additional_event_metadata or {}),
     }
+    if frame_format == "event_index":
+        frame = {
+            "event_index": index,
+            "event_metadata": event_metadata,
+            "storage_index": [index.get(axis, 0) for axis in ("t", "c", "z")],
+        }
+        if exposure_ms is not None:
+            frame["exposure_time"] = exposure_ms / 1000
+        return frame
     frame = {
         "format": "frame-dict",
         "version": "1.0",
         "pixel_size_um": pixel_size_um,
         "camera_device": "SyntheticCamera",
-        "exposure_ms": 10.0,
         "property_values": [],
         "runner_time_ms": runner_time_ms,
         "mda_event": {"index": index, "metadata": event_metadata},
     }
+    if exposure_ms is not None:
+        frame["exposure_ms"] = exposure_ms
     if hardware_triggered is not None:
         frame["hardware_triggered"] = hardware_triggered
     return frame
@@ -130,26 +114,7 @@ def write_opm_v2_zarr(
     chunks: tuple[int, ...],
     frame_metadatas: list[dict],
 ) -> None:
-    """Write a current group-based OME-Zarr acquisition fixture.
-
-    Parameters
-    ----------
-    path : pathlib.Path
-        Destination acquisition directory.
-    raw_data : numpy.ndarray
-        Known camera pixels in TPCZYX or TPCYX order.
-    labels : tuple of str
-        Logical labels matching raw_data dimensions.
-    chunks : tuple of int
-        Storage chunks in the same dimension order.
-    frame_metadatas : list of dict
-        Upstream frame records giving channel labels and physical calibration.
-
-    Returns
-    -------
-    None
-        Persist the real per-position image arrays and their frame records.
-    """
+    """Write a current group-based OME-Zarr acquisition fixture."""
     normalized = raw_data if "z" in labels else raw_data[:, :, :, None, :, :]
     normalized_chunks = chunks if "z" in labels else (*chunks[:3], 1, *chunks[-2:])
     time_count, position_count, channel_count, z_count, _y_count, _x_count = (
@@ -203,38 +168,32 @@ def write_opm_v2_zarr(
     )
     for position, array in enumerate(collection.arrays):
         array.write(normalized[:, position]).result()
-    root = zarr.open_group(path, mode="r+")
     for position, frames in enumerate(frames_by_position):
-        root[str(position)].attrs["ome_writers"] = {"frame_metadata": frames}
+        update_group_attributes(
+            path / str(position), {"ome_writers": {"frame_metadata": frames}}
+        )
 
 
 @pytest.fixture
-def opm_v2_projection_zarr(tmp_path) -> OpmV2ProjectionFixture:
+def opm_v2_projection_zarr(tmp_path, simulated_camera) -> OpmV2ProjectionFixture:
     """Create a small, faithful OPMMirrorHandler projection acquisition.
 
     Schema provenance (QI2lab/opm-v2 main, commit ee354a1421732218d1128332c42a93aef106aa33):
     - ``handlers/opm_mirror_handler.py`` defines shape/chunks/labels and .zattrs.
     - ``engine/setup_events_v2.py`` defines projection event metadata.
     - pymmcore-plus ``FrameMetaV1`` defines the enclosing frame metadata.
-
-    Parameters
-    ----------
-    tmp_path : pathlib.Path
-        Isolated directory receiving the acquisition.
-
-    Returns
-    -------
-    OpmV2ProjectionFixture
-        Saved multi-timepoint, multi-channel camera ramp and its calibration.
     """
     path = tmp_path / "opm_v2_projection.zarr"
     shape = (2, 1, 2, 16, 18)  # T, P, C, Y, X; projection has no Z index.
     chunks = (1, 1, 1, shape[-2], shape[-1])
-    yy, xx = np.mgrid[: shape[-2], : shape[-1]]
     raw_data = np.empty(shape, dtype=np.uint16)
     for time in range(shape[0]):
         for channel in range(shape[2]):
-            raw_data[time, 0, channel] = 200 + 50 * time + 25 * channel + 2 * yy + xx
+            raw_data[time, 0, channel] = simulated_camera(
+                (1, *shape[-2:]),
+                geometry="cartesian",
+                exposure=1 + time / 4 + channel / 2,
+            ).raw[0]
 
     camera_offset = 100.0
     camera_conversion = 0.25
@@ -302,22 +261,7 @@ def opm_v2_projection_zarr(tmp_path) -> OpmV2ProjectionFixture:
 def simulated_acquisition_metadata(
     path: Path, mode: str, shape: tuple[int, ...]
 ) -> AcquisitionMetadata:
-    """Describe a calibrated 0.8 um combined-laser scan.
-
-    Parameters
-    ----------
-    path : pathlib.Path
-        On-disk acquisition store for the simulated specimen.
-    mode : str
-        Mirror or stage scanning mode.
-    shape : tuple of int
-        Acquisition dimensions in TPCZYX order.
-
-    Returns
-    -------
-    AcquisitionMetadata
-        Physical scan and camera calibration for the simulated acquisition.
-    """
+    """Describe a calibrated 0.8 um combined-laser scan."""
     return AcquisitionMetadata(
         path=path,
         storage_format="opm-v2-ome-zarr-v3",
@@ -345,21 +289,7 @@ def simulated_acquisition_metadata(
 
 
 def write_simulated_acquisition(metadata: AcquisitionMetadata, raw: np.ndarray) -> None:
-    """Persist simulated camera pixels and their physical acquisition metadata.
-
-    Parameters
-    ----------
-    metadata : AcquisitionMetadata
-        Scan geometry and camera calibration for the specimen.
-    raw : numpy.ndarray
-        Simulated uint16 camera data in TPCZYX order.
-
-    Returns
-    -------
-    None
-        Pixels and scan metadata are persisted at the metadata path; no image,
-        metadata inspection, or processing-state boundary is mocked.
-    """
+    """Persist simulated camera pixels and their physical acquisition metadata."""
     frames = []
     for position, (stage_z, stage_x, stage_y) in enumerate(
         metadata.stage_positions_zxy
@@ -407,6 +337,11 @@ def write_simulated_acquisition(metadata: AcquisitionMetadata, raw: np.ndarray) 
                             camera_offset=metadata.camera_offset,
                             camera_conversion=metadata.camera_conversion,
                             runner_time_ms=float(len(frames)),
+                            exposure_ms=(
+                                1000 * metadata.plane_period_s / len(metadata.channels)
+                                if metadata.plane_period_s is not None
+                                else None
+                            ),
                             hardware_triggered=True,
                         )
                     )
@@ -418,21 +353,15 @@ def write_simulated_acquisition(metadata: AcquisitionMetadata, raw: np.ndarray) 
         frame_metadatas=frames,
     )
 
+    if metadata.deconvolution is not None:
+        update_group_attributes(
+            metadata.path, {"opm_processing": {"deconvolution": metadata.deconvolution}}
+        )
+
 
 @pytest.fixture
 def current_opm_v2_stage_scan(tmp_path: Path) -> Path:
-    """Create a small Bio-Formats2Raw collection matching current opm-v2.
-
-    Parameters
-    ----------
-    tmp_path : pathlib.Path
-        Isolated directory receiving the stage acquisition.
-
-    Returns
-    -------
-    pathlib.Path
-        Collection containing known pixels, event-indexed metadata and stage poses.
-    """
+    """Create a small Bio-Formats2Raw collection matching current opm-v2."""
     path = tmp_path / "current_stage.ome.zarr"
     shape = (1, 2, 2, 3, 4, 5)  # T, P, C, Z, Y, X
     stage_positions_zxy = ((30.0, 100.0, 200.0), (30.0, 100.0, 220.0))
@@ -461,75 +390,58 @@ def current_opm_v2_stage_scan(tmp_path: Path) -> Path:
         chunks=(1, 1, 1, 4, 5),
     )
 
-    root = zarr.open_group(path, mode="a")
     for position in range(shape[1]):
         frames = []
         for scan in range(shape[3]):
             for channel, name in enumerate(("488nm", "561nm")):
                 frames.append(
-                    {
-                        "event_index": {
-                            "t": 0,
-                            "p": position,
-                            "c": channel,
-                            "z": scan,
+                    opm_v2_frame_metadata(
+                        frame_format="event_index",
+                        index={"t": 0, "p": position, "c": channel, "z": scan},
+                        daq_metadata={
+                            "mode": "stage",
+                            "scan_axis_step_um": 0.4,
+                            "laser_powers": [12.0, 18.0, 0.0],
+                            "current_channel": name,
                         },
-                        "exposure_time": (10.0, 15.0)[channel] / 1000.0,
-                        "event_metadata": {
-                            "DAQ": {
-                                "mode": "stage",
-                                "scan_axis_step_um": 0.4,
-                                "laser_powers": [12.0, 18.0, 0.0],
-                                "current_channel": name,
-                            },
-                            "Camera": {
-                                "exposure_ms": (10.0, 15.0)[channel],
-                                "offset": 100.0,
-                                "e_to_ADU": 0.24,
-                            },
-                            "OPM": {
-                                "angle_deg": 30.0,
-                                "camera_Zstage_orientation": "negative",
-                                "camera_XYstage_orientation": "positive",
-                                "camera_mirror_orientation": "positive",
-                                "excess_scan_positions": 0,
-                                "excess_scan_start_positions": 0,
-                                "excess_scan_end_positions": 0,
-                            },
-                            "Stage": {
-                                "x_pos": 100.0 + 0.4 * scan,
-                                "y_pos": stage_positions_zxy[position][2],
-                                "z_pos": stage_positions_zxy[position][0],
-                                "excess_image": False,
-                            },
+                        opm_metadata={
+                            "angle_deg": 30.0,
+                            "camera_Zstage_orientation": "negative",
+                            "camera_XYstage_orientation": "positive",
+                            "camera_mirror_orientation": "positive",
+                            "excess_scan_positions": 0,
+                            "excess_scan_start_positions": 0,
+                            "excess_scan_end_positions": 0,
                         },
-                        "storage_index": [0, channel, scan],
-                    }
+                        stage_metadata={
+                            "x_pos": 100.0 + 0.4 * scan,
+                            "y_pos": stage_positions_zxy[position][2],
+                            "z_pos": stage_positions_zxy[position][0],
+                            "excess_image": False,
+                        },
+                        camera_shape_yx=shape[-2:],
+                        pixel_size_um=0.115,
+                        camera_offset=100.0,
+                        camera_conversion=0.24,
+                        runner_time_ms=float(len(frames)),
+                        exposure_ms=(10.0, 15.0)[channel],
+                    )
                 )
-        root[str(position)].attrs["ome_writers"] = {"frame_metadata": frames}
+        update_group_attributes(
+            path / str(position), {"ome_writers": {"frame_metadata": frames}}
+        )
 
         data = np.empty((1, shape[2], shape[3], shape[4], shape[5]), dtype=np.uint16)
         zz, yy, xx = np.mgrid[: shape[3], : shape[4], : shape[5]]
         for channel in range(shape[2]):
             data[0, channel] = 1000 * position + 100 * channel + 10 * zz + 2 * yy + xx
-        root[str(position)]["0"][:] = data
+        open_group(path)[f"{position}/0"].to_tensorstore().write(data).result()
     return path
 
 
 @pytest.fixture
 def current_single_position_mirror_timelapse(tmp_path: Path) -> Path:
-    """Create the root-Image layout ome-writers uses for one position.
-
-    Parameters
-    ----------
-    tmp_path : pathlib.Path
-        Isolated directory receiving the mirror acquisition.
-
-    Returns
-    -------
-    pathlib.Path
-        Root image containing three camera timepoints and upstream scan metadata.
-    """
+    """Create the root-Image layout ome-writers uses for one position."""
     path = tmp_path / "single_mirror.ome.zarr"
     shape = (3, 1, 4, 5, 6)  # T, C, Z, Y, X
     dims = [
@@ -573,37 +485,35 @@ def current_single_position_mirror_timelapse(tmp_path: Path) -> Path:
     for time in range(shape[0]):
         for scan in range(shape[2]):
             frames.append(
-                {
-                    "event_index": {"t": time, "p": 0, "c": 0, "z": scan},
-                    "event_metadata": {
-                        "DAQ": {
-                            "mode": "mirror",
-                            "image_mirror_step_um": 0.4,
-                            "current_channel": "488nm",
-                            "laser_powers": [10.0],
-                        },
-                        "Camera": {
-                            "exposure_ms": 2.0,
-                            "offset": 100.0,
-                            "e_to_ADU": 0.25,
-                        },
-                        "OPM": {
-                            "angle_deg": 30.0,
-                            "camera_mirror_orientation": "positive",
-                            "camera_XYstage_orientation": "positive",
-                            "camera_Zstage_orientation": "positive",
-                        },
-                        "Stage": {
-                            "x_pos": 100.0,
-                            "y_pos": 200.0,
-                            "z_pos": 30.0,
-                        },
+                opm_v2_frame_metadata(
+                    frame_format="event_index",
+                    index={"t": time, "p": 0, "c": 0, "z": scan},
+                    daq_metadata={
+                        "mode": "mirror",
+                        "image_mirror_step_um": 0.4,
+                        "current_channel": "488nm",
+                        "laser_powers": [10.0],
                     },
-                    "storage_index": [time, 0, scan],
-                }
+                    opm_metadata={
+                        "angle_deg": 30.0,
+                        "camera_mirror_orientation": "positive",
+                        "camera_XYstage_orientation": "positive",
+                        "camera_Zstage_orientation": "positive",
+                    },
+                    stage_metadata={
+                        "x_pos": 100.0,
+                        "y_pos": 200.0,
+                        "z_pos": 30.0,
+                    },
+                    camera_shape_yx=shape[-2:],
+                    pixel_size_um=0.115,
+                    camera_offset=100.0,
+                    camera_conversion=0.25,
+                    runner_time_ms=float(len(frames)),
+                    exposure_ms=None,
+                )
             )
-    root = zarr.open_group(path, mode="a")
-    root.attrs["ome_writers"] = {"frame_metadata": frames}
+    update_group_attributes(path, {"ome_writers": {"frame_metadata": frames}})
     return path
 
 
@@ -615,37 +525,10 @@ def acquisition_factory(tmp_path):
     overrides of AcquisitionMetadata fields. Defaults describe a 30 degree OPM
     with 115 nm detector pixels, 400 nm scans, 100 ADU offset and 0.25 photons/ADU.
     It returns the path, metadata, original pixels and reopened disk collection.
-
-    Parameters
-    ----------
-    tmp_path : pathlib.Path
-        Isolated directory receiving each independently named acquisition.
-
-    Returns
-    -------
-    callable
-        Dataset writer accepting camera pixels and physical metadata overrides.
     """
 
     def create(raw_data, *, name="sample", mode="mirror", **overrides):
-        """Write one independent dataset with overrides of its physical calibration.
-
-        Parameters
-        ----------
-        raw_data : numpy.ndarray
-            Simulated camera values in time, position, channel, scan, Y, X order.
-        name : str
-            Dataset basename inside the test's temporary directory.
-        mode : str
-            Acquisition mode recorded in upstream frame metadata.
-        **overrides
-            AcquisitionMetadata fields replacing the common OPM calibration.
-
-        Returns
-        -------
-        types.SimpleNamespace
-            Dataset path, metadata, raw_data and reopened position collection.
-        """
+        """Write one independent dataset with overrides of its physical calibration."""
         metadata = replace(
             simulated_acquisition_metadata(
                 tmp_path / f"{name}.ome.zarr", mode, raw_data.shape
@@ -669,37 +552,83 @@ def acquisition_factory(tmp_path):
     return create
 
 
+@pytest.fixture(scope="session")
+def acquisition_metadata():
+    """Provide frozen physical calibration for checks that do not read pixels."""
+    return simulated_acquisition_metadata(
+        Path("calibration.ome.zarr"), "mirror", (1, 1, 1, 3, 4, 5)
+    )
+
+
+@pytest.fixture
+def deconvolution_acquisition(acquisition_factory):
+    """Provide a tiny raw store with independently variable calibration attributes."""
+    return acquisition_factory(np.zeros((1, 1, 1, 3, 4, 5), dtype=np.uint16))
+
+
+@pytest.fixture(params=("mirror", "stage"))
+def scan_camera_acquisition(request, acquisition_factory):
+    """Known numbered planes with an explicit excess-plane and scan convention."""
+    expected = np.broadcast_to(
+        np.arange(1, 17, dtype=np.uint16)[:, None, None], (16, 32, 32)
+    ).copy()
+    stage = request.param == "stage"
+    ordered = (
+        np.concatenate((np.zeros((1, 32, 32), np.uint16), expected))
+        if stage
+        else expected
+    )
+    raw = ordered[::-1] if stage else ordered
+    dataset = acquisition_factory(
+        raw[None, None, None],
+        mode=request.param,
+        camera_offset=0,
+        camera_conversion=1,
+        excess_scan_positions=int(stage),
+        excess_scan_start_positions=int(stage),
+    )
+    return SimpleNamespace(
+        path=dataset.path, raw_data=dataset.raw_data, expected=expected
+    )
+
+
 @pytest.fixture
 def processing_options():
-    """Return common settings for a full-resolution isolated volume workflow.
-
-    Returns
-    -------
-    dict
-        Disable illumination fitting, tile projections and automatic fusion;
-        preserve native laboratory Z sampling. Tests override other options
-        explicitly and validate their written fluorescence.
-    """
+    """Return common settings for a full-resolution isolated volume workflow."""
     return {
         "flatfield_correction": False,
+        # These shared disk fixtures have ideal photon counting with no read noise.
         "max_projection": False,
         "create_fused_max_projection": False,
         "z_downsample_level": 1,
     }
 
 
-@pytest.fixture
-def inspection_case(opm_v2_tiled_ground_truth_zarr, processing_options, selection):
+@pytest.fixture(params=("mirror", "stage"))
+def inspection_case(
+    request,
+    simulated_camera,
+    acquisition_factory,
+    processing_options,
+    selection,
+    small_cpu_kernels,
+):
     """Prepare CLI inputs from a simulated object and real deskew processing.
 
     Parameters
     ----------
-    opm_v2_tiled_ground_truth_zarr : OpmV2TiledGroundTruthFixture
-        Known laboratory object sampled through oblique camera planes.
+    request : pytest.FixtureRequest
+        Mirror or stage scan mode.
+    simulated_camera : callable
+        Shared physical forward model for a known fluorescent object.
+    acquisition_factory : callable
+        Native writer for calibrated opm-v2 acquisition metadata and pixels.
     processing_options : dict
         Shared settings preserving the laboratory output grid.
     selection : str
         Raw, directory, processed, custom-name or unavailable-source scenario.
+    small_cpu_kernels : None
+        Production CPU kernels configured for these small simulated volumes.
 
     Returns
     -------
@@ -710,7 +639,17 @@ def inspection_case(opm_v2_tiled_ground_truth_zarr, processing_options, selectio
     from opm_processing.dataio.processing_state import ProcessingState
     from opm_processing.process import process
 
-    case = opm_v2_tiled_ground_truth_zarr
+    observed = simulated_camera((16, 32, 32))
+    pixels = np.broadcast_to(observed.raw, (1, 2, 1, *observed.raw.shape)).copy()
+    if request.param == "stage":
+        pixels = pixels[:, :, :, ::-1].copy()
+    case = acquisition_factory(
+        pixels,
+        name="inspection",
+        mode=request.param,
+        acquired_plane_count=pixels.shape[3],
+        plane_period_s=0.01,
+    )
     path = case.path
     output = path.parent / f"{acquisition_stem(path)}_deskewed.ome.zarr"
     collection = None
@@ -731,3 +670,32 @@ def inspection_case(opm_v2_tiled_ground_truth_zarr, processing_options, selectio
         else path
     )
     return SimpleNamespace(case=case, collection=collection, selected=selected)
+
+
+@pytest.fixture
+def calibrated_mirror_timelapse(
+    current_single_position_mirror_timelapse, simulated_camera
+):
+    """Simulate photon observations at three times in a root NGFF Image."""
+    from types import SimpleNamespace
+
+    from opm_processing.dataio.acquisition import (
+        inspect_acquisition,
+        open_acquisition_datastore,
+    )
+    from opm_processing.imageprocessing.opmtools import orthogonal_deskew
+
+    path = current_single_position_mirror_timelapse
+    source = open_acquisition_datastore(inspect_acquisition(path))
+    shape = tuple(source.shape[-3:])
+    expected = []
+    for time in range(source.shape[0]):
+        raw = simulated_camera(shape, exposure=1 + time / 4).raw
+        source[time, 0, 0].write(raw).result()
+        photons = np.maximum(raw.astype(np.float32) - 100, 0) * 0.25
+        expected.append(
+            orthogonal_deskew(
+                photons, theta=30.0, distance=0.4, pixel_size=0.115, downsample_factor=1
+            )
+        )
+    return SimpleNamespace(path=path, expected=expected)

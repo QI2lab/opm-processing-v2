@@ -1,8 +1,6 @@
 """Analytical metadata units and CLI inspection of simulated OPM acquisitions."""
 
 import json
-import subprocess
-import sys
 
 import numpy as np
 import pytest
@@ -116,23 +114,13 @@ def test_processed_volume_dimensions_use_recorded_lab_grid(
 def test_inspect_cli_reports_simulated_raw_and_processed_data(
     inspection_case,
     selection,
+    invoke_cli,
 ):
     """Inspect real processing products of an optically simulated oblique object."""
     case, collection = inspection_case.case, inspection_case.collection
     if collection is not None:
         assert any(np.any(array.read().result() > 0) for array in collection.arrays)
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "opm_processing.dataio.acquisition",
-            str(inspection_case.selected),
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    report = json.loads(result.stdout)
+    report = json.loads(invoke_cli("inspect-opm", inspection_case.selected).output)
     if selection == "processed-only":
         assert report["raw"] is None
     else:
@@ -141,12 +129,12 @@ def test_inspect_cli_reports_simulated_raw_and_processed_data(
         assert raw["index_sizes"]["s"] == case.raw_data.shape[3]
         assert "z" not in raw["index_sizes"]
         assert raw["sampling_um"] == {
-            "s": case.scan_axis_step_um,
-            "y'": case.pixel_size_um,
-            "x": case.pixel_size_um,
+            "s": case.metadata.scan_axis_step_um,
+            "y'": case.metadata.pixel_size_um,
+            "x": case.metadata.pixel_size_um,
         }
         assert raw["y_prime_sampling_projected_y_um"] == pytest.approx(
-            case.pixel_size_um * np.sqrt(3) / 2
+            case.metadata.pixel_size_um * np.sqrt(3) / 2
         )
         assert raw["timing"] == {
             "frame_exposure_ms": [10],
@@ -166,7 +154,7 @@ def test_inspect_cli_reports_simulated_raw_and_processed_data(
             assert image["channels"] == ["488nm"]
             for axis, size in zip("zyx", array.shape[-3:], strict=True):
                 assert image["volume_dimensions_um"][axis] == pytest.approx(
-                    size * case.pixel_size_um
+                    size * case.metadata.pixel_size_um
                 )
 
 

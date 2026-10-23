@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import replace
 from pathlib import Path
-from typing import Annotated
-
-import typer
 
 from opm_processing.dataio.acquisition import (
     acquisition_stem,
@@ -23,33 +21,11 @@ from opm_processing.imageprocessing.maxtilefusion import (
 from opm_processing.imageprocessing.tilefusion import TileFusion
 from opm_processing.process import process_skewed
 
-app = typer.Typer(pretty_exceptions_enable=False)
 
-
-@app.command()
 def process_roi(
-    root_path: Annotated[
-        Path,
-        typer.Argument(
-            help=(
-                "Raw acquisition directory, OME-Zarr path, or processed output "
-                "directory containing one <acquisition>.processing.json."
-            )
-        ),
-    ],
-    roi_json: Annotated[
-        Path | None,
-        typer.Argument(
-            help=(
-                "ROI JSON written by display; defaults to "
-                "<acquisition>_roi.json in the input directory."
-            )
-        ),
-    ] = None,
-    deconvolve: Annotated[
-        bool,
-        typer.Option("--deconvolve/--no-deconvolve"),
-    ] = True,
+    root_path: Path,
+    roi_json: Path,
+    deconvolve: bool = False,
     flatfield_correction: bool = False,
     save_float32: bool = False,
     z_downsample_level: int = 2,
@@ -59,35 +35,17 @@ def process_roi(
     decon_verbose: int = 1,
     decon_psf_paths: list[Path] | None = None,
     registration_channel: int = 0,
-    resume: Annotated[
-        bool,
-        typer.Option(
-            "--resume/--no-resume",
-            help=(
-                "Resume from completed tiles/channels by default. Use "
-                "--no-resume to overwrite the processed ROI and start again."
-            ),
-        ),
-    ] = True,
-    output: Annotated[
-        Path | None,
-        typer.Option(
-            "--output",
-            help=(
-                "Output directory; defaults to <acquisition>_roi in the input "
-                "directory (beside the source when a Zarr path is supplied)."
-            ),
-        ),
-    ] = None,
-) -> None:
+    resume: bool = True,
+    output: Path | None = None,
+) -> Path:
     """Process a napari-selected world-space ROI and fuse its cropped tiles.
 
     Parameters
     ----------
     root_path : pathlib.Path
         Raw acquisition path or directory containing its processing state.
-    roi_json : pathlib.Path or None
-        ROI exported by display; None uses the input directory's default ROI.
+    roi_json : pathlib.Path
+        Saved physical ROI selection.
     deconvolve : bool
         Deconvolve the selected raw regions before deskewing.
     flatfield_correction : bool
@@ -113,11 +71,11 @@ def process_roi(
     output : pathlib.Path or None
         Output directory; None uses <acquisition>_roi beside the input.
 
+
     Returns
     -------
-    None
-        Cropped tiles and checkpoints are saved, with fused outputs when the ROI
-        spans multiple positions.
+    pathlib.Path
+        Final TCZYX OME-Zarr image; cropped tiles and checkpoints are retained.
     """
     requested_path = Path(root_path).expanduser().resolve()
     state_paths = tuple(requested_path.glob("*.processing.json"))
@@ -135,12 +93,12 @@ def process_roi(
         context_dir = acquisition.path.parent
     if acquisition.is_2d:
         raise ValueError(
-            "process-ROI currently targets skewed 3D acquisitions; use process "
+            "ROI processing currently targets skewed 3D acquisitions; use process "
             "for native 2D data"
         )
     if crop_after_deskew:
         raise ValueError(
-            "process-ROI already writes exact physical ROI crops; "
+            "ROI processing already writes exact physical ROI crops; "
             "--crop-after-deskew is not applicable"
         )
     stem = acquisition_stem(acquisition.path)
@@ -157,6 +115,43 @@ def process_roi(
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Preserve geometric overlap outside the requested rectangle for local
+    # registration. Crop to the exact requested bounds only during final fusion.
+    margins = [0.0, 0.0]
+    footprints = roi.tile_footprints
+    for index, left in enumerate(footprints):
+        for right in footprints[index + 1 :]:
+            if (
+                left["time_index"] != right["time_index"]
+                or left["position_index"] == right["position_index"]
+            ):
+                continue
+            a, b = left["bounds_yx_um"], right["bounds_yx_um"]
+            overlap = [
+                min(a[1], b[1]) - max(a[0], b[0]),
+                min(a[3], b[3]) - max(a[2], b[2]),
+            ]
+            if min(overlap) <= 0:
+                continue
+            # Depth-neighbor alignment can move the common oblique-plane
+            # footprint along Y by dz*cot(theta); retain that image context.
+            depth = abs(left["origin_zyx_um"][0] - right["origin_zyx_um"][0])
+            margins[0] = max(
+                margins[0], depth / math.tan(math.radians(acquisition.angle_deg))
+            )
+            for axis in range(2):
+                if left["origin_zyx_um"][axis + 1] != right["origin_zyx_um"][axis + 1]:
+                    margins[axis] = max(margins[axis], overlap[axis])
+    y0, y1, x0, x1 = roi.bounds_yx_um
+    processing_roi = replace(
+        roi,
+        bounds_yx_um=(
+            y0 - margins[0],
+            y1 + margins[0],
+            x0 - margins[1],
+            x1 + margins[1],
+        ),
+    )
     process_skewed(
         root_path=acquisition.path,
         acquisition=acquisition,
@@ -172,7 +167,7 @@ def process_roi(
         decon_gpu_id=decon_gpu_id,
         decon_verbose=decon_verbose,
         decon_psf_paths=decon_psf_paths,
-        roi_selection=roi,
+        roi_selection=processing_roi,
         resume=resume,
     )
 
@@ -183,37 +178,19 @@ def process_roi(
     selected_positions = tuple(
         dict.fromkeys(int(record["position_index"]) for record in tile_records)
     )
-    if len(selected_positions) <= 1:
-        print(
-            "ROI processing complete; fusion skipped because the ROI intersects "
-            "one position."
-        )
-        return
-
-    print(f"Fusing {len(tile_records)} cropped ROI tiles...")
+    # The shared fusion writer also assembles independently stored ROI timepoints
+    # into TCZYX for one position; there are no pair measurements in that case.
     fusion_roi = replace(roi, position_indices=selected_positions)
     fusion = TileFusion(
         root_path=processed_path,
         channel_to_use=registration_channel,
         roi_selection=fusion_roi,
+        multiscale_factors=(),
+        resolution_multiples=((1, 1, 1),),
     )
     fusion.run()
     fused_path = output_dir / f"{stem}_fused.ome.zarr"
     max_z_path = output_dir / f"{stem}_max_z_fused.ome.zarr"
     regenerate_fused_max_projection(fused_path, max_z_path)
     print(f"ROI processing and fusion complete: {output_dir}")
-
-
-def main() -> None:
-    """Run the ROI-processing command-line application.
-
-    Returns
-    -------
-    None
-        The Typer application parses arguments and processes the requested ROI.
-    """
-    app()
-
-
-if __name__ == "__main__":
-    main()
+    return fused_path

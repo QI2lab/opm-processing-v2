@@ -1,6 +1,6 @@
-"""Depth-color units and simulated point-object disk-to-disk export."""
+"""Depth colors and export pixels with isolated input and output files."""
 
-from types import SimpleNamespace
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -10,7 +10,6 @@ from cmap import Colormap
 from opm_processing import export_projections as exporter
 from opm_processing.imageprocessing.depth_color import (
     depth_legends,
-    depth_palette,
     depth_projection,
 )
 
@@ -29,7 +28,15 @@ def test_anisotropic_point_source_depth_and_brightness():
     for axis in range(3):
         projection = depth_projection(volume, axis, (0, 100))
         pixel = tuple(center[a] for a in range(3) if a != axis)
-        expected = (depth_palette(shape[axis])[center[axis]] * 0.8).astype(np.uint8)
+        expected = (
+            np.rint(
+                Colormap("turbo").lut(256)[
+                    round(255 * (center[axis] + 1) / shape[axis]), :3
+                ]
+                * 255
+            ).astype(np.uint8)
+            * 0.8
+        ).astype(np.uint8)
         np.testing.assert_array_equal(projection[pixel], expected)
     legends = depth_legends(shape, spacing)
     assert [entry["axis"] for entry in legends] == ["Z", "Y", "X"]
@@ -41,16 +48,20 @@ def test_raw_maximum_precedes_display_clipping():
     """Select the physical intensity maximum before applying display contrast."""
     volume = np.array([[[100]], [[200]]], dtype=float)
     np.testing.assert_array_equal(
-        depth_projection(volume, 0, (0, 50))[0, 0], depth_palette(2)[1]
+        depth_projection(volume, 0, (0, 50))[0, 0],
+        np.rint(Colormap("turbo").lut(256)[255, :3] * 255).astype(np.uint8),
     )
     np.testing.assert_array_equal(depth_projection(np.zeros((2, 2, 2)), 0, (0, 1)), 0)
     np.testing.assert_array_equal(
-        depth_projection(np.ones((2, 1, 1)), 0, (0, 1))[0, 0], depth_palette(2)[0]
+        depth_projection(np.ones((2, 1, 1)), 0, (0, 1))[0, 0],
+        np.rint(Colormap("turbo").lut(256)[128, :3] * 255).astype(np.uint8),
     )
 
 
-@pytest.mark.integration
-def test_color_tiff_export_from_disk(tmp_path, position_store_factory):
+@pytest.mark.unit
+def test_color_tiff_export_pixels_and_metadata(
+    tmp_path, position_store_factory, acquisition_metadata
+):
     """Export simulated point objects from OME-Zarr to verified RGB TIFF pixels."""
     # Emitters lie outside the upper-left panel annotation. Equal XY pitch
     # lets us check saved colors at exact detector coordinates without resizing.
@@ -64,8 +75,10 @@ def test_color_tiff_export_from_disk(tmp_path, position_store_factory):
         channels=("488",),
     )
     source_path = collection.path
-    acquisition = SimpleNamespace(
-        scan_position_count=21, channels=[SimpleNamespace(exposure_ms=5)]
+    acquisition = replace(
+        acquisition_metadata,
+        acquired_plane_count=21,
+        plane_period_s=0.005,
     )
     exporter.export_dataset(source_path, tmp_path, acquisition, depth_color=True)
     files = list(tmp_path.rglob("*.tiff"))
@@ -106,7 +119,7 @@ def test_color_tiff_export_from_disk(tmp_path, position_store_factory):
 
 
 @pytest.mark.unit
-def test_timepoint_workers_overlap_and_propagate_failure():
+def test_timepoint_workers_overlap_and_propagate_failure(tmp_path):
     """Verify concurrent work and propagation of the original worker exception."""
     from threading import Barrier, Lock
 
@@ -116,6 +129,7 @@ def test_timepoint_workers_overlap_and_propagate_failure():
     maximum = 0
 
     def work(t):
+        """Track concurrent rendering while returning a prescribed frame."""
         nonlocal active, maximum
         with lock:
             active += 1
@@ -127,8 +141,9 @@ def test_timepoint_workers_overlap_and_propagate_failure():
     assert sorted(exporter.run_timepoints(work, range(6), 3)) == list(range(6))
     assert maximum == 3
 
-    def fail(t):
-        raise RuntimeError("read failed")
-
-    with pytest.raises(RuntimeError, match="read failed"):
-        list(exporter.run_timepoints(fail, range(100), 2))
+    with pytest.raises(FileNotFoundError):
+        list(
+            exporter.run_timepoints(
+                lambda _: (tmp_path / "missing-frame.tiff").read_bytes(), range(100), 2
+            )
+        )

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -11,8 +11,9 @@ from opm_processing.dataio.processing_state import (
     processing_state_path,
 )
 
+pytestmark = pytest.mark.unit
 
-@pytest.mark.unit
+
 @pytest.mark.parametrize(
     ("save_float32", "dtype"),
     ((False, "uint16"), (True, "float32")),
@@ -70,7 +71,6 @@ def test_processing_state_round_trip_has_exact_durable_ground_truth(
     assert reopened.registered_output_for_max_projection(maximum) == output
 
 
-@pytest.mark.unit
 def test_processing_state_resume_requires_exact_run_configuration(
     tmp_path, processing_state
 ) -> None:
@@ -98,7 +98,6 @@ def test_processing_state_resume_requires_exact_run_configuration(
     assert path.read_bytes() == saved
 
 
-@pytest.mark.unit
 def test_overwriting_one_run_preserves_siblings_and_invalidates_only_its_registration(
     tmp_path,
     processing_state,
@@ -136,7 +135,6 @@ def test_overwriting_one_run_preserves_siblings_and_invalidates_only_its_registr
         state.registration(deconvolved)
 
 
-@pytest.mark.unit
 def test_failed_channel_checkpoint_keeps_previous_durable_state(
     tmp_path, processing_state, monkeypatch
 ):
@@ -146,16 +144,17 @@ def test_failed_channel_checkpoint_keeps_previous_durable_state(
     state.initialize_run(output, configuration={}, overwrite=True)
     assert state.completed_channels(output) == set()
     state.complete_channel(output, 0, 3, 0, is_zero=True)
-    snapshot = state.path.read_bytes()
+    before = state.path.read_bytes()
 
-    def fail_replace(self, target):
-        raise OSError("interrupted state replacement")
-
-    monkeypatch.setattr(Path, "replace", fail_replace)
+    monkeypatch.setattr(
+        type(state.path),
+        "replace",
+        Mock(side_effect=OSError("interrupted state replacement")),
+    )
     with pytest.raises(OSError, match="interrupted state replacement"):
         state.complete_channel(output, 0, 3, 1)
 
-    assert state.path.read_bytes() == snapshot
+    assert state.path.read_bytes() == before
     reopened = ProcessingState.read(state.path)
     assert reopened.completed_channels(output) == {(0, 3, 0)}
     assert reopened.zero_channels(output) == {(0, 3, 0)}

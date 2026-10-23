@@ -5,6 +5,8 @@ document the corresponding Python calculations and workflow parameters.
 
 ::: opm_processing.process.process
 
+::: opm_processing.export_rois.export_rois
+
 ::: opm_processing.process_roi.process_roi
 
 ::: opm_processing.fuse.register_and_fuse

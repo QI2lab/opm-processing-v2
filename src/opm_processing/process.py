@@ -13,6 +13,8 @@ import sys
 import time
 import traceback
 from contextlib import ExitStack
+from functools import partial
+from multiprocessing.connection import wait as wait_for_worker
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any
 
@@ -20,6 +22,7 @@ import numpy as np
 import typer
 from tifffile import TiffFile, TiffWriter, imread
 from tqdm import tqdm
+from yaozarrs import open_group, v05
 
 from opm_processing.dataio.acquisition import (
     AcquisitionMetadata,
@@ -27,11 +30,18 @@ from opm_processing.dataio.acquisition import (
     inspect_acquisition,
     open_acquisition_datastore,
 )
+from opm_processing.dataio.deconvolution import (
+    detector_gain_from_metadata,
+    load_deconvolution_psfs,
+    read_noise_from_metadata,
+    scan_upsample_from_metadata,
+)
 from opm_processing.dataio.live import (
     LIVE_POLL_INTERVAL_SECONDS,
     LiveManifest,
     ZarrTileReadiness,
     iter_live_tiles,
+    read_lifecycle_event,
 )
 from opm_processing.dataio.ngff import downsample_yx, round_spatial
 from opm_processing.dataio.position_collection import (
@@ -45,12 +55,12 @@ from opm_processing.dataio.processing_state import (
     ProcessingState,
     processing_state_path,
 )
+from opm_processing.dataio.ptv import mark_ptv_tile, publish_processing_state_ptv
 from opm_processing.dataio.roi import (
     PhysicalRoi,
     world_roi_to_skewed_bounds,
 )
 from opm_processing.imageprocessing.camera import (
-    QI2LAB_STAGE_SCAN_DETECTOR_WIDTH,
     camera_correct,
     illumination_correct,
 )
@@ -58,7 +68,6 @@ from opm_processing.imageprocessing.coordinates import (
     stage_z_level_indices,
 )
 from opm_processing.imageprocessing.maxtilefusion import MaxTileFusion
-from opm_processing.imageprocessing.opmpsf import generate_proj_psf, generate_skewed_psf
 from opm_processing.imageprocessing.opmtools import (
     deskew_shape_estimator,
     orthogonal_deskew,
@@ -70,11 +79,11 @@ if TYPE_CHECKING:
 
     import tensorstore as ts
 
-app = typer.Typer()
+app = typer.Typer(pretty_exceptions_enable=False)
 app.pretty_exceptions_enable = False
 
-# Reject cached fields made with a different camera-calibration contract.
-FLATFIELD_SOFTWARE = "opm-processing/basicpy-stage-depth-camera-contract-v10"
+# Reject cached fields made before depth estimates shared one maximum field.
+FLATFIELD_SOFTWARE = "opm-processing/basicpy-stage-z-max-camera-contract-v12"
 
 
 def progress_tile_groups(
@@ -478,7 +487,7 @@ def build_illumination_signal_decisions(
     threshold: float | None,
     min_signal_fraction: float,
     *,
-    apply_stage_scan_gain: bool,
+    detector_gain_x: np.ndarray | None,
 ) -> np.ndarray | None:
     """Find nonempty illumination candidates without pre-scanning every tile.
 
@@ -497,8 +506,8 @@ def build_illumination_signal_decisions(
         detection.
     min_signal_fraction : float
         Required fraction of volume pixels at or above the signal threshold.
-    apply_stage_scan_gain : bool
-        Apply the fixed qi2lab detector-X gain during camera calibration.
+    detector_gain_x : numpy.ndarray or None
+        Apply the recorded detector-X response during camera calibration.
 
     Returns
     -------
@@ -548,7 +557,7 @@ def build_illumination_signal_decisions(
                         raw,
                         camera_offset,
                         camera_conversion,
-                        apply_stage_scan_gain=apply_stage_scan_gain,
+                        detector_gain_x=detector_gain_x,
                     )
                     is_empty = is_empty_tile(
                         calibrated,
@@ -621,12 +630,12 @@ def read_current_flatfield(
     path : pathlib.Path
         Filesystem path of the artifact to read or write.
     expected_shape : tuple[int, int, int, int]
-        Required depth, channel, Y, X dimensions.
+        Required singleton depth, channel, Y, X dimensions.
 
     Returns
     -------
     numpy.ndarray or None
-        Depth-CYX fields, or None when the estimator version or acquisition
+        Shared 1CYX fields, or None when the estimator version or acquisition
         dimensions differ from this run.
     """
     with TiffFile(path) as tif:
@@ -636,7 +645,11 @@ def read_current_flatfield(
         flatfields = tif.asarray().astype(np.float32)
     if expected_shape[0] == 1 and flatfields.shape == expected_shape[1:]:
         flatfields = flatfields[np.newaxis, ...]
-    if flatfields.shape != expected_shape:
+    elif expected_shape[:2] == (1, 1) and flatfields.shape == expected_shape[2:]:
+        flatfields = flatfields[np.newaxis, np.newaxis, ...]
+    if flatfields.shape != expected_shape or not np.all(
+        np.isfinite(flatfields) & (flatfields > 0)
+    ):
         return None
     return flatfields
 
@@ -646,14 +659,14 @@ def write_flatfield(
     flatfields: np.ndarray,
     pixel_size_um: float,
 ) -> None:
-    """Write reusable physical-stage-Z illumination fields.
+    """Write one reusable illumination field per channel, shared across depth.
 
     Parameters
     ----------
     path : pathlib.Path
         Filesystem path of the artifact to read or write.
     flatfields : numpy.ndarray
-        Positive float32 illumination fields in depth, channel, Y, X order.
+        Positive float32 illumination fields in singleton-depth, channel, Y, X order.
     pixel_size_um : float
         Camera pixel pitch in micrometers.
 
@@ -663,6 +676,11 @@ def write_flatfield(
         Fields are written with spatial metadata and the current estimator
         identifier.
     """
+    flatfields = np.asarray(flatfields, dtype=np.float32)
+    if flatfields.ndim != 4 or flatfields.shape[0] != 1 or min(flatfields.shape) < 1:
+        raise ValueError("Shared flatfields must have shape (1, channels, Y, X)")
+    if not np.all(np.isfinite(flatfields) & (flatfields > 0)):
+        raise ValueError("Shared flatfields must be finite and positive")
     with TiffWriter(path, bigtiff=True) as tif:
         metadata = {
             "axes": "ZCYX",
@@ -690,7 +708,7 @@ def load_or_estimate_flatfield(
     pixel_size_um: float,
     stage_positions_zxy: np.ndarray,
     *,
-    apply_stage_scan_gain: bool,
+    detector_gain_x: np.ndarray | None,
     signal_threshold: float | None,
     minimum_signal_fraction: float,
     signal_mask: np.ndarray | None,
@@ -711,8 +729,8 @@ def load_or_estimate_flatfield(
         Camera pixel pitch in micrometers.
     stage_positions_zxy : numpy.ndarray
         Physical stage Z, scan-axis X, and lateral Y coordinates in micrometers.
-    apply_stage_scan_gain : bool
-        Apply the fixed qi2lab detector-X gain during camera calibration.
+    detector_gain_x : numpy.ndarray or None
+        Apply the recorded detector-X response during camera calibration.
     signal_threshold : float or None
         Calibrated signal cutoff for selecting illumination samples; None disables
         it.
@@ -725,11 +743,11 @@ def load_or_estimate_flatfield(
     Returns
     -------
     numpy.ndarray
-        Depth-CYX illumination fields reused from disk or estimated and saved.
+        Shared 1CYX illumination fields reused from disk or estimated and saved.
     """
     stage_z_indices = stage_z_level_indices(stage_positions_zxy)
     expected_shape = (
-        int(stage_z_indices.max()) + 1,
+        1,
         datastore.shape[2],
         datastore.shape[-2],
         datastore.shape[-1],
@@ -752,7 +770,7 @@ def load_or_estimate_flatfield(
             camera_conversion,
             signal_threshold,
             minimum_signal_fraction,
-            apply_stage_scan_gain=apply_stage_scan_gain,
+            detector_gain_x=detector_gain_x,
         )
 
     flatfields = call_estimate_illuminations(
@@ -760,7 +778,7 @@ def load_or_estimate_flatfield(
         camera_offset,
         camera_conversion,
         np.asarray(stage_positions_zxy, dtype=float),
-        apply_stage_scan_gain,
+        detector_gain_x,
         None if signal_mask is None else signal_mask == 1,
     )
     write_flatfield(
@@ -799,7 +817,7 @@ def open_live_acquisition(
     Parameters
     ----------
     root_path : pathlib.Path
-        Raw acquisition store, or its containing directory for live processing.
+        Containing acquisition directory with one live manifest and lifecycle log.
 
     Returns
     -------
@@ -815,11 +833,13 @@ def open_live_acquisition(
     requested_path = Path(root_path).expanduser().resolve()
     if requested_path.name.endswith((".zarr", ".ome.zarr")):
         raise ValueError(
-            "--live requires the containing acquisition directory, not the "
+            "--live and --live-wait require the containing acquisition directory, not the "
             "OME-Zarr path"
         )
     if not requested_path.is_dir():
-        raise ValueError("--live requires the containing acquisition directory")
+        raise ValueError(
+            "--live and --live-wait require the containing acquisition directory"
+        )
     while True:
         manifests = sorted(requested_path.glob("*.manifest.json"))
         if len(manifests) == 1:
@@ -839,16 +859,28 @@ def open_live_acquisition(
     log_path = manifest_path.with_name(f"{manifest_stem}.log.jsonl")
     manifest = LiveManifest.read(manifest_path)
     root_path = manifest.data_path
-    required_metadata = [root_path / "zarr.json", root_path / "OME" / "zarr.json"]
-    required_metadata.extend(
-        metadata_path
-        for position in range(manifest.index_sizes["p"])
-        for metadata_path in (
-            root_path / str(position) / "zarr.json",
-            root_path / str(position) / "0" / "zarr.json",
-        )
-    )
-    while not all(path.is_file() for path in required_metadata):
+    while True:
+        event = read_lifecycle_event(log_path, manifest.acquisition_id)
+        if event in {"canceled", "errored"}:
+            raise RuntimeError(f"Live acquisition {event}; processing was not started")
+        if (root_path / "zarr.json").is_file():
+            layout = open_group(root_path).ome_metadata()
+            if isinstance(layout, v05.Image):
+                required_metadata = [
+                    root_path / layout.multiscales[0].datasets[0].path / "zarr.json"
+                ]
+            else:
+                required_metadata = [root_path / "OME" / "zarr.json"]
+                required_metadata.extend(
+                    metadata_path
+                    for position in range(manifest.index_sizes["p"])
+                    for metadata_path in (
+                        root_path / str(position) / "zarr.json",
+                        root_path / str(position) / "0" / "zarr.json",
+                    )
+                )
+            if all(path.is_file() for path in required_metadata):
+                break
         print(
             f"Waiting {LIVE_POLL_INTERVAL_SECONDS:g} seconds for OME-Zarr metadata..."
         )
@@ -870,6 +902,7 @@ def plan_roi_tiles(
     z_downsample_level: int,
     halo_scan: int,
     halo_x: int,
+    scan_upsample_factor: int = 1,
 ) -> tuple[dict[str, Any], ...]:
     """Plan variable-size cropped ROI tiles without full-tile zero padding.
 
@@ -897,6 +930,8 @@ def plan_roi_tiles(
         Extra scan planes retained around each ROI for deconvolution support.
     halo_x : int
         Extra camera-X pixels retained around each ROI for deconvolution support.
+    scan_upsample_factor : int
+        Integer refinement applied after reading raw scan planes.
 
     Returns
     -------
@@ -905,12 +940,22 @@ def plan_roi_tiles(
         origins.
     """
     plans: list[dict[str, Any]] = []
-    roi_y0, roi_y1, roi_x0, roi_x1 = roi.bounds_yx_um
     for time_index in time_indices:
         for position_index in position_indices:
             registered_origin = roi.registered_tile_origin_zyx_um(
                 time_index,
                 position_index,
+            )
+            if registered_origin is None:
+                continue
+            footprint = next(
+                item
+                for item in roi.tile_footprints
+                if int(item["time_index"]) == time_index
+                and int(item["position_index"]) == position_index
+            )
+            registered_origin = tuple(
+                footprint.get("raw_origin_zyx_um", registered_origin)
             )
             skewed = world_roi_to_skewed_bounds(
                 roi.bounds_yx_um,
@@ -929,14 +974,19 @@ def plan_roi_tiles(
                 int(deskew_input_shape[1]),
                 skewed.x_stop - skewed.x_start,
             )
+            local_reconstruction_shape = (
+                (local_input_shape[0] - 1) * scan_upsample_factor + 1,
+                *local_input_shape[1:],
+            )
             local_deskew_shape, _pad_y, _pad_x, _crop_y = deskew_shape_estimator(
-                local_input_shape,
+                local_reconstruction_shape,
                 theta=angle_deg,
-                distance=scan_step_um,
+                distance=scan_step_um / scan_upsample_factor,
                 pixel_size=pixel_size_um,
                 crop_after_deskew=False,
+                downsample_factor=z_downsample_level,
             )
-            local_z = int(local_deskew_shape[0]) // int(z_downsample_level)
+            local_z = int(local_deskew_shape[0])
             local_y = int(local_deskew_shape[1])
             local_x = int(local_deskew_shape[2])
             local_origin_y = float(registered_origin[1]) + int(
@@ -945,22 +995,19 @@ def plan_roi_tiles(
             local_origin_x = float(registered_origin[2]) + int(skewed.x_start) * float(
                 pixel_size_um
             )
-            crop_y0 = max(
-                0,
-                math.floor((roi_y0 - local_origin_y) / pixel_size_um),
+            grid_edges = (
+                np.asarray(roi.bounds_yx_um)
+                - np.repeat((local_origin_y, local_origin_x), 2)
+            ) / pixel_size_um
+            nearest = np.rint(grid_edges)
+            # Suppress roundoff at exact pixel edges without moving fractional ROIs.
+            grid_edges = np.where(
+                np.abs(grid_edges - nearest) <= 1e-7, nearest, grid_edges
             )
-            crop_y1 = min(
-                local_y,
-                math.ceil((roi_y1 - local_origin_y) / pixel_size_um),
-            )
-            crop_x0 = max(
-                0,
-                math.floor((roi_x0 - local_origin_x) / pixel_size_um),
-            )
-            crop_x1 = min(
-                local_x,
-                math.ceil((roi_x1 - local_origin_x) / pixel_size_um),
-            )
+            crop_y0 = max(0, math.floor(grid_edges[0]))
+            crop_y1 = min(local_y, math.ceil(grid_edges[1]))
+            crop_x0 = max(0, math.floor(grid_edges[2]))
+            crop_x1 = min(local_x, math.ceil(grid_edges[3]))
             if crop_y0 >= crop_y1 or crop_x0 >= crop_x1:
                 continue
             output_origin = (
@@ -988,6 +1035,11 @@ def plan_roi_tiles(
                         int(skewed.x_stop),
                     ],
                     "skewed_shape_syx": list(local_input_shape),
+                    **(
+                        {"reconstruction_shape_syx": list(local_reconstruction_shape)}
+                        if scan_upsample_factor > 1
+                        else {}
+                    ),
                     "deskew_crop_yx": [crop_y0, crop_y1, crop_x0, crop_x1],
                 }
             )
@@ -1021,6 +1073,126 @@ def apply_stage_axis_flips(
                 np.max(transformed[:, column]) - transformed[:, column]
             )
     return transformed
+
+
+def confirm_partial_output_resume(
+    acquisition: AcquisitionMetadata,
+    output_dir: Path | None,
+    *,
+    deconvolve: bool,
+    max_projection: bool,
+    resume: bool,
+) -> bool:
+    """Ask before overwriting an incomplete offline processing run.
+
+    Parameters
+    ----------
+    acquisition : AcquisitionMetadata
+        Inspected source supplying expected time and position dimensions.
+    output_dir : Path or None
+        Processed output directory, or None for the source directory.
+    deconvolve : bool
+        Select the deconvolved output family.
+    max_projection : bool
+        Include the per-position maximum-Z output for volume processing.
+    resume : bool
+        Explicit resume skips the prompt and preserves existing validation.
+
+    Returns
+    -------
+    bool
+        True after explicit or confirmed resume; False for an intentional
+        overwrite, new run, or completed run. Cancel or unavailable input aborts
+        before writes.
+    """
+    if resume:
+        return True
+    output_dir = (
+        acquisition.path.parent
+        if output_dir is None
+        else Path(output_dir).expanduser().resolve()
+    )
+    stem = acquisition_stem(acquisition.path)
+    mode = acquisition.mode.casefold()
+    planar = acquisition.is_2d or "projection" in mode
+    if planar:
+        label = "projection" if "projection" in mode else "2d"
+        labels = [f"decon_{label}" if deconvolve else label]
+    else:
+        label = "decon_deskewed" if deconvolve else "deskewed"
+        labels = [label, f"max_z_{label}"] if max_projection else [label]
+    existing = [
+        output_dir / f"{stem}_{label}.ome.zarr"
+        for label in labels
+        if (output_dir / f"{stem}_{label}.ome.zarr").exists()
+    ]
+    if not existing:
+        return False
+
+    try:
+        state = ProcessingState.read(processing_state_path(output_dir, stem))
+        if (
+            Path(state.document["source"]["path"]).resolve()
+            != acquisition.path.resolve()
+        ):
+            raise ValueError("Completion journal belongs to a different acquisition")
+    except (OSError, ValueError, KeyError, TypeError):
+        state = None
+
+    partial = []
+    for path in existing:
+        try:
+            if state is None:
+                raise ValueError("No readable completion journal")
+            run = state.run(path)
+            selection = run["configuration"]["selection"]
+            times = range(
+                *(selection.get("time") or (0, acquisition.index_sizes.get("t", 1)))
+            )
+            positions = range(
+                *(selection.get("position") or (0, acquisition.tile_count))
+            )
+            expected = len(times) * len(positions)
+            completed = sum(
+                time_index in times and position_index in positions
+                for time_index, position_index in state.completed_tiles(path)
+            )
+            metadata_present = all(
+                file.is_file()
+                for file in (
+                    path / "zarr.json",
+                    path / "OME" / "zarr.json",
+                    path / "OME" / "METADATA.ome.xml",
+                )
+            ) and all(
+                (path / str(position) / "zarr.json").is_file()
+                and (path / str(position) / "0" / "zarr.json").is_file()
+                for position in positions
+            )
+            if completed == expected and metadata_present:
+                continue
+            detail = f"{completed} of {expected} selected tiles complete"
+            if not metadata_present:
+                detail += "; position metadata is missing"
+        except (OSError, ValueError, KeyError, TypeError):
+            detail = "completion cannot be verified from the processing journal"
+        partial.append(f"{path} ({detail})")
+
+    if not partial:
+        return False
+    typer.echo("Partial processed output found:\n" + "\n".join(partial))
+    typer.echo("Overwrite restarts the selected outputs from scratch.")
+    while True:
+        action = typer.prompt("Resume / Overwrite / Cancel", default="cancel")
+        match action.strip().casefold():
+            case "resume" | "r":
+                return True
+            case "overwrite" | "o":
+                return False
+            case "cancel" | "c":
+                raise typer.Abort()
+            case _:
+                typer.echo("Enter resume, overwrite, or cancel (r/o/c).")
 
 
 @app.command()
@@ -1072,26 +1244,14 @@ def process(
     decon_verbose: int = 1,
     decon_fallback_step_scan: int | None = None,
     decon_psf_paths: list[Path] | None = None,
-    decon_scan_upsample: Annotated[
-        int | None,
-        typer.Option(
-            "--decon-scan-upsample",
-            min=1,
-            help=(
-                "Opt into experimental undersampled RLGC with this integer scan "
-                "upsampling factor. Requires --deconvolve and a 3D scan. "
-                "Uses a full volume on the GPU; supplied PSFs must use the finer "
-                "scan spacing."
-            ),
-        ),
-    ] = None,
     resume: Annotated[
         bool,
         typer.Option(
             "--resume",
             help=(
                 "Reuse compatible processed outputs and continue after the last "
-                "durably completed tile. Without this flag, outputs are overwritten."
+                "durably completed tile. Without this flag, partial outputs prompt "
+                "to resume, overwrite, or cancel; completed outputs are overwritten."
             ),
         ),
     ] = False,
@@ -1115,6 +1275,24 @@ def process(
             ),
         ),
     ] = None,
+    live_wait: Annotated[
+        bool,
+        typer.Option(
+            "--live-wait",
+            help=(
+                "Wait for live acquisition completion and all raw tiles before "
+                "processing. Supports --flatfield-correction without a supplied "
+                "illumination file. Pass the acquisition directory."
+            ),
+        ),
+    ] = False,
+    plane_period_ms: Annotated[
+        float | None,
+        typer.Option(
+            "--plane-period-ms",
+            help="Confirmed hardware plane period in milliseconds for legacy acquisitions.",
+        ),
+    ] = None,
 ) -> None:
     """Process an OPM acquisition using its recorded scan and camera calibration.
 
@@ -1122,6 +1300,9 @@ def process(
     ----------
     root_path : pathlib.Path
         Raw acquisition store, or its containing directory for live processing.
+    plane_period_ms : float or None
+        Confirmed hardware trigger period for missing legacy timing metadata.
+        Recorded periods cannot be overridden. Exposure is not used as a period.
     deconvolve : bool
         Apply Richardson–Lucy gradient-consensus deconvolution before saving.
     save_float32 : bool
@@ -1149,7 +1330,7 @@ def process(
         Start-inclusive, stop-exclusive position selection; None processes all
         positions.
     eager_mode : bool
-        Use eager stopping for planar deconvolution; unused for skewed volumes.
+        Legacy compatibility option; reference KL stopping requires both halves.
     decon_crop_scan : int or None
         Retained scan-plane chunk size for 3D deconvolution; None calibrates it
         automatically.
@@ -1163,16 +1344,18 @@ def process(
     decon_psf_paths : list[Path] or None
         Channel-ordered PSF files; None generates theoretical PSFs. Planar
         processing uses a central Z slice of 3D PSFs.
-    decon_scan_upsample : int or None
-        Experimental integer scan upsampling factor; None uses the standard solver.
-        Requires 3D deconvolution and a full GPU volume.
     resume : bool
-        Reuse compatible output checkpoints; False overwrites this output run.
+        Reuse compatible output checkpoints; False asks before overwriting partial
+        outputs and overwrites completed output runs.
     output : Path or None
         Output directory to create; None uses the acquisition directory.
     live : Path or None
         Supplied CYX illumination TIFF enabling live processing; None processes
         offline.
+    live_wait : bool
+        Wait for successful live acquisition completion and all expected raw
+        tiles, then process offline, estimating illumination when requested.
+
 
     Returns
     -------
@@ -1185,16 +1368,8 @@ def process(
         skip_empty_min_signal_fraction,
     )
 
-    if decon_scan_upsample is not None:
-        if not deconvolve:
-            raise typer.BadParameter("--decon-scan-upsample requires --deconvolve")
-        if decon_scan_upsample < 1 or int(decon_scan_upsample) != decon_scan_upsample:
-            raise typer.BadParameter("--decon-scan-upsample must be a positive integer")
-        if decon_crop_scan is not None or decon_fallback_step_scan is not None:
-            raise typer.BadParameter(
-                "Experimental undersampled RLGC uses a full GPU volume; "
-                "--decon-crop-scan and --decon-fallback-step-scan are unsupported"
-            )
+    if live_wait and live is not None:
+        raise typer.BadParameter("--live-wait cannot be combined with --live")
 
     if live is not None:
         if flatfield_correction:
@@ -1205,6 +1380,9 @@ def process(
         if time_range is not None or pos_range is not None:
             raise ValueError("--live does not support time or position subranges")
         acquisition, live_manifest, live_log_path = open_live_acquisition(root_path)
+        acquisition = acquisition.with_plane_period(
+            None if plane_period_ms is None else plane_period_ms / 1000
+        )
         root_path = acquisition.path
         opm_mode = acquisition.mode.casefold()
         if "mirror" not in opm_mode and "stage" not in opm_mode:
@@ -1230,7 +1408,6 @@ def process(
             decon_verbose=decon_verbose,
             decon_fallback_step_scan=decon_fallback_step_scan,
             decon_psf_paths=decon_psf_paths,
-            decon_scan_upsample=decon_scan_upsample,
             illumination_path=live,
             live_manifest=live_manifest,
             live_log_path=live_log_path,
@@ -1238,7 +1415,24 @@ def process(
         )
         return
 
-    acquisition = inspect_acquisition(root_path)
+    if live_wait:
+        acquisition, manifest, log_path = open_live_acquisition(root_path)
+        print(
+            "Waiting for live acquisition completion before calibration and processing..."
+        )
+        for _tile in iter_live_tiles(
+            ZarrTileReadiness(acquisition), manifest, log_path, sleeper=time.sleep
+        ):
+            pass
+        # Refresh metadata after the controller has finished writing, then keep
+        # its manifest geometry and calibration for the ordinary offline path.
+        acquisition = manifest.apply(inspect_acquisition(acquisition.path))
+        print("Live acquisition completed; starting offline processing.")
+    else:
+        acquisition = inspect_acquisition(root_path)
+    acquisition = acquisition.with_plane_period(
+        None if plane_period_ms is None else plane_period_ms / 1000
+    )
     root_path = acquisition.path
     opm_mode = acquisition.mode.casefold()
     sizes = acquisition.index_sizes
@@ -1249,6 +1443,13 @@ def process(
         f"channels={list(acquisition.channel_names)}"
     )
     print(f"Processing OPM mode: {opm_mode}")
+    resume = confirm_partial_output_resume(
+        acquisition,
+        output,
+        deconvolve=deconvolve,
+        max_projection=max_projection,
+        resume=resume,
+    )
     common = {
         "root_path": root_path,
         "output_dir": output,
@@ -1267,10 +1468,6 @@ def process(
         "resume": resume,
     }
     if acquisition.is_2d or "projection" in opm_mode:
-        if decon_scan_upsample is not None:
-            raise typer.BadParameter(
-                "--decon-scan-upsample requires a 3D mirror or stage scan"
-            )
         process_projection(
             **common,
             eager_deconvolution=eager_mode,
@@ -1280,7 +1477,6 @@ def process(
             **common,
             decon_crop_scan=decon_crop_scan,
             decon_fallback_step_scan=decon_fallback_step_scan,
-            decon_scan_upsample=decon_scan_upsample,
             max_projection=max_projection,
             create_fused_max_projection=create_fused_max_projection,
             z_downsample_level=z_downsample_level,
@@ -1316,7 +1512,6 @@ def process_skewed(
     live_log_path: Path | None = None,
     roi_selection: PhysicalRoi | None = None,
     resume: bool = False,
-    decon_scan_upsample: int | None = None,
 ) -> None:
     """Calibrate, optionally deconvolve, and deskew mirror or stage scan tiles.
 
@@ -1378,9 +1573,7 @@ def process_skewed(
         full tiles.
     resume : bool
         Reuse compatible output checkpoints; False overwrites this output run.
-    decon_scan_upsample : int or None
-        Experimental integer scan upsampling factor; None uses the standard solver.
-        Requires 3D deconvolution and a full GPU volume.
+
 
     Returns
     -------
@@ -1388,6 +1581,9 @@ def process_skewed(
         Deskewed tiles, optional maximum projections, and checkpoints are written to
         disk.
     """
+    acquisition.validate_processing_calibration()
+    decon_scan_upsample = scan_upsample_from_metadata(acquisition) if deconvolve else 1
+    decon_read_noise = read_noise_from_metadata(acquisition) if deconvolve else None
     # Fusion consumes the per-position maximum-projection datastore.  Treat
     # --no-max-projection as disabling that dependent output as well instead of
     # trying to open a datastore that was intentionally never created.
@@ -1396,15 +1592,15 @@ def process_skewed(
         skip_empty_below,
         skip_empty_min_signal_fraction,
     )
-    if deconvolve and decon_scan_upsample is None:
+    if deconvolve:
         from opm_processing.imageprocessing.rlgc import (
+            GC_RELATIVE_CHANGE_LIMIT,
+            GC_UPDATED_FRACTION_LIMIT,
             RlgcChunkState,
-            chunked_rlgc,
+            rlgc,
         )
 
         decon_chunk_state = RlgcChunkState(decon_crop_scan)
-    elif deconvolve:
-        from opm_processing.imageprocessing.rlgc_undersampled import rlgc_undersampled
 
     max_z_factors_yx = (2, 4, 8, 16, 32)
     output_dir = (
@@ -1415,14 +1611,13 @@ def process_skewed(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     datastore = open_acquisition_datastore(acquisition)
-    opm_mode = acquisition.mode
     scan_axis_step_um = acquisition.scan_axis_step_um
-    reconstruction_step_um = scan_axis_step_um / (decon_scan_upsample or 1)
-    if decon_scan_upsample is not None:
+    reconstruction_step_um = scan_axis_step_um / decon_scan_upsample
+    if decon_scan_upsample > 1:
         print(
-            f"Experimental undersampled RLGC: factor={decon_scan_upsample}, "
+            f"Automatic RLGC scan refinement: factor={decon_scan_upsample}, "
             f"acquired step={scan_axis_step_um:g} um, "
-            f"reconstruction step={reconstruction_step_um:g} um (full GPU volume)"
+            f"reconstruction step={reconstruction_step_um:g} um"
         )
     excess_scan_positions = (
         acquisition.excess_scan_start_positions or acquisition.excess_scan_positions
@@ -1434,46 +1629,19 @@ def process_skewed(
     opm_tilt_deg = acquisition.angle_deg
     camera_offset = acquisition.camera_offset
     camera_conversion = acquisition.camera_conversion
+    detector_gain_x = detector_gain_from_metadata(acquisition, int(datastore.shape[-1]))
     channels = list(acquisition.channel_names)
     stage_positions_raw = np.asarray(acquisition.stage_positions_zxy, dtype=float)
     pixel_size_um = float(pixel_size_um)
     opm_tilt_deg = float(opm_tilt_deg)
     camera_offset = float(camera_offset)
     camera_conversion = float(camera_conversion)
-    apply_qi2lab_stage_scan_gain = (
-        "stage" in str(opm_mode).casefold()
-        and int(datastore.shape[-1]) == QI2LAB_STAGE_SCAN_DETECTOR_WIDTH
-    )
     output_dtype = np.dtype(np.float32 if save_float32 else np.uint16)
     psfs: list[np.ndarray] | None = None
     if deconvolve:
-        if decon_psf_paths is not None:
-            if len(decon_psf_paths) != len(channels):
-                raise ValueError("decon_psf_paths must contain one PSF per channel")
-            psfs = [
-                (
-                    np.load(path)
-                    if Path(path).suffix == ".npy"
-                    else np.asarray(imread(path))
-                )
-                for path in tqdm(decon_psf_paths, desc="PSFs", unit="PSF")
-            ]
-        else:
-            psfs = [
-                generate_skewed_psf(
-                    em_wvl=max(
-                        float(wavelength.strip().lower().removesuffix("nm"))
-                        for wavelength in channel.split("+")
-                    )
-                    / 1000,
-                    pixel_size_um=pixel_size_um,
-                    scan_axis_step_um=reconstruction_step_um,
-                    theta_deg=opm_tilt_deg,
-                    pz=0.0,
-                    plot=False,
-                )
-                for channel in tqdm(channels, desc="PSFs", unit="PSF")
-            ]
+        psfs, psf_parameters = load_deconvolution_psfs(
+            acquisition, decon_psf_paths, reconstruction_step_um=reconstruction_step_um
+        )
     stage_positions = apply_stage_axis_flips(stage_positions_raw, stage_axis_flips)
     stage_z_indices = stage_z_level_indices(stage_positions_raw)
     stage_z_flipped = stage_axis_flips[2]
@@ -1486,7 +1654,8 @@ def process_skewed(
         datastore.shape[-2],
         datastore.shape[-1],
     )
-    if decon_scan_upsample is not None:
+    raw_input_shape = deskew_input_shape
+    if decon_scan_upsample > 1:
         deskew_input_shape = (
             (deskew_input_shape[0] - 1) * decon_scan_upsample + 1,
             *deskew_input_shape[1:],
@@ -1497,12 +1666,19 @@ def process_skewed(
         distance=reconstruction_step_um,
         pixel_size=pixel_size_um,
         crop_after_deskew=crop_after_deskew,
+        downsample_factor=z_downsample_level,
     )
 
     roi_position_indices = (
         None if roi_selection is None else roi_selection.position_indices
     )
-    roi_halo_scan = 0 if psfs is None else max(int(psf.shape[0]) // 2 for psf in psfs)
+    roi_halo_scan = (
+        0
+        if psfs is None
+        else max(
+            math.ceil((int(psf.shape[0]) // 2) / decon_scan_upsample) for psf in psfs
+        )
+    )
     roi_halo_x = 0 if psfs is None else max(int(psf.shape[-1]) // 2 for psf in psfs)
 
     if time_range is not None:
@@ -1536,7 +1712,7 @@ def process_skewed(
             roi_selection,
             plan_times,
             plan_positions,
-            tuple(int(value) for value in deskew_input_shape),
+            tuple(int(value) for value in raw_input_shape),
             channel_count=int(datastore.shape[2]),
             pixel_size_um=pixel_size_um,
             scan_step_um=scan_axis_step_um,
@@ -1544,6 +1720,7 @@ def process_skewed(
             z_downsample_level=z_downsample_level,
             halo_scan=roi_halo_scan,
             halo_x=roi_halo_x,
+            scan_upsample_factor=decon_scan_upsample,
         )
         roi_plan_lookup = {
             (int(plan["time_index"]), int(plan["position_index"])): (index, plan)
@@ -1554,7 +1731,7 @@ def process_skewed(
         time_shape,
         pos_shape,
         datastore.shape[2],
-        deskewed_shape[0] // z_downsample_level,
+        deskewed_shape[0],
         deskewed_shape[1],
         deskewed_shape[2],
     ]
@@ -1589,7 +1766,7 @@ def process_skewed(
             camera_conversion,
             skip_empty_below,
             skip_empty_min_signal_fraction,
-            apply_stage_scan_gain=apply_qi2lab_stage_scan_gain,
+            detector_gain_x=detector_gain_x,
         )
     )
     output_kind = "deconvolved_deskewed" if deconvolve else "deskewed"
@@ -1600,7 +1777,25 @@ def process_skewed(
     )
     processing_configuration = {
         "kind": output_kind,
+        "deskew_interpolation": "orthogonal-perpendicular-distance-weights-v2-complete-z-bins",
+        "calibration": {
+            "gain_offset_applied": True,
+            "camera_offset_adu": camera_offset,
+            "camera_conversion": camera_conversion,
+            "camera_correction": "opm_processing.imageprocessing.camera.camera_correct",
+            "detector_gain_x_applied": detector_gain_x is not None,
+            "illumination_correction_applied": bool(flatfield_correction),
+            "localization_uncertainty": {
+                "coverage_validated": False,
+                "noise_model": "unvalidated",
+                "source": None,
+            },
+        },
+        "timing": acquisition.timing_attributes(),
         "dtype": output_dtype.name,
+        "detector_gain_x": None
+        if detector_gain_x is None
+        else detector_gain_x.tolist(),
         "flatfield": bool(flatfield_correction),
         "selection": {
             "time": time_range,
@@ -1620,9 +1815,42 @@ def process_skewed(
             None
             if not deconvolve
             else {
-                "model_revision": "opm-physical-rlgc-20261008",
+                "model_revision": "gradient-consensus-v12-recorded-calibration",
+                "observation_model": "poisson",
+                "gc_stopping": {
+                    "reference": "gc_deconv.m@0340af0d7a4c5d92a97a1b443dfedb367dfb9f3d",
+                    "kl_enabled": True,
+                    "kl_domain": "acquired-pixel-prediction",
+                    "kl_direction": "prediction-to-split",
+                    "kl_comparison": "preceding-iteration-fresh-halves",
+                    "kl_require_both": True,
+                    "consensus_product": "relative-directions-before-blur",
+                    "split": "matlab-do_binosplit",
+                    "read_noise": decon_read_noise,
+                    "read_noise_units": "calibrated-detector-counts-rms",
+                    "read_noise_reference": "gc_deconv.m",
+                    "accepted_fraction_limit": GC_UPDATED_FRACTION_LIMIT,
+                    "relative_change_limit": GC_RELATIVE_CHANGE_LIMIT,
+                    "peak_floor": 1e-12,
+                    "iteration_limit": None,
+                },
+                "observations": "calibrated-detector-counts",
+                "detector_response": "forward-adjoint-sensitivity",
                 "crop_scan": decon_crop_scan,
                 "fallback_step_scan": decon_fallback_step_scan,
+                "psf_parameters": None
+                if decon_psf_paths is not None
+                else psf_parameters,
+                **(
+                    {}
+                    if decon_psf_paths is not None
+                    else {
+                        "psf_sampling": "oblique-camera-pixel-integral-centered-taper-v3",
+                    }
+                ),
+                "emission_wavelengths_nm": (acquisition.deconvolution or {}).get(
+                    "emission_wavelengths_nm"
+                ),
                 "psf_sha256": (
                     None
                     if decon_psf_paths is None
@@ -1631,9 +1859,9 @@ def process_skewed(
             }
         ),
     }
-    if decon_scan_upsample is not None:
+    if decon_scan_upsample > 1:
         processing_configuration["deconvolution"].update(
-            backend="rlgc_undersampled",
+            backend="rlgc",
             scan_upsample_factor=int(decon_scan_upsample),
         )
         processing_configuration["reconstruction"] = {
@@ -1650,7 +1878,9 @@ def process_skewed(
                 "skewed_bounds_sx",
                 "skewed_shape_syx",
                 "deskew_crop_yx",
+                "reconstruction_shape_syx",
             )
+            if key in plan
         }
         for plan in roi_plans
     )
@@ -1681,6 +1911,8 @@ def process_skewed(
             roi_output_shapes,
             deskewed_voxel_size_um,
             spatial_origins_zyx_um=[plan["origin_zyx_um"] for plan in roi_plans],
+            time_interval_s=acquisition.volume_interval_s,
+            attributes=acquisition.timing_attributes(),
             channels=channels,
             dtype=output_dtype,
             overwrite=True,
@@ -1696,10 +1928,17 @@ def process_skewed(
             output_path,
             output_shape,
             deskewed_voxel_size_um,
+            time_interval_s=acquisition.volume_interval_s,
+            attributes=acquisition.timing_attributes(),
             stage_positions=stage_positions[:pos_shape],
+            spatial_offset_um=(0, crop_y * pixel_size_um, 0),
             channels=channels,
             dtype=output_dtype,
             overwrite=True,
+        )
+    if output_collection.time_interval_s != acquisition.volume_interval_s:
+        raise ValueError(
+            "Existing output time scale disagrees with hardware volume cadence"
         )
     ts_store = output_collection.arrays
 
@@ -1730,7 +1969,7 @@ def process_skewed(
         max_z_voxel_size_um = deskewed_voxel_size_um
         max_z_offset_um = (
             round_spatial(0.5 * (datastore_shape[3] - 1) * max_z_voxel_size_um[0]),
-            0.0,
+            round_spatial(crop_y * pixel_size_um),
             0.0,
         )
         max_z_output_shape = tuple(int(value) for value in max_z_datastore_shape)
@@ -1750,12 +1989,18 @@ def process_skewed(
                 max_z_output_path,
                 max_z_output_shape,
                 max_z_voxel_size_um,
+                time_interval_s=acquisition.volume_interval_s,
+                attributes=acquisition.timing_attributes(),
                 stage_positions=stage_positions[:pos_shape],
                 channels=channels,
                 dtype=output_dtype,
                 multiscale_factors_yx=max_z_factors_yx,
                 spatial_offset_um=max_z_offset_um,
                 overwrite=True,
+            )
+        if max_z_collection.time_interval_s != acquisition.volume_interval_s:
+            raise ValueError(
+                "Existing projection time scale disagrees with hardware volume cadence"
             )
         max_z_ts_store = max_z_collection.arrays
 
@@ -1770,7 +2015,7 @@ def process_skewed(
                 camera_conversion,
                 pixel_size_um,
                 stage_positions_raw,
-                apply_stage_scan_gain=apply_qi2lab_stage_scan_gain,
+                detector_gain_x=detector_gain_x,
                 signal_threshold=skip_empty_below,
                 minimum_signal_fraction=skip_empty_min_signal_fraction,
                 signal_mask=signal_mask,
@@ -1778,7 +2023,7 @@ def process_skewed(
     else:
         flatfields = np.ones(
             (
-                int(stage_z_indices.max()) + 1,
+                1,
                 datastore.shape[2],
                 datastore.shape[-2],
                 datastore.shape[-1],
@@ -1798,6 +2043,9 @@ def process_skewed(
         resume=state_resume,
         output_preexisting=output_preexisting,
     )
+    ptv_export_enabled = acquisition.volume_interval_s is not None
+    if ptv_export_enabled:
+        publish_processing_state_ptv(output_path, processing_state)
     if max_projection:
         if state_resume and max_z_output_preexisting:
             try:
@@ -1962,7 +2210,7 @@ def process_skewed(
                     continue
                 if skewed_roi is None:
                     raw_selection = datastore[t_idx, pos_idx, chan_idx, :]
-                    illumination = flatfields[stage_z_indices[pos_idx], chan_idx, :]
+                    illumination = flatfields[0, chan_idx, :]
                     detector_x_offset = 0
                 else:
                     useful_start = int(skewed_roi.scan_start)
@@ -1986,7 +2234,7 @@ def process_skewed(
                         skewed_roi.x_start : skewed_roi.x_stop,
                     ]
                     illumination = flatfields[
-                        stage_z_indices[pos_idx],
+                        0,
                         chan_idx,
                         :,
                         skewed_roi.x_start : skewed_roi.x_stop,
@@ -2006,7 +2254,7 @@ def process_skewed(
                     camera_offset,
                     camera_conversion,
                     detector_x_offset=detector_x_offset,
-                    apply_stage_scan_gain=apply_qi2lab_stage_scan_gain,
+                    detector_gain_x=None if deconvolve else detector_gain_x,
                 )
                 if skewed_roi is not None and scan_axis_reversed:
                     camera_calibrated_data = np.flip(camera_calibrated_data, axis=0)
@@ -2045,10 +2293,19 @@ def process_skewed(
                             )
                         )
                     continue
-                camera_corrected_data = illumination_correct(
-                    camera_calibrated_data,
-                    illumination,
-                )
+                if deconvolve:
+                    camera_corrected_data = camera_calibrated_data
+                    decon_response = np.asarray(illumination, dtype=np.float32)
+                    if detector_gain_x is not None:
+                        gain = detector_gain_x[
+                            detector_x_offset : detector_x_offset + raw_data.shape[-1]
+                        ]
+                        decon_response = decon_response * gain
+                else:
+                    camera_corrected_data = illumination_correct(
+                        camera_calibrated_data,
+                        illumination,
+                    )
                 if skewed_roi is None and scan_axis_reversed:
                     camera_corrected_data = np.flip(camera_corrected_data, axis=0)
 
@@ -2063,64 +2320,44 @@ def process_skewed(
                         decon_input = camera_corrected_data[
                             excess_scan_positions:, :, :
                         ]
-                    if decon_scan_upsample is not None:
-                        deconvolved_data = rlgc_undersampled(
-                            decon_input,
-                            np.asarray(psfs[chan_idx]),
-                            scan_upsample_factor=decon_scan_upsample,
-                            gpu_id=decon_gpu_id,
-                        )
-                    else:
-                        effective_crop_scan = decon_chunk_state.determine_once(
-                            tuple(int(size) for size in decon_input.shape),
-                            [tuple(int(size) for size in psf.shape) for psf in psfs],
-                            gpu_id=decon_gpu_id,
-                        )
-                        deconvolved_data = chunked_rlgc(
-                            decon_input,
-                            np.asarray(psfs[chan_idx]),
-                            crop_scan=effective_crop_scan,
-                            gpu_id=decon_gpu_id,
-                            verbose=decon_verbose,
-                            fallback_step_scan=decon_fallback_step_scan,
-                            on_successful_crop_scan=(
-                                decon_chunk_state.remember_successful_crop
-                            ),
-                        )
-                    deskewed = orthogonal_deskew(
-                        deconvolved_data,
-                        theta=opm_tilt_deg,
-                        distance=reconstruction_step_um,
-                        pixel_size=pixel_size_um,
-                        downsample_factor=z_downsample_level,
+                    factor = decon_scan_upsample
+                    fine_shape = (
+                        (decon_input.shape[0] - 1) * factor + 1,
+                        *decon_input.shape[1:],
                     )
+                    effective_crop_scan = decon_chunk_state.determine_once(
+                        fine_shape,
+                        [tuple(int(size) for size in psf.shape) for psf in psfs],
+                        gpu_id=decon_gpu_id,
+                    )
+                    deconvolved_data = rlgc(
+                        decon_input,
+                        np.asarray(psfs[chan_idx]),
+                        crop_scan=effective_crop_scan,
+                        gpu_id=decon_gpu_id,
+                        verbose=decon_verbose,
+                        fallback_step_scan=decon_fallback_step_scan,
+                        on_successful_crop_scan=partial(
+                            setattr, decon_chunk_state, "crop_scan"
+                        ),
+                        detector_response=decon_response,
+                        read_noise=decon_read_noise,
+                        scan_upsample_factor=factor,
+                        boundary="reflect" if decon_scan_upsample == 1 else "zero",
+                    )
+                    deskew_input = deconvolved_data
+                elif skewed_roi is not None:
+                    deskew_input = camera_corrected_data
                 else:
-                    if skewed_roi is not None:
-                        deskewed = orthogonal_deskew(
-                            camera_corrected_data,
-                            theta=opm_tilt_deg,
-                            distance=scan_axis_step_um,
-                            pixel_size=pixel_size_um,
-                            downsample_factor=z_downsample_level,
-                        )
-                    elif flyback_crop is not None:
-                        deskewed = orthogonal_deskew(
-                            camera_corrected_data[
-                                excess_scan_positions:-flyback_crop, :, :
-                            ],
-                            theta=opm_tilt_deg,
-                            distance=scan_axis_step_um,
-                            pixel_size=pixel_size_um,
-                            downsample_factor=z_downsample_level,
-                        )
-                    else:
-                        deskewed = orthogonal_deskew(
-                            camera_corrected_data[excess_scan_positions:, :, :],
-                            theta=opm_tilt_deg,
-                            distance=scan_axis_step_um,
-                            pixel_size=pixel_size_um,
-                            downsample_factor=z_downsample_level,
-                        )
+                    stop = -flyback_crop if flyback_crop is not None else None
+                    deskew_input = camera_corrected_data[excess_scan_positions:stop]
+                deskewed = orthogonal_deskew(
+                    deskew_input,
+                    theta=opm_tilt_deg,
+                    distance=reconstruction_step_um,
+                    pixel_size=pixel_size_um,
+                    downsample_factor=z_downsample_level,
+                )
 
                 if roi_plan is not None:
                     crop_y0, crop_y1, crop_x0, crop_x1 = (
@@ -2132,7 +2369,10 @@ def process_skewed(
                         crop_x0:crop_x1,
                     ]
                 elif crop_after_deskew:
-                    deskewed = deskewed[:, crop_y:-crop_y, :]
+                    cropped_ny = deskewed_shape[1] - _pad_y
+                    deskewed = deskewed[:, crop_y : crop_y + cropped_ny, :]
+                    if _pad_y:
+                        deskewed = np.pad(deskewed, ((0, 0), (0, _pad_y), (0, 0)))
 
                 if max_projection:
                     max_z_deskewed = np.max(deskewed, axis=0, keepdims=True)
@@ -2172,7 +2412,7 @@ def process_skewed(
             if max_projection:
                 for ts_max_write in ts_max_writes:
                     ts_max_write.result()
-            tile_zero_channels = (
+            tile_zero_channels = tuple(
                 channel_index
                 for time_index, position_index, channel_index in zero_channels
                 if time_index == int(t_idx) and position_index == int(pos_idx)
@@ -2183,6 +2423,13 @@ def process_skewed(
                 pos_idx,
                 zero_channels=tile_zero_channels,
             )
+            if ptv_export_enabled:
+                mark_ptv_tile(
+                    output_path,
+                    int(t_idx),
+                    int(pos_idx),
+                    zero_channels=tile_zero_channels,
+                )
             if max_projection:
                 processing_state.complete_tile(max_z_output_path, t_idx, pos_idx)
 
@@ -2223,6 +2470,8 @@ def process_skewed(
                 dtype=np.float64,
             ),
             spatial_offset_z_um=float(max_z_collection.spatial_origins_zyx_um[0][0]),
+            source_collection=max_z_output_path,
+            time_interval_s=max_z_collection.time_interval_s,
             reverse_stage_z=not stage_z_flipped,
             opm_angle_deg=opm_tilt_deg,
         )
@@ -2315,7 +2564,7 @@ def process_projection(
         Start-inclusive, stop-exclusive position selection; None processes all
         positions.
     eager_deconvolution : bool
-        Use eager stopping in the planar gradient-consensus solver.
+        Legacy compatibility option; reference KL stopping requires both halves.
     resume : bool
         Reuse compatible output checkpoints; False overwrites this output run.
     decon_gpu_id : int
@@ -2328,15 +2577,22 @@ def process_projection(
     output_dir : Path or None
         Directory for processed images and state; None uses the source directory.
 
+
     Returns
     -------
     None
         Processed planar tiles, stage-placed mosaics, and checkpoints are written to
         disk.
     """
+    acquisition.validate_processing_calibration()
+    decon_read_noise = read_noise_from_metadata(acquisition) if deconvolve else None
     overwrite = not resume
     if deconvolve:
-        from opm_processing.imageprocessing.rlgc import rlgc_2d
+        from opm_processing.imageprocessing.rlgc import (
+            GC_RELATIVE_CHANGE_LIMIT,
+            GC_UPDATED_FRACTION_LIMIT,
+            rlgc,
+        )
 
     skip_empty_below, skip_empty_min_signal_fraction = validate_empty_tile_options(
         skip_empty_below,
@@ -2356,6 +2612,7 @@ def process_projection(
     opm_tilt_deg = acquisition.angle_deg
     camera_offset = acquisition.camera_offset
     camera_conversion = acquisition.camera_conversion
+    detector_gain_x = detector_gain_from_metadata(acquisition, int(datastore.shape[-1]))
     channels = list(acquisition.channel_names)
     stage_positions_raw = np.asarray(acquisition.stage_positions_zxy, dtype=float)
     stage_axis_flips = acquisition.stage_axis_flips_xyz
@@ -2366,29 +2623,9 @@ def process_projection(
     output_dtype = np.dtype(np.float32 if save_float32 else np.uint16)
     psfs: list[np.ndarray] | None = None
     if deconvolve:
-        if decon_psf_paths is not None:
-            if len(decon_psf_paths) != len(channels):
-                raise ValueError("decon_psf_paths must contain one PSF per channel")
-            psfs = [
-                (
-                    np.load(path)
-                    if Path(path).suffix == ".npy"
-                    else np.asarray(imread(path))
-                )
-                for path in tqdm(decon_psf_paths, desc="PSFs", unit="PSF")
-            ]
-        else:
-            psfs = [
-                generate_proj_psf(
-                    em_wvl=max(
-                        float(wavelength.strip().lower().removesuffix("nm"))
-                        for wavelength in channel.split("+")
-                    )
-                    / 1000,
-                    pixel_size_um=pixel_size_um,
-                )
-                for channel in tqdm(channels, desc="PSFs", unit="PSF")
-            ]
+        psfs, psf_parameters = load_deconvolution_psfs(
+            acquisition, decon_psf_paths, projection=True
+        )
     stage_positions = apply_stage_axis_flips(stage_positions_raw, stage_axis_flips)
     stage_z_indices = stage_z_level_indices(stage_positions_raw)
     stage_z_flipped = stage_axis_flips[2]
@@ -2431,13 +2668,17 @@ def process_projection(
             camera_conversion,
             skip_empty_below,
             skip_empty_min_signal_fraction,
-            apply_stage_scan_gain=False,
+            detector_gain_x=detector_gain_x,
         )
     )
     voxel_size_um = (1.0, pixel_size_um, pixel_size_um)
     processing_configuration = {
         "kind": output_kind,
+        "timing": acquisition.timing_attributes(),
         "dtype": output_dtype.name,
+        "detector_gain_x": None
+        if detector_gain_x is None
+        else detector_gain_x.tolist(),
         "flatfield": bool(flatfield_correction),
         "selection": {"time": time_range, "position": pos_range},
         "empty": (
@@ -2449,8 +2690,40 @@ def process_projection(
             None
             if not deconvolve
             else {
-                "model_revision": "opm-physical-rlgc-20261008",
+                "model_revision": "gradient-consensus-v12-recorded-calibration",
+                "observation_model": "poisson",
+                "gc_stopping": {
+                    "reference": "gc_deconv.m@0340af0d7a4c5d92a97a1b443dfedb367dfb9f3d",
+                    "kl_enabled": True,
+                    "kl_domain": "acquired-pixel-prediction",
+                    "kl_direction": "prediction-to-split",
+                    "kl_comparison": "preceding-iteration-fresh-halves",
+                    "kl_require_both": True,
+                    "consensus_product": "relative-directions-before-blur",
+                    "split": "matlab-do_binosplit",
+                    "read_noise": decon_read_noise,
+                    "read_noise_units": "calibrated-detector-counts-rms",
+                    "read_noise_reference": "gc_deconv.m",
+                    "accepted_fraction_limit": GC_UPDATED_FRACTION_LIMIT,
+                    "relative_change_limit": GC_RELATIVE_CHANGE_LIMIT,
+                    "peak_floor": 1e-12,
+                },
+                "observations": "calibrated-detector-counts",
+                "detector_response": "forward-adjoint-sensitivity",
                 "eager": bool(eager_deconvolution),
+                "psf_parameters": None
+                if decon_psf_paths is not None
+                else psf_parameters,
+                **(
+                    {}
+                    if decon_psf_paths is not None
+                    else {
+                        "psf_sampling": "oblique-camera-pixel-integral-centered-taper-v3",
+                    }
+                ),
+                "emission_wavelengths_nm": (acquisition.deconvolution or {}).get(
+                    "emission_wavelengths_nm"
+                ),
                 "psf_sha256": (
                     None
                     if decon_psf_paths is None
@@ -2470,10 +2743,16 @@ def process_projection(
             output_path,
             datastore.shape,
             voxel_size_um,
+            time_interval_s=acquisition.volume_interval_s,
+            attributes=acquisition.timing_attributes(),
             stage_positions=stage_positions,
             channels=channels,
             overwrite=True,
             dtype=output_dtype,
+        )
+    if output_collection.time_interval_s != acquisition.volume_interval_s:
+        raise ValueError(
+            "Existing output time scale disagrees with hardware volume cadence"
         )
     ts_store = output_collection.arrays
 
@@ -2485,7 +2764,7 @@ def process_projection(
             camera_conversion,
             pixel_size_um,
             stage_positions_raw,
-            apply_stage_scan_gain=False,
+            detector_gain_x=detector_gain_x,
             signal_threshold=skip_empty_below,
             minimum_signal_fraction=skip_empty_min_signal_fraction,
             signal_mask=signal_mask,
@@ -2493,7 +2772,7 @@ def process_projection(
     else:
         flatfields = np.ones(
             (
-                int(stage_z_indices.max()) + 1,
+                1,
                 datastore.shape[2],
                 datastore.shape[-2],
                 datastore.shape[-1],
@@ -2559,6 +2838,7 @@ def process_projection(
                 raw_data,
                 camera_offset,
                 camera_conversion,
+                detector_gain_x=None if deconvolve else detector_gain_x,
             )
 
             if tile_is_empty(
@@ -2575,21 +2855,22 @@ def process_projection(
                     ts_store[pos_idx][t_idx, chan_idx].write(output_dtype.type(0))
                 )
                 continue
-            camera_corrected_data = illumination_correct(
-                camera_calibrated_data,
-                flatfields[stage_z_indices[pos_idx], chan_idx, :],
-            )
-
             if deconvolve:
-                deconvolved_data = rlgc_2d(
-                    image=camera_corrected_data,
-                    skewed_psf=np.asarray(psfs[chan_idx]),
+                deconvolved_data = rlgc(
+                    image=camera_calibrated_data,
+                    psf=np.asarray(psfs[chan_idx]),
                     gpu_id=decon_gpu_id,
                     verbose=decon_verbose,
                     safe_mode=not eager_deconvolution,
+                    detector_response=flatfields[0, chan_idx, :]
+                    * (1 if detector_gain_x is None else detector_gain_x),
+                    read_noise=decon_read_noise,
                 )
             else:
-                deconvolved_data = camera_corrected_data
+                deconvolved_data = illumination_correct(
+                    camera_calibrated_data,
+                    flatfields[0, chan_idx, :],
+                )
 
             formatted = format_processed_output(
                 deconvolved_data,
@@ -2628,6 +2909,7 @@ def process_projection(
             pixel_size=np.asarray((pixel_size_um, pixel_size_um), dtype=np.float32),
             time_range=time_range,
             reverse_stage_z=not stage_z_flipped,
+            time_interval_s=output_collection.time_interval_s,
             opm_angle_deg=opm_tilt_deg,
         )
         tile_fusion.run()
@@ -2688,7 +2970,7 @@ def run_estimate_illuminations(
     camera_offset: float,
     camera_conversion: float,
     stage_positions_zxy: np.ndarray | None,
-    apply_stage_scan_gain: bool,
+    detector_gain_x: np.ndarray | None,
     signal_mask: np.ndarray | None,
     conn: Connection,
 ) -> None:
@@ -2704,8 +2986,8 @@ def run_estimate_illuminations(
         Calibrated intensity units per ADU after baseline subtraction.
     stage_positions_zxy : numpy.ndarray
         Physical stage Z, scan-axis X, and lateral Y coordinates in micrometers.
-    apply_stage_scan_gain : bool
-        Apply the fixed qi2lab detector-X gain during camera calibration.
+    detector_gain_x : numpy.ndarray or None
+        Apply the recorded detector-X response during camera calibration.
     signal_mask : numpy.ndarray or None
         TPC mask selecting nonempty estimation tiles; None allows automatic
         selection.
@@ -2736,7 +3018,7 @@ def run_estimate_illuminations(
             camera_offset,
             camera_conversion,
             stage_positions_zxy,
-            apply_stage_scan_gain=apply_stage_scan_gain,
+            detector_gain_x=detector_gain_x,
             signal_mask=signal_mask,
         )
         conn.send(flatfields)
@@ -2752,7 +3034,7 @@ def call_estimate_illuminations(
     camera_offset: float,
     camera_conversion: float,
     stage_positions_zxy: np.ndarray | None,
-    apply_stage_scan_gain: bool,
+    detector_gain_x: np.ndarray | None,
     signal_mask: np.ndarray | None,
 ) -> np.ndarray:
     """Call ``estimate_illuminations`` in an isolated subprocess.
@@ -2767,8 +3049,8 @@ def call_estimate_illuminations(
         Calibrated intensity units per ADU after baseline subtraction.
     stage_positions_zxy : numpy.ndarray
         Physical stage Z, scan-axis X, and lateral Y coordinates in micrometers.
-    apply_stage_scan_gain : bool
-        Apply the fixed qi2lab detector-X gain during camera calibration.
+    detector_gain_x : numpy.ndarray or None
+        Apply the recorded detector-X response during camera calibration.
     signal_mask : numpy.ndarray or None
         TPC mask selecting nonempty estimation tiles; None allows automatic
         selection.
@@ -2776,7 +3058,7 @@ def call_estimate_illuminations(
     Returns
     -------
     numpy.ndarray
-        Estimated depth-CYX fields after the isolated worker exits successfully.
+        Shared per-channel fields after the isolated worker exits successfully.
 
     Notes
     -----
@@ -2794,7 +3076,7 @@ def call_estimate_illuminations(
             camera_offset,
             camera_conversion,
             stage_positions_zxy,
-            apply_stage_scan_gain,
+            detector_gain_x,
             signal_mask,
             child_conn,
         ),
@@ -2803,6 +3085,9 @@ def call_estimate_illuminations(
     child_conn.close()
     try:
         try:
+            ready = wait_for_worker((parent_conn, p.sentinel))
+            if parent_conn not in ready:
+                raise EOFError("Worker exited before returning a result")
             result = parent_conn.recv()
         except EOFError as error:
             p.join()

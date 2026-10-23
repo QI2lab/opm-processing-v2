@@ -90,12 +90,10 @@ nav:
       - inspect-opm: reference/cli/inspect-opm.md
       - process: reference/cli/process.md
       - fuse: reference/cli/fuse.md
-      - display: reference/cli/display.md
-      - process-ROI: reference/cli/process-roi.md
       - export-ome-tiff: reference/cli/export-ome-tiff.md
+      - export-rois: reference/cli/export-rois.md
       - export-projections: reference/cli/export-projections.md
       - encode-projections: reference/cli/encode-projections.md
-      - convert-timelapse: reference/cli/convert-timelapse.md
       - Dataset layout and metadata: reference/data.md
       - Python:
           - Acquisition and state: reference/python/dataio.md
@@ -108,9 +106,6 @@ nav:
       - Orthogonal interpolation geometry: orthogonal_interpolation_diagram.md
   - Examples:
       - Simulation scripts: examples/index.md
-      - Meridian sphere: meridian_sphere_simulation.md
-      - Publication figure: opm_publication_figure.md
-      - Fixed-plane sampling: fixed_plane_sampling_series.md
   - Development:
       - Contributing: development/contributing.md
       - Running tests: development/testing.md
