@@ -44,19 +44,22 @@ def camera_codes():
     return np.arange(65536, dtype=np.uint16).reshape(16, 16, 256)
 
 
-@pytest.fixture
-def photon_splitter(cupy_gpu):
-    """Run MATLAB's unclipped first-half split with a reproducible GPU generator."""
+@pytest.fixture(params=["gpu", "host"])
+def photon_splitter(cupy_gpu, request):
+    """Run the production split with installed CuPy or NumPy generators."""
     from opm_processing.imageprocessing import rlgc
+
+    xp = cupy_gpu if request.param == "gpu" else np
+    to_numpy = cupy_gpu.asnumpy if request.param == "gpu" else np.asarray
 
     def split(observed, seed=19):
         """Split prescribed observations with a reproducible GPU random generator."""
-        counts = cupy_gpu.asarray(observed, dtype=cupy_gpu.float32)
-        rng = cupy_gpu.random.default_rng(seed)
+        counts = xp.asarray(observed, dtype=xp.float32)
+        rng = xp.random.default_rng(seed)
         first = rlgc._split_observed_counts(counts, rng)
-        return cupy_gpu.asnumpy(first)
+        return to_numpy(first)
 
-    return SimpleNamespace(split=split)
+    return SimpleNamespace(split=split, xp=xp, to_numpy=to_numpy)
 
 
 @pytest.fixture

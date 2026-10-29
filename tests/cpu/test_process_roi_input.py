@@ -13,7 +13,11 @@ pytestmark = pytest.mark.integration
 
 @pytest.mark.parametrize("explicit_paths", (False, True))
 def test_process_roi_uses_raw_source_and_processed_directory_defaults(
-    tmp_path: Path, roi_run, processed_directory_factory, explicit_paths: bool
+    tmp_path: Path,
+    roi_run,
+    processed_directory_factory,
+    explicit_paths: bool,
+    relocate_acquisition,
 ) -> None:
     """Resolve CLI inputs and persist the calibrated cropped raw pixels."""
     from dataclasses import replace
@@ -37,8 +41,17 @@ def test_process_roi_uses_raw_source_and_processed_directory_defaults(
     expected_output = (
         tmp_path / "custom_output" if explicit_paths else processed / f"{stem}_roi"
     )
+    relocated = relocate_acquisition(tmp_path, copy=explicit_paths)
+    source = relocated / source.relative_to(tmp_path)
+    processed = relocated / processed.relative_to(tmp_path)
+    roi_path = relocated / roi_path.relative_to(tmp_path)
+    expected_output = relocated / expected_output.relative_to(tmp_path)
     process_roi_module.process_roi(
-        processed, roi_path, deconvolve=False, output=expected_output
+        processed,
+        roi_path,
+        registration_channel=1,
+        deconvolve=False,
+        output=expected_output,
     )
     output = open_position_collection(expected_output / f"{stem}_deskewed.ome.zarr")
     for array, expected in zip(output.arrays, run.expected_tiles, strict=False):

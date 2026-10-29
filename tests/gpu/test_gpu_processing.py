@@ -92,9 +92,13 @@ def test_fft_convolution_matches_direct_reference(cupy_gpu):
     "p_values,q_values",
     [([0, 1, 3, 20], [4, 0, 2, 1]), ([0, 0, 0], [0, 0, 0]), ([2, 2, 2], [9, 9, 9])],
 )
-def test_kld_matches_independent_probability_definition(cupy_gpu, p_values, q_values):
+@pytest.mark.parametrize("array_backend", ["gpu", "host"])
+def test_kld_matches_independent_probability_definition(
+    cupy_gpu, p_values, q_values, array_backend
+):
     """The production CUDA divergence implements normalized directed relative entropy."""
-    cp = cupy_gpu
+    cp = cupy_gpu if array_backend == "gpu" else np
+    to_numpy = cupy_gpu.asnumpy if array_backend == "gpu" else np.asarray
     rlgc = importlib.import_module("opm_processing.imageprocessing.rlgc")
     p = cp.asarray(p_values, dtype=cp.float32)
     q = cp.asarray(q_values, dtype=cp.float32)
@@ -107,8 +111,8 @@ def test_kld_matches_independent_probability_definition(cupy_gpu, p_values, q_va
     expected = np.sum(probability_p * np.log(probability_p / probability_q))
     actual = rlgc._kl_div_into(p, q, scratch)
     np.testing.assert_allclose(actual, expected, rtol=2e-6, atol=2e-6)
-    np.testing.assert_array_equal(cp.asnumpy(p), p_values)
-    np.testing.assert_array_equal(cp.asnumpy(q), q_values)
+    np.testing.assert_array_equal(to_numpy(p), p_values)
+    np.testing.assert_array_equal(to_numpy(q), q_values)
 
 
 @pytest.mark.parametrize("applied_shift", ((1.0, -2.0, 3.0), (0.6, -2.3, 3.4)))
@@ -157,13 +161,52 @@ def test_gpu_registration_recovers_known_3d_translation(cupy_gpu, applied_shift)
     assert score > unregistered_score
 
 
-def test_rlgc_empty_image_remains_empty(cupy_gpu):
-    """Data-derived initialization must not introduce signal into an empty image."""
+@pytest.mark.parametrize("crop_scan", [None, 1, 2, 0, -1, 1.5, True])
+@pytest.mark.parametrize(
+    "verbosity", [None, 0, 1], ids=["default", "no-diagnostics", "diagnostics"]
+)
+def test_rlgc_empty_image_remains_empty(
+    cupy_gpu, crop_scan, verbosity, capsys, monkeypatch
+):
+    """Preserve empty data and release solver state with opt-in diagnostics."""
     rlgc = importlib.import_module("opm_processing.imageprocessing.rlgc")
+    clear = rlgc.clear_rlgc_caches
+    cleanups = []
+
+    def observe_cleanup(*args, **kwargs):
+        """Count actual resource release without replacing its implementation."""
+        cleanups.append(True)
+        return clear(*args, **kwargs)
+
+    monkeypatch.setattr(rlgc, "clear_rlgc_caches", observe_cleanup)
     observed = np.zeros((3, 12, 16), dtype=np.float32)
     psf = np.ones((3, 3, 3), dtype=np.float32)
-    restored = rlgc.rlgc(observed, psf)
+    if crop_scan is not None and (
+        isinstance(crop_scan, bool) or crop_scan in (0, -1, 1.5)
+    ):
+        with pytest.raises(ValueError, match="crop_scan must be a positive integer"):
+            rlgc.rlgc(observed, psf, crop_scan=crop_scan)
+        return
+    options = {} if verbosity is None else {"verbose": verbosity}
+    restored = rlgc.rlgc(observed, psf, crop_scan=crop_scan, **options)
     np.testing.assert_array_equal(restored, observed)
+    assert len(cleanups) == 1
+    captured = capsys.readouterr()
+    assert not captured.out
+    assert ("decon:" in captured.err) == (crop_scan in (1, 2))
+    if verbosity:
+        assert "RLGC acquired_shape=" in captured.err
+        assert "iteration=" in captured.err
+        assert "stop=" in captured.err
+    else:
+        assert "RLGC acquired_shape=" not in captured.err
+        assert "iteration=" not in captured.err
+        assert "stop=" not in captured.err
+        if crop_scan is None:
+            assert not captured.err
+    assert not rlgc._fft_cache_3d
+    pool = cupy_gpu.get_default_memory_pool()
+    assert pool.total_bytes() == pool.used_bytes()
 
 
 @pytest.mark.parametrize("singleton_z", [False, True])
@@ -196,9 +239,13 @@ def test_rlgc_2d_recovers_points_using_central_psf(
 
 
 @pytest.mark.parametrize("scale", (0.01, 1, 1000))
-def test_split_kl_scores_match_direct_probability_definition(cupy_gpu, scale):
+@pytest.mark.parametrize("array_backend", ["gpu", "host"])
+def test_split_kl_scores_match_direct_probability_definition(
+    cupy_gpu, scale, array_backend
+):
     """Lock MATLAB's prediction-to-split direction, normalization and pseudocount."""
     solver = importlib.import_module("opm_processing.imageprocessing.rlgc")
+    xp = cupy_gpu if array_backend == "gpu" else np
     rng = np.random.default_rng(51)
     prediction = (rng.uniform(0, 30, (3, 5, 7)) * scale).astype(np.float32)
     prediction[0] = 0
@@ -211,7 +258,7 @@ def test_split_kl_scores_match_direct_probability_definition(cupy_gpu, scale):
         target /= target.sum()
         expected.append(np.sum(probability * np.log(probability / target)))
     actual = solver.split_kl_scores(
-        *(cupy_gpu.asarray(value) for value in (prediction, *halves)),
-        cupy_gpu.empty_like(cupy_gpu.asarray(prediction)),
+        *(xp.asarray(value) for value in (prediction, *halves)),
+        xp.empty_like(xp.asarray(prediction)),
     )
     np.testing.assert_allclose(actual, expected, rtol=2e-6, atol=2e-7)

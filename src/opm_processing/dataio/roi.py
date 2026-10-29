@@ -17,6 +17,7 @@ from opm_processing.dataio.position_collection import open_position_collection
 from opm_processing.dataio.processing_state import (
     ProcessingState,
     processing_state_path,
+    resolve_store_path,
 )
 
 ROI_SCHEMA = "opm-processing-roi-v1"
@@ -151,10 +152,10 @@ def projection_tile_footprints(path: str | Path) -> tuple[dict[str, Any], ...]:
         stage_positions_to_image_coordinates,
     )
 
-    acquisition = inspect_acquisition(Path(state.document["source"]["path"]))
+    acquisition = inspect_acquisition(state.source_path())
     if suffix == suffixes[0]:
         candidates = (
-            [Path(projection["source_collection"])]
+            [resolve_store_path(projection["source_collection"], source.parent)]
             if projection.get("source_collection")
             else [source.parent / f"{stem}{label}" for label in suffixes[1:]]
         )

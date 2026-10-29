@@ -26,7 +26,10 @@ estimating illumination or processing images. See the
 [live acquisition guide](live.md#wait-for-completion-before-processing).
 
 `--deconvolve` uses GPU RLGC; channel-ordered PSFs can be supplied with repeated
-`--decon-psf-paths` options. Otherwise theoretical PSFs are generated.
+`--decon-psf-paths` options. Otherwise theoretical PSFs use the qi2lab silicone
+objective defaults and channel wavelengths; recorded PSF calibration overrides
+these defaults. Combined channels such as `561 + 637` use the longest wavelength
+for their single PSF. As-acquired stores need no processing-specific PSF metadata.
 With deconvolution, camera-calibrated detector estimates retain their precision
 during splitting, and flatfield and detector-gain responses enter the solver's
 measurement model. Without deconvolution, correction still divides the

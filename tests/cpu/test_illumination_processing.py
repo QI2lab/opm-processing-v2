@@ -236,7 +236,7 @@ def test_invalid_cached_fields_are_not_reused(tmp_path, level):
     assert read_current_flatfield(path, field.shape) is None
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 def test_live_wait_defers_processing_and_selects_flatfield(live_wait_case, monkeypatch):
     """Wait for both completion and chunks, then reuse or estimate illumination."""
     processing = importlib.import_module("opm_processing.process")

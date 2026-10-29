@@ -68,6 +68,9 @@ from opm_processing.imageprocessing.coordinates import (
 )
 from opm_processing.imageprocessing.opmtools import orthogonal_deskew
 
+DEFAULT_REGISTRATION_DOWNSAMPLE = (3, 5, 5)
+DEFAULT_REGISTRATION_SSIM_WINDOW = 15
+
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
 
@@ -1402,8 +1405,8 @@ class TileFusion:
         self,
         root_path: str | Path,
         blend_pixels: tuple[int, int, int] = (20, 600, 400),
-        downsample_factors: tuple[int, int, int] = (3, 5, 5),
-        ssim_window: int = 15,
+        downsample_factors: tuple[int, int, int] = DEFAULT_REGISTRATION_DOWNSAMPLE,
+        ssim_window: int = DEFAULT_REGISTRATION_SSIM_WINDOW,
         threshold: float = 0.7,
         multiscale_factors: Sequence[int] = (2, 4, 8, 16, 32),
         resolution_multiples: Sequence[int | Sequence[int]] = (
@@ -1527,7 +1530,7 @@ class TileFusion:
             processing_state_path(self.output_dir, self.acquisition_name)
         )
         self.processing_state.run(self.data)
-        state_source_path = Path(self.processing_state.document["source"]["path"])
+        state_source_path = self.processing_state.source_path()
         if source_path is not None and source_path != state_source_path:
             raise ValueError(
                 "Processing state source does not match the fusion acquisition"

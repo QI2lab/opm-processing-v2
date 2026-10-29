@@ -6,6 +6,11 @@ is preferred when both versions of that acquisition exist. Saves
 8-bit display images under `projection_frames` beside the store. Timestamps require
 the processed NGFF time scale or recorded hardware volume timing.
 
+After moving or copying an acquisition directory, pass its current location.
+The raw store beside the processed data takes precedence over the original path
+in the processing journal. `--acquisition` overrides this selection; the recorded
+path remains a fallback when raw data is stored separately.
+
 | Option | Description |
 | --- | --- |
 | `--output PATH` | Set the output root. |

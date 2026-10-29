@@ -16,6 +16,7 @@ from opm_processing.dataio.acquisition import (
     AcquisitionMetadata,
     ChannelMetadata,
 )
+from opm_processing.dataio.processing_state import resolve_store_path
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -76,11 +77,7 @@ class LiveManifest:
             )
 
         acquisition_id = document["acquisition_id"]
-        raw_data_path = document["data_path"]
-        data_path = Path(raw_data_path).expanduser()
-        if not data_path.is_absolute():
-            data_path = manifest_path.parent / data_path
-        data_path = data_path.resolve()
+        data_path = resolve_store_path(document["data_path"], manifest_path.parent)
 
         sizes_document = document["index_sizes"]
         index_sizes = {

@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 @pytest.fixture
 def roi_preview(
     request,
-    acquisition_factory,
+    opm_v2_acquisition_factory,
     small_cpu_kernels,
     simulated_camera,
     simulation_parameters,
@@ -40,7 +40,7 @@ def roi_preview(
         ).raw
     if mode == "stage":
         pixels = pixels[:, :, :, ::-1].copy()
-    dataset = acquisition_factory(
+    dataset = opm_v2_acquisition_factory(
         pixels,
         mode=mode,
         camera_conversion=1.0,
@@ -103,23 +103,7 @@ def napari_model(monkeypatch, tmp_path_factory):
 
 
 @pytest.fixture
-def roi_psf(roi_preview, pipeline_optical_data, tmp_path):
-    """Store the same physical PSF used by the shared forward simulator.
-
-    Returns
-    -------
-    pathlib.Path
-        Measured-kernel input sampled at the acquisition scan spacing.
-    """
-    step = roi_preview.dataset.metadata.scan_axis_step_um
-    psf = pipeline_optical_data(step)[2]
-    path = tmp_path / "roi_psf.npy"
-    np.save(path, psf)
-    return path
-
-
-@pytest.fixture
-def roi_run(tmp_path: Path, acquisition_factory, simulated_camera):
+def roi_run(tmp_path: Path, opm_v2_acquisition_factory, simulated_camera):
     """Build a three-channel acquisition with two selected nonzero positions."""
     import importlib
     from types import SimpleNamespace
@@ -136,10 +120,10 @@ def roi_run(tmp_path: Path, acquisition_factory, simulated_camera):
                 conversion=1.0,
                 exposure=1 + position / 4 + channel / 2,
             ).raw
-    dataset = acquisition_factory(
+    dataset = opm_v2_acquisition_factory(
         pixels, camera_conversion=1.0, stage_positions_zxy=((0.0, 0.0, 0.0),) * 3
     )
-    source, raw, metadata = dataset.path, dataset.collection, dataset.metadata
+    source, metadata = dataset.path, dataset.metadata
     roi = PhysicalRoi(
         bounds_yx_um=(0.23, 2.3, 0.23, 1.38),
         source_path=tmp_path / "sample_max_z_fused.ome.zarr",
@@ -162,7 +146,7 @@ def roi_run(tmp_path: Path, acquisition_factory, simulated_camera):
         process=process,
         source=source,
         metadata=metadata,
-        raw=raw,
+        raw_arrays=dataset.raw_arrays,
         roi=roi,
         roi_path=roi_path,
         output_dir=tmp_path / "sample_roi",

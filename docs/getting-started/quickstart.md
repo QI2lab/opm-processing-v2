@@ -38,7 +38,7 @@ projection. See [fusion](../guides/fusion.md) for registration and depth gains.
 Select multiple ROIs in napari and reconstruct them from raw data:
 
 ```bash
-uv run export-rois "/path/to/acquisition" --deconvolve
+uv run export-rois "/path/to/acquisition" --registration-channel 1 --deconvolve
 ```
 
 Export the highest-resolution fused volume and maximum-Z projection:

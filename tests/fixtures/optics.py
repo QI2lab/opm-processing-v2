@@ -337,7 +337,7 @@ def uniform_detector_acquisition(
             "write_fused_max_projection_tiff",
         ):
             options.pop(key)
-        options.update(roi_json=roi_path, output=tmp_path)
+        options.update(roi_json=roi_path, output=tmp_path, registration_channel=0)
     suffix = "projection" if mode == "projection" else "deskewed"
     return SimpleNamespace(
         dataset=dataset,

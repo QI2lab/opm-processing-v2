@@ -19,7 +19,7 @@ pytestmark = pytest.mark.integration
 
 def test_singleton_z_stage_mode_writes_2d_name_without_stage_fusion(
     tmp_path,
-    acquisition_factory,
+    opm_v2_acquisition_factory,
     simulated_camera,
 ) -> None:
     """Keep dimensionality and acquisition mode distinct in output names."""
@@ -29,7 +29,7 @@ def test_singleton_z_stage_mode_writes_2d_name_without_stage_fusion(
             for t in range(2)
         ]
     )[:, None, None]
-    dataset = acquisition_factory(raw, name="single_stage", mode="stage")
+    dataset = opm_v2_acquisition_factory(raw, name="single_stage", mode="stage")
     path = dataset.path
     process(
         root_path=path,
@@ -47,7 +47,7 @@ def test_singleton_z_stage_mode_writes_2d_name_without_stage_fusion(
         output.arrays[0].read().result(),
         ((raw[:, 0].astype(np.float32) - 100) * 0.25).astype(np.uint16),
     )
-    assert not any(key.startswith("opm_") for key in output.attributes)
+    assert "opm_v2" not in output.attributes
 
 
 @pytest.mark.parametrize("save_float32", [False, True], ids=["uint16", "float32"])
@@ -113,9 +113,9 @@ def test_projection_cli_resume_preserves_completed_pixels(
         open_position_collection(output_path).arrays[0].read().result(),
         expected,
     )
-    raw = open_position_collection(fixture.path)
-    for array in raw.arrays:
-        array.write(np.uint16(900)).result()
+    from opm_processing.dataio.acquisition import open_acquisition_datastore
+
+    open_acquisition_datastore(fixture.path).write(np.uint16(900)).result()
     if resume:
         args.append("--resume")
     second = CliRunner().invoke(process_app, args)

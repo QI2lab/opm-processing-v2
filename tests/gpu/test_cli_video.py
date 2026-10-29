@@ -6,6 +6,7 @@ import pytest
 import tifffile
 
 from opm_processing.encode_projections import find_sequences
+from opm_processing.export_projections import acquisition_for
 
 pytestmark = [pytest.mark.integration, pytest.mark.usefixtures("nvenc_gpu")]
 
@@ -14,10 +15,17 @@ pytestmark = [pytest.mark.integration, pytest.mark.usefixtures("nvenc_gpu")]
 @pytest.mark.parametrize("codec", ["h264", "hevc"])
 @pytest.mark.parametrize("rate_control", ["cbr", "vbr"])
 def test_video_cli_preserves_simulated_timepoints_and_display_pixels(
-    roi_preview, codec, rate_control, invoke_cli
+    roi_preview, codec, rate_control, invoke_cli, relocate_acquisition
 ):
     """Encode real TIFF frames and decode MP4s with the installed FFmpeg package."""
-    root = roi_preview.dataset.path.parent
+    root = relocate_acquisition(
+        roi_preview.dataset.path.parent, copy=rate_control == "vbr"
+    )
+    assert roi_preview.dataset.path.exists() == (rate_control == "vbr")
+    assert (
+        acquisition_for(root / roi_preview.collection.path.name).path
+        == root / roi_preview.dataset.path.name
+    )
     color = codec == "hevc"
     fps = 7.5 if rate_control == "vbr" else None
     invoke_cli(
@@ -28,6 +36,9 @@ def test_video_cli_preserves_simulated_timepoints_and_display_pixels(
         video=codec == "h264" and rate_control == "cbr",
         fps=fps,
     )
+    # TIFF metadata now records the first location. Encoding must discover the
+    # current frame directory after the complete acquisition is relocated again.
+    root = relocate_acquisition(root, copy=rate_control == "vbr")
     invoke_cli(
         "encode-projections",
         root,

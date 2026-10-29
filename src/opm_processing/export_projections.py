@@ -5,7 +5,7 @@ from __future__ import annotations
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from functools import lru_cache
 from itertools import islice
-from pathlib import Path
+from pathlib import Path  # noqa: TC003 - Typer resolves CLI annotations at runtime.
 from typing import TYPE_CHECKING, Annotated, Any
 
 import numpy as np
@@ -76,14 +76,15 @@ def find_datasets(path: Path) -> list[Path]:
 
 
 def acquisition_for(path: Path, override: Path | None = None) -> AcquisitionMetadata:
-    """Find the raw acquisition explicitly or through its processing sidecar.
+    """Find raw data at the current location, with journal links as a fallback.
 
     Parameters
     ----------
     path : Path
         Filesystem location of the image store or metadata document being read.
     override : Path | None
-        Explicit raw acquisition path, or None to read it from processing state.
+        Explicit raw acquisition path, or None to prefer the co-located source
+        identified by processing state before trying its recorded location.
 
     Returns
     -------
@@ -99,12 +100,7 @@ def acquisition_for(path: Path, override: Path | None = None) -> AcquisitionMeta
         state = ProcessingState.read(sidecar)
 
         if path.name in state.document["outputs"]:
-            source = Path(state.document["source"]["path"])
-
-            if not source.is_absolute():
-                source = sidecar.parent / source
-
-            matches.append(source)
+            matches.append(state.source_path())
 
     if len(matches) != 1:
         raise ValueError(

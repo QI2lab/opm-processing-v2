@@ -106,7 +106,7 @@ def test_processed_volume_dimensions_use_recorded_lab_grid(
     assert image["pyramid_levels"] == 2
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 @pytest.mark.parametrize(
     "selection",
     ["raw-only", "directory", "raw", "processed", "custom-processed", "processed-only"],
@@ -151,7 +151,7 @@ def test_inspect_cli_reports_simulated_raw_and_processed_data(
         ):
             assert image["axes"] == list("tczyx")
             assert image["shape"] == list(array.shape)
-            assert image["channels"] == ["488nm"]
+            assert image["channels"] == list(case.metadata.channel_names)
             for axis, size in zip("zyx", array.shape[-3:], strict=True):
                 assert image["volume_dimensions_um"][axis] == pytest.approx(
                     size * case.metadata.pixel_size_um

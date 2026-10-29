@@ -6,7 +6,7 @@ Use `export-rois` to select rectangles on a deskewed maximum-Z preview and
 process their raw regions after closing napari:
 
 ```bash
-uv run export-rois "/path/to/processed" --deconvolve
+uv run export-rois "/path/to/processed" --registration-channel 1 --deconvolve
 ```
 
 For viewing alone, open OME-Zarr outputs through napari's installed OME-Zarr

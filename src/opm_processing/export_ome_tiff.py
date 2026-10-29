@@ -8,7 +8,7 @@ NGFF metadata, source acquisition settings, and the processing journal.
 from __future__ import annotations
 
 import json
-from pathlib import Path
+from pathlib import Path  # noqa: TC003 - Typer resolves CLI annotations at runtime.
 from typing import TYPE_CHECKING, Annotated
 from uuid import uuid4
 
@@ -478,9 +478,7 @@ def load_export_metadata(image_store: Path) -> tuple[OME, dict[str, str]]:
             if image_store.name.endswith("_fused.ome.zarr")
             else image_store
         )
-        source = Path(state.document["source"]["path"])
-        if not source.is_absolute():
-            source = state_path.parent / source
+        source = state.source_path()
         for candidate in (source, processed):
             companion = candidate / "OME" / "METADATA.ome.xml"
             if companion.is_file():

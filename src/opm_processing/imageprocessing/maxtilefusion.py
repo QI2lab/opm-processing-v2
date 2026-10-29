@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -438,6 +439,15 @@ class MaxTileFusion:
             if source_collection is None
             else str(Path(source_collection).resolve())
         )
+        if self.source_collection is not None:
+            try:
+                self.source_collection = Path(
+                    os.path.relpath(
+                        self.source_collection, self.output_path.parent.resolve()
+                    )
+                ).as_posix()
+            except ValueError:
+                pass
         pixel_size = tuple(float(value) for value in pixel_size)
         if len(pixel_size) == 2:
             self.z_pixel_size = 1.0

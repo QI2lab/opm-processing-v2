@@ -11,7 +11,7 @@ from yaozarrs import open_group, v05
 
 from opm_processing.export_ome_tiff import app
 
-pytestmark = pytest.mark.integration
+pytestmark = pytest.mark.unit
 
 
 @pytest.mark.parametrize("source_xml,workers", [(True, 1), (False, 3)])

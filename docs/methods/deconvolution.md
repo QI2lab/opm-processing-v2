@@ -25,15 +25,27 @@ acquired-plane solver.
 Without deconvolution, processing uses the acquired scan spacing.
 The [usage example](../examples/index.md) runs the same pipeline from Python.
 
-OME-NGFF does not specify the optical calibration needed to generate this PSF.
-Record the following acquisition attributes under the root's
-`opm_processing.deconvolution` object:
+As-acquired OME-Zarr stores do not need processing-specific PSF attributes.
+Processing defaults to the qi2lab 100x, NA 1.35 silicone objective, with immersion
+index 1.4, specimen index 1.38, coverslip index 1.515 and thickness 170 micrometers,
+and design working distance 300 micrometers. The default source depth is zero
+for oblique scans and 15 micrometers for planar kernels. Camera pitch, scan step
+and angle still come from acquisition metadata.
+
+Without recorded emission calibration, processing uses the channel wavelength
+as a PSF approximation. Combined labels such as `561 + 637` represent one stored
+camera channel and use the longest wavelength, 637 nm in this example. This
+approximation does not resolve separate emission spectra within a combined image.
+The resolved optical settings and wavelengths are recorded in the processing
+configuration. The acquisition store is left unchanged.
+
+Optional overrides belong under the root's `opm_processing.deconvolution` object:
 
 | Field | Expected value |
 | --- | --- |
 | `read_noise` | Optional object with `rms` and `units`. Units are `ADU`, `electrons`, or `calibrated-detector-counts`. Missing calibration selects zero read noise. |
-| `emission_wavelengths_nm` | One positive emission wavelength per channel, in storage order; required for theoretical PSFs. |
-| `psf_parameters` | Optical and numerical PSF settings described below; required unless measured PSFs are supplied. |
+| `emission_wavelengths_nm` | One positive emission wavelength per channel, in storage order; overrides the channel wavelength approximation. |
+| `psf_parameters` | Complete optical and numerical PSF settings described below; overrides the processing defaults. |
 | `detector_gain_x` | Optional measured positive response, one value per detector column. Applied only when recorded, independently of image width or acquisition mode. |
 
 Frame `Camera.read_noise_e` or `Camera.read_noise_adu` is also read when the root
@@ -85,16 +97,17 @@ Here `acquisition` is returned by `inspect_acquisition`; `calibrated_data` and
 | `read_noise` | RMS in the same units as `image`; default `0` selects no read noise. |
 | `detector_response` | Optional positive YX illumination/sensitivity response, broadcast over scan planes. Pass the image before dividing by this response; default `None`. |
 | `gpu_id` | CUDA device index; default `0`. |
-| `crop_scan` | FFT tile length in reconstruction scan planes; default `None` estimates it from free GPU memory. Tiling shares one reconstruction and stopping history. |
+| `crop_scan` | Retained scan-chunk length in reconstruction planes; default `None` estimates it from free GPU memory. Each overlapping raw chunk completes deconvolution before the next starts. |
 | `fallback_step_scan` | Tile reduction after allocation failure; default reduces the length by one quarter. |
 | `rng_seed` | Seed for fresh half-image splits; default `42`. |
+| `verbose` | Chunked processing shows a `decon` progress bar. Diagnostics are off by default (`0`); set `1` for chunk geometry, iterations and stopping reasons. |
 | `limit`, `max_delta` | Reference updated-fraction and relative-change thresholds; both default `0.001`. |
 | `use_kl` | Reference two-half KL stopping; default `True`. |
 | `scan_upsample_factor` | Integer scan-grid refinement; default `1`. For sparse acquisition use `boundary="zero"`. |
 | `boundary` | Default `"reflect"` for native sampling; `"zero"` for the acquired-plane sparse operator. |
 | `max_iterations` | Optional safety cap; default `None` for RLGC. Ordinary RL (`gradient_consensus=False`) requires a finite cap. |
-| `storage` | `"gpu"` or `"host"` for reconstruction arrays; default selected from tile size. FFTs use CUDA in either case. |
-| `callback` | Optional function receiving the iteration index and completed reconstruction. |
+| `storage` | `"gpu"` (default) or explicitly selected `"host"` for one chunk's reconstruction arrays. FFTs use CUDA in either case. |
+| `callback` | Optional function receiving the iteration index and completed chunk reconstruction. Iteration numbering restarts for each chunk. |
 
 The return value is a NumPy `float32` array with the input rank. With scan
 refinement N, M acquired planes produce `(M-1)*N+1` output planes; YX dimensions
@@ -138,12 +151,11 @@ Ordinary RL has no built-in stopping rule for noisy data.
 ## PSFs, response and execution
 
 PSFs must match channel order and reconstruction sampling. Theoretical PSFs use
-recorded optical calibration, emission wavelengths and oblique geometry.
-Excitation labels such as `488nm` are not substituted for emission wavelengths.
+resolved optical settings and wavelengths, and recorded oblique geometry.
 Planar processing uses the central plane of a supplied 3D PSF. Kernels are
 normalized to unit sum. Supplying measured `--decon-psf-paths` bypasses theoretical
-generation. Missing required PSF calibration produces an error; the library does
-not choose an objective, refractive index, wavelength or specimen depth.
+generation. Explicit optical calibration takes precedence over defaults. An
+unresolvable channel wavelength requires emission calibration or a measured PSF.
 
 Flatfield and measured detector-X response enter the forward model
 `A(x)=F*convolution(x)` and its sensitivity-normalized adjoint. They are not
@@ -154,11 +166,18 @@ retain their usual order.
 
 The single `rlgc` solver supports planar, native and undersampled reconstruction.
 Native reconstruction uses symmetric PSF halos, efficient FFT dimensions and
-cached workspaces. Scan chunks use overlap-save convolution within each global
-iteration: initialization, random halves, consensus and stopping are shared
-across the volume. Chunk boundaries are not independently reconstructed.
-Allocation fallback can retain global state in host RAM while evaluating only
-haloed FFT tiles on the GPU. Host RAM must accommodate the reconstruction state.
+cached workspaces. Large inputs use sequential scan chunks with a discarded
+processing halo of one full PSF scan support on either side. Each haloed chunk
+completes reconstruction using the same optical model and stopping rules; its
+retained interior is copied into the full output. Only the input and output span
+the acquisition. Solver-state memory depends on chunk size and detector extent.
+Allocation failure retries with a smaller scan chunk, without moving full-volume
+solver state into RAM. Device allocations are limited to 80 percent of available
+physical GPU memory, respecting any tighter caller limit, so allocation fallback
+can run before Windows spills device state into shared memory. FFT plans and
+device allocations are reused between chunks and released after the volume.
+Chunk initialization, random halves and stopping histories
+are independent, so chunked and full-volume reconstructions need not be identical.
 NumPy and CuPy random generators need not produce identical random halves.
 Processing records the solver configuration; incompatible outputs cannot be
 mixed by `--resume`.
@@ -171,7 +190,7 @@ grid; missing planes are not zero measurements. An acquisition with M planes
 produces `(M-1)*N+1` reconstruction planes, preserving endpoints.
 
 The PSF and subsequent deskew use the finer spacing. This path uses the same
-photon consensus and stopping rules, including the same FFT tiling. Both `process`
+photon consensus and stopping rules, including sequential scan chunking. Both `process`
 and `export-rois` infer this factor from acquisition metadata. ROI raw reads remain
 on the acquired grid; deconvolution and subsequent deskew use the refined grid.
 Both OPM paths follow `gc_deconv.m` for the noise shift. The MATLAB

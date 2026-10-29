@@ -3,7 +3,7 @@
 import pytest
 
 from tests.pipeline import (
-    test_extended_mosaic_full_and_tiled_agree as test_extended_mosaic_full_and_tiled_agree,
+    test_extended_mosaic_acquisition_to_fusion as test_extended_mosaic_acquisition_to_fusion,
 )
 
 pytestmark = [

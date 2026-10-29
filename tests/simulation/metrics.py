@@ -81,7 +81,9 @@ def camera_score_difference(raw, prediction, baseline, camera):
     )
 
 
-def predictive_deviance(density, expectation, psf, *, boundary="constant", response=1):
+def predictive_deviance(
+    density, expectation, psf, *, boundary="constant", response=1, selection=None
+):
     """Score absolute expected camera counts, including background, without a fit.
 
     Finite float32 kernels and FFT roundoff may create numerically zero tails.
@@ -100,6 +102,8 @@ def predictive_deviance(density, expectation, psf, *, boundary="constant", respo
         SciPy boundary mode; constant uses zero-extended FFT convolution.
     response : array-like or float
         Detector response applied after blur.
+    selection : array-like or slice or None
+        Optional camera-grid region scored after the complete optical blur.
 
     Returns
     -------
@@ -119,7 +123,10 @@ def predictive_deviance(density, expectation, psf, *, boundary="constant", respo
     else:
         blurred = ndimage.convolve(density, psf, mode=boundary)
     prediction = np.maximum(blurred * response, np.finfo(float).tiny)
-    return float(2 * kl_div(expectation, prediction).sum(dtype=np.float64))
+    divergence = kl_div(expectation, prediction)
+    if selection is not None:
+        divergence = divergence[selection]
+    return float(2 * divergence.sum(dtype=np.float64))
 
 
 def first_minimum(distance, intensity):

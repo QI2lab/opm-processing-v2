@@ -29,7 +29,7 @@ Measured PSFs must be sampled at the inferred reconstruction spacing.
 | `--write-fused-max-projection-tiff` | Also save that mosaic as OME-TIFF. |
 | `--decon-crop-scan VALUE` | Set scan planes per deconvolution chunk; default automatic. |
 | `--decon-gpu-id VALUE` | Select the CUDA device; default 0. |
-| `--decon-verbose VALUE` | Set solver verbosity; 0 suppresses iteration reports. |
+| `--decon-verbose VALUE` | Opt-in solver diagnostics: default 0 (off); 1 reports chunk geometry and iterations. |
 | `--decon-fallback-step-scan VALUE` | Set chunk reduction after GPU allocation failure. |
 | `--decon-psf-paths PATH` | Supply channel-ordered PSFs; repeat for each channel. |
 | `--eager-mode` | Legacy planar KL-stopping option; has no effect with MATLAB-default GC stopping. |

@@ -13,17 +13,20 @@ pytestmark = [
     pytest.mark.parametrize(
         "pipeline_case",
         [
-            (mode, illumination, step, crop, noise)
+            (mode, illumination, step, crop)
             for mode in ("stage", "mirror")
             for step in (0.4, 1.2)
-            for illumination, crop, noise in ((False, None, False), (True, 4, True))
+            for illumination, crop in ((False, None), (True, 4))
         ],
         indirect=True,
         ids=[
             f"{mode}-{step}um-{method}"
             for mode in ("stage", "mirror")
             for step in (0.4, 1.2)
-            for method in ("full-no-calibration", "tiled-estimated-taper-read-noise")
+            for method in (
+                "full-generated-psf",
+                "tiled-generated-psf-estimated-taper",
+            )
         ],
     ),
 ]

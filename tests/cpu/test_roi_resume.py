@@ -55,7 +55,9 @@ def test_roi_resumes_at_last_durable_channel(roi_run, monkeypatch, interruption)
         monkeypatch.setattr(ProcessingState, "complete_channel", checkpoint)
         expected_error = KeyboardInterrupt
     with pytest.raises(expected_error):
-        roi_command.process_roi(run.source, run.roi_path, deconvolve=False)
+        roi_command.process_roi(
+            run.source, run.roi_path, registration_channel=1, deconvolve=False
+        )
 
     state = ProcessingState.read(state_path)
     saved = {(0, 1, channel) for channel in range(3)}
@@ -68,10 +70,12 @@ def test_roi_resumes_at_last_durable_channel(roi_run, monkeypatch, interruption)
 
     # A replay of any completed channel would now produce different pixels.
     for _, position, channel in saved:
-        run.raw.arrays[position][0, channel].write(np.uint16(901)).result()
+        run.raw_arrays[position][0, channel].write(np.uint16(901)).result()
     monkeypatch.setattr(ProcessingState, "complete_channel", real_complete)
     monkeypatch.setattr(run.process, "write_checkpointed_roi_channel", real_write)
-    roi_command.process_roi(run.source, run.roi_path, deconvolve=False)
+    roi_command.process_roi(
+        run.source, run.roi_path, registration_channel=1, deconvolve=False
+    )
 
     resumed = open_position_collection(output)
     for array, expected_array in zip(resumed.arrays, expected, strict=False):
@@ -87,7 +91,7 @@ def test_roi_resumes_at_last_durable_channel(roi_run, monkeypatch, interruption)
 def test_empty_roi_channel_is_checkpointed_and_skipped(roi_run, monkeypatch):
     """Persist an empty channel before interruption and preserve it on resume."""
     run = roi_run
-    run.raw.arrays[1][0, 0].write(np.uint16(100)).result()
+    run.raw_arrays[1][0, 0].write(np.uint16(100)).result()
     real_complete = ProcessingState.complete_channel
 
     def stop_after_empty(self, *args, **kwargs):
@@ -114,7 +118,7 @@ def test_empty_roi_channel_is_checkpointed_and_skipped(roi_run, monkeypatch):
     assert state.zero_channels(output) == {(0, 1, 0)}
     assert state.completed_tiles(output) == set()
 
-    run.raw.arrays[1][0, 0].write(np.uint16(901)).result()
+    run.raw_arrays[1][0, 0].write(np.uint16(901)).result()
     monkeypatch.setattr(ProcessingState, "complete_channel", real_complete)
     run.process.process_skewed(run.source, **options)
     result = open_position_collection(output)
@@ -135,12 +139,16 @@ def test_roi_processing_resumes_by_default(roi_run, flag, expected):
     """CLI resume preserves saved pixels; explicit restart replaces them."""
     run = roi_run
     options = {} if flag is None else {"resume": expected}
-    roi_command.process_roi(run.source, run.roi_path, deconvolve=False, **options)
+    roi_command.process_roi(
+        run.source, run.roi_path, registration_channel=1, deconvolve=False, **options
+    )
     output_path = run.output_dir / "sample_deskewed.ome.zarr"
     before = open_position_collection(output_path).arrays[0].read().result()
     np.testing.assert_array_equal(before, run.expected_tiles[0])
-    run.raw.arrays[1].write(np.uint16(901)).result()
-    roi_command.process_roi(run.source, run.roi_path, deconvolve=False, **options)
+    run.raw_arrays[1].write(np.uint16(901)).result()
+    roi_command.process_roi(
+        run.source, run.roi_path, registration_channel=1, deconvolve=False, **options
+    )
     after = open_position_collection(output_path).arrays[0].read().result()
     np.testing.assert_array_equal(
         open_position_collection(output_path).arrays[1].read().result(),
@@ -229,6 +237,7 @@ def test_roi_command_fuses_selected_tiles_and_projects_pixels(
     roi_command.process_roi(
         dataset.path,
         roi_path,
+        registration_channel=1,
         deconvolve=False,
         flatfield_correction=False,
         save_float32=True,

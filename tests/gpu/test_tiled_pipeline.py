@@ -1,9 +1,9 @@
-"""Automatic memory-limited RLGC compared with full processing of identical mosaics."""
+"""Automatically chunked RLGC from physical acquisition through fused datastore."""
 
 import pytest
 
 from tests.pipeline import (
-    test_extended_mosaic_full_and_tiled_agree as test_extended_mosaic_full_and_tiled_agree,
+    test_extended_mosaic_acquisition_to_fusion as test_extended_mosaic_acquisition_to_fusion,
 )
 
 pytestmark = [

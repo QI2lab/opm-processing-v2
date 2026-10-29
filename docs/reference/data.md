@@ -48,9 +48,19 @@ contain OME/NGFF image metadata; mutable processing checkpoints are kept in the
 journal. Run fingerprints include the settings and geometry needed for compatible
 resume. Completion is recorded after writes are durable.
 
-The journal also locates the raw acquisition when ROI processing or export is
-launched from a separate output directory. Keep that raw path accessible, and
-keep the journal beside the outputs when moving a dataset.
+The journal also locates the raw acquisition when processing, fusion, inspection,
+or export starts from an output directory. New journals record a relative source
+link as well as the absolute provenance path. Keep the journal beside its outputs
+and preserve the relative raw/output layout when moving or copying a dataset.
+An existing same-named raw store beside the current input takes precedence over
+the recorded absolute location, including when the original copy is accessible.
+Nested ROI journals can also resolve raw data through the matching acquisition
+journal in a parent directory. Separately stored acquisitions on another drive
+must remain accessible at their recorded location or be explicitly selected.
+
+Stage-placed projection metadata stores relative links to its source collection.
+Live manifests likewise prefer an existing raw store beside the current manifest
+over their historical absolute `data_path`.
 
 ## Units and pyramids
 

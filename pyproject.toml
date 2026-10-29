@@ -101,6 +101,11 @@ docs = [
 # Keep the GPU extra selected during ordinary sync/run on CUDA workstations.
 gpu = ["opm-processing-v2[gpu]; sys_platform == 'win32' or sys_platform == 'linux'"]
 dev = [
+    # Runtime subset needed by opm-v2's actual acquisition writer in tests.
+    # Install opm-v2 itself without microscope-control dependencies; see tests/CONTRIBUTING.md.
+    "ome-writers[tensorstore] @ git+https://github.com/pymmcore-plus/ome-writers@bac0f391eeadc1083b70cbafb2e5efd3e7075df9",
+    "pymmcore-plus @ git+https://github.com/pymmcore-plus/pymmcore-plus@70d330d57c97d5936e4aa8efefcab6bb161c0030",
+    "useq-schema>=0.9.2",
     "ipython",
     "pdbpp",  # https://github.com/pdbpp/pdbpp
     "pytest",

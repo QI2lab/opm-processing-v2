@@ -22,8 +22,9 @@ process(
 
 The pipeline selects each channel, timepoint and position using the stored axes.
 Camera calibration and scan geometry come from the OME-Zarr; missing read-noise
-calibration selects the no-read-noise model. Theoretical PSFs require recorded
-optical calibration and emission wavelengths. Measured PSFs can be supplied
+calibration selects the no-read-noise model. Theoretical PSFs use the processing
+defaults for the silicone objective and channel wavelengths unless optical
+calibration and emission wavelengths are recorded. Measured PSFs can be supplied
 instead with `decon_psf_paths=[Path(...), ...]`, in channel order.
 
 See [deconvolution parameters and metadata](../methods/deconvolution.md) for the

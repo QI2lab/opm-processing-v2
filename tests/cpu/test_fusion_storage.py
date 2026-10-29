@@ -277,7 +277,7 @@ def test_multiscale_storage_round_trip_matches_reference(
     assert not any(key.startswith("opm_") for key in reopened.attrs)
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 def test_regenerate_max_z_flag_preserves_multiscale_pyramid_round_trip(
     registered_projection_case,
 ) -> None:

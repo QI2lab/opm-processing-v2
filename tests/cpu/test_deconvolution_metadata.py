@@ -1,4 +1,4 @@
-"""Stored calibration determines deconvolution units without instrument defaults."""
+"""Resolve acquired calibration and processing defaults in physical units."""
 
 from dataclasses import replace
 
@@ -142,19 +142,94 @@ def test_invalid_recorded_noise_is_not_silently_replaced(
         read_noise_from_metadata(acquisition)
 
 
-@pytest.mark.parametrize("field", ["psf_parameters", "emission_wavelengths_nm"])
-def test_missing_optics_are_not_inferred_from_channel_labels(
-    deconvolution_acquisition, field
-):
-    """Require recorded optical calibration independently of excitation labels."""
+def test_as_acquired_data_uses_processing_optics(deconvolution_acquisition):
+    """Raw stores need no processing attributes to select the silicone objective."""
     acquisition = inspect_acquisition(deconvolution_acquisition.path)
-    read = (
-        psf_parameters_from_metadata
-        if field == "psf_parameters"
-        else emission_wavelengths_from_metadata
+    assert not acquisition.deconvolution
+    parameters = psf_parameters_from_metadata(acquisition)
+    assert parameters["lens"]["NA"] == 1.35
+    assert parameters["lens"]["ni"] == 1.4
+    assert parameters["skewed_depth_um"] == 0.0
+    assert emission_wavelengths_from_metadata(acquisition) == (0.488,)
+    parameters["lens"]["NA"] = 0.5
+    assert psf_parameters_from_metadata(acquisition)["lens"]["NA"] == 1.35
+
+
+@pytest.mark.parametrize(
+    "labels, expected",
+    [
+        (["488nm", "561nm", "637nm"], (0.488, 0.561, 0.637)),
+        (["561 + 637"], (0.637,)),
+        (["637nm + 561 NM"], (0.637,)),
+        (["488", "561 + 637"], (0.488, 0.637)),
+    ],
+)
+def test_channel_wavelength_approximation_preserves_storage_order(
+    acquisition_metadata, labels, expected
+):
+    """Combined excitation remains one camera channel with its longest wavelength."""
+    template = acquisition_metadata.channels[0]
+    acquisition = replace(
+        acquisition_metadata,
+        channels=tuple(
+            replace(template, index=index, name=label, wavelength_nm=None)
+            for index, label in enumerate(labels)
+        ),
     )
-    with pytest.raises(ValueError, match=field):
-        read(acquisition)
+    assert emission_wavelengths_from_metadata(acquisition) == expected
+
+
+def test_unresolved_channel_requires_wavelength_calibration(acquisition_metadata):
+    """Name an unresolvable channel rather than guessing its spectrum."""
+    channel = replace(
+        acquisition_metadata.channels[0], name="beads", wavelength_nm=None
+    )
+    acquisition = replace(acquisition_metadata, channels=(channel,))
+    with pytest.raises(ValueError, match=r"beads.*emission_wavelengths_nm"):
+        emission_wavelengths_from_metadata(acquisition)
+    channel = replace(channel, wavelength_nm=615)
+    assert emission_wavelengths_from_metadata(
+        replace(acquisition, channels=(channel,))
+    ) == (0.615,)
+
+
+@pytest.mark.parametrize(
+    "values", [None, 615, [], [0], [-615], [np.nan], [np.inf], [561, 637], ["unknown"]]
+)
+def test_invalid_explicit_wavelengths_do_not_use_defaults(acquisition_metadata, values):
+    """Explicit calibration takes priority, including validation of invalid data."""
+    acquisition = replace(
+        acquisition_metadata, deconvolution={"emission_wavelengths_nm": values}
+    )
+    with pytest.raises(ValueError, match="wavelength"):
+        emission_wavelengths_from_metadata(acquisition)
+
+
+@pytest.mark.parametrize("projection", [False, True])
+def test_as_acquired_combined_channel_psf_has_lateral_symmetry(
+    deconvolution_acquisition, projection
+):
+    """A centered emitter has lateral reflection symmetry with default optics."""
+    acquisition = inspect_acquisition(deconvolution_acquisition.path)
+    channel = replace(acquisition.channels[0], name="561 + 637", wavelength_nm=None)
+    acquisition = replace(acquisition, channels=(channel,), scan_axis_step_um=1.2)
+    kernels, parameters = load_deconvolution_psfs(
+        acquisition, projection=projection, reconstruction_step_um=0.4
+    )
+    assert parameters["lens"]["NA"] == 1.35
+    assert len(kernels) == 1
+    kernel = kernels[0]
+    assert kernel.ndim == 3
+    assert (kernel.shape[0] == 1) == projection
+    assert all(size % 2 == 1 for size in kernel.shape)
+    assert np.all(np.isfinite(kernel) & (kernel >= 0))
+    assert kernel.sum() > 0
+    np.testing.assert_allclose(
+        kernel,
+        kernel[..., ::-1],
+        rtol=1e-6,
+        atol=8 * np.finfo(np.float32).eps * kernel.max(),
+    )
 
 
 @pytest.mark.parametrize("profile", [None, [0.7, 0.8, 0.9, 1, 1.1]])

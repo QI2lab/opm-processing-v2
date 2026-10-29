@@ -25,7 +25,7 @@ or recompressing pixels. See [export-ome-tiff](../reference/cli/export-ome-tiff.
 ## Reconstructed ROI exports
 
 ```bash
-uv run export-rois "/path/to/processed" --deconvolve --tiff
+uv run export-rois "/path/to/processed" --registration-channel 1 --deconvolve --tiff
 ```
 
 Draw multiple XY rectangles on an existing deskewed maximum-Z preview in
@@ -89,3 +89,30 @@ Hardware encoding requires an NVENC-capable NVIDIA GPU and compatible driver.
 MP4s are lossy presentation copies. See
 [export-projections](../reference/cli/export-projections.md) and
 [encode-projections](../reference/cli/encode-projections.md) for options.
+
+## AO grid and pupil overlays
+
+```bash
+uv run python scripts/export_ao_overview.py "/path/to/acquisition" --channel 1
+```
+
+The script writes an `ao_overview` directory with a projection overview PNG,
+`ao_grid_pupils.tiff`, coordinate provenance JSON, and one coefficient plot per
+correction region. The TIFF has a transparent RGBA page for each AO depth at the
+selected timepoint, at the exact level-zero projection dimensions. Use
+`--depth-index 0` for a single-page overlay and a different `--output` directory
+for an additional selection. Background image pixels are included only in the
+overview PNG.
+
+Pupil reconstruction and coefficient plots use the selected
+`sjs_opm_scripts/ao_scripts/parse_ao_grid_results.py` directly. The default looks
+for that repository beside this checkout; use `--ao-reader` for another location.
+WaveKit ordering and RMS normalization come from that reader. Pupils default to
+the final saved coefficient state and its 488 nm wavelength convention; change
+`--coefficient-state` or `--wavelength-nm` explicitly when needed. A shared color
+range compares regions; `--phase-limit` sets a fixed symmetric limit in radians.
+
+Grid placement uses planned AO positions, recorded stage-to-laboratory scan
+compensation, and interpolated registered tile translations for the selected
+depth. The JSON records the resulting full-resolution pupil centers and the
+reference implementation's hash. Existing generated files require `--overwrite`.
