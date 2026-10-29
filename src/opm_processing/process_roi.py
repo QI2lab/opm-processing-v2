@@ -6,7 +6,10 @@ import math
 from dataclasses import replace
 from pathlib import Path
 
+import numpy as np
+
 from opm_processing.dataio.acquisition import (
+    AcquisitionMetadata,
     acquisition_stem,
     inspect_acquisition,
 )
@@ -18,13 +21,115 @@ from opm_processing.dataio.roi import PhysicalRoi
 from opm_processing.imageprocessing.maxtilefusion import (
     regenerate_fused_max_projection,
 )
-from opm_processing.imageprocessing.tilefusion import TileFusion
+from opm_processing.imageprocessing.opmtools import deskew_shape_estimator
+from opm_processing.imageprocessing.tilefusion import (
+    DEFAULT_REGISTRATION_DOWNSAMPLE,
+    DEFAULT_REGISTRATION_SSIM_WINDOW,
+    TileFusion,
+    _infer_registration_limits,
+)
 from opm_processing.process import process_skewed
+
+
+def roi_with_registration_context(
+    roi: PhysicalRoi,
+    acquisition: AcquisitionMetadata,
+    z_downsample_level: int,
+) -> PhysicalRoi:
+    """Retain registration search and SSIM context around the selected rectangle.
+
+    Parameters
+    ----------
+    roi : PhysicalRoi
+        Original selection with saved full-acquisition tile placements.
+    acquisition : AcquisitionMetadata
+        Raw pixel calibration and camera height.
+    z_downsample_level : int
+        Deskewed Z reduction used by the subsequent ROI fusion.
+
+    Returns
+    -------
+    PhysicalRoi
+        Expanded processing rectangle. Context follows the same geometry-based
+        search limits as fusion, including depth-dependent footprint shifts;
+        nearly coincident tiles never request their entire overlap as a halo.
+    """
+    pixel = float(acquisition.pixel_size_um)
+    spacing = np.array((pixel * z_downsample_level, pixel, pixel))
+    deskew_shape, *_ = deskew_shape_estimator(
+        acquisition.shape[-3:],
+        theta=acquisition.angle_deg,
+        distance=acquisition.scan_axis_step_um,
+        pixel_size=pixel,
+        downsample_factor=z_downsample_level,
+        crop_after_deskew=False,
+    )
+    z_count = int(deskew_shape[0])
+    support = (
+        (DEFAULT_REGISTRATION_SSIM_WINDOW // 2 + 1)
+        * np.asarray(DEFAULT_REGISTRATION_DOWNSAMPLE[1:])
+        * pixel
+    )
+    bounds = np.asarray(roi.bounds_yx_um, dtype=float)
+    margins = np.zeros(2)
+    footprints = roi.tile_footprints
+    times = sorted({tile["time_index"] for tile in footprints})
+    for _ in range(32):
+        expanded = bounds + np.array((-margins[0], margins[0], -margins[1], margins[1]))
+        needed = np.zeros(2)
+        for time in times:
+            group = [tile for tile in footprints if tile["time_index"] == time]
+            if len(group) < 2 or all(
+                np.array_equal(tile["origin_zyx_um"], group[0]["origin_zyx_um"])
+                for tile in group
+            ):
+                continue
+            origins, shapes = [], []
+            for tile in group:
+                y0, y1, x0, x1 = tile["bounds_yx_um"]
+                y0, y1 = max(y0, expanded[0]), min(y1, expanded[1])
+                x0, x1 = max(x0, expanded[2]), min(x1, expanded[3])
+                if y1 <= y0 or x1 <= x0:
+                    continue
+                origins.append((tile["origin_zyx_um"][0], y0, x0))
+                shapes.append(
+                    (
+                        z_count,
+                        math.ceil((y1 - y0) / pixel),
+                        math.ceil((x1 - x0) / pixel),
+                    )
+                )
+            limits = _infer_registration_limits(
+                origins,
+                shapes,
+                spacing,
+                DEFAULT_REGISTRATION_DOWNSAMPLE,
+                acquisition.angle_deg,
+            )
+            for limit in limits.values():
+                needed = np.maximum(needed, np.asarray(limit[1:]) * pixel + support)
+        needed = np.ceil(needed / pixel - 1e-9) * pixel
+        if np.all(needed <= margins):
+            break
+        margins = np.maximum(margins, needed)
+    else:
+        raise RuntimeError(
+            "ROI registration context did not reach a stable search envelope"
+        )
+    print(f"ROI registration context: Y={margins[0]:.3f} um, X={margins[1]:.3f} um")
+    return replace(
+        roi,
+        bounds_yx_um=tuple(
+            bounds + np.array((-margins[0], margins[0], -margins[1], margins[1]))
+        ),
+    )
 
 
 def process_roi(
     root_path: Path,
     roi_json: Path,
+    *,
+    registration_channel: int,
     deconvolve: bool = False,
     flatfield_correction: bool = False,
     save_float32: bool = False,
@@ -32,9 +137,8 @@ def process_roi(
     crop_after_deskew: bool = False,
     decon_crop_scan: int | None = None,
     decon_gpu_id: int = 0,
-    decon_verbose: int = 1,
+    decon_verbose: int = 0,
     decon_psf_paths: list[Path] | None = None,
-    registration_channel: int = 0,
     resume: bool = True,
     output: Path | None = None,
 ) -> Path:
@@ -61,7 +165,7 @@ def process_roi(
     decon_gpu_id : int
         Zero-based CUDA device used for deconvolution.
     decon_verbose : int
-        Deconvolution diagnostic verbosity.
+        Deconvolution diagnostics: zero (default) disables them; one enables them.
     decon_psf_paths : list[pathlib.Path] or None
         Channel-ordered PSF files; None generates theoretical PSFs.
     registration_channel : int
@@ -86,7 +190,7 @@ def process_roi(
                 "the input directory contains multiple processing-state files."
             )
         state = ProcessingState.read(state_paths[0])
-        acquisition = inspect_acquisition(Path(state.document["source"]["path"]))
+        acquisition = inspect_acquisition(state.source_path())
         context_dir = requested_path
     else:
         acquisition = inspect_acquisition(requested_path)
@@ -96,6 +200,8 @@ def process_roi(
             "ROI processing currently targets skewed 3D acquisitions; use process "
             "for native 2D data"
         )
+    if not 0 <= registration_channel < len(acquisition.channels):
+        raise ValueError("Registration channel is outside the acquired channel range")
     if crop_after_deskew:
         raise ValueError(
             "ROI processing already writes exact physical ROI crops; "
@@ -115,43 +221,19 @@ def process_roi(
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Preserve geometric overlap outside the requested rectangle for local
-    # registration. Crop to the exact requested bounds only during final fusion.
-    margins = [0.0, 0.0]
-    footprints = roi.tile_footprints
-    for index, left in enumerate(footprints):
-        for right in footprints[index + 1 :]:
-            if (
-                left["time_index"] != right["time_index"]
-                or left["position_index"] == right["position_index"]
-            ):
-                continue
-            a, b = left["bounds_yx_um"], right["bounds_yx_um"]
-            overlap = [
-                min(a[1], b[1]) - max(a[0], b[0]),
-                min(a[3], b[3]) - max(a[2], b[2]),
-            ]
-            if min(overlap) <= 0:
-                continue
-            # Depth-neighbor alignment can move the common oblique-plane
-            # footprint along Y by dz*cot(theta); retain that image context.
-            depth = abs(left["origin_zyx_um"][0] - right["origin_zyx_um"][0])
-            margins[0] = max(
-                margins[0], depth / math.tan(math.radians(acquisition.angle_deg))
-            )
-            for axis in range(2):
-                if left["origin_zyx_um"][axis + 1] != right["origin_zyx_um"][axis + 1]:
-                    margins[axis] = max(margins[axis], overlap[axis])
-    y0, y1, x0, x1 = roi.bounds_yx_um
-    processing_roi = replace(
-        roi,
-        bounds_yx_um=(
-            y0 - margins[0],
-            y1 + margins[0],
-            x0 - margins[1],
-            x1 + margins[1],
-        ),
-    )
+    processing_roi = roi_with_registration_context(roi, acquisition, z_downsample_level)
+    state_path = processing_state_path(output_dir, stem)
+    if resume and deconvolve and state_path.is_file():
+        old_state = ProcessingState.read(state_path)
+        old_output = output_dir / f"{stem}_decon_deskewed.ome.zarr"
+        old_run = old_state.document["outputs"].get(old_output.name)
+        if (
+            old_run is not None
+            and not old_state.completed_channels(old_output)
+            and not old_state.completed_tiles(old_output)
+        ):
+            print("Rebuilding uncheckpointed ROI output; reusing saved selection.")
+            resume = False
     process_skewed(
         root_path=acquisition.path,
         acquisition=acquisition,

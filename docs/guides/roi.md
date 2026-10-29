@@ -24,14 +24,14 @@ which raw data correspond to each rectangle.
 ## Select and process
 
 ```bash
-uv run export-rois "/path/to/processed"
+uv run export-rois "/path/to/processed" --registration-channel 1
 ```
 
 You can also pass the raw acquisition store or the exact preview path:
 
 ```bash
 uv run export-rois "/path/to/sample_max_z_fused.ome.zarr" --deconvolve --registration-channel 1
-uv run export-rois "/path/to/sample_max_z_deskewed.ome.zarr" --deconvolve --tiff
+uv run export-rois "/path/to/sample_max_z_deskewed.ome.zarr" --registration-channel 1 --deconvolve --tiff
 ```
 
 1. Inspect channels and, for timelapses, move the time slider.
@@ -45,12 +45,21 @@ channel and timepoint do not restrict the output. Closing without rectangles
 creates no exports.
 
 Raw data are camera-calibrated, optionally deconvolved with RLGC, and
-orthogonally deskewed. Multi-position ROIs retain overlap for a fresh local
+orthogonally deskewed. Raw reads are restricted to the selected region plus
+registration context and discarded PSF halos before deconvolution. Registration
+context follows the search envelope and SSIM support. Larger raw crops use the
+standard sequential, overlapping scan-chunk deconvolution. A `decon` bar tracks the
+chunks. Set `--decon-verbose 1` to report chunk geometry, iterations and stopping
+reasons; diagnostics are off by default.
+Multi-position ROIs retain overlap for a fresh local
 registration and fusion, including when the preview was already registered.
 The final image is cropped to the requested physical XY bounds. Single-position
 ROIs are assembled across time without measuring pairwise registration links.
 `--flatfield-correction` enables the same illumination handling as `process`.
 Deconvolution is disabled unless `--deconvolve` is supplied.
+`--registration-channel` is required and uses zero-based indices; choose 0 for
+single-channel data. Saved full-volume transforms, displaced for the raw and
+deskew crops, initialize the local registration.
 
 ## Outputs and resume
 
@@ -71,5 +80,8 @@ checkpoints without reopening napari. Local registration checkpoints belong to
 the ROI run; preview registration is never used as the final ROI solution.
 Use `--no-resume` to draw new rectangles and restart processing. An incompatible
 configuration is rejected during resume.
+To retain existing outputs while using a different crop layout, choose a new
+`--output` directory. With resume enabled, selections from the default
+`roi_exports` directory are reused without copying or overwriting its image data.
 
 See the [command reference](../reference/cli/export-rois.md) for options.

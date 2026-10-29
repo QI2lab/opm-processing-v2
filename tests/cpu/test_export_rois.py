@@ -1,6 +1,7 @@
 """Physical GUI selections and raw-to-OME ROI processing integration."""
 
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -14,6 +15,52 @@ from opm_processing.dataio.position_collection import open_image_array
 from opm_processing.dataio.processing_state import ProcessingState
 
 
+@pytest.mark.unit
+@pytest.mark.parametrize("windows_paths", [False, True])
+@pytest.mark.parametrize(
+    ("raw_name", "preview_name", "matches"),
+    [
+        ("sample.ome.zarr", "sample_max_z_fused.ome.zarr", True),
+        ("other.ome.zarr", "sample_max_z_fused.ome.zarr", False),
+        ("sample.ome.zarr", "other_max_z_fused.ome.zarr", False),
+    ],
+)
+def test_saved_selection_relocation_requires_same_stores(
+    tmp_path, windows_paths, raw_name, preview_name, matches
+):
+    """Allow root relocation while rejecting a different raw store or preview."""
+    from pathlib import PureWindowsPath
+
+    old = PureWindowsPath(r"F:\old") if windows_paths else tmp_path / "old"
+    manifest = {
+        "source_path": str(old / raw_name),
+        "preview_path": str(old / preview_name),
+    }
+    assert (
+        export_rois.selection_paths_match(
+            manifest,
+            tmp_path / "current" / "sample.ome.zarr",
+            tmp_path / "current" / "sample_max_z_fused.ome.zarr",
+        )
+        == matches
+    )
+
+
+@pytest.mark.unit
+def test_selections_with_separate_accessible_raw_directory(tmp_path):
+    """Moving previews alone can retain an unchanged external raw-data source."""
+    raw = tmp_path / "raw" / "sample.ome.zarr"
+    manifest = {
+        "source_path": str(raw),
+        "preview_path": str(tmp_path / "old" / "sample_max_z_fused.ome.zarr"),
+    }
+    preview = tmp_path / "current" / "sample_max_z_fused.ome.zarr"
+    assert export_rois.selection_paths_match(manifest, raw, preview)
+    assert not export_rois.selection_paths_match(
+        manifest, Path(tmp_path / "different" / raw.name), preview
+    )
+
+
 @pytest.mark.integration
 @pytest.mark.parametrize(
     "roi_preview",
@@ -21,16 +68,42 @@ from opm_processing.dataio.processing_state import ProcessingState
         ("mirror", 1, False),
         ("stage", 1, False),
         ("mirror", 2, False),
+        ("stage", 2, False),
         ("stage", 2, True),
     ],
     indirect=True,
 )
 @pytest.mark.parametrize("tiff", [False, True])
-def test_raw_roi_exports_and_resume(roi_preview, tiff, monkeypatch):
+def test_raw_roi_exports_and_resume(
+    roi_preview, tiff, monkeypatch, relocate_acquisition, invoke_cli
+):
     """Reconstruct multiple rectangles with all times/channels and global origins."""
     case = roi_preview
+    reference = case.collection.arrays[0].read().result()
+    directory = case.preview.parent
+    preview_name = case.preview.name
     selections = [(3, 12, 2, 10), (5, 15, 4, 12)]
     calls = []
+    checkpoints = []
+    complete_channel = ProcessingState.complete_channel
+    from opm_processing.imageprocessing.tilefusion import TileFusion
+
+    register = TileFusion.register_with_retries
+
+    def register_selected_channel(fusion):
+        """Inspect the real registration object and execute its actual algorithm."""
+        if fusion._variable_roi_tiles:
+            assert fusion.channel_to_use == 1
+        return register(fusion)
+
+    monkeypatch.setattr(TileFusion, "register_with_retries", register_selected_channel)
+
+    def observe_checkpoint(state, *args, **kwargs):
+        """Record actual writes so relocation must retain completed channels."""
+        checkpoints.append(args)
+        return complete_channel(state, *args, **kwargs)
+
+    monkeypatch.setattr(ProcessingState, "complete_channel", observe_checkpoint)
 
     def choose(source, shape):
         """Supply user interaction while exercising actual processing and storage."""
@@ -39,14 +112,51 @@ def test_raw_roi_exports_and_resume(roi_preview, tiff, monkeypatch):
         return selections
 
     monkeypatch.setattr(export_rois, "select_rois", choose)
-    args = [str(case.preview), "--save-float32"] + (["--tiff"] if tiff else [])
-    for _attempt in range(2):
+    missing_channel = CliRunner().invoke(export_rois.app, [str(directory)])
+    assert missing_channel.exit_code == 2
+    assert "--registration-channel" in missing_channel.output
+    assert not calls
+    completed = None
+    for attempt in range(2):
+        # Cover fresh selection after a move and saved-selection/checkpoint
+        # resume after a copy, even while the old acquisition remains available.
+        if attempt == int(tiff):
+            directory = relocate_acquisition(directory, copy=tiff)
+            if attempt:
+                # Independently invoked commands must find raw data from a
+                # nested moved ROI journal before export_rois resumes it.
+                roi_directory = directory / "roi_exports" / "roi_001"
+                invoke_cli(
+                    "fuse",
+                    roi_directory,
+                    roi=roi_directory / "roi.json",
+                    registration_channel=1,
+                    max_workers=1,
+                )
+                fused = (
+                    open_image_array(roi_directory / "sample_fused.ome.zarr")
+                    .read()
+                    .result()
+                )
+                y0, y1, x0, x1 = selections[0]
+                np.testing.assert_allclose(
+                    fused[..., : reference.shape[-3], : y1 - y0, : x1 - x0],
+                    reference[..., y0:y1, x0:x1],
+                    rtol=2e-6,
+                    atol=2e-3,
+                )
+        args = [str(directory), "--registration-channel", "1", "--save-float32"] + (
+            ["--tiff"] if tiff else []
+        )
         result = CliRunner().invoke(export_rois.app, args)
         assert result.exit_code == 0, result.exception
         assert len(calls) == 1
+        if completed is not None:
+            assert len(checkpoints) == completed
+        completed = len(checkpoints)
         for index, (y0, y1, x0, x1) in enumerate(selections, 1):
-            directory = case.preview.parent / "roi_exports" / f"roi_{index:03d}"
-            image = directory / "sample_fused.ome.zarr"
+            roi_directory = directory / "roi_exports" / f"roi_{index:03d}"
+            image = roi_directory / "sample_fused.ome.zarr"
             root = open_group(image)
             assert isinstance(root.ome_metadata(), v05.Image)
             data = open_image_array(image).read().result()
@@ -54,7 +164,7 @@ def test_raw_roi_exports_and_resume(roi_preview, tiff, monkeypatch):
             assert data.shape[-2:] == (y1 - y0, x1 - x0)
             # The selected preimage must retain the same measured photons as
             # full processing of this simulated specimen, at every time/channel.
-            expected = case.collection.arrays[0].read().result()[..., y0:y1, x0:x1]
+            expected = reference[..., y0:y1, x0:x1]
             np.testing.assert_allclose(data, expected, rtol=2e-6, atol=2e-3)
             assert np.all(data.max(axis=(2, 3, 4)) > 0)
             dataset = root.ome_metadata().multiscales[0].datasets[0]
@@ -63,12 +173,13 @@ def test_raw_roi_exports_and_resume(roi_preview, tiff, monkeypatch):
             assert origin[-2:] == pytest.approx(
                 (case.origin[1] + y0 * pixel, case.origin[2] + x0 * pixel)
             )
-            state = ProcessingState.read(directory / "sample.processing.json")
-            tiles = directory / "sample_deskewed.ome.zarr"
+            state = ProcessingState.read(roi_directory / "sample.processing.json")
+            assert state.source_path() == directory / case.dataset.path.name
+            tiles = roi_directory / "sample_deskewed.ome.zarr"
             assert len(state.completed_channels(tiles)) == 2 * 2 * case.positions
             if case.positions > 1:
                 assert state.registration(tiles)["pairwise_metrics"]
-            target = directory / f"sample_roi_{index:03d}.ome.tiff"
+            target = roi_directory / f"sample_roi_{index:03d}.ome.tiff"
             assert target.is_file() == tiff
             if tiff:
                 with tifffile.TiffFile(target) as tif:
@@ -89,12 +200,44 @@ def test_raw_roi_exports_and_resume(roi_preview, tiff, monkeypatch):
                         ome.stage_label.y,
                         ome.stage_label.x,
                     ) == pytest.approx(origin[-3:])
+    # The directory form of process_roi must resolve the relocated main journal
+    # too; export_rois normally passes the already-resolved raw store directly.
+    first_roi = directory / "roi_exports" / "roi_001"
+    export_rois.process_roi(
+        directory,
+        first_roi / "roi.json",
+        registration_channel=1,
+        output=first_roi,
+        save_float32=True,
+        z_downsample_level=1,
+    )
+    assert len(checkpoints) == completed
     manifest = json.loads(
-        (case.preview.parent / "roi_exports" / "selections.json").read_text(
-            encoding="utf-8"
-        )
+        (directory / "roi_exports" / "selections.json").read_text(encoding="utf-8")
     )
     assert len(manifest["rois"]) == 2
+    assert calls[0].name == preview_name
+    if case.positions == 1 and case.dataset.metadata.mode == "mirror" and not tiff:
+        alternate = directory / "selected_again"
+        invoke_cli(
+            "export-rois",
+            directory,
+            registration_channel=1,
+            output=alternate,
+            save_float32=True,
+        )
+        assert len(calls) == 1
+        for index, (y0, y1, x0, x1) in enumerate(selections, 1):
+            saved = (
+                open_image_array(
+                    alternate / f"roi_{index:03d}" / "sample_fused.ome.zarr"
+                )
+                .read()
+                .result()
+            )
+            np.testing.assert_allclose(
+                saved, reference[..., y0:y1, x0:x1], rtol=2e-6, atol=2e-3
+            )
 
 
 @pytest.mark.unit
@@ -106,7 +249,7 @@ def test_missing_preview_explains_creation(tmp_path):
 
 @pytest.mark.integration
 @pytest.mark.parametrize(
-    "mosaic_acquisition", [("mirror", 0.4), ("stage", 1.2)], indirect=True
+    "mosaic_acquisition", [("mirror", 0.4, 0.001), ("stage", 1.2, 0.001)], indirect=True
 )
 def test_roi_maps_extended_specimen_to_raw_tiles(mosaic_acquisition, monkeypatch):
     """Keep the oblique preimage and measure fresh links across a real tile seam."""
@@ -139,7 +282,9 @@ def test_roi_maps_extended_specimen_to_raw_tiles(mosaic_acquisition, monkeypatch
         return result
 
     monkeypatch.setattr(TileFusion, "register_and_score", staticmethod(measure))
-    result = CliRunner().invoke(export_rois.app, [str(preview), "--save-float32"])
+    result = CliRunner().invoke(
+        export_rois.app, [str(preview), "--registration-channel", "0", "--save-float32"]
+    )
     assert result.exit_code == 0, result.exception
     directory = preview.parent / "roi_exports" / "roi_001"
     state = ProcessingState.read(directory / "mosaic.processing.json")
@@ -158,7 +303,7 @@ def test_roi_maps_extended_specimen_to_raw_tiles(mosaic_acquisition, monkeypatch
     assert np.isfinite(final).all() and np.any(final > 0)
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 @pytest.mark.parametrize(
     "roi_preview", [("mirror", 1, False), ("stage", 1, False)], indirect=True
 )
@@ -186,7 +331,7 @@ def test_single_position_gui_keeps_time_and_global_coordinates(
     ]
 
 
-@pytest.mark.integration
+@pytest.mark.unit
 @pytest.mark.parametrize("z_origin", [0.0, -2441.811])
 def test_draw_rois_on_thick_projection(
     monkeypatch, z_origin, napari_model, fused_store_factory, simulated_camera

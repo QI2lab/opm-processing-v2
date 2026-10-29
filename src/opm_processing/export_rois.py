@@ -1,7 +1,7 @@
 """Select maximum-Z ROIs, reconstruct raw regions, and export OME-Zarr/TIFF."""
 
 import json
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import TYPE_CHECKING, Annotated
 
 import numpy as np
@@ -25,12 +25,46 @@ from opm_processing.dataio.processing_state import (
 )
 from opm_processing.dataio.roi import (
     ROI_PREVIEW_SUFFIXES,
+    PhysicalRoi,
     projection_tile_footprints,
     roi_from_image_pixel_rectangle,
 )
 from opm_processing.process_roi import process_roi
 
 app = typer.Typer(pretty_exceptions_enable=False)
+
+
+def selection_paths_match(manifest: dict, acquisition: Path, preview: Path) -> bool:
+    """Match saved selections after relocating their acquisition and preview.
+
+    Parameters
+    ----------
+    manifest : dict
+        Saved acquisition and preview paths from selections.json.
+    acquisition : pathlib.Path
+        Raw store selected from the current command input.
+    preview : pathlib.Path
+        Current preview used for the saved physical rectangles.
+
+    Returns
+    -------
+    bool
+        True for the same paths or the same relative layout under a new root.
+    """
+    path_type = (
+        PureWindowsPath if PureWindowsPath(manifest["preview_path"]).drive else Path
+    )
+    saved_preview = path_type(manifest["preview_path"])
+    saved_source = path_type(manifest["source_path"])
+    if saved_preview.name != preview.name:
+        return False
+    if saved_source == acquisition:
+        return True
+    try:
+        relative_source = saved_source.relative_to(saved_preview.parent)
+    except ValueError:
+        return False
+    return preview.parent.joinpath(*relative_source.parts) == acquisition
 
 
 def resolve_roi_source(root_path: Path) -> Path:
@@ -218,6 +252,12 @@ def export_rois(
             help="Raw acquisition, processed directory, or maximum-Z preview."
         ),
     ],
+    registration_channel: Annotated[
+        int,
+        typer.Option(
+            min=0, help="Required zero-based channel index for ROI registration."
+        ),
+    ],
     output: Annotated[
         Path | None,
         typer.Option(help="Destination; defaults to roi_exports beside the preview."),
@@ -226,7 +266,7 @@ def export_rois(
         bool,
         typer.Option(
             "--deconvolve/--no-deconvolve",
-            help="Run RLGC on the selected raw regions before deskewing.",
+            help="Crop raw tiles with PSF and registration support before deconvolution and deskewing.",
         ),
     ] = False,
     tiff: Annotated[
@@ -237,9 +277,11 @@ def export_rois(
     z_downsample_level: Annotated[int, typer.Option(min=1)] = 1,
     decon_crop_scan: Annotated[int | None, typer.Option(min=1)] = None,
     decon_gpu_id: Annotated[int, typer.Option(min=0)] = 0,
-    decon_verbose: int = 1,
+    decon_verbose: Annotated[
+        int,
+        typer.Option(min=0, help="Deconvolution diagnostics: 0 off (default), 1 on."),
+    ] = 0,
     decon_psf_paths: list[Path] | None = None,
-    registration_channel: Annotated[int, typer.Option(min=0)] = 0,
     resume: Annotated[
         bool,
         typer.Option(
@@ -272,11 +314,11 @@ def export_rois(
     decon_gpu_id : int
         CUDA device index for RLGC.
     decon_verbose : int
-        Reconstruction diagnostic verbosity.
+        Reconstruction diagnostics: zero (default) disables them; one enables them.
     decon_psf_paths : list[pathlib.Path] or None
         Channel-ordered measured PSFs; None uses recorded theoretical calibration.
     registration_channel : int
-        Channel used for fresh local registration of multi-position ROIs.
+        Required zero-based channel used for local registration of the ROI.
     resume : bool
         Reuse saved selections and compatible processing checkpoints.
     workers : int
@@ -291,7 +333,7 @@ def export_rois(
     )
     stem = source.name.removesuffix(suffix)
     state = ProcessingState.read(processing_state_path(source.parent, stem))
-    acquisition = inspect_acquisition(Path(state.document["source"]["path"]))
+    acquisition = inspect_acquisition(state.source_path())
     acquisition.validate_processing_calibration()
     if acquisition.is_2d:
         raise ValueError("ROI reconstruction requires a raw oblique 3D acquisition")
@@ -301,15 +343,19 @@ def export_rois(
         output.expanduser().resolve() if output else source.parent / "roi_exports"
     )
     manifest_path = destination / "selections.json"
-    if resume and manifest_path.is_file():
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if manifest["source_path"] != str(acquisition.path) or manifest[
-            "preview_path"
-        ] != str(source):
+    saved_manifest = manifest_path
+    if resume and output is not None and not saved_manifest.is_file():
+        saved_manifest = source.parent / "roi_exports" / "selections.json"
+    if resume and saved_manifest.is_file():
+        manifest = json.loads(saved_manifest.read_text(encoding="utf-8"))
+        if not selection_paths_match(manifest, acquisition.path, source):
             raise ValueError(
                 "Saved selections belong to a different acquisition or preview; choose another --output"
             )
         selections = [destination / name for name in manifest["rois"]]
+        if saved_manifest != manifest_path:
+            for name, target in zip(manifest["rois"], selections, strict=True):
+                PhysicalRoi.read(saved_manifest.parent / name).write(target)
     else:
         image_path = resolve_export_image(source)
         root = open_group(image_path)
@@ -338,6 +384,8 @@ def export_rois(
             "preview_path": str(source),
             "rois": [path.relative_to(destination).as_posix() for path in selections],
         }
+    if not manifest_path.is_file() or not resume:
+        destination.mkdir(parents=True, exist_ok=True)
         temporary = manifest_path.with_suffix(".tmp")
         temporary.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         temporary.replace(manifest_path)
