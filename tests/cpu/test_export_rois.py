@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 import tifffile
 from ome_types import from_xml
+from rich.text import Text
 from typer.testing import CliRunner
 from yaozarrs import open_group, v05
 
@@ -114,7 +115,7 @@ def test_raw_roi_exports_and_resume(
     monkeypatch.setattr(export_rois, "select_rois", choose)
     missing_channel = CliRunner().invoke(export_rois.app, [str(directory)])
     assert missing_channel.exit_code == 2
-    assert "--registration-channel" in missing_channel.output
+    assert "--registration-channel" in Text.from_ansi(missing_channel.output).plain
     assert not calls
     completed = None
     for attempt in range(2):
