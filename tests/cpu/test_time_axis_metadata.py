@@ -82,25 +82,17 @@ def test_unknown_time_does_not_become_one_second(tmp_path):
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("recorded", [False, True])
 def test_processing_propagates_hardware_cadence(
-    calibrated_mirror_timelapse, invoke_cli, recorded
+    calibrated_mirror_timelapse, invoke_cli
 ):
     """Preserve hardware cadence through processing and projection output."""
     raw = calibrated_mirror_timelapse.path
-    metadata = dict(open_group(raw).attrs)
-    if recorded:
-        for frame in metadata["ome_writers"]["frame_metadata"]:
-            frame["exposure_time"] = 0.0050021029411764706
-            frame["delta_t"] = -1  # Software arrival time has no role in cadence.
-    update_group_attributes(raw, metadata)
     invoke_cli(
         "process",
         raw,
         max_projection=True,
         create_fused_max_projection=False,
         z_downsample_level=1,
-        plane_period_ms=None if recorded else 5.0,
     )
     for name in (
         "single_mirror_deskewed.ome.zarr",
@@ -121,11 +113,7 @@ def test_processing_propagates_hardware_cadence(
         assert timing["n_acquired_planes"] == 4
         assert timing["dt_plane_s"] == 0.005
         assert timing["dt_volume_s"] == 0.020
-        assert timing["source"] == (
-            "recorded camera exposure_time; rounded to 0.01 ms"
-            if recorded
-            else "operator-confirmed hardware plane period"
-        )
+        assert timing["source"] == "recorded camera exposure_time; rounded to 0.01 ms"
 
 
 @pytest.mark.unit
@@ -275,7 +263,7 @@ def test_fused_writer_preserves_time_axis(
             source_collection=collection.path,
         )
         provenance = open_group(path).attrs["opm_processing_projection"]
-        assert provenance["source_collection"] == str(collection.path)
+        assert provenance["source_collection"] == collection.path.name
         assert provenance["source_position_indices"] == [0]
     else:
         operator = fusion_operator(

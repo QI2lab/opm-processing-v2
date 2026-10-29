@@ -212,20 +212,29 @@ def test_empty_tile_detection_uses_global_occupancy() -> None:
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("live_mode", ["live", "live-wait"])
 @pytest.mark.parametrize(
     ("save_float32", "expected_dtype"),
     ((False, np.dtype(np.uint16)), (True, np.dtype(np.float32))),
 )
 def test_live_process_matches_direct_deskew_without_estimating(
-    tmp_path, live_acquisition_factory, save_float32, expected_dtype, simulated_camera
+    tmp_path,
+    opm_v2_live_acquisition_factory,
+    save_float32,
+    expected_dtype,
+    simulated_camera,
+    relocate_acquisition,
+    live_mode,
 ) -> None:
     """Process a complete live acquisition using only the supplied illumination."""
     observed = simulated_camera((4, 8, 5), conversion=0.24).raw
     raw = observed[None, None, None, ::-1].copy()
-    dataset = live_acquisition_factory(
+    dataset = opm_v2_live_acquisition_factory(
         raw, name="live", illumination=np.full((1, 8, 5), 2.0, np.float32)
     )
-    illumination_path = dataset.illumination_path
+    root = relocate_acquisition(tmp_path, copy=save_float32)
+    assert dataset.path.exists() == save_float32
+    illumination_path = root / dataset.illumination_path.name
     expected_float = orthogonal_deskew(
         np.maximum(observed.astype(np.float32) - 100, 0) * 0.24 / 2,
         theta=30.0,
@@ -234,20 +243,26 @@ def test_live_process_matches_direct_deskew_without_estimating(
         downsample_factor=1,
     )
     args = [
-        str(tmp_path),
-        "--live",
-        str(illumination_path),
+        str(root),
         "--no-max-projection",
         "--no-create-fused-max-projection",
         "--z-downsample-level",
         "1",
     ]
+    if live_mode == "live":
+        args.extend(("--live", str(illumination_path)))
+    else:
+        # Offline live-wait finds the supplied field in the current directory.
+        field = root / "live_flatfield.ome.tif"
+        processing = importlib.import_module("opm_processing.process")
+        processing.write_flatfield(field, np.full((1, 1, 8, 5), 2.0, np.float32), 0.115)
+        args.extend(("--live-wait", "--flatfield-correction"))
     if save_float32:
         args.append("--save-float32")
     result = CliRunner().invoke(app, args)
     assert result.exit_code == 0, result.output
 
-    output = open_position_collection(tmp_path / "live_deskewed.ome.zarr")
+    output = open_position_collection(root / "live_deskewed.ome.zarr")
     actual = output.arrays[0][0, 0].read().result()
     expected = (
         expected_float
@@ -262,7 +277,7 @@ def test_live_process_matches_direct_deskew_without_estimating(
         positive = actual[actual > 0]
         assert positive.size > 0
         assert np.any(positive != np.floor(positive))
-    assert not any(key.startswith("opm_") for key in output.attributes)
+    assert "opm_v2" not in output.attributes
 
 
 @pytest.mark.unit

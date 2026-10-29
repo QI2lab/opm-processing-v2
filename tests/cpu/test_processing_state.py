@@ -159,3 +159,43 @@ def test_failed_channel_checkpoint_keeps_previous_durable_state(
     assert reopened.completed_channels(output) == {(0, 3, 0)}
     assert reopened.zero_channels(output) == {(0, 3, 0)}
     assert reopened.completed_tiles(output) == set()
+
+
+@pytest.mark.parametrize("windows_path", [False, True])
+def test_relocated_nested_checkpoint_validates_before_updating_source(
+    tmp_path, windows_path
+):
+    """Rebase nested ROI sources without losing checkpoints or weakening config checks."""
+    source = tmp_path / "sample.ome.zarr"
+    source.mkdir()
+    roi_directory = tmp_path / "roi_exports" / "roi_001"
+    path = roi_directory / "sample.processing.json"
+    output = roi_directory / "sample_deskewed.ome.zarr"
+    state = ProcessingState.create(path, source)
+    state.initialize_run(output, configuration={"deconvolve": False}, overwrite=False)
+    state.complete_channel(output, 0, 1, 2)
+    state.document["source"]["path"] = (
+        r"F:\old\sample.ome.zarr"
+        if windows_path
+        else str(tmp_path / "old" / source.name)
+    )
+    state.save()
+    saved = path.read_bytes()
+
+    resumed = ProcessingState.open(path, source, overwrite=False)
+    with pytest.raises(ValueError, match="incompatible"):
+        resumed.initialize_run(
+            output, configuration={"deconvolve": True}, overwrite=False
+        )
+    assert path.read_bytes() == saved
+    resumed.initialize_run(output, configuration={"deconvolve": False}, overwrite=False)
+    reopened = ProcessingState.read(path)
+    assert reopened.document["source"]["path"] == str(source)
+    assert reopened.completed_channels(output) == {(0, 1, 2)}
+
+    other = tmp_path / "other.ome.zarr"
+    other.mkdir()
+    saved = path.read_bytes()
+    with pytest.raises(ValueError, match="different acquisition"):
+        ProcessingState.open(path, other, overwrite=False)
+    assert path.read_bytes() == saved

@@ -12,7 +12,7 @@ import json
 import os
 import time
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
@@ -21,6 +21,58 @@ if TYPE_CHECKING:
 
 PROCESSING_STATE_SCHEMA = "opm-processing-state"
 PROCESSING_STATE_VERSION = 1
+
+
+def resolve_store_path(recorded_path: str | Path, directory: str | Path) -> Path:
+    """Prefer a store beside the current input over its recorded location.
+
+    Parameters
+    ----------
+    recorded_path : str or pathlib.Path
+        Historical absolute path or directory-relative store link.
+    directory : str or pathlib.Path
+        Current command input or journal directory.
+
+    Returns
+    -------
+    pathlib.Path
+        Existing same-named local store, otherwise the recorded location.
+        Windows basenames remain portable when data is moved between platforms.
+    """
+    recorded = Path(recorded_path).expanduser()
+    windows_path = PureWindowsPath(recorded_path)
+    name = windows_path.name if windows_path.drive else recorded.name
+    directory = Path(directory).expanduser().resolve()
+    local = directory / name
+    if local.is_dir():
+        return local.resolve()
+    if not recorded.is_absolute():
+        recorded = directory / recorded
+    return recorded.resolve()
+
+
+def _source_record(source: Path, directory: Path) -> dict[str, str]:
+    """Record source provenance and a portable link from the journal directory.
+
+    Parameters
+    ----------
+    source : pathlib.Path
+        Resolved raw acquisition path.
+    directory : pathlib.Path
+        Resolved directory containing the processing journal.
+
+    Returns
+    -------
+    dict[str, str]
+        Absolute provenance and a relative link when both paths share a drive.
+    """
+    record = {"path": str(source)}
+    try:
+        record["relative_path"] = Path(os.path.relpath(source, directory)).as_posix()
+    except ValueError:
+        # Windows acquisitions and outputs may reside on separate drives.
+        pass
+    return record
 
 
 def processing_state_path(output_root: Path, acquisition_stem: str) -> Path:
@@ -137,7 +189,7 @@ class ProcessingState:
             document={
                 "schema": PROCESSING_STATE_SCHEMA,
                 "schema_version": PROCESSING_STATE_VERSION,
-                "source": {"path": str(source)},
+                "source": _source_record(source, state_path.parent),
                 "outputs": {},
                 "registration": {},
             },
@@ -167,6 +219,49 @@ class ProcessingState:
             raise ValueError(f"Unsupported processing-state version: {state_path}")
         return cls(path=state_path, document=document)
 
+    def source_path(self, directory: Path | None = None) -> Path:
+        """Resolve the acquisition relative to the journal's current location first.
+
+        A moved or copied acquisition directory retains its original source path
+        as provenance. Prefer the same-named raw store beside the current journal,
+        even when the historical location still exists. Relative links preserve
+        separate raw/output layouts. Legacy nested ROI journals can use the
+        matching acquisition journal in a parent directory.
+
+        Parameters
+        ----------
+        directory : pathlib.Path or None
+            Current acquisition context supplied by the caller. None uses the
+            journal directory; ROI checkpoints can use the selected raw root.
+
+        Returns
+        -------
+        pathlib.Path
+            Current co-located raw store, or the recorded source location. The
+            latter may be absent for portable processed-only exports.
+        """
+        recorded = self.document["source"]["path"]
+        name = PureWindowsPath(recorded).name
+        for context in (directory, self.path.parent):
+            if context is None:
+                continue
+            local = Path(context).expanduser().resolve() / name
+            if local.is_dir():
+                return local.resolve()
+        relative = self.document["source"].get("relative_path")
+        if relative is not None:
+            linked = self.path.parent.joinpath(*PureWindowsPath(relative).parts)
+            if linked.is_dir():
+                return linked.resolve()
+        for parent in self.path.parent.parents:
+            local = parent / name
+            journal = parent / self.path.name
+            if local.is_dir() and journal.is_file():
+                ancestor = type(self).read(journal)
+                if PureWindowsPath(ancestor.document["source"]["path"]).name == name:
+                    return local.resolve()
+        return resolve_store_path(recorded, self.path.parent)
+
     @classmethod
     def open(cls, path: Path, source_path: Path, *, overwrite: bool) -> ProcessingState:
         """Create or reopen state while enforcing its acquisition identity.
@@ -190,7 +285,7 @@ class ProcessingState:
         if not state_path.exists():
             return cls.create(state_path, source)
         state = cls.read(state_path)
-        recorded_source = Path(state.document["source"]["path"]).resolve()
+        recorded_source = state.source_path(directory=source.parent)
         if recorded_source != source:
             if overwrite:
                 return cls.create(state_path, source)
@@ -198,6 +293,10 @@ class ProcessingState:
                 "Processing state belongs to a different acquisition: "
                 f"{recorded_source} != {source}"
             )
+        # Persist a relocated source only after initialize_run has accepted the
+        # unchanged configuration, preserving journals on failed resume checks.
+        state.document["source"].pop("relative_path", None)
+        state.document["source"].update(_source_record(source, state_path.parent))
         return state
 
     def _run_key(self, output_path: Path) -> str:
@@ -261,7 +360,7 @@ class ProcessingState:
             if "configuration" not in existing or "dataset_id" not in existing:
                 existing["configuration"] = convert_metadata(configuration)
                 existing.setdefault("dataset_id", str(uuid4()))
-                self.save()
+            self.save()
             return
         record = {
             **expected,

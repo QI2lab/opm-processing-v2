@@ -361,7 +361,18 @@ def test_acquisition_manifest_is_json_serializable(acquisition_metadata, times):
 @pytest.mark.parametrize("export_image_input", ["collection"], indirect=True)
 @pytest.mark.parametrize(
     "acquisition_link",
-    ["override", "journal", "relative", "missing", "ambiguous"],
+    [
+        "override",
+        "journal",
+        "relative",
+        "moved",
+        "copied",
+        "windows-moved",
+        "external",
+        "relative-external",
+        "missing",
+        "ambiguous",
+    ],
     indirect=True,
 )
 def test_projection_metadata_requires_an_unambiguous_source(acquisition_link):

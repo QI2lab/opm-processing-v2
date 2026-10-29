@@ -257,10 +257,7 @@ def inspect_dataset(path: str | Path) -> dict[str, Any]:
     associated = set()
     for sidecar in directory.glob("*.processing.json"):
         state = ProcessingState.read(sidecar)
-        source = Path(state.document["source"]["path"])
-        if not source.is_absolute():
-            source = sidecar.parent / source
-        source = source.resolve()
+        source = state.source_path()
         products = {sidecar.parent / name for name in state.document["outputs"]}
         products.update(
             sidecar.parent / record[key]
