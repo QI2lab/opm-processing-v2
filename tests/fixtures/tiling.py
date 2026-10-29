@@ -274,7 +274,7 @@ def deskew_processing_case(deskew_field, factor, mode, acquisition_factory):
 
 @pytest.fixture
 def stage_placement_acquisition(
-    tmp_path,
+    opm_v2_acquisition_factory,
     angle,
     mode,
     simulation_parameters,
@@ -284,7 +284,8 @@ def stage_placement_acquisition(
     """Image one fixed point through the shared physical oblique camera model."""
     from dataclasses import replace
 
-    from tests.fixtures.acquisition import opm_v2_frame_metadata, write_opm_v2_zarr
+    from opm_processing.dataio.acquisition import ChannelMetadata
+    from tests.fixtures.acquisition import opm_v2_frame_metadata
     from tests.simulation.forward_model import Acquisition, forward_model
     from tests.simulation.objects import deposit_point
 
@@ -348,7 +349,7 @@ def stage_placement_acquisition(
                         "laser_powers": [10.0],
                         "interleaved": True,
                         "blanking": True,
-                        "current_channel": "488nm",
+                        "current_channel": "637nm",
                         "scan_axis_step_um": step_um,
                         "image_mirror_position": float(scan),
                         "image_mirror_step_um": step_um,
@@ -376,12 +377,17 @@ def stage_placement_acquisition(
                     hardware_triggered=True,
                 )
             )
-    path = tmp_path / "physical_stage.zarr"
-    write_opm_v2_zarr(
-        path=path,
-        raw_data=raw,
-        labels=("t", "p", "c", "z", "y", "x"),
-        chunks=(1, 1, 1, 1, camera_height, camera_width),
+    dataset = opm_v2_acquisition_factory(
+        raw,
+        name="physical_stage",
+        mode=mode,
         frame_metadatas=frames,
+        channels=(ChannelMetadata(0, "637nm", 637.0, 10.0, 10.0),),
+        scan_axis_step_um=step_um,
+        angle_deg=angle,
+        pixel_size_um=pixel_um,
+        camera_offset=microscope.camera.offset_adu,
+        camera_conversion=microscope.camera.electrons_per_adu,
+        stage_positions_zxy=tuple((value, 0.0, 0.0) for value in stage_z_values_um),
     )
-    return SimpleNamespace(path=path, pixel_um=pixel_um)
+    return SimpleNamespace(path=dataset.path, pixel_um=pixel_um)

@@ -22,6 +22,27 @@ pytest_plugins = (
 )
 
 
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    """Retain outcomes so contract checks do not mask actual failures or CUDA skips.
+
+    Parameters
+    ----------
+    item : pytest.Item
+        Current test.
+    call : pytest.CallInfo
+        Execution phase being reported.
+
+    Yields
+    ------
+    None
+        Control to pytest's normal report implementation.
+    """
+    outcome = yield
+    report = outcome.get_result()
+    setattr(item, f"pipeline_report_{report.when}", report)
+
+
 def pytest_collection_modifyitems(items):
     """Require unit or integration tests and consistent execution hardware.
 
@@ -71,4 +92,15 @@ def pytest_collection_modifyitems(items):
         }.intersection(item.fixturenames):
             raise pytest.UsageError(
                 f"{item.nodeid}: integration tests require shared forward-model ground truth"
+            )
+        if (
+            categories == ["integration"]
+            and "opm_v2_acquisition_factory" not in item.fixturenames
+        ):
+            raise pytest.UsageError(
+                f"{item.nodeid}: every integration must start with OpmDataHandler output"
+            )
+        if categories == ["integration"] and "acquisition_factory" in item.fixturenames:
+            raise pytest.UsageError(
+                f"{item.nodeid}: synthetic acquisition layouts are forbidden in integration tests"
             )

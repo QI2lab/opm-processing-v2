@@ -101,7 +101,74 @@ def acquisition_link(request, export_image_input, tmp_path):
             if kind == "relative":
                 state.document["source"]["path"] = source.name
                 state.save()
+            elif kind in (
+                "moved",
+                "copied",
+                "windows-moved",
+                "external",
+                "relative-external",
+            ):
+                historical = tmp_path / "original-location" / source.name
+                if kind == "copied":
+                    import shutil
+
+                    shutil.copytree(source, historical)
+                elif kind in ("external", "relative-external"):
+                    assert source.resolve().is_relative_to(tmp_path.resolve())
+                    assert historical.is_relative_to(tmp_path.resolve())
+                    historical.parent.mkdir()
+                    source.rename(historical)
+                    source = historical
+                state.document["source"]["path"] = (
+                    rf"F:\original-location\{source.name}"
+                    if kind == "windows-moved"
+                    else str(
+                        historical.relative_to(tmp_path)
+                        if kind == "relative-external"
+                        else historical
+                    )
+                )
+                state.save()
     return SimpleNamespace(processed=processed, source=source, kind=kind)
+
+
+@pytest.fixture
+def relocate_acquisition(tmp_path, integration_pipeline_records):
+    """Move or copy actual acquisition artifacts within the test workspace.
+
+    Returns
+    -------
+    callable
+        Relocate a completed acquisition directory without rewriting provenance.
+    """
+    import shutil
+
+    def relocate(root, *, copy=False):
+        """Preserve original journals while relocating real stores and sidecars."""
+        root = root.resolve()
+        destination = root / "relocated"
+        workspace = tmp_path.resolve()
+        assert root.is_relative_to(workspace) and destination.is_relative_to(workspace)
+        assert not destination.exists()
+        artifacts = tuple(root.iterdir())
+        targets = [(artifact, destination / artifact.name) for artifact in artifacts]
+        assert all(
+            source.resolve().parent == root and target.is_relative_to(destination)
+            for source, target in targets
+        )
+        destination.mkdir()
+        for source, target in targets:
+            if copy:
+                if source.is_dir():
+                    shutil.copytree(source, target)
+                else:
+                    shutil.copy2(source, target)
+            else:
+                source.rename(target)
+        integration_pipeline_records["relocations"].append((root, destination))
+        return destination
+
+    return relocate
 
 
 @pytest.fixture

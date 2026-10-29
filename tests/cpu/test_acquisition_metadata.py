@@ -249,4 +249,4 @@ def test_single_position_mirror_timelapse_preserves_calibrated_fluorescence(
         actual = output.arrays[0][time, 0].read().result()
         assert actual.dtype == dtype
         np.testing.assert_allclose(actual, expected.astype(dtype), rtol=2e-6, atol=1e-5)
-    assert not any(key.startswith("opm_") for key in output.attributes)
+    assert "opm_v2" not in output.attributes

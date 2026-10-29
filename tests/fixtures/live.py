@@ -87,6 +87,57 @@ def write_manifest(
 
 
 @pytest.fixture
+def opm_v2_live_acquisition_factory(tmp_path, opm_v2_acquisition_factory):
+    """Write complete live camera acquisitions and lifecycle files with opm-v2.
+
+    Returns
+    -------
+    callable
+        Persist simulated observations and the illumination supplied to processing.
+    """
+    from opm_processing.dataio.acquisition import ChannelMetadata
+
+    def create(raw_data, *, name="sample", illumination=None):
+        """Deliver actual frames through the upstream publisher and TensorStore writer."""
+        path = tmp_path / f"{name}.ome.zarr"
+        document = manifest_document(path, timepoints=raw_data.shape[0])
+        document["data_path"] = str(path)
+        document["index_sizes"] = dict(zip("tpcz", raw_data.shape[:4], strict=True))
+        document["channels"] = [
+            {
+                "name": "637nm",
+                "wavelength_nm": 637.0,
+                "exposure_ms": 10.0,
+                "laser_power": 12.0,
+            }
+            for _ in range(raw_data.shape[2])
+        ]
+        dataset = opm_v2_acquisition_factory(
+            raw_data,
+            name=name,
+            mode="stage",
+            live_manifest=document,
+            channels=tuple(
+                ChannelMetadata(index, "637nm", 637.0, 10.0, 12.0)
+                for index in range(raw_data.shape[2])
+            ),
+            stage_positions_zxy=tuple(map(tuple, document["stage_positions_zxy"])),
+            camera_conversion=document["camera_e_to_adu"],
+            orientations=tuple(document["orientations"].items()),
+        )
+        field_path = tmp_path / f"{name}_illumination.ome.tif"
+        field = (
+            np.ones((raw_data.shape[2], *raw_data.shape[-2:]), np.float32)
+            if illumination is None
+            else illumination
+        )
+        imwrite(field_path, field, metadata={"axes": "CYX"})
+        return SimpleNamespace(path=dataset.path, illumination_path=field_path)
+
+    return create
+
+
+@pytest.fixture
 def live_acquisition_factory(tmp_path):
     """Return a writer for complete or partially acquired live camera objects."""
 

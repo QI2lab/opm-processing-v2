@@ -1,7 +1,8 @@
-"""Deconvolution calibration recorded in an acquisition's OME-Zarr attributes."""
+"""Resolve deconvolution settings from acquisition metadata and OPM defaults."""
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -103,7 +104,7 @@ def read_noise_from_metadata(acquisition: AcquisitionMetadata) -> float:
 
 
 def psf_parameters_from_metadata(acquisition: AcquisitionMetadata) -> dict:
-    """Read theoretical PSF settings without supplying microscope assumptions.
+    """Read theoretical PSF settings, defaulting to the qi2lab silicone objective.
 
     Parameters
     ----------
@@ -113,20 +114,36 @@ def psf_parameters_from_metadata(acquisition: AcquisitionMetadata) -> dict:
     Returns
     -------
     dict
-        Recorded lens, specimen depth, support and numerical PSF settings.
-
-    Raises
-    ------
-    ValueError
-        The acquisition has no theoretical PSF calibration.
+        Recorded settings when supplied; otherwise the processing defaults for
+        the 100x, NA 1.35 silicone objective. Each call returns fresh defaults.
     """
     parameters = (acquisition.deconvolution or {}).get("psf_parameters")
-    if not parameters:
-        raise ValueError(
-            "The OME-Zarr has no opm_processing.deconvolution.psf_parameters. "
-            "Record the optical calibration or supply measured --decon-psf-paths."
-        )
-    return parameters
+    if parameters is not None:
+        return parameters
+    return {
+        "lens": {
+            "NA": 1.35,
+            "ni0": 1.4,
+            "ni": 1.4,
+            "ns": 1.38,
+            "ng0": 1.515,
+            "ng": 1.515,
+            "tg0": 170.0,
+            "tg": 170.0,
+            "ti0": 300.0,
+        },
+        "skewed_depth_um": 0.0,
+        "projection_depth_um": 15.0,
+        "projection_nz": 20,
+        "projection_dz_um": 0.115,
+        "projection_nxy": 71,
+        "taper_sigma_px_3d": 10.0,
+        "taper_sigma_px_2d": 15.0,
+        "depth_scale_um": 15.0,
+        "depth_width_scale": 5.0,
+        "support_fwhms": 12.0,
+        "grid_oversampling": 2,
+    }
 
 
 def detector_gain_from_metadata(
@@ -165,7 +182,12 @@ def detector_gain_from_metadata(
 def emission_wavelengths_from_metadata(
     acquisition: AcquisitionMetadata,
 ) -> tuple[float, ...]:
-    """Read channel-ordered emission wavelengths in micrometers, never from labels.
+    """Resolve channel wavelengths, preferring recorded emission calibration.
+
+    As-acquired stores need no processing-specific attributes. In their absence,
+    use the channel wavelength as the established PSF approximation. Combined
+    labels such as ``561 + 637`` select the longest wavelength for that one
+    stored camera channel.
 
     Parameters
     ----------
@@ -175,20 +197,43 @@ def emission_wavelengths_from_metadata(
     Returns
     -------
     tuple of float
-        Positive emission wavelengths in micrometers, in channel order.
+        Positive PSF wavelengths in micrometers, in channel order.
 
     Raises
     ------
     ValueError
         A channel wavelength is absent, nonfinite or nonpositive.
     """
-    values = (acquisition.deconvolution or {}).get("emission_wavelengths_nm", ())
-    if len(values) != len(acquisition.channels):
+    calibration = acquisition.deconvolution or {}
+    if "emission_wavelengths_nm" in calibration:
+        values = calibration["emission_wavelengths_nm"]
+    else:
+        values = []
+        for channel in acquisition.channels:
+            parts = [
+                re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*(?:nm)?\s*", part, re.IGNORECASE)
+                for part in channel.name.split("+")
+            ]
+            if all(parts):
+                values.append(max(float(part[1]) for part in parts))
+            elif channel.wavelength_nm is not None:
+                values.append(channel.wavelength_nm)
+            else:
+                raise ValueError(
+                    f"Cannot resolve a PSF wavelength for channel {channel.name!r}. "
+                    "Supply emission_wavelengths_nm in opm_processing.deconvolution "
+                    "or measured --decon-psf-paths."
+                )
+    try:
+        wavelengths = np.asarray(values, dtype=float)
+    except (TypeError, ValueError) as exc:
         raise ValueError(
-            "The OME-Zarr must record one emission_wavelengths_nm value per channel "
-            "in opm_processing.deconvolution to generate PSFs."
+            "Emission wavelengths must be numeric nanometer values"
+        ) from exc
+    if wavelengths.shape != (len(acquisition.channels),):
+        raise ValueError(
+            "emission_wavelengths_nm must contain one value per stored channel"
         )
-    wavelengths = np.asarray(values, dtype=float)
     if not np.all(np.isfinite(wavelengths) & (wavelengths > 0)):
         raise ValueError("Recorded emission wavelengths must be finite and positive")
     return tuple(float(value) / 1000 for value in wavelengths)
@@ -201,7 +246,7 @@ def load_deconvolution_psfs(
     projection: bool = False,
     reconstruction_step_um: float | None = None,
 ) -> tuple[list[np.ndarray], dict | None]:
-    """Load measured kernels or generate them from the recorded optical calibration.
+    """Load measured kernels or generate them from resolved optical settings.
 
     Parameters
     ----------
@@ -223,7 +268,7 @@ def load_deconvolution_psfs(
     Raises
     ------
     ValueError
-        Measured PSF count differs from channel count or optical calibration is absent.
+        Measured PSF count differs from channel count or a wavelength is unresolved.
     """
     from tqdm import tqdm
 
