@@ -12,7 +12,7 @@ pytestmark = [
     pytest.mark.parametrize(
         "pipeline_case",
         [
-            (mode, illumination, step, None, False)
+            (mode, illumination, step, None)
             for mode in ("stage", "mirror")
             for illumination in (False, True)
             for step in (0.4, 1.2)

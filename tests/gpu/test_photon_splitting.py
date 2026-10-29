@@ -26,14 +26,13 @@ def test_matlab_split_matches_independent_distribution_moments(
     first = photon_splitter.split(observed)
     np.testing.assert_array_equal(first, photon_splitter.split(observed))
     if not fractional:
-        reference = cupy_gpu.random.default_rng(19).binomial(
-            cupy_gpu.asarray(np.where(observed >= 150, 1, observed)).astype(
-                cupy_gpu.int64
-            ),
+        xp = photon_splitter.xp
+        reference = xp.random.default_rng(19).binomial(
+            xp.asarray(np.where(observed >= 150, 1, observed)).astype(xp.int64),
             0.5,
         )
         np.testing.assert_array_equal(
-            first[levels < 150], cupy_gpu.asnumpy(reference)[levels < 150]
+            first[levels < 150], photon_splitter.to_numpy(reference)[levels < 150]
         )
     second = observed - first
     np.testing.assert_allclose(

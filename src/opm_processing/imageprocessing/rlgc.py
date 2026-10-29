@@ -55,18 +55,23 @@ operator uses zero extension and scan-plane selection,
 rather than MATLAB's 2D pixel averaging. These geometric/execution adaptations
 are not a claim of identical boundary conditions or bitwise MATLAB results.
 
-FFT tiles use overlap-save with the PSF support at every convolution. They share
-one object, initialization, count split and stopping decision. GPU-memory fallback
-can keep this global state in host RAM and transfer only haloed FFT tiles. NumPy
-and CuPy random generators follow the same split distribution but differ bitwise.
+Large acquisitions are reconstructed one overlapping raw scan chunk at a time.
+Each chunk runs the same optical model, random splitting and stopping rules;
+only its retained interior is copied into the full output. Reconstruction state
+is bounded by the chunk and its processing halos, rather than acquisition length.
+Independent chunks need not reproduce a full-volume reconstruction bitwise.
 """
 
 import gc
 import logging
-from collections.abc import Callable
+import math
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 import numpy as np
+import psutil
+from tqdm import tqdm
 
 from opm_processing.cuda import preload_cuda_libraries
 
@@ -95,6 +100,24 @@ _fft_cache_3d: dict[tuple[int, int, int, int], cp.ndarray] = {}
 
 GC_UPDATED_FRACTION_LIMIT = 0.001
 GC_RELATIVE_CHANGE_LIMIT = 0.001
+
+
+def _host_slices(shape: tuple[int, ...]) -> Iterator[slice]:
+    """Yield slabs with approximately one million elements of scratch space.
+
+    Parameters
+    ----------
+    shape : tuple of int
+        Global host-array dimensions.
+
+    Yields
+    ------
+    slice
+        First-axis slab; the split sequence is independent of FFT crop size.
+    """
+    step = max(1, 2**20 // math.prod(shape[1:]))
+    for start in range(0, shape[0], step):
+        yield slice(start, min(start + step, shape[0]))
 
 
 def _gc_stopping_metrics(
@@ -130,9 +153,19 @@ def _gc_stopping_metrics(
         Accepted fraction, relative change and selected stopping reason.
     """
     xp = cp.get_array_module(recon)
-    fraction = float(recon.size - xp.count_nonzero(consensus < 0)) / recon.size
-    denominator = xp.maximum(xp.max(recon), 1e-12)
-    delta = float(xp.max(xp.abs(recon - previous)) / denominator)
+    if xp is np:
+        rejected = 0
+        peak, change = np.float32(0), np.float32(0)
+        for slab in _host_slices(recon.shape):
+            rejected += np.count_nonzero(consensus[slab] < 0)
+            peak = np.maximum(peak, np.max(recon[slab]))
+            change = np.maximum(change, np.max(np.abs(recon[slab] - previous[slab])))
+        fraction = float(recon.size - rejected) / recon.size
+        delta = float(change / np.maximum(peak, 1e-12))
+    else:
+        fraction = float(recon.size - xp.count_nonzero(consensus < 0)) / recon.size
+        denominator = xp.maximum(xp.max(recon), 1e-12)
+        delta = float(xp.max(xp.abs(recon - previous)) / denominator)
     reason = (
         "consensus_fraction"
         if fraction < limit
@@ -392,6 +425,8 @@ def _kl_div_into(
         as a Python float. NaN terms are zeroed as in the reference.
     """
     xp = cp.get_array_module(p)
+    if xp is np:
+        return _host_kl_div_into(p, q, scratch)
     probability_p = p + 1e-4
     probability_q = q + 1e-4
     probability_p = probability_p / xp.sum(probability_p)
@@ -399,6 +434,47 @@ def _kl_div_into(
     scratch[...] = probability_p * (xp.log(probability_p) - xp.log(probability_q))
     scratch[xp.isnan(scratch)] = 0
     return float(xp.sum(scratch))
+
+
+def _host_kl_div_into(
+    p: np.ndarray,
+    q: np.ndarray,
+    scratch: np.ndarray,
+    *,
+    clip_prediction: bool = False,
+) -> float:
+    """Evaluate the same global normalized KL with slab-sized temporaries.
+
+    Parameters
+    ----------
+    p, q : numpy.ndarray
+        Global prediction and observation distributions, including strided views.
+    scratch : numpy.ndarray
+        Existing global float32 KL workspace.
+    clip_prediction : bool
+        Clip prediction roundoff for KL only, without changing the RL update.
+
+    Returns
+    -------
+    float
+        Prediction-to-observation KL using global float32 normalization and sum.
+    """
+    if clip_prediction:
+        np.maximum(p, 0, out=scratch)
+        scratch += np.float32(1e-4)
+    else:
+        np.add(p, np.float32(1e-4), out=scratch)
+    mass_p = np.sum(scratch)
+    np.add(q, np.float32(1e-4), out=scratch)
+    mass_q = np.sum(scratch)
+    for slab in _host_slices(p.shape):
+        values = np.maximum(p[slab], 0) if clip_prediction else p[slab]
+        probability_p = (values + np.float32(1e-4)) / mass_p
+        probability_q = (q[slab] + np.float32(1e-4)) / mass_q
+        terms = probability_p * (np.log(probability_p) - np.log(probability_q))
+        terms[np.isnan(terms)] = 0
+        scratch[slab] = terms
+    return float(np.sum(scratch))
 
 
 def split_kl_scores(
@@ -431,6 +507,11 @@ def split_kl_scores(
         Normalized prediction-to-half KL divergences.
     """
     xp = cp.get_array_module(predicted)
+    if xp is np:
+        return tuple(
+            _host_kl_div_into(predicted, half, scratch, clip_prediction=True)
+            for half in (split1, split2)
+        )
     predicted = xp.maximum(predicted, 0)
     return tuple(_kl_div_into(predicted, half, scratch) for half in (split1, split2))
 
@@ -571,6 +652,36 @@ def _split_observed_counts(
         Unclipped first half, including the signed fractional remainder.
     """
     xp = cp.get_array_module(observed)
+    if xp is np and observed.ndim:
+        first = np.empty_like(observed, dtype=np.float32)
+        # Keep the original order of the three global random draws: binomial,
+        # Gaussian, then uniform. Only their temporary work arrays are slabbed.
+        for slab in _host_slices(observed.shape):
+            values = observed[slab]
+            whole = np.floor(values)
+            counts = (whole + (values - whole >= 0.5)).astype(np.int64)
+            first[slab] = rng.binomial(np.where(counts >= 150, 1, counts), p=0.5)
+        for slab in _host_slices(observed.shape):
+            values = observed[slab]
+            whole = np.floor(values)
+            counts = (whole + (values - whole >= 0.5)).astype(np.int64)
+            high = counts >= 150
+            high_n = np.where(high, counts, 1).astype(np.float32)
+            candidate = high_n * 0.5 + np.sqrt(high_n * 0.25) * rng.standard_normal(
+                values.shape, dtype=np.float32
+            )
+            candidate = np.where(
+                (candidate >= high_n) | (candidate < 0), high_n * 0.5, candidate
+            )
+            np.copyto(first[slab], candidate, where=high)
+        for slab in _host_slices(observed.shape):
+            values = observed[slab]
+            whole = np.floor(values)
+            counts = (whole + (values - whole >= 0.5)).astype(np.int64)
+            first[slab] += rng.random(values.shape, dtype=np.float32) * (
+                values - counts.astype(np.float32)
+            )
+        return first
     whole = xp.floor(observed)
     counts = (whole + (observed - whole >= 0.5)).astype(xp.int64)
     high_counts = counts >= 150
@@ -635,6 +746,14 @@ def _split_calibrated_counts(
     xp = cp.get_array_module(observed)
     shifted = observed if variance == 0 else observed + variance
     first = _split_observed_counts(shifted, rng)
+    if xp is np:
+        second = np.empty_like(first)
+        np.subtract(shifted, first, out=second)
+        first -= np.float32(0.5) * variance
+        np.maximum(first, 0, out=first)
+        second -= np.float32(0.5) * variance
+        np.maximum(second, 0, out=second)
+        return first, second
     second = shifted - first
     return xp.maximum(first - 0.5 * variance, 0), xp.maximum(second - 0.5 * variance, 0)
 
@@ -829,6 +948,8 @@ def _iterate_rlgc(
     """
     xp = cp.get_array_module(observed)
     variance = _read_noise_variance(read_noise)
+    if logger is not None:
+        logger.info("%spreparing sensitivity and reconstruction state", log_prefix)
     sensitivity = xp.maximum(adjoint(xp.ones_like(observed)), xp.float32(1e-12))
     recon = (
         xp.full(shape, xp.mean(observed), dtype=xp.float32)
@@ -842,8 +963,18 @@ def _iterate_rlgc(
     completed = 0
     reason = "max_iterations"
     while max_iterations is None or completed < max_iterations:
+        if logger is not None:
+            logger.info(
+                "%siteration=%d starting forward projection", log_prefix, completed + 1
+            )
         predicted = forward(recon)
         if gradient_consensus:
+            if logger is not None:
+                logger.info(
+                    "%siteration=%d forming count splits",
+                    log_prefix,
+                    completed + 1,
+                )
             split1, split2 = _split_calibrated_counts(observed, rng, variance)
             if use_kl:
                 scores = split_kl_scores(
@@ -853,20 +984,68 @@ def _iterate_rlgc(
                     reason = "split_kl"
                     break
                 previous_kl = scores
-            denominator = xp.maximum(predicted + variance, xp.float32(1e-12))
-            half1 = adjoint(2 * (split1 + variance) / denominator) / sensitivity
-            half2 = adjoint(2 * (split2 + variance) / denominator) / sensitivity
-            consensus = smooth((half1 - 1) * (half2 - 1), sensitivity)
-            ratio = adjoint((observed + variance) / denominator) / sensitivity
-            xp.maximum(ratio, 0, out=ratio)
-            updated = (
-                filter_update(recon, ratio, consensus)
-                if xp is cp
-                else np.where(consensus < 0, recon, recon * ratio)
-            )
+            if logger is not None:
+                logger.info(
+                    "%siteration=%d backprojecting and evaluating consensus",
+                    log_prefix,
+                    completed + 1,
+                )
+            if xp is np:
+                # Reuse dead buffers without changing float32 operation order.
+                # FFT crop size never changes the object, halves, or GC/KL rules.
+                denominator = predicted
+                np.add(denominator, variance, out=denominator)
+                np.maximum(denominator, np.float32(1e-12), out=denominator)
+                del predicted
+                split1 += variance
+                split1 *= 2
+                split1 /= denominator
+                half1 = adjoint(split1)
+                del split1
+                half1 /= sensitivity
+                split2 += variance
+                split2 *= 2
+                split2 /= denominator
+                half2 = adjoint(split2)
+                del split2
+                half2 /= sensitivity
+                half1 -= 1
+                half2 -= 1
+                half1 *= half2
+                del half2
+                consensus = smooth(half1, sensitivity)
+                del half1
+                measured_ratio = np.empty_like(observed)
+                for slab in _host_slices(observed.shape):
+                    np.add(observed[slab], variance, out=measured_ratio[slab])
+                    measured_ratio[slab] /= denominator[slab]
+                ratio = adjoint(measured_ratio)
+                del measured_ratio, denominator
+                ratio /= sensitivity
+                np.maximum(ratio, 0, out=ratio)
+                updated = ratio
+                for slab in _host_slices(recon.shape):
+                    updated[slab] *= recon[slab]
+                    np.copyto(updated[slab], recon[slab], where=consensus[slab] < 0)
+            else:
+                denominator = xp.maximum(predicted + variance, xp.float32(1e-12))
+                half1 = adjoint(2 * (split1 + variance) / denominator) / sensitivity
+                half2 = adjoint(2 * (split2 + variance) / denominator) / sensitivity
+                consensus = smooth((half1 - 1) * (half2 - 1), sensitivity)
+                ratio = adjoint((observed + variance) / denominator) / sensitivity
+                xp.maximum(ratio, 0, out=ratio)
+                updated = filter_update(recon, ratio, consensus)
             fraction, delta, reason = _gc_stopping_metrics(
                 recon, updated, consensus, limit, max_delta
             )
+            if xp is np:
+                del ratio, consensus
+            else:
+                # These arrays belong only to this iteration. Keeping their
+                # bindings alive while the next split is allocated doubles the
+                # working set and can defeat scan-chunk allocation fallback.
+                del predicted, denominator, split1, split2, half1, half2
+                del ratio, consensus
         else:
             ratio = (
                 adjoint(observed / xp.maximum(predicted, xp.float32(1e-12)))
@@ -879,6 +1058,7 @@ def _iterate_rlgc(
                 xp.max(xp.abs(updated - recon)) / xp.maximum(xp.max(updated), 1e-12)
             )
             reason = "relative_change" if delta < max_delta else None
+            del predicted, ratio
         recon = updated
         completed += 1
         if callback is not None:
@@ -1029,8 +1209,32 @@ def _rlgc_once(
             padded_shape = tuple(
                 n + sum(p) for n, p in zip(fine_shape, pads, strict=True)
             )
+            if storage == "host":
+                # Explicit host storage still needs room for this chunk's state
+                # and temporaries. The outer scan-chunk loop bounds this shape.
+                estimated_host_bytes = (
+                    math.prod(padded_shape) * 10 * np.dtype(np.float32).itemsize
+                )
+                available_host_bytes = psutil.virtual_memory().available
+                if estimated_host_bytes > 0.8 * available_host_bytes:
+                    raise MemoryError(
+                        f"RLGC host state for padded shape {padded_shape} needs approximately "
+                        f"{estimated_host_bytes / 1024**3:.1f} GiB; only "
+                        f"{available_host_bytes / 1024**3:.1f} GiB RAM is available. "
+                        "Reduce --decon-crop-scan or free host RAM."
+                    )
             core = _observed_region_slices(padded_shape, pads)
             convolve = _Convolution(psf, padded_shape, crop_scan, normalize_psf)
+            if logger is not None:
+                logger.info(
+                    "%sRLGC object_shape=%s padded_shape=%s FFT_tile=%s storage=%s (%.2f GiB per float32 state array)",
+                    log_prefix,
+                    fine_shape,
+                    padded_shape,
+                    convolve.tile_shape,
+                    storage,
+                    math.prod(padded_shape) * np.dtype(np.float32).itemsize / 1024**3,
+                )
             field = None if response is None else xp.asarray(response)
             reflected = boundary == "reflect"
             if reflected:
@@ -1043,6 +1247,22 @@ def _rlgc_once(
                 observed = xp.asarray(image)
                 shape = fine_shape
                 region = np.s_[:, :, :]
+
+            unsupported_scan = None
+            if not reflected and factor > 1:
+                # Determine exact zero columns of the acquired-plane operator
+                # from PSF support, without a floating-point sensitivity cutoff.
+                # FFT roundoff there must not be divided by the 1e-12 floor.
+                visible = np.zeros(fine_shape[0], dtype=bool)
+                acquired = np.arange(image.shape[0]) * factor
+                offsets = (
+                    np.flatnonzero(np.any(psf > 0, axis=(1, 2))) - psf.shape[0] // 2
+                )
+                for offset in offsets:
+                    indices = acquired - offset
+                    visible[indices[(indices >= 0) & (indices < fine_shape[0])]] = True
+                if not visible.all():
+                    unsupported_scan = xp.asarray(np.flatnonzero(~visible))
 
             def blur(values: Array, adjoint: bool = False) -> Array:
                 """Convolve on the selected reflected or zero-extended object grid.
@@ -1101,7 +1321,10 @@ def _rlgc_once(
                     return blur(weighted, adjoint=True)
                 scattered = xp.zeros(fine_shape, dtype=xp.float32)
                 scattered[::factor] = weighted
-                return blur(scattered, adjoint=True)
+                result = blur(scattered, adjoint=True)
+                if unsupported_scan is not None:
+                    result[unsupported_scan] = 0
+                return result
 
             def smooth(product: Array, sensitivity: Array) -> Array:
                 """Apply optical consensus smoothing for the selected geometry.
@@ -1196,6 +1419,147 @@ def _is_gpu_memory_error(exc: BaseException) -> bool:
     return "out of memory" in message or "oom" in message
 
 
+@contextmanager
+def _gpu_memory_budget(gpu_id: int) -> Iterator[None]:
+    """Bound default-pool allocations to physical device memory during an attempt.
+
+    Parameters
+    ----------
+    gpu_id : int
+        CUDA device used by the solver.
+
+    Yields
+    ------
+    None
+        Device state and FFT workspaces use at most 80 percent of available
+        physical memory, including this process's reusable allocations. Respect
+        a caller's tighter limit and restore it on success or failure. This makes
+        allocation fallback effective on systems that otherwise spill into shared
+        GPU memory instead of raising an allocation error.
+    """
+    with cp.cuda.Device(gpu_id):
+        pool = cp.get_default_memory_pool()
+        original_limit = pool.get_limit()
+        free_bytes, total_bytes = cp.cuda.runtime.memGetInfo()
+        budget = max(1, int(0.8 * min(total_bytes, free_bytes + pool.total_bytes())))
+        if original_limit:
+            budget = min(budget, original_limit)
+        pool.set_limit(size=budget)
+        try:
+            yield
+        finally:
+            pool.set_limit(size=original_limit)
+
+
+def _chunked_rlgc_once(
+    image: np.ndarray,
+    psf: np.ndarray,
+    *,
+    crop_scan: int,
+    rng_seed: int | None,
+    logger: logging.Logger | None,
+    log_prefix: str,
+    **solver_options: object,
+) -> np.ndarray:
+    """Complete each haloed scan chunk before allocating the next solver state.
+
+    Parameters
+    ----------
+    image, psf : numpy.ndarray
+        Acquired camera data and PSF sampled on the reconstruction grid.
+    crop_scan : int
+        Requested retained scan extent on the reconstruction grid. Chunk origins
+        align with acquired planes when scan refinement is enabled.
+    rng_seed : int or None
+        Base random seed, incremented by chunk index as in the original workflow.
+    logger : logging.Logger or None
+        Destination for chunk and iteration diagnostics.
+    log_prefix : str
+        Context prepended to diagnostic messages.
+    solver_options : keyword arguments
+        Optical, numerical, device and storage options for the same RLGC engine.
+
+    Returns
+    -------
+    numpy.ndarray
+        Full float32 output assembled from disjoint retained chunk interiors.
+        Only the input and output span the entire acquisition.
+    """
+    factor = solver_options.get("scan_upsample_factor", 1)
+    if (
+        isinstance(factor, bool)
+        or not isinstance(factor, (int, np.integer))
+        or factor < 1
+    ):
+        raise ValueError("scan_upsample_factor must be a positive integer")
+    work = image[None] if image.ndim == 2 else image
+    fine_scan = (work.shape[0] - 1) * factor + 1
+    # Reuse FFT plans and device allocations between chunks. The public wrapper
+    # releases resources after this frame returns, and clears them before OOM
+    # retries. Per-chunk cleanup repeatedly rebuilds the same expensive plans.
+    solver_options["release_memory"] = False
+    if crop_scan >= fine_scan:
+        return _rlgc_once(
+            image,
+            psf,
+            rng_seed=rng_seed,
+            logger=logger,
+            log_prefix=log_prefix,
+            **solver_options,
+        )
+    if solver_options.get("initial_estimate") is not None:
+        raise ValueError(
+            "An explicit initial_estimate requires full-frame deconvolution"
+        )
+    # Preserve the original discarded halo of one complete PSF scan support.
+    # Round outward to actual acquired planes, retaining the exact fine-grid phase.
+    psf_scan = 1 if np.ndim(psf) == 2 else psf.shape[0]
+    halo = math.ceil(psf_scan / factor)
+    retained = max(1, int(crop_scan) // factor)
+    count = math.ceil(work.shape[0] / retained)
+    output = np.empty((fine_scan, *work.shape[1:]), dtype=np.float32)
+    with tqdm(
+        range(0, work.shape[0], retained),
+        total=count,
+        desc="decon",
+        unit="chunk",
+        leave=False,
+    ) as chunks:
+        for tile_index, raw_start in enumerate(chunks):
+            dest_start = raw_start * factor
+            dest_stop = min((raw_start + retained) * factor, fine_scan)
+            source_start = max(raw_start - halo, 0)
+            source_stop = min(
+                math.ceil((dest_stop - 1) / factor) + 1 + halo,
+                work.shape[0],
+            )
+            prefix = f"{log_prefix}chunk={tile_index + 1}/{count} "
+            if logger is not None:
+                logger.info(
+                    "%sraw_scan=[%d:%d] retained_fine_scan=[%d:%d] storage=%s",
+                    prefix,
+                    source_start,
+                    source_stop,
+                    dest_start,
+                    dest_stop,
+                    solver_options.get("storage", "gpu"),
+                )
+            reconstructed = _rlgc_once(
+                work[source_start:source_stop],
+                psf,
+                rng_seed=None if rng_seed is None else rng_seed + tile_index,
+                logger=logger,
+                log_prefix=prefix,
+                **solver_options,
+            )
+            local_start = dest_start - source_start * factor
+            output[dest_start:dest_stop] = reconstructed[
+                local_start : local_start + dest_stop - dest_start
+            ]
+            del reconstructed
+    return output
+
+
 def rlgc(
     image: np.ndarray,
     psf: np.ndarray,
@@ -1206,7 +1570,7 @@ def rlgc(
     max_delta: float = GC_RELATIVE_CHANGE_LIMIT,
     rng_seed: int | None = 42,
     normalize_psf: bool = True,
-    verbose: int = 1,
+    verbose: int = 0,
     release_memory: bool = True,
     logger: logging.Logger | None = None,
     log_prefix: str = "",
@@ -1216,7 +1580,7 @@ def rlgc(
     read_noise: float = 0.0,
     **solver_options: object,
 ) -> np.ndarray:
-    """Deconvolve calibrated data with the single RLGC engine and FFT tiling.
+    """Deconvolve raw scan chunks sequentially with bounded RLGC solver state.
 
     The solver first attempts the requested ``crop_scan``. If CUDA memory
     allocation fails, it retries with smaller scan-axis chunks. Every solver
@@ -1235,7 +1599,8 @@ def rlgc(
     crop_scan : int or None, default=None
         Requested retained scan-axis tile size. If None, determine a crop from
         current free GPU memory and this PSF. Values at least as large as the
-        scan-axis length select full-frame processing.
+        reconstructed scan-axis length select full-frame processing. Refined
+        scans round retained extents to at least one acquired scan interval.
     safe_mode : bool, default=True
         Retained for compatibility. The reference KL rule always requires both
         halves to worsen; this wrapper option has no effect.
@@ -1244,12 +1609,14 @@ def rlgc(
     max_delta : float, default=0.001
         Stop when the largest relative update falls below this threshold.
     rng_seed : int or None, default=42
-        Seed for the per-iteration 50:50 data split. Every FFT tile shares the global
-        split and convergence history.
+        Seed for per-iteration 50:50 data splits, incremented by scan chunk index.
     normalize_psf : bool, default=True
         If True, normalize the padded PSF to unit sum before deconvolution.
-    verbose : int, default=1
-        If at least 1, show a progress bar over scan-axis tiles.
+    verbose : int, default=0
+        Chunked processing shows a decon progress bar. Zero emits no solver
+        diagnostics. Set to 1 to report storage, FFT geometry, iterations and
+        stopping reasons. An explicit logger opts into diagnostics with its own
+        logging controls.
     release_memory : bool, default=True
         If True, release CuPy memory pools and FFT caches before returning.
     logger : logging.Logger or None, default=None
@@ -1275,8 +1642,10 @@ def rlgc(
         ``scan_upsample_factor`` and ``boundary="zero"`` select acquired-plane
         reconstruction; ``initial_estimate`` overrides mean-data initialization;
         ``gradient_consensus=False`` selects ordinary RL. ``callback`` observes
-        completed iterates. ``storage`` chooses GPU or host state; FFTs use CUDA
-        in both cases. ``pad_yx`` controls symmetric camera-axis padding.
+        completed chunk iterates (iteration numbering restarts per chunk).
+        ``storage`` chooses GPU or host chunk state; FFTs use CUDA in both cases.
+        ``pad_yx`` controls symmetric camera-axis padding. An explicit
+        ``initial_estimate`` requires full-frame processing.
 
     Returns
     -------
@@ -1284,12 +1653,23 @@ def rlgc(
         Deconvolved image as float32.
     """
     image_arr = np.asarray(image)
+    if logger is None and verbose > 0:
+        logger = logging.Logger("opm_processing.rlgc", level=logging.INFO)
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        logger.addHandler(handler)
     if image_arr.ndim == 2:
         image_scan = 1
     elif image_arr.ndim == 3:
         image_scan = image_arr.shape[0]
     else:
         raise ValueError(f"Expected a 2D or 3D image, got shape {image_arr.shape}")
+    if crop_scan is not None and (
+        isinstance(crop_scan, bool)
+        or not isinstance(crop_scan, (int, np.integer))
+        or crop_scan < 1
+    ):
+        raise ValueError("crop_scan must be a positive integer")
 
     if (image_arr.ndim == 2 or image_arr.shape[0] == 1) and solver_options.get(
         "boundary", "reflect"
@@ -1314,9 +1694,16 @@ def rlgc(
         raise ValueError("fallback_step_scan must be at least 1")
     min_crop_scan = 1
     attempted_crop_scan = min(int(crop_scan), int(image_scan))
-    solver_options.setdefault(
-        "storage", "host" if attempted_crop_scan < image_scan else "gpu"
-    )
+    solver_options.setdefault("storage", "gpu")
+    if logger is not None:
+        logger.info(
+            "%sRLGC acquired_shape=%s PSF_shape=%s retained_scan=%d storage=%s",
+            log_prefix,
+            image_arr.shape,
+            np.asarray(psf).shape,
+            attempted_crop_scan,
+            solver_options["storage"],
+        )
 
     while True:
         try:
@@ -1327,25 +1714,28 @@ def rlgc(
                     attempted_crop_scan,
                     crop_scan,
                 )
-            output = _rlgc_once(
-                image=image_arr,
-                psf=psf,
-                gpu_id=gpu_id,
-                crop_scan=None
-                if attempted_crop_scan >= image_scan
-                else attempted_crop_scan,
-                safe_mode=safe_mode,
-                limit=limit,
-                max_delta=max_delta,
-                rng_seed=rng_seed,
-                normalize_psf=normalize_psf,
-                release_memory=release_memory,
-                logger=logger,
-                log_prefix=log_prefix,
-                detector_response=detector_response,
-                read_noise=read_noise,
-                **solver_options,
-            )
+            with _gpu_memory_budget(gpu_id):
+                output = _chunked_rlgc_once(
+                    image=image_arr,
+                    psf=psf,
+                    gpu_id=gpu_id,
+                    crop_scan=attempted_crop_scan,
+                    safe_mode=safe_mode,
+                    limit=limit,
+                    max_delta=max_delta,
+                    rng_seed=rng_seed,
+                    normalize_psf=normalize_psf,
+                    release_memory=release_memory,
+                    logger=logger,
+                    log_prefix=log_prefix,
+                    detector_response=detector_response,
+                    read_noise=read_noise,
+                    **solver_options,
+                )
+            if release_memory:
+                # The chunk engine has now returned, so its device arrays are
+                # no longer held by the engine's frame when pools are released.
+                clear_rlgc_caches(clear_memory_pool=True)
             if on_successful_crop_scan is not None:
                 on_successful_crop_scan(attempted_crop_scan)
             if logger is not None and logger.isEnabledFor(logging.INFO):
@@ -1358,18 +1748,22 @@ def rlgc(
             return output[0] if original_ndim == 2 else output
         except Exception as exc:
             if not _is_gpu_memory_error(exc):
+                if release_memory:
+                    clear_rlgc_caches(clear_memory_pool=True)
                 raise
 
-            clear_rlgc_caches(clear_memory_pool=True)
-            already_on_host = solver_options["storage"] == "host"
-            solver_options["storage"] = "host"
             if attempted_crop_scan == min_crop_scan:
-                if not already_on_host:
-                    continue
+                if release_memory:
+                    clear_rlgc_caches(clear_memory_pool=True)
                 raise RuntimeError(
-                    "RLGC failed due to GPU memory constraints even at the "
+                    "RLGC exhausted allocation fallback even at the "
                     f"minimum scan-axis crop size {attempted_crop_scan}."
                 ) from exc
+            # A failed chunk's traceback owns its arrays. Release those frames
+            # before trying a smaller chunk, otherwise fallback retains exactly
+            # the state whose allocation exhausted memory.
+            exc.__traceback__ = None
+            clear_rlgc_caches(clear_memory_pool=True)
             retry_step = (
                 max(1, attempted_crop_scan // 4)
                 if fallback_step_scan is None

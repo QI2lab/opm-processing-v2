@@ -65,7 +65,10 @@ def test_generated_psf_camera_reconstruction(cupy_gpu, production_point_acquisit
         (1000, 5e-16, 5e-16, "relative_change"),
     ],
 )
-def test_gc_stopping_matches_matlab_reference(cupy_gpu, accepted, change, peak, reason):
+@pytest.mark.parametrize("array_backend", ["gpu", "host"])
+def test_gc_stopping_matches_matlab_reference(
+    cupy_gpu, accepted, change, peak, reason, array_backend
+):
     """Lock MATLAB's strict bounds, absolute change, zero gate and denominator floor."""
     from opm_processing.imageprocessing.rlgc import (
         GC_RELATIVE_CHANGE_LIMIT,
@@ -73,10 +76,11 @@ def test_gc_stopping_matches_matlab_reference(cupy_gpu, accepted, change, peak, 
         _gc_stopping_metrics,
     )
 
-    current = cupy_gpu.full(1000, peak, dtype=cupy_gpu.float64)
+    xp = cupy_gpu if array_backend == "gpu" else np
+    current = xp.full(1000, peak, dtype=xp.float64)
     previous = current.copy()
     previous[0] -= change
-    consensus = cupy_gpu.full(1000, -1.0)
+    consensus = xp.full(1000, -1.0)
     consensus[:accepted] = 0
     fraction, delta, actual = _gc_stopping_metrics(
         previous,

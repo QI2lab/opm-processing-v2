@@ -7,7 +7,10 @@ import numpy as np
 import tensorstore as ts
 from yaozarrs import open_group, v05
 
-from opm_processing.dataio.acquisition import inspect_acquisition
+from opm_processing.dataio.acquisition import (
+    inspect_acquisition,
+    open_acquisition_datastore,
+)
 from opm_processing.dataio.deconvolution import scan_upsample_from_metadata
 from opm_processing.dataio.processing_state import ProcessingState
 from opm_processing.imageprocessing.camera import camera_correct, illumination_correct
@@ -20,8 +23,14 @@ def test_qi2lab_acquisition_to_fused_ngff_v05(pipeline_case, deconvolve):
     case = pipeline_case
     raw = open_group(case.dataset.path)
     assert "opm_v2" in raw.attrs
+    assert raw.attrs["opm_v2"]["storage_backend"] == "tensorstore"
     assert raw["0"].attrs["ome_writers"]["frame_metadata"]
     metadata = inspect_acquisition(case.dataset.path)
+    np.testing.assert_array_equal(
+        open_acquisition_datastore(metadata).read().result(), case.dataset.raw_data
+    )
+    assert "psf_parameters" not in (metadata.deconvolution or {})
+    assert "emission_wavelengths_nm" not in (metadata.deconvolution or {})
     assert metadata.shape == case.dataset.raw_data.shape
     assert metadata.camera_conversion == case.microscope.camera.electrons_per_adu
     assert metadata.scan_axis_step_um == case.microscope.scan_step_um
@@ -66,6 +75,19 @@ def test_qi2lab_acquisition_to_fused_ngff_v05(pipeline_case, deconvolve):
                     downsample_factor=1,
                 )
                 np.testing.assert_array_equal(saved, expected)
+            else:
+                reconstruction_index = (
+                    time * metadata.shape[1] + position
+                ) * metadata.shape[2] + channel
+                expected = orthogonal_deskew(
+                    case.reconstructions[reconstruction_index],
+                    theta=metadata.angle_deg,
+                    distance=metadata.scan_axis_step_um
+                    / scan_upsample_from_metadata(metadata),
+                    pixel_size=metadata.pixel_size_um,
+                    downsample_factor=1,
+                )
+                np.testing.assert_array_equal(saved, expected)
 
     fusion = case.fusion
     # Stage Z is converted to laboratory Z; the detector-X stage coordinate
@@ -101,8 +123,69 @@ def test_qi2lab_acquisition_to_fused_ngff_v05(pipeline_case, deconvolve):
         expected_noise = (
             case.microscope.camera.read_noise_e if metadata.deconvolution else 0
         )
-        assert settings["gc_stopping"]["read_noise"] == expected_noise
-        assert settings["gc_stopping"]["kl_enabled"] is True
+        assert settings["read_noise"] == expected_noise
+        assert "decon_psf_paths" not in case.options
+        assert not metadata.deconvolution
+        assert settings["emission_wavelengths_nm"] == [637.0, 637.0]
+        assert settings["psf_parameters"]["lens"]["NA"] == 1.35
+        assert settings["psf_sha256"] is None
+        # Predict independently simulated camera means with each actual
+        # reconstruction. The score uses absolute counts without fitting.
+        from scipy.interpolate import interp1d
+        from scipy.signal import fftconvolve
+        from scipy.special import kl_div
+
+        factor = scan_upsample_from_metadata(metadata)
+        assert len(case.reconstructions) == np.prod(metadata.shape[:3])
+        assert len(case.deconvolution_runs) == len(case.reconstructions)
+        for run in case.deconvolution_runs:
+            assert run["input_shape"] == metadata.shape[-3:]
+            crop = run["crop_scan"]
+            fine_scan = (metadata.shape[-3] - 1) * factor + 1
+            retained = max(1, crop // factor)
+            expected_count = (
+                1 if crop >= fine_scan else int(np.ceil(metadata.shape[-3] / retained))
+            )
+            assert len(run["chunks"]) == expected_count
+            for chunk in run["chunks"]:
+                assert chunk["storage"] == "gpu"
+                halo = int(np.ceil(chunk["psf_shape"][0] / factor))
+                raw_bound = retained + 2 * halo + int(factor > 1)
+                assert chunk["input_shape"][0] <= min(metadata.shape[-3], raw_bound)
+                assert chunk["input_shape"][1:] == metadata.shape[-2:]
+                assert chunk["output_shape"] == (
+                    (chunk["input_shape"][0] - 1) * factor + 1,
+                    *metadata.shape[-2:],
+                )
+        for index, recovered in zip(
+            np.ndindex(*metadata.shape[:3]), case.reconstructions, strict=True
+        ):
+            time, _position, channel = index
+            observed = case.dataset.raw_data[index]
+            if metadata.scan_axis_reversed:
+                observed = observed[::-1]
+            baseline = camera_correct(
+                observed, metadata.camera_offset, metadata.camera_conversion
+            )
+            response = 1 if case.field is None else case.field[0, channel]
+            baseline = baseline / response
+            if factor > 1:
+                baseline = interp1d(
+                    np.arange(baseline.shape[0]) * factor, baseline, axis=0
+                )(np.arange(recovered.shape[0]))
+            expected = case.expectation * (1 + time / 4 + channel / 2)
+            scores = [
+                kl_div(
+                    expected,
+                    np.maximum(
+                        fftconvolve(density, case.psf, mode="same")[::factor]
+                        * response,
+                        np.finfo(float).tiny,
+                    ),
+                ).sum()
+                for density in (recovered, baseline)
+            ]
+            assert scores[0] < scores[1]
 
     base = assert_fused_ngff(case)
     # Coincident independently exposed tiles have equal weights. This checks
@@ -170,14 +253,14 @@ def assert_fused_ngff(case):
     return base
 
 
-def test_extended_mosaic_full_and_tiled_agree(
+def test_extended_mosaic_acquisition_to_fusion(
     mosaic_acquisition,
     deconvolve,
     pipeline_runner,
     monkeypatch,
     tmp_path,
 ):
-    """Check automatic chunks and foreground seams against identical full processing."""
+    """Check real automatic chunks, optical accuracy and persisted mosaic seams."""
     case = mosaic_acquisition
     parameters = case.parameters
     shape = case.dataset.raw_data.shape[-3:]
@@ -215,7 +298,7 @@ def test_extended_mosaic_full_and_tiled_agree(
             return operator
 
         monkeypatch.setattr(solver, "_Convolution", observe_layout)
-        pads = solver._linear_fft_pad_width(shape, case.psf.shape)
+        pads = solver._linear_fft_pad_width(shape, case.dataset.psfs[0].shape)
         padded_shape = tuple(n + sum(p) for n, p in zip(shape, pads, strict=True))
         # Configure the public planner's memory fraction for a sub-volume budget.
         # Query actual free memory; do not replace the CUDA runtime or allocator.
@@ -225,12 +308,7 @@ def test_extended_mosaic_full_and_tiled_agree(
 
     options = {
         "deconvolve": deconvolve,
-        "psf_path": case.psf_path,
         "blend": tuple(parameters["blend_pixels_zyx"]),
-        # Keep the same real RNG and arithmetic backend for the two layouts.
-        # The public host-storage mode still performs every convolution on CUDA.
-        # Backend-specific random streams differ even with the same seed.
-        "decon_storage": "host" if deconvolve else None,
     }
     full = pipeline_runner(
         case.dataset,
@@ -264,16 +342,16 @@ def test_extended_mosaic_full_and_tiled_agree(
         )
     if deconvolve:
         assert layouts and all(
-            tile_shape[0] < full_shape[0] for full_shape, tile_shape, _ in layouts
+            chunk_shape == fft_shape for chunk_shape, fft_shape, _ in layouts
         )
-        crops = {crop for _, _, crop in layouts}
+        crops = {run["crop_scan"] for run in tiled.deconvolution_runs}
         assert len(crops) == 1
         crop = crops.pop()
         assert 1 < crop < shape[0]
         foreground_scan = expectation[..., : shape[-1]].max(axis=(1, 2))
         foreground_scan = foreground_scan > foreground_scan.max() / 2
-        boundaries = np.arange(crop, padded_shape[0], crop) - pads[0][0]
-        boundaries = boundaries[(boundaries > 0) & (boundaries < shape[0])]
+        retained = max(1, crop // factor) * factor
+        boundaries = np.arange(retained, shape[0], retained)
         assert (
             np.count_nonzero(
                 foreground_scan[boundaries - 1] & foreground_scan[boundaries]
@@ -281,6 +359,15 @@ def test_extended_mosaic_full_and_tiled_agree(
             >= 2
         )
         assert tiled.options["decon_crop_scan"] is None
+        for run in tiled.deconvolution_runs:
+            assert len(run["chunks"]) > 1
+            for chunk in run["chunks"]:
+                assert chunk["storage"] == "gpu"
+                halo = int(np.ceil(chunk["psf_shape"][0] / factor))
+                raw_bound = retained // factor + 2 * halo + int(factor > 1)
+                assert chunk["input_shape"][0] <= raw_bound
+                assert chunk["input_shape"][0] < run["input_shape"][0]
+        assert all(chunk_shape[0] < padded_shape[0] for chunk_shape, _, _ in layouts)
         # Compare actual reconstructions with known optical camera means, rather
         # than treating a different FFT layout as physical ground truth.
         from scipy.interpolate import interp1d
@@ -311,18 +398,34 @@ def test_extended_mosaic_full_and_tiled_agree(
                     case.psf,
                     boundary=boundary,
                 ) < predictive_deviance(baseline, expected, case.psf, boundary=boundary)
+                if result is tiled:
+                    seams = np.zeros(shape[0], dtype=bool)
+                    seams[boundaries - 1] = True
+                    seams[boundaries] = True
+                    assert predictive_deviance(
+                        recovered,
+                        expected,
+                        case.psf,
+                        boundary=boundary,
+                        selection=seams,
+                    ) < predictive_deviance(
+                        baseline,
+                        expected,
+                        case.psf,
+                        boundary=boundary,
+                        selection=seams,
+                    )
 
-    # A numerical layout comparison uses the same unsigned camera pixels,
-    # recorded noise, measured PSF, random seed and unmodified GC stopping rules.
-    # Tolerance covers accumulated single-precision FFT roundoff, not a change
-    # in exposure, normalization, likelihood or reconstruction parameters.
-    tolerance = {"rtol": 2e-4, "atol": 2e-3} if deconvolve else {"rtol": 0, "atol": 0}
+    # Independent GC chunks have their own initialization and stopping histories.
+    # Their accuracy is checked against camera truth above, not another solver
+    # layout. Orthogonal interpolation without deconvolution remains exact.
     for reference, blocked in zip(
         full.collection.arrays, tiled.collection.arrays, strict=True
     ):
-        np.testing.assert_allclose(
-            blocked.read().result(), reference.read().result(), **tolerance
-        )
+        actual = blocked.read().result()
+        expected = reference.read().result()
+        if not deconvolve:
+            np.testing.assert_array_equal(actual, expected)
 
     support = (
         orthogonal_deskew(
@@ -398,4 +501,5 @@ def test_extended_mosaic_full_and_tiled_agree(
             y_borders = np.arange(block_y, actual.shape[-2], block_y)
             assert np.any(foreground[..., x_borders - 1] & foreground[..., x_borders])
             assert np.any(foreground[:, y_borders - 1] & foreground[:, y_borders])
-    np.testing.assert_allclose(fused[1], fused[0], **tolerance)
+    if not deconvolve:
+        np.testing.assert_array_equal(fused[1], fused[0])

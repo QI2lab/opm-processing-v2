@@ -32,6 +32,7 @@ from opm_processing.dataio.acquisition import (
 )
 from opm_processing.dataio.deconvolution import (
     detector_gain_from_metadata,
+    emission_wavelengths_from_metadata,
     load_deconvolution_psfs,
     read_noise_from_metadata,
     scan_upsample_from_metadata,
@@ -242,7 +243,9 @@ def open_variable_resume_collection(
     if actual_shapes != expected_shapes:
         raise ValueError(
             "Existing ROI output shapes are incompatible with this run: "
-            f"{actual_shapes} != {expected_shapes}. Use --no-resume to overwrite it."
+            f"{actual_shapes} != {expected_shapes}. "
+            "Choose another --output directory to preserve existing results, "
+            "or use --no-resume to overwrite them."
         )
     actual_dtypes = {np.dtype(array.dtype.numpy_dtype) for array in collection.arrays}
     if actual_dtypes != {np.dtype(expected_dtype)}:
@@ -1132,7 +1135,7 @@ def confirm_partial_output_resume(
     try:
         state = ProcessingState.read(processing_state_path(output_dir, stem))
         if (
-            Path(state.document["source"]["path"]).resolve()
+            state.source_path(directory=acquisition.path.parent)
             != acquisition.path.resolve()
         ):
             raise ValueError("Completion journal belongs to a different acquisition")
@@ -1241,7 +1244,10 @@ def process(
     eager_mode: bool = False,
     decon_crop_scan: int | None = None,
     decon_gpu_id: int = 0,
-    decon_verbose: int = 1,
+    decon_verbose: Annotated[
+        int,
+        typer.Option(min=0, help="Deconvolution diagnostics: 0 off (default), 1 on."),
+    ] = 0,
     decon_fallback_step_scan: int | None = None,
     decon_psf_paths: list[Path] | None = None,
     resume: Annotated[
@@ -1337,7 +1343,7 @@ def process(
     decon_gpu_id : int
         Zero-based CUDA device index used by the deconvolution solver.
     decon_verbose : int
-        Solver diagnostic verbosity, with zero suppressing iteration reports.
+        Solver diagnostics: zero (default) disables them; one enables them.
     decon_fallback_step_scan : int or None
         Scan planes removed from a chunk after GPU allocation failure; None uses the
         solver default.
@@ -1503,7 +1509,7 @@ def process_skewed(
     pos_range: tuple[int, int] | None = None,
     decon_crop_scan: int | None = None,
     decon_gpu_id: int = 0,
-    decon_verbose: int = 1,
+    decon_verbose: int = 0,
     decon_fallback_step_scan: int | None = None,
     decon_psf_paths: list[Path] | None = None,
     output_dir: Path | None = None,
@@ -1553,7 +1559,7 @@ def process_skewed(
     decon_gpu_id : int
         Zero-based CUDA device index used by the deconvolution solver.
     decon_verbose : int
-        Solver diagnostic verbosity, with zero suppressing iteration reports.
+        Solver diagnostics: zero (default) disables them; one enables them.
     decon_fallback_step_scan : int or None
         Scan planes removed from a chunk after GPU allocation failure; None uses the
         solver default.
@@ -1594,8 +1600,6 @@ def process_skewed(
     )
     if deconvolve:
         from opm_processing.imageprocessing.rlgc import (
-            GC_RELATIVE_CHANGE_LIMIT,
-            GC_UPDATED_FRACTION_LIMIT,
             RlgcChunkState,
             rlgc,
         )
@@ -1613,7 +1617,7 @@ def process_skewed(
     datastore = open_acquisition_datastore(acquisition)
     scan_axis_step_um = acquisition.scan_axis_step_um
     reconstruction_step_um = scan_axis_step_um / decon_scan_upsample
-    if decon_scan_upsample > 1:
+    if decon_scan_upsample > 1 and decon_verbose > 0:
         print(
             f"Automatic RLGC scan refinement: factor={decon_scan_upsample}, "
             f"acquired step={scan_axis_step_um:g} um, "
@@ -1672,14 +1676,17 @@ def process_skewed(
     roi_position_indices = (
         None if roi_selection is None else roi_selection.position_indices
     )
+    # Use the same discarded PSF support as scan-chunk reconstruction, outside
+    # the registration context. Cropping precedes camera correction and RLGC.
     roi_halo_scan = (
         0
         if psfs is None
         else max(
-            math.ceil((int(psf.shape[0]) // 2) / decon_scan_upsample) for psf in psfs
+            math.ceil((psf.shape[0] if psf.ndim == 3 else 1) / decon_scan_upsample)
+            for psf in psfs
         )
     )
-    roi_halo_x = 0 if psfs is None else max(int(psf.shape[-1]) // 2 for psf in psfs)
+    roi_halo_x = 0 if psfs is None else max(psf.shape[-1] for psf in psfs)
 
     if time_range is not None:
         time_shape = time_range[1]
@@ -1777,19 +1784,9 @@ def process_skewed(
     )
     processing_configuration = {
         "kind": output_kind,
-        "deskew_interpolation": "orthogonal-perpendicular-distance-weights-v2-complete-z-bins",
         "calibration": {
-            "gain_offset_applied": True,
             "camera_offset_adu": camera_offset,
             "camera_conversion": camera_conversion,
-            "camera_correction": "opm_processing.imageprocessing.camera.camera_correct",
-            "detector_gain_x_applied": detector_gain_x is not None,
-            "illumination_correction_applied": bool(flatfield_correction),
-            "localization_uncertainty": {
-                "coverage_validated": False,
-                "noise_model": "unvalidated",
-                "source": None,
-            },
         },
         "timing": acquisition.timing_attributes(),
         "dtype": output_dtype.name,
@@ -1815,41 +1812,19 @@ def process_skewed(
             None
             if not deconvolve
             else {
-                "model_revision": "gradient-consensus-v12-recorded-calibration",
-                "observation_model": "poisson",
-                "gc_stopping": {
-                    "reference": "gc_deconv.m@0340af0d7a4c5d92a97a1b443dfedb367dfb9f3d",
-                    "kl_enabled": True,
-                    "kl_domain": "acquired-pixel-prediction",
-                    "kl_direction": "prediction-to-split",
-                    "kl_comparison": "preceding-iteration-fresh-halves",
-                    "kl_require_both": True,
-                    "consensus_product": "relative-directions-before-blur",
-                    "split": "matlab-do_binosplit",
-                    "read_noise": decon_read_noise,
-                    "read_noise_units": "calibrated-detector-counts-rms",
-                    "read_noise_reference": "gc_deconv.m",
-                    "accepted_fraction_limit": GC_UPDATED_FRACTION_LIMIT,
-                    "relative_change_limit": GC_RELATIVE_CHANGE_LIMIT,
-                    "peak_floor": 1e-12,
-                    "iteration_limit": None,
-                },
-                "observations": "calibrated-detector-counts",
-                "detector_response": "forward-adjoint-sensitivity",
+                "read_noise": decon_read_noise,
                 "crop_scan": decon_crop_scan,
                 "fallback_step_scan": decon_fallback_step_scan,
                 "psf_parameters": None
                 if decon_psf_paths is not None
                 else psf_parameters,
-                **(
-                    {}
+                "emission_wavelengths_nm": (
+                    (acquisition.deconvolution or {}).get("emission_wavelengths_nm")
                     if decon_psf_paths is not None
-                    else {
-                        "psf_sampling": "oblique-camera-pixel-integral-centered-taper-v3",
-                    }
-                ),
-                "emission_wavelengths_nm": (acquisition.deconvolution or {}).get(
-                    "emission_wavelengths_nm"
+                    else [
+                        value * 1000
+                        for value in emission_wavelengths_from_metadata(acquisition)
+                    ]
                 ),
                 "psf_sha256": (
                     None
@@ -1861,7 +1836,6 @@ def process_skewed(
     }
     if decon_scan_upsample > 1:
         processing_configuration["deconvolution"].update(
-            backend="rlgc",
             scan_upsample_factor=int(decon_scan_upsample),
         )
         processing_configuration["reconstruction"] = {
@@ -2407,6 +2381,14 @@ def process_skewed(
                         channel_key,
                         is_zero=channel_key in zero_channels,
                     )
+                    # ROI writes are durable here. Cropped views otherwise keep
+                    # the previous full reconstruction/deskew alive throughout
+                    # the next channel's deconvolution.
+                    del raw_data, camera_calibrated_data, camera_corrected_data
+                    del deskew_input, formatted
+                    deskewed = None
+                    if deconvolve:
+                        del decon_input, deconvolved_data
             for ts_write in ts_writes:
                 ts_write.result()
             if max_projection:
@@ -2533,7 +2515,7 @@ def process_projection(
     eager_deconvolution: bool = False,
     resume: bool = False,
     decon_gpu_id: int = 0,
-    decon_verbose: int = 1,
+    decon_verbose: int = 0,
     decon_psf_paths: list[Path] | None = None,
     output_dir: Path | None = None,
 ) -> None:
@@ -2570,7 +2552,7 @@ def process_projection(
     decon_gpu_id : int
         Zero-based CUDA device index used by the deconvolution solver.
     decon_verbose : int
-        Solver diagnostic verbosity, with zero suppressing iteration reports.
+        Solver diagnostics: zero (default) disables them; one enables them.
     decon_psf_paths : list[Path] or None
         Channel-ordered PSF files; None generates theoretical PSFs. Planar
         processing uses a central Z slice of 3D PSFs.
@@ -2589,8 +2571,6 @@ def process_projection(
     overwrite = not resume
     if deconvolve:
         from opm_processing.imageprocessing.rlgc import (
-            GC_RELATIVE_CHANGE_LIMIT,
-            GC_UPDATED_FRACTION_LIMIT,
             rlgc,
         )
 
@@ -2690,39 +2670,18 @@ def process_projection(
             None
             if not deconvolve
             else {
-                "model_revision": "gradient-consensus-v12-recorded-calibration",
-                "observation_model": "poisson",
-                "gc_stopping": {
-                    "reference": "gc_deconv.m@0340af0d7a4c5d92a97a1b443dfedb367dfb9f3d",
-                    "kl_enabled": True,
-                    "kl_domain": "acquired-pixel-prediction",
-                    "kl_direction": "prediction-to-split",
-                    "kl_comparison": "preceding-iteration-fresh-halves",
-                    "kl_require_both": True,
-                    "consensus_product": "relative-directions-before-blur",
-                    "split": "matlab-do_binosplit",
-                    "read_noise": decon_read_noise,
-                    "read_noise_units": "calibrated-detector-counts-rms",
-                    "read_noise_reference": "gc_deconv.m",
-                    "accepted_fraction_limit": GC_UPDATED_FRACTION_LIMIT,
-                    "relative_change_limit": GC_RELATIVE_CHANGE_LIMIT,
-                    "peak_floor": 1e-12,
-                },
-                "observations": "calibrated-detector-counts",
-                "detector_response": "forward-adjoint-sensitivity",
+                "read_noise": decon_read_noise,
                 "eager": bool(eager_deconvolution),
                 "psf_parameters": None
                 if decon_psf_paths is not None
                 else psf_parameters,
-                **(
-                    {}
+                "emission_wavelengths_nm": (
+                    (acquisition.deconvolution or {}).get("emission_wavelengths_nm")
                     if decon_psf_paths is not None
-                    else {
-                        "psf_sampling": "oblique-camera-pixel-integral-centered-taper-v3",
-                    }
-                ),
-                "emission_wavelengths_nm": (acquisition.deconvolution or {}).get(
-                    "emission_wavelengths_nm"
+                    else [
+                        value * 1000
+                        for value in emission_wavelengths_from_metadata(acquisition)
+                    ]
                 ),
                 "psf_sha256": (
                     None
