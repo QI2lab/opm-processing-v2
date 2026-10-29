@@ -8,3 +8,6 @@ iy = "iy"
 [default.extend-identifiers]
 # NumPy's public array.flags attribute uses this spelling.
 writeable = "writeable"
+# SciPy's public interpolation classes use ND for N-dimensional data.
+LinearNDInterpolator = "LinearNDInterpolator"
+NearestNDInterpolator = "NearestNDInterpolator"
