@@ -169,6 +169,95 @@ def ao_region_factory():
 
 
 @pytest.fixture
+def ao_modal_sequence_factory():
+    """Construct prescribed warm starts with the actual shared pupil operator."""
+    from types import SimpleNamespace
+
+    from scripts.ao_wavekit_phase import phase_from_modal_coeff
+    from scripts.export_ao_overview import Region
+
+    def create(baseline, commands):
+        baseline = np.asarray(baseline, dtype=float)
+        commands = {
+            key: np.asarray(value, dtype=float) for key, value in commands.items()
+        }
+        records, saved = [], []
+        for (depth, index), final in commands.items():
+            start = baseline if depth == 0 else commands[depth - 1, index]
+            records.append(
+                {
+                    "source": f"saved_z{depth}_position{index}.zarr",
+                    "depth_index": depth,
+                    "region_index": index,
+                    "starting_coefficients": start.tolist(),
+                    "final_coefficients": final.tolist(),
+                }
+            )
+            pupil = phase_from_modal_coeff(
+                final,
+                samples=512,
+                norm=True,
+                wavelength=0.488,
+                out="radians",
+            )
+            saved.append(Region(depth, index, None, pupil))
+        return SimpleNamespace(
+            baseline=baseline,
+            commands=commands,
+            saved=saved,
+            manifest={
+                "coefficient_state": "final",
+                "wavelength_nm": 488,
+                "regions": records,
+            },
+        )
+
+    return create
+
+
+@pytest.fixture
+def ao_modal_chain(ao_modal_sequence_factory):
+    """Provide inherited physical modal states for two sites and three depths."""
+
+    def create():
+        reference = np.array([0.3, -0.2, 0.1])
+        commands = {
+            (depth, index): reference
+            + np.array(
+                [
+                    (0.01, 0.04, 0.09)[depth] * (index + 1),
+                    -0.02 * (depth + 1),
+                    0.03 * (depth + 1),
+                ]
+            )
+            for index in range(2)
+            for depth in range(3)
+        }
+        case = ao_modal_sequence_factory(reference, commands)
+        return case.manifest, case.saved, reference
+
+    return create
+
+
+@pytest.fixture
+def ao_two_position_warm_start(ao_modal_sequence_factory):
+    """Supply signed updates with independently prescribed nonzero initial state."""
+    from scripts import ao_wavekit_phase
+
+    baseline = np.array([0.2, -0.1])
+    final = {
+        (0, 0): np.array([0.5, 0.4]),
+        (1, 0): np.array([0.9, 0.7]),
+        (2, 0): np.array([0.6, 1.2]),
+        (0, 1): np.array([0.1, 0.3]),
+        (1, 1): np.array([-0.2, 0.1]),
+        (2, 1): np.array([-0.5, 0.6]),
+    }
+    case = ao_modal_sequence_factory(baseline, dict(sorted(final.items())))
+    return baseline, final, case.manifest, case.saved, ao_wavekit_phase
+
+
+@pytest.fixture
 def analytical_basis(ao_analytical_phase):
     """Tabulate independent normalized pupils using the shared Jacobi evaluator."""
     import json
