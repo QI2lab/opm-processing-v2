@@ -32,7 +32,6 @@ def test_oblique_psf_refinement_against_independent_acquisition(
         name: poisson_log_ratio_moments(expectation, kernel * total)
         for name, kernel in case.kernels.items()
     }
-    print({"scan_step_um": case.microscope.scan_step_um, "loss_variance": metrics})
     # At this declared exposure, reference refinement and the finest tested
     # production quadrature are each smaller than one shot-noise standard deviation.
     assert refinement[0] < np.sqrt(refinement[1]), refinement

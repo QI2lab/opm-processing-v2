@@ -15,6 +15,7 @@ import importlib
 import numpy as np
 import pytest
 from scipy import ndimage
+from scipy.stats import entropy
 
 from tests.simulation.camera import digitize
 from tests.simulation.metrics import (
@@ -106,11 +107,10 @@ def test_kld_matches_independent_probability_definition(
     q = cp.asarray(q_values, dtype=cp.float32)
     scratch = cp.empty_like(p)
 
-    probability_p = np.asarray(p_values, dtype=np.float64) + 1e-4
-    probability_q = np.asarray(q_values, dtype=np.float64) + 1e-4
-    probability_p /= probability_p.sum()
-    probability_q /= probability_q.sum()
-    expected = np.sum(probability_p * np.log(probability_p / probability_q))
+    expected = entropy(
+        np.asarray(p_values, dtype=np.float64) + 1e-4,
+        np.asarray(q_values, dtype=np.float64) + 1e-4,
+    )
     actual = rlgc._kl_div_into(p, q, scratch)
     np.testing.assert_allclose(actual, expected, rtol=2e-6, atol=2e-6)
     np.testing.assert_array_equal(to_numpy(p), p_values)
@@ -254,20 +254,20 @@ def test_rlgc_2d_recovers_points_using_central_psf(
 def test_split_kl_scores_match_direct_probability_definition(
     cupy_gpu, scale, array_backend
 ):
-    """Lock MATLAB's prediction-to-split direction, normalization and pseudocount."""
+    """Check prescribed prediction-to-split relative entropy and pseudocount."""
     solver = importlib.import_module("opm_processing.imageprocessing.rlgc")
     xp = cupy_gpu if array_backend == "gpu" else np
     rng = np.random.default_rng(51)
     prediction = (rng.uniform(0, 30, (3, 5, 7)) * scale).astype(np.float32)
     prediction[0] = 0
     halves = [rng.poisson(3, prediction.shape).astype(np.float32) for _ in range(2)]
-    probability = prediction.astype(np.float64) + 1e-4
-    probability /= probability.sum()
-    expected = []
-    for half in halves:
-        target = half.astype(np.float64) + 1e-4
-        target /= target.sum()
-        expected.append(np.sum(probability * np.log(probability / target)))
+    expected = [
+        entropy(
+            (prediction.astype(np.float64) + 1e-4).ravel(),
+            (half.astype(np.float64) + 1e-4).ravel(),
+        )
+        for half in halves
+    ]
     actual = solver.split_kl_scores(
         *(xp.asarray(value) for value in (prediction, *halves)),
         xp.empty_like(xp.asarray(prediction)),
