@@ -18,6 +18,8 @@ from scipy import ndimage
 
 from tests.simulation.camera import digitize
 from tests.simulation.metrics import (
+    camera_flux_accuracy,
+    camera_prediction,
     predictive_deviance,
 )
 
@@ -231,9 +233,10 @@ def test_rlgc_2d_recovers_points_using_central_psf(
 ):
     """Run the real wrapper and solver against independently blurred YX truth."""
     rlgc = importlib.import_module("opm_processing.imageprocessing.rlgc")
-    truth, central, skewed_psf = planar_point_model
+    case = planar_point_model
+    truth, central, skewed_psf = case.truth, case.central, case.psf
     observed = digitize(
-        ndimage.convolve(truth, central, mode="reflect") + 0.25,
+        case.expectation,
         ideal_photon_camera,
         seed=31,
     ).astype(np.float32)
@@ -244,7 +247,7 @@ def test_rlgc_2d_recovers_points_using_central_psf(
     assert restored.shape == truth.shape
     assert restored.dtype == np.float32
     psf = central[None] if singleton_z else central
-    expectation = ndimage.convolve(truth, psf, mode="reflect") + 0.25
+    expectation = case.expectation[None] if singleton_z else case.expectation
     assert predictive_deviance(
         restored, expectation, psf, boundary="reflect"
     ) < predictive_deviance(observed, expectation, psf, boundary="reflect")
@@ -252,6 +255,18 @@ def test_rlgc_2d_recovers_points_using_central_psf(
         np.unravel_index(np.argmax(restored), restored.shape),
         np.unravel_index(np.argmax(truth), truth.shape),
     )
+    prediction = camera_prediction(restored, psf, boundary="reflect")
+    for aperture in case.apertures:
+        assert camera_flux_accuracy(
+            prediction, expectation, ideal_photon_camera, aperture
+        )
+    plane = restored[0] if singleton_z else restored
+    for point, field in zip(case.points, case.point_fields, strict=True):
+        candidates = np.where(field, plane, -np.inf)
+        peak = np.unravel_index(np.argmax(candidates), plane.shape)
+        # Localize both original emitters to one output sample, without a
+        # peak-dependent search window or fitted amplitude.
+        np.testing.assert_allclose(peak, point, rtol=0, atol=1)
 
 
 @pytest.mark.parametrize("scale", (0.01, 1, 1000))

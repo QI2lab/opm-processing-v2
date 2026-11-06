@@ -103,6 +103,7 @@ class PointAcquisition(FrozenOpticalData):
     expectations: tuple[np.ndarray, ...]
     kernels: dict[int, np.ndarray]
     kernel: np.ndarray
+    apertures: tuple[np.ndarray, ...]
 
 
 @pytest.fixture(scope="session")
@@ -437,6 +438,8 @@ def measured_psf_calibration(tmp_path, optical_setup, psf_format):
 @pytest.fixture
 def planar_point_model(optical_setup):
     """Return two known emitters and the normalized central YX PSF used to blur them."""
+    from scipy import ndimage
+
     central = optical_setup.psf[optical_setup.psf.shape[0] // 2].copy()
     central /= central.sum()
     psf = np.stack((np.ones_like(central), central * 7, np.ones_like(central) * 100))
@@ -445,7 +448,29 @@ def planar_point_model(optical_setup):
     deposit_point(density, axes, (13, 12, 1), 2000)
     deposit_point(density, axes, (30, 28, 1), 3000)
     truth = density[1]
-    return truth, central, psf
+    points = ((12, 13), (28, 30))
+    coordinates = np.indices(truth.shape)
+    distances = np.asarray(
+        [
+            sum(
+                (axis - center) ** 2
+                for axis, center in zip(coordinates, point, strict=True)
+            )
+            for point in points
+        ]
+    )
+    # Fixed Voronoi half-fields isolate both known emitters without choosing
+    # regions from reconstructed peaks or intensity thresholds.
+    point_fields = tuple(np.argmin(distances, axis=0) == index for index in range(2))
+    return SimpleNamespace(
+        truth=truth,
+        central=central,
+        psf=psf,
+        points=points,
+        point_fields=point_fields,
+        apertures=(np.ones(truth.shape, bool), *point_fields),
+        expectation=ndimage.convolve(truth, central, mode="reflect") + 0.25,
+    )
 
 
 @pytest.fixture
@@ -472,8 +497,20 @@ def point_response_model(optical_setup):
         deposit_point(truth, axes, point[::-1], count)
     response = np.broadcast_to(np.linspace(0.25, 2, 37, dtype=np.float32), (35, 37))
     expectation = response * (ndimage.convolve(truth, psf, mode="reflect") + 0.25)
+    apertures = [np.ones(truth.shape, bool)]
+    for point in points:
+        aperture = np.zeros(truth.shape, bool)
+        aperture[
+            tuple(slice(c - r, c + r + 1) for c, r in zip(point, radii, strict=True))
+        ] = True
+        apertures.append(aperture)
     return SimpleNamespace(
-        truth=truth, psf=psf, response=response, expectation=expectation, points=points
+        truth=truth,
+        psf=psf,
+        response=response,
+        expectation=expectation,
+        points=points,
+        apertures=tuple(apertures),
     )
 
 
@@ -926,9 +963,21 @@ def production_point_acquisition(
         for n, size in zip(kernel.shape, shape, strict=True)
     )
     kernel = kernel[region]
+    scan, row, column = np.meshgrid(
+        *((np.arange(size) - (size - 1) / 2) for size in shape), indexing="ij"
+    )
+    angle = np.deg2rad(microscope.angle_deg)
+    pixel = microscope.pixel_size_um
+    distance = np.sqrt(
+        (row * pixel * np.sin(angle)) ** 2
+        + (scan * step + row * pixel * np.cos(angle)) ** 2
+        + (column * pixel) ** 2
+    )
+    radius = 0.61 * microscope.wavelength_um / microscope.numerical_aperture
     return PointAcquisition(
         microscope=microscope,
         expectations=expectations,
         kernels=kernels,
         kernel=kernel / kernel.sum(),
+        apertures=(np.ones(shape, bool), distance <= radius, distance >= 2 * radius),
     )

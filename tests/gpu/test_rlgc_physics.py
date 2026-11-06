@@ -12,6 +12,8 @@ from scipy.signal import fftconvolve
 
 from tests.simulation.camera import digitize
 from tests.simulation.metrics import (
+    camera_flux_accuracy,
+    camera_prediction,
     camera_score_difference,
     predictive_deviance,
     two_point_profile,
@@ -42,9 +44,14 @@ def test_generated_psf_camera_reconstruction(cupy_gpu, production_point_acquisit
     assert predictive_deviance(recovered, expected, case.kernel) < predictive_deviance(
         calibrated, expected, case.kernel
     )
+    prediction = camera_prediction(recovered, case.kernel, boundary="constant")
+    for name, aperture in zip(
+        ("whole", "source", "background"), case.apertures, strict=True
+    ):
+        assert camera_flux_accuracy(prediction, expected, camera, aperture), name
     score = camera_score_difference(
         digitize(expected, camera, seed=43),
-        np.maximum(fftconvolve(recovered, case.kernel, mode="same"), 0),
+        prediction,
         np.maximum(fftconvolve(calibrated, case.kernel, mode="same"), 0),
         camera,
     )
