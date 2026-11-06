@@ -180,6 +180,72 @@ def test_current_stage_metadata_is_discovered_without_array_open(
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("scan_um", [None, 0, 30])
+def test_recorded_overlap_uses_raw_geometry_and_stage_distance(
+    current_opm_v2_stage_scan, scan_um
+):
+    """Read producer overlaps, prioritizing a recorded stage-scan distance."""
+    path = current_opm_v2_stage_scan
+    opm = dict(open_group(path).attrs["opm_v2"])
+    positions = {
+        "scan_axis_overlap": 0.15,
+        "tile_axis_overlap": 0.25,
+        "z_axis_overlap": 0.3,
+    }
+    if scan_um is not None:
+        positions["scan_axis_overlap_um"] = scan_um
+    opm["configuration"]["acq_config"]["Positions"] = positions
+    update_group_attributes(path, {"opm_v2": opm})
+
+    metadata = inspect_acquisition(path)
+    scan_overlap = (
+        (0.8 + 4 * 0.115 * np.cos(np.deg2rad(30))) * 0.15
+        if scan_um is None
+        else scan_um
+    )
+    np.testing.assert_allclose(
+        metadata.registration_overlap_zyx_um,
+        (4 * 0.115 * 0.5 * 0.3, scan_overlap, 5 * 0.115 * 0.25),
+    )
+    assert metadata.to_dict()["scan_axis_overlap_um"] == scan_um
+    assert metadata.to_dict()["registration_overlap_zyx_um"] == (
+        metadata.registration_overlap_zyx_um
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("scan_axis_overlap_um", -1),
+        ("scan_axis_overlap", 15),
+        ("tile_axis_overlap", float("nan")),
+        ("z_axis_overlap", "invalid"),
+    ],
+)
+def test_invalid_recorded_overlap_is_not_silently_guessed(
+    current_opm_v2_stage_scan, name, value
+):
+    """Reject invalid producer settings before constructing search bounds."""
+    path = current_opm_v2_stage_scan
+    opm = dict(open_group(path).attrs["opm_v2"])
+    opm["configuration"]["acq_config"]["Positions"] = {name: value}
+    # Use a serializable nonfinite spelling; the inspector must reject it.
+    if isinstance(value, float) and np.isnan(value):
+        opm["configuration"]["acq_config"]["Positions"][name] = "nan"
+    update_group_attributes(path, {"opm_v2": opm})
+    with pytest.raises(ValueError, match=f"Positions.{name}"):
+        inspect_acquisition(path)
+
+
+@pytest.mark.unit
+def test_missing_overlap_metadata_remains_unknown(current_opm_v2_stage_scan):
+    """Absent overlap settings must not invent an acquisition percentage."""
+    metadata = inspect_acquisition(current_opm_v2_stage_scan)
+    assert metadata.registration_overlap_zyx_um == (None, None, None)
+
+
+@pytest.mark.unit
 def test_current_stage_collection_opens_as_virtual_tpczyx(
     current_opm_v2_stage_scan: Path,
 ) -> None:

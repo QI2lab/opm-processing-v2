@@ -1231,16 +1231,17 @@ def _infer_registration_limits(
     angle_deg: float | None,
     *,
     is_2d: bool = False,
+    overlap_zyx_um: Sequence[float | None] | None = None,
 ) -> dict[tuple[int, int], tuple[int, int, int]]:
     """Infer search envelopes from physical overlaps and OPM scan geometry.
 
-    Stage-placement uncertainty is budgeted at ten percent of the smallest
-    face overlap on each tiled axis, with two registration sampling bins as
-    a floor. Untiled axes use ten percent of their tile extent. Depth pairs
+    Recorded acquisition overlap sets each axis's search allowance, with two
+    registration sampling bins as a floor. Missing metadata uses the measured
+    nearest-face overlap, or the tile extent on untiled axes. Depth pairs
     additionally allow the oblique-plane footprint displacement dz*cot(theta)
     along image Y. This is a search allowance, not a shear of tile origins.
-    Depth-face pairs allow up to twenty percent of their depth extent while
-    requiring at least three actually matched planes; other axes retain at
+    Depth-face pairs require at least three actually matched planes rather
+    than capping Z at half the nominal intersection. Other axes retain at
     least half their overlap.
 
     Parameters
@@ -1257,6 +1258,9 @@ def _infer_registration_limits(
         Oblique scan angle in degrees, or None when unavailable.
     is_2d : bool, default = False
         Whether tiles represent planar images.
+    overlap_zyx_um : sequence of float or None, optional
+        Recorded acquisition overlaps in physical image ZYX units. None on
+        an axis falls back to stage geometry, without a fractional budget.
 
     Returns
     -------
@@ -1301,16 +1305,23 @@ def _infer_registration_limits(
         if (left, right) in nearest_pairs and delta[axis] > 0:
             face_overlaps[axis].append(float(overlap[axis]))
     extent = np.min(shapes, axis=0)
+    recorded_overlap = (None, None, None) if overlap_zyx_um is None else overlap_zyx_um
+    if len(recorded_overlap) != 3 or any(
+        value is not None and (not math.isfinite(value) or value < 0)
+        for value in recorded_overlap
+    ):
+        raise ValueError("overlap_zyx_um must contain three nonnegative values or None")
     base = np.maximum(
         2 * sampling,
         np.ceil(
-            0.1
-            * np.asarray(
-                [
-                    min(values) if values else extent[axis]
-                    for axis, values in enumerate(face_overlaps)
-                ]
-            )
+            [
+                recorded_overlap[axis] / spacing[axis]
+                if recorded_overlap[axis] is not None
+                else min(values)
+                if values
+                else extent[axis]
+                for axis, values in enumerate(face_overlaps)
+            ]
         ),
     )
     cotangent = (
@@ -1335,9 +1346,6 @@ def _infer_registration_limits(
         if depth_pair:
             # Narrow depth intersections must not cap corrections at half their
             # width. Context reads below permit matching outside that crop.
-            budget[0] = max(
-                budget[0], math.ceil(0.2 * min(shapes[left, 0], shapes[right, 0]))
-            )
             # A correction towards the other tile increases the overlap. Do
             # not limit that correction by the small nominal intersection.
             # The contextual search checks actual common geometric support.
@@ -1473,8 +1481,8 @@ class TileFusion:
             Absolute residual threshold in effective registration sampling bins.
         max_registration_shift_zyx : tuple[int, int, int] or None
             Maximum accepted registration correction in ZYX voxels. None
-            infers a separate limit for each pair from stage spacing, tile
-            overlap, voxel size, scan angle, and registration sampling.
+            reads recorded acquisition overlap and bounds each pair using stage
+            geometry, voxel size, scan angle, and registration sampling.
         reverse_stage_y : bool
             Whether to reverse stage-derived image-Y placement. Tile pixel
             arrays are not modified.
@@ -1722,6 +1730,7 @@ class TileFusion:
                     self.downsample_factors,
                     self.acquisition.angle_deg,
                     is_2d=self._is_2d,
+                    overlap_zyx_um=self.acquisition.registration_overlap_zyx_um,
                 )
                 self._pair_registration_limits.update(
                     {
@@ -1740,7 +1749,7 @@ class TileFusion:
                 for axis in range(3)
             )
             print(
-                "Automatic registration limits: per-pair geometry; "
+                "Automatic registration limits: recorded overlap and per-pair geometry; "
                 f"maximum ZYX corrections {max_registration_shift_zyx} pixels."
             )
         if len(max_registration_shift_zyx) != 3 or any(
@@ -3769,7 +3778,7 @@ class TileFusion:
             "registration_retries": getattr(self, "registration_retries", 2),
             "retry_policy": "selective-pairs-and-global-measured-peak-5pct-2px-bin-v3",
             "shift_limits_policy": (
-                "stage-overlap-contextual-depth-actual-support-per-pair-v3"
+                "recorded-overlap-contextual-depth-actual-support-per-pair-v4"
                 if getattr(self, "_automatic_registration_limits", False)
                 else "explicit"
             ),

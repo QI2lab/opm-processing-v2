@@ -1,9 +1,13 @@
 """Geometry controls automatic search envelopes without moving tile origins."""
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 from scipy.ndimage import gaussian_filter
 
+from opm_processing.dataio.acquisition import inspect_acquisition
+from opm_processing.imageprocessing.opmtools import deskew_shape_estimator
 from opm_processing.imageprocessing.tilefusion import (
     TileFusion,
     _aligned_registration_views,
@@ -13,6 +17,37 @@ from opm_processing.imageprocessing.tilefusion import (
 )
 
 pytestmark = pytest.mark.unit
+
+
+@pytest.mark.parametrize("z_downsample", [1, 2, 4])
+def test_recorded_overlap_uses_deskewed_voxel_spacing(
+    current_opm_v2_stage_scan, z_downsample
+):
+    """The physical allowance stays constant across actual deskew output grids."""
+    acquisition = replace(
+        inspect_acquisition(current_opm_v2_stage_scan),
+        shape=(1, 2, 2, 64, 256, 16),
+        scan_axis_overlap_um=30,
+        tile_axis_overlap=0.15,
+        z_axis_overlap=0.2,
+    )
+    shape, *_ = deskew_shape_estimator(
+        (64, 256, 16), 30, 0.4, 0.115, False, 4, z_downsample
+    )
+    spacing = (0.115 * z_downsample, 0.115, 0.115)
+    limits = _infer_registration_limits(
+        [(0, 0, 0), (10.14, 0, 0)],
+        [shape, shape],
+        spacing,
+        (1, 1, 1),
+        30,
+        overlap_zyx_um=acquisition.registration_overlap_zyx_um,
+    )
+    # A 20% overlap of a 14.72-um laboratory-Z footprint is 2.944 um.
+    # Integer output-grid rounding may add less than one deskewed Z voxel.
+    allowance_um = limits[0, 1][0] * spacing[0]
+    assert 2.944 <= allowance_um < 2.944 + spacing[0]
+    assert limits[0, 1][0] == {1: 26, 2: 13, 4: 7}[z_downsample]
 
 
 @pytest.mark.parametrize("sampling", [(1, 1, 1), (1, 2, 2)])
@@ -100,17 +135,19 @@ def test_stage_grid_allows_depth_footprint_drift_and_preserves_overlap():
         [(-z, -y, x) for z in (0, 11.76) for y in (0, 642.28) for x in (0, 183.89)]
     )
     original = positions.copy()
+    # Recorded Z/tile fractions and the stage-scan overlap in micrometers.
+    overlap = (256 * 0.115 * 0.5 * 0.2, 30, 1900 * 0.115 * 0.15)
     limits = _infer_registration_limits(
         positions,
         [(64, 6288, 1900)] * 8,
         (0.23, 0.115, 0.115),
         (3, 5, 5),
         30,
+        overlap_zyx_um=overlap,
     )
     depth_limits = limits[0, 4]
     assert depth_limits[0] == 13  # Actual matched support gates depth corrections.
-    assert 240 <= depth_limits[1] <= 260
-    assert depth_limits[2] == 31
+    assert depth_limits == (13, 439, 285)
     assert all(
         abs(shift) <= limit
         for shift, limit in zip((1, -182, 9), depth_limits, strict=False)
@@ -123,6 +160,7 @@ def test_stage_grid_allows_depth_footprint_drift_and_preserves_overlap():
         (0.23, 0.115, 0.115),
         (3, 5, 5),
         30,
+        overlap_zyx_um=overlap,
     )
     assert reordered[3, 7] == depth_limits
 
@@ -137,7 +175,9 @@ def test_projection_limits_ignore_depth_and_disjoint_tiles():
         30,
         is_2d=True,
     )
-    assert limits == {(0, 1): (0, 10, 10)}
+    # With no recorded settings, preserve half the actual overlap; do not
+    # multiply the geometric overlap or the untiled Y extent by ten percent.
+    assert limits == {(0, 1): (0, 50, 10)}
 
 
 def test_variable_roi_limits_use_intersection_not_common_shape():
@@ -150,7 +190,65 @@ def test_variable_roi_limits_use_intersection_not_common_shape():
         45,
     )
     # The cropped Y intersection is only ten pixels despite a large Z/Y allowance.
-    assert limits[0, 1] == (6, 5, 10)
+    assert limits[0, 1] == (6, 5, 20)
+
+
+def test_recorded_overlap_changes_allowance_without_changing_pair_geometry():
+    """Recorded overlap supplies a physical allowance before support caps apply."""
+    arguments = (
+        [(0, 0, 0), (0, 0, 60)],
+        [(64, 96, 96)] * 2,
+        (1, 1, 1),
+        (3, 2, 2),
+        30,
+    )
+    assert _infer_registration_limits(*arguments, overlap_zyx_um=(12.8, 24, 24)) == {
+        (0, 1): (13, 24, 18)
+    }
+    assert _infer_registration_limits(*arguments, overlap_zyx_um=(6, 8, 8)) == {
+        (0, 1): (6, 8, 8)
+    }
+    scaled = (
+        np.asarray(arguments[0]) * 1000,
+        arguments[1],
+        (1000, 1000, 1000),
+        arguments[3],
+        arguments[4],
+    )
+    assert _infer_registration_limits(
+        *scaled, overlap_zyx_um=(12800, 24000, 24000)
+    ) == {(0, 1): (13, 24, 18)}
+
+
+def test_recorded_depth_overlap_recovers_lateral_pair_beyond_old_z_budget(
+    registration_pair,
+):
+    """Recover independent slab sampling with a nine-pixel axial stage error."""
+    truth = gaussian_filter(
+        np.random.default_rng(186).uniform(100, 1000, (80, 96, 160)), (3, 2, 2)
+    ).astype(np.float32)
+    volumes = [truth[:64, :, :96], truth[9:73, :, 64:160]]
+    positions = [(0, 0, 0), (0, 0, 60)]
+    limits = _infer_registration_limits(
+        positions,
+        [volume.shape for volume in volumes],
+        (1, 1, 1),
+        (3, 2, 2),
+        30,
+        overlap_zyx_um=(12.8, 24, 24),
+    )
+    fusion = registration_pair(
+        volumes,
+        positions,
+        spacing=(1, 1, 1),
+        sampling=(3, 2, 2),
+        ssim_window=7,
+        _pair_registration_limits=limits,
+        max_registration_shift_zyx=limits[0, 1],
+    )
+    fusion.refine_tile_positions_with_cross_correlation()
+    np.testing.assert_allclose(fusion.pairwise_metrics[0, 1][:3], (9, 0, 4), atol=1)
+    assert fusion.pairwise_metrics[0, 1][3] > 0.95
 
 
 def test_geometry_is_invariant_to_physical_unit_conversion():

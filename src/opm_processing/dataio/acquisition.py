@@ -68,6 +68,59 @@ class AcquisitionMetadata:
     plane_period_s: float | None = None
     timing_source: str | None = None
     deconvolution: dict[str, Any] | None = None
+    scan_axis_overlap_um: float | None = None
+    scan_axis_overlap: float | None = None
+    tile_axis_overlap: float | None = None
+    z_axis_overlap: float | None = None
+
+    @property
+    def registration_overlap_zyx_um(self) -> tuple[float | None, ...]:
+        """Convert recorded tile overlaps to physical processed-image ZYX extents.
+
+        Stage scans record scan overlap in micrometers; that setting takes
+        precedence over the fractional scan overlap retained in the config.
+        Camera extents use the raw crop and angle, independent of processing
+        crops or downsampling. Missing settings remain unknown.
+        """
+        if self.pixel_size_um is None:
+            return (
+                None,
+                self.scan_axis_overlap_um if self.mode == "stage" else None,
+                None,
+            )
+        camera_y = self.index_sizes["y"] * self.pixel_size_um
+        camera_x = self.index_sizes["x"] * self.pixel_size_um
+        depth_extent = None
+        scan_extent = camera_y
+        if not self.is_2d:
+            if self.angle_deg is None:
+                scan_extent = None
+            else:
+                angle = math.radians(self.angle_deg)
+                depth_extent = camera_y * math.sin(angle)
+                scan_extent = (
+                    None
+                    if self.scan_span_um is None
+                    else self.scan_span_um + camera_y * math.cos(angle)
+                )
+        depth = (
+            None
+            if depth_extent is None or self.z_axis_overlap is None
+            else depth_extent * self.z_axis_overlap
+        )
+        scan = (
+            None
+            if scan_extent is None or self.scan_axis_overlap is None
+            else scan_extent * self.scan_axis_overlap
+        )
+        if self.mode == "stage" and self.scan_axis_overlap_um is not None:
+            scan = self.scan_axis_overlap_um
+        tile = (
+            None
+            if self.tile_axis_overlap is None
+            else camera_x * self.tile_axis_overlap
+        )
+        return (depth, scan, tile)
 
     def validate_processing_calibration(self) -> None:
         """Reject missing or invalid recorded camera and scan calibration."""
@@ -344,6 +397,7 @@ class AcquisitionMetadata:
         result["tile_count"] = self.tile_count
         result["scan_position_count"] = self.scan_position_count
         result["scan_span_um"] = self.scan_span_um
+        result["registration_overlap_zyx_um"] = self.registration_overlap_zyx_um
         result["channel_count"] = len(self.channels)
         result["stage_axis_flips_xyz"] = self.stage_axis_flips_xyz
         result["scan_axis_reversed"] = self.scan_axis_reversed
@@ -901,6 +955,25 @@ def _inspect_ome_zarr(path: Path, root: ZarrGroup) -> AcquisitionMetadata:
     camera = first_metadata.get("Camera", {})
     opm_frame = first_metadata.get("OPM", {})
     config = opm.get("configuration", {}).get("acq_config", {})
+    overlap_settings = {}
+    positions_config = config.get("Positions", {})
+    for name in (
+        "scan_axis_overlap_um",
+        "scan_axis_overlap",
+        "tile_axis_overlap",
+        "z_axis_overlap",
+    ):
+        if positions_config.get(name) is None:
+            continue
+        value = _number(positions_config[name])
+        if (
+            value is None
+            or not math.isfinite(value)
+            or value < 0
+            or (name != "scan_axis_overlap_um" and value >= 1)
+        ):
+            raise ValueError(f"Invalid recorded Positions.{name}")
+        overlap_settings[name] = value
     daq_config = config.get("DAQ", {})
     if not channel_names:
         found: dict[int, str] = {}
@@ -1008,6 +1081,7 @@ def _inspect_ome_zarr(path: Path, root: ZarrGroup) -> AcquisitionMetadata:
         else None,
         plane_period_s=plane_period_s,
         timing_source=timing_source,
+        **overlap_settings,
     )
 
 
