@@ -91,6 +91,7 @@ def test_roi_resumes_at_last_durable_channel(
             run.truth,
             resumed.spatial_origins_zyx_um[index],
             resumed.voxel_size_um,
+            positions=(index + 1,),
         )
         for _, position, channel in saved:
             if position == index + 1:
@@ -149,6 +150,7 @@ def test_empty_roi_channel_is_checkpointed_and_skipped(
             result.spatial_origins_zyx_um[index],
             result.voxel_size_um,
             channels=(1, 2) if index == 0 else None,
+            positions=(index + 1,),
         )
     assert ProcessingState.read(state_path).zero_channels(output) == {(0, 1, 0)}
 
@@ -172,6 +174,7 @@ def test_roi_processing_resumes_by_default(roi_run, resume, assert_roi_point_acc
             run.truth,
             collection.spatial_origins_zyx_um[index],
             collection.voxel_size_um,
+            positions=(index + 1,),
         )
     run.raw_arrays[1].write(np.uint16(901)).result()
     roi_command.process_roi(
@@ -240,16 +243,38 @@ def test_roi_command_fuses_selected_tiles_and_projects_pixels(
         open_image_array(run.output_dir / "sample_max_z_fused.ome.zarr").read().result()
     )
     dataset = open_group(fused_path).ome_metadata().multiscales[0].datasets[0]
+    state = ProcessingState.read(run.output_dir / "sample.processing.json")
+    source_tiles = run.output_dir / "sample_deskewed.ome.zarr"
+    records = state.roi_series(source_tiles)
+    for field in ("skewed_bounds_sx", "deskew_crop_yx"):
+        assert all(record[field] == records[0][field] for record in records)
+    # The prescribed source plans are coincident and every view has identical
+    # crop/support. Correct registration must retain that known placement,
+    # proving equal contributor weights for the original-dose mean below.
+    expected_origin = (
+        round(run.metadata.pixel_size_um / 2, 3),
+        run.roi.bounds_yx_um[0],
+        run.roi.bounds_yx_um[2],
+    )
+    registration = state.registration(source_tiles)
+    np.testing.assert_allclose(
+        [tile["origin_zyx_um"] for tile in registration["tiles"]],
+        np.broadcast_to(expected_origin, (len(records), 3)),
+        rtol=0,
+        atol=1e-6,
+    )
     assert_roi_point_accuracy(
         fused,
         run.truth,
         dataset.translation_transform.translation[-3:],
         dataset.scale_transform.scale[-3:],
+        positions=run.roi.position_indices,
+        equal_weights=True,
+        coverage_normalized=True,
     )
     # Projection is a separate numerical reduction, checked with NumPy after
     # the stored fused volume passes the original-object accuracy requirement.
     np.testing.assert_array_equal(projected, np.max(fused, axis=2, keepdims=True))
-    state = ProcessingState.read(run.output_dir / "sample.processing.json")
     assert state.completed_tiles(run.output_dir / "sample_deskewed.ome.zarr") == {
         (0, 1),
         (0, 2),

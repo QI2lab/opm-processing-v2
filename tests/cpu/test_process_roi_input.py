@@ -59,6 +59,7 @@ def test_process_roi_uses_raw_source_and_processed_directory_defaults(
             run.truth,
             output.spatial_origins_zyx_um[index],
             output.voxel_size_um,
+            positions=(index + 1,),
         )
     state = ProcessingState.read(expected_output / f"{stem}.processing.json")
     assert state.document["source"]["path"] == str(source)
