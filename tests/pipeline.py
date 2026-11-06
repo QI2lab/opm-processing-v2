@@ -15,7 +15,7 @@ from opm_processing.dataio.deconvolution import scan_upsample_from_metadata
 from opm_processing.dataio.processing_state import ProcessingState
 from opm_processing.imageprocessing.camera import camera_correct, illumination_correct
 from opm_processing.imageprocessing.opmtools import orthogonal_deskew
-from tests.simulation.metrics import predictive_deviance
+from tests.simulation.metrics import camera_prediction, predictive_deviance
 
 
 def test_qi2lab_acquisition_to_fused_ngff_v05(
@@ -134,7 +134,6 @@ def test_qi2lab_acquisition_to_fused_ngff_v05(
         # Predict independently simulated camera means with each actual
         # reconstruction. The score uses absolute counts without fitting.
         from scipy.interpolate import interp1d
-        from scipy.signal import fftconvolve
         from scipy.special import kl_div
 
         factor = scan_upsample_from_metadata(metadata)
@@ -170,7 +169,8 @@ def test_qi2lab_acquisition_to_fused_ngff_v05(
                 observed, metadata.camera_offset, metadata.camera_conversion
             )
             response = 1 if case.field is None else case.field[0, channel]
-            baseline = baseline / response
+            if case.field is not None:
+                baseline = illumination_correct(baseline, case.field[0, channel])
             if factor > 1:
                 baseline = interp1d(
                     np.arange(baseline.shape[0]) * factor, baseline, axis=0
@@ -179,11 +179,7 @@ def test_qi2lab_acquisition_to_fused_ngff_v05(
             scores = [
                 kl_div(
                     expected,
-                    np.maximum(
-                        fftconvolve(density, case.psf, mode="same")[::factor]
-                        * response,
-                        np.finfo(float).tiny,
-                    ),
+                    camera_prediction(density, case.psf, response=response)[::factor],
                 ).sum()
                 for density in (recovered, baseline)
             ]
@@ -485,28 +481,36 @@ def test_extended_mosaic_acquisition_to_fusion(
             atol=1e-8,
         )
         assert (0, 1) in fusion.optimized_pairwise_metrics
-        # Independent linear feathering: retain both exclusive camera regions
-        # and normalize overlapping measurements of the same physical specimen.
-        numerator = np.zeros_like(actual, dtype=np.float64)
-        denominator = np.zeros_like(actual, dtype=np.float64)
-        x = np.arange(shape[-1])
+        # These three prescribed planes have one contributor or two unit
+        # weights. Their closed-form values check placement and mixing without
+        # implementing a second feathered-fusion renderer in the test suite.
+        width = shape[-1]
         blend = parameters["blend_pixels_zyx"][-1]
-        weights = np.minimum(1, np.minimum(x + 1, shape[-1] - x) / blend)
-        for position, array in enumerate(result.collection.arrays):
-            start = np.rint(
-                (origins[position] - fusion.offset_um) / result.collection.voxel_size_um
-            ).astype(int)
-            selection = tuple(
-                slice(a, a + n) for a, n in zip(start, support.shape, strict=True)
-            )
-            numerator[(slice(None), slice(None), *selection)] += (
-                array.read().result() * weights
-            )
-            denominator[(slice(None), slice(None), *selection)] += support * weights
-        expected = np.divide(
-            numerator, denominator, out=np.zeros_like(numerator), where=denominator > 0
+        overlap_midpoint = (width - offset) // 2
+        assert blend <= overlap_midpoint < width - blend
+        assert blend <= offset + overlap_midpoint < width - blend
+        first, second = [array.read().result() for array in result.collection.arrays]
+        start = np.rint(
+            (origins[0] - fusion.offset_um) / result.collection.voxel_size_um
+        ).astype(int)
+        zy = tuple(
+            slice(a, a + n) for a, n in zip(start[:2], support.shape[:2], strict=True)
         )
-        np.testing.assert_allclose(actual, expected, rtol=5e-6, atol=5e-6)
+        for column, expected in (
+            (offset // 2, first[..., offset // 2]),
+            (
+                offset + overlap_midpoint,
+                (first[..., offset + overlap_midpoint] + second[..., overlap_midpoint])
+                / 2,
+            ),
+            (width + offset // 2, second[..., width - offset + offset // 2]),
+        ):
+            np.testing.assert_allclose(
+                actual[(slice(None), slice(None), *zy, start[2] + column)],
+                expected,
+                rtol=5e-6,
+                atol=5e-6,
+            )
         # Bright lines occur in the left-only, shared and right-only regions.
         for region in (
             slice(0, offset),
