@@ -18,7 +18,9 @@ from opm_processing.imageprocessing.opmtools import orthogonal_deskew
 from tests.simulation.metrics import predictive_deviance
 
 
-def test_qi2lab_acquisition_to_fused_ngff_v05(pipeline_case, deconvolve):
+def test_qi2lab_acquisition_to_fused_ngff_v05(
+    pipeline_case, deconvolve, pipeline_inverse_accuracy
+):
     """Retain calibrated pixels, registered coordinates and pyramids across stages."""
     case = pipeline_case
     raw = open_group(case.dataset.path)
@@ -206,6 +208,13 @@ def test_qi2lab_acquisition_to_fused_ngff_v05(pipeline_case, deconvolve):
         )
         expected_fused[(time, slice(None), *slices)] = exposures.mean(axis=0)
     np.testing.assert_allclose(base, expected_fused, rtol=5e-6, atol=5e-6)
+    if deconvolve:
+        pipeline_inverse_accuracy(
+            case,
+            case.camera_means,
+            case.microscope,
+            case.optical_data.optical_object.ground_truth,
+        )
 
 
 def assert_fused_ngff(case):
@@ -259,6 +268,8 @@ def test_extended_mosaic_acquisition_to_fusion(
     pipeline_runner,
     pipeline_geometry,
     pipeline_camera_accuracy,
+    pipeline_source_image,
+    pipeline_inverse_accuracy,
     monkeypatch,
     tmp_path,
 ):
@@ -268,19 +279,16 @@ def test_extended_mosaic_acquisition_to_fusion(
     shape = case.dataset.raw_data.shape[-3:]
     factor = scan_upsample_from_metadata(case.dataset.metadata) if deconvolve else 1
     shape = ((shape[0] - 1) * factor + 1, *shape[1:])
-    expectation = case.reconstruction_expectation if deconvolve else case.expectation
-    scan_step = case.microscope.scan_step_um / factor
+    expectation = (
+        case.reconstruction_source_expectation
+        if deconvolve
+        else case.source_expectation
+    )
     offset = parameters["tile_offset_x_pixels"]
     tile_limits = np.asarray(parameters["deskew_tile_shape_zyx"])
     # The noiseless specimen image crosses Y and X output tile borders, so the
     # numerical comparison exercises foreground seams as well as dark regions.
-    signal = orthogonal_deskew(
-        expectation,
-        theta=case.microscope.angle_deg,
-        distance=scan_step,
-        pixel_size=case.microscope.pixel_size_um,
-        downsample_factor=1,
-    )
+    signal = pipeline_source_image(case.optical_data, scan_factor=factor)
     bright = signal[..., : shape[-1]] > signal.max() / 2
     for axis in (0, 1, 2):
         boundaries = np.arange(tile_limits[axis], bright.shape[axis], tile_limits[axis])
@@ -505,8 +513,8 @@ def test_extended_mosaic_acquisition_to_fusion(
             slice(offset, shape[-1]),
             slice(shape[-1], None),
         ):
-            field = case.expectation[..., region]
-            assert field.max() > case.expectation.max() / 2
+            field = case.source_expectation[..., region]
+            assert field.max() > case.source_expectation.max() / 2
         if result is tiled:
             block_y, block_x = fusion._fusion_block_shape(
                 fusion.write_block_shape[2],
@@ -522,3 +530,21 @@ def test_extended_mosaic_acquisition_to_fusion(
             assert np.any(foreground[:, y_borders - 1] & foreground[:, y_borders])
     if not deconvolve:
         np.testing.assert_array_equal(fused[1], fused[0])
+    else:
+        means = np.stack(
+            [
+                case.expectation[..., position * offset : position * offset + shape[-1]]
+                for position in range(2)
+            ]
+        )[None, :, None]
+        offsets_x = (
+            np.arange(2) * offset - (case.expectation.shape[-1] - shape[-1]) / 2
+        ) * case.microscope.pixel_size_um
+        for result in (full, tiled):
+            pipeline_inverse_accuracy(
+                result,
+                means,
+                case.microscope,
+                case.optical_data.optical_object.ground_truth,
+                offsets_x=offsets_x,
+            )
