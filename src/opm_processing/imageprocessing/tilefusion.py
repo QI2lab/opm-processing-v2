@@ -59,6 +59,7 @@ from opm_processing.dataio.ngff import (
 from opm_processing.dataio.position_collection import open_position_collection
 from opm_processing.dataio.processing_state import (
     ProcessingState,
+    processing_state_image_attributes,
     processing_state_path,
 )
 from opm_processing.dataio.timing import time_axis
@@ -1482,6 +1483,7 @@ class TileFusion:
         roi_selection: PhysicalRoi | None = None,
         normalize_depth_intensity: bool = True,
         registration_retries: int = 2,
+        output_dir: str | Path | None = None,
     ) -> None:
         """Initialize registration and fusion for a processed acquisition.
 
@@ -1543,6 +1545,9 @@ class TileFusion:
             Maximum automatic search expansions. Each expansion remeasures only
             affected pairs and refits all global offsets. Explicit shift limits
             are never expanded.
+        output_dir : str or pathlib.Path or None
+            Destination for fused OME-Zarr images. None writes beside the
+            processed tiles. Registration and depth-gain records stay there.
 
         Returns
         -------
@@ -1550,11 +1555,17 @@ class TileFusion:
             No value is returned.
         """
         (
-            self.output_dir,
+            processing_dir,
             self.data,
             self.acquisition_name,
             source_path,
         ) = resolve_fusion_input(root_path)
+        self.output_dir = (
+            processing_dir
+            if output_dir is None
+            else Path(output_dir).expanduser().resolve()
+        )
+        self.output_dir.mkdir(parents=True, exist_ok=True)
 
         if max_workers is None:
             max_workers = _default_fusion_workers()
@@ -1577,7 +1588,7 @@ class TileFusion:
         )
         collection = open_position_collection(self.data)
         self.processing_state = ProcessingState.read(
-            processing_state_path(self.output_dir, self.acquisition_name)
+            processing_state_path(processing_dir, self.acquisition_name)
         )
         self.processing_state.run(self.data)
         state_source_path = self.processing_state.source_path()
@@ -4092,7 +4103,15 @@ class TileFusion:
             output_path,
             image,
             specs,
-            extra_attributes={},
+            extra_attributes={
+                **(
+                    processing_state_image_attributes(
+                        self.processing_state.path, Path(output_path)
+                    )
+                    if hasattr(self, "processing_state")
+                    else {}
+                ),
+            },
             chunks=codec_chunks,
             writer="tensorstore",
             overwrite=True,
@@ -4808,7 +4827,7 @@ class TileFusion:
         -------
         None
             Writes the fused NGFF store to:
-            `{processing_output}/{stem}_fused.ome.zarr`
+            `{output_dir}/{stem}_fused.ome.zarr`
 
         Raises
         ------
@@ -4853,7 +4872,8 @@ class TileFusion:
         self._fuse_by_blocks()
         self._write_multiscales()
         report_path = (
-            self.output_dir / f"{self.acquisition_name}_depth_intensity_gains.json"
+            self.processing_state.path.parent
+            / f"{self.acquisition_name}_depth_intensity_gains.json"
         )
         report_path.write_text(
             json.dumps(self._depth_intensity_report or {"enabled": False}, indent=2)
@@ -4872,4 +4892,12 @@ class TileFusion:
                     }
                     for tile_index, tile_position in enumerate(self._tile_positions)
                 ),
+            )
+        else:
+            # A cropped rendering reuses the full registered placement, but
+            # its artifact may now live in another output directory.
+            self.processing_state.complete_registration(
+                self.data,
+                fused_path=omezarr,
+                tiles=self.processing_state.registration(self.data)["tiles"],
             )

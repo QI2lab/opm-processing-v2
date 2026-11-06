@@ -2,16 +2,46 @@
 
 from __future__ import annotations
 
+import json
+import os
+import shutil
 from unittest.mock import Mock
 
 import pytest
 
 from opm_processing.dataio.processing_state import (
     ProcessingState,
+    image_processing_state_path,
+    processing_state_image_attributes,
     processing_state_path,
 )
 
 pytestmark = pytest.mark.unit
+
+
+def test_external_image_journal_link_survives_copying_the_directory_tree(tmp_path):
+    """Prefer the copied relative journal even while original paths still exist."""
+    source = tmp_path / "original" / "sample.ome.zarr"
+    source.mkdir(parents=True)
+    state = ProcessingState.create(source.parent / "sample.processing.json", source)
+    image = source.parent / "rendered" / "sample_fused.ome.zarr"
+    image.mkdir(parents=True)
+    (image / "zarr.json").write_text(
+        json.dumps(
+            {
+                "zarr_format": 3,
+                "node_type": "group",
+                "attributes": processing_state_image_attributes(state.path, image),
+            }
+        )
+    )
+    copied = tmp_path / "copied"
+    shutil.copytree(source.parent, copied)
+    assert (
+        image_processing_state_path(copied / "rendered" / image.name, "sample")
+        == copied / state.path.name
+    )
+    assert state.path.is_file()
 
 
 @pytest.mark.parametrize(
@@ -96,6 +126,44 @@ def test_processing_state_resume_requires_exact_run_configuration(
             overwrite=False,
         )
     assert path.read_bytes() == saved
+
+
+@pytest.mark.parametrize("cross_drive", [False, True])
+def test_registration_tracks_external_artifacts_in_the_original_journal(
+    tmp_path, processing_state, monkeypatch, cross_drive
+):
+    """Record another output location without weakening processed-run ownership."""
+    state = processing_state
+    processed = tmp_path / "sample_deskewed.ome.zarr"
+    destination = tmp_path.parent / f"{tmp_path.name}-fused"
+    fused = destination / "sample_fused.ome.zarr"
+    maximum = destination / "sample_max_z_fused.ome.zarr"
+    if cross_drive:
+        relative = os.path.relpath
+
+        def different_drive(path, start):
+            if path in (fused, maximum):
+                raise ValueError("path is on another Windows drive")
+            return relative(path, start)
+
+        monkeypatch.setattr(os.path, "relpath", different_drive)
+    state.initialize_run(processed, configuration={}, overwrite=True)
+    state.save_registration(
+        processed,
+        configuration={"channel": 0},
+        pairwise_metrics={"0,1": [0, 1, 2, 0.9]},
+    )
+    state.complete_registration(processed, fused_path=fused, tiles=())
+    state.set_registered_max_projection(processed, max_projection_path=maximum)
+    reopened = ProcessingState.read(state.path)
+    assert reopened.path.parent == processed.parent
+    assert reopened.registered_output_for_fused(fused) == processed
+    assert reopened.registered_output_for_max_projection(maximum) == processed
+    record = reopened.registration(processed)
+    assert record["pairwise_metrics"] == {"0,1": [0, 1, 2, 0.9]}
+    assert (state.path.parent / record["fused_path"]).resolve() == fused
+    with pytest.raises(ValueError, match="must be inside"):
+        reopened.initialize_run(fused, configuration={}, overwrite=True)
 
 
 def test_overwriting_one_run_preserves_siblings_and_invalidates_only_its_registration(

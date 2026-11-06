@@ -16,7 +16,10 @@ from opm_processing.dataio.acquisition import (
     acquisition_stem,
     inspect_acquisition,
 )
-from opm_processing.dataio.processing_state import ProcessingState
+from opm_processing.dataio.processing_state import (
+    ProcessingState,
+    image_processing_state_path,
+)
 
 
 def hardware_timing(
@@ -255,20 +258,35 @@ def inspect_dataset(path: str | Path) -> dict[str, Any]:
     if len(raw_paths) > 1:
         raise ValueError("Multiple raw acquisitions found; specify one raw store")
     associated = set()
-    for sidecar in directory.glob("*.processing.json"):
+    linked_sources = set()
+    state_paths = set(directory.glob("*.processing.json"))
+    state_paths.update(
+        image_processing_state_path(store, acquisition_stem(store))
+        for store, root in roots.items()
+        if root.attrs.get("opm_processing", {}).get("processing_state")
+    )
+    for sidecar in sorted(state_paths):
         state = ProcessingState.read(sidecar)
         source = state.source_path()
-        products = {sidecar.parent / name for name in state.document["outputs"]}
+        products = {
+            (sidecar.parent / name).resolve() for name in state.document["outputs"]
+        }
         products.update(
-            sidecar.parent / record[key]
+            (sidecar.parent / record[key]).resolve()
             for record in state.document["registration"].values()
             for key in ("fused_path", "max_projection_path")
             if record.get(key)
         )
-        if source in raw_paths or (direct and path in products):
+        if (
+            source in raw_paths
+            or (direct and path in products)
+            or (not direct and any(store in products for store in roots))
+        ):
             associated.update(products)
-            if source.is_dir() and not raw_paths:
-                raw_paths = [source]
+            if source.is_dir():
+                linked_sources.add(source)
+    if not raw_paths and len(linked_sources) == 1:
+        raw_paths = list(linked_sources)
     raw = raw_report(inspect_acquisition(raw_paths[0])) if raw_paths else None
     if raw is not None:
         prefix = acquisition_stem(raw["path"]) + "_"

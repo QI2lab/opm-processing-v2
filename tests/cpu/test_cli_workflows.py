@@ -13,10 +13,89 @@ from opm_processing.dataio.position_collection import (
     open_position_collection,
 )
 from opm_processing.dataio.processing_state import ProcessingState
+from opm_processing.dataio.roi import projection_tile_footprints
+from opm_processing.export_ome_tiff import load_export_metadata
 from opm_processing.imageprocessing.tilefusion import TileFusion
 from opm_processing.process import confirm_partial_output_resume
 
 pytestmark = pytest.mark.integration
+
+
+@pytest.mark.parametrize("deconvolve", [False])
+@pytest.mark.parametrize("pipeline_case", [("stage", False, 0.4, None)], indirect=True)
+def test_fuse_output_dir_keeps_registration_with_processed(
+    pipeline_case, invoke_cli, tmp_path, monkeypatch
+):
+    """Render elsewhere from cached registration, preserving pixels and provenance."""
+    case = pipeline_case
+    source = case.processed.parent
+    destination = tmp_path.parent / f"{tmp_path.name}-rendered" / "nested"
+    state_path = source / "pipeline.processing.json"
+    before = ProcessingState.read(state_path).registration(case.processed)
+    expected = open_image_array(case.output).read().result()
+    measurements = []
+    measure = TileFusion.register_and_score
+
+    def observe_measurement(*args, **kwargs):
+        result = measure(*args, **kwargs)
+        measurements.append(result)
+        return result
+
+    monkeypatch.setattr(
+        TileFusion, "register_and_score", staticmethod(observe_measurement)
+    )
+    invoke_cli(
+        "fuse",
+        case.processed,
+        output_dir=destination,
+        blend_pixels=(0, 0, 0),
+        downsample_factors=(1, 1, 1),
+        registration_channel=case.dataset.metadata.shape[2] - 1,
+        ssim_window=3,
+        registration_threshold=0.1,
+        max_registration_shift_zyx=(2, 2, 2),
+        chunk_shape_yx=(16, 16),
+        max_workers=1,
+        normalize_depth_intensity=False,
+    )
+    assert not measurements
+    fused = destination / case.output.name
+    maximum = destination / "pipeline_max_z_fused.ome.zarr"
+    np.testing.assert_array_equal(open_image_array(fused).read().result(), expected)
+    np.testing.assert_array_equal(
+        open_image_array(maximum).read().result(), expected.max(axis=2, keepdims=True)
+    )
+    assert not (destination / state_path.name).exists()
+    assert (source / "pipeline_depth_intensity_gains.json").is_file()
+    assert not (destination / "pipeline_depth_intensity_gains.json").exists()
+    state = ProcessingState.read(state_path)
+    after = state.registration(case.processed)
+    assert after["configuration_sha256"] == before["configuration_sha256"]
+    assert after["pairwise_metrics"] == before["pairwise_metrics"]
+    assert after["tiles"] == before["tiles"]
+    assert state.registered_output_for_fused(fused) == case.processed
+    assert state.registered_output_for_max_projection(maximum) == case.processed
+    footprints = projection_tile_footprints(maximum)
+    assert (
+        len(footprints)
+        == case.dataset.metadata.shape[0] * case.dataset.metadata.shape[1]
+    )
+    _, provenance = load_export_metadata(fused)
+    assert json.loads(provenance["Acquisition"])["path"] == str(case.dataset.path)
+    inspection = json.loads(invoke_cli("inspect-opm", fused).output)
+    assert inspection["raw"]["path"] == str(case.dataset.path)
+    inspection = json.loads(invoke_cli("inspect-opm", destination).output)
+    assert inspection["raw"]["path"] == str(case.dataset.path)
+    invoke_cli(
+        "fuse",
+        case.processed,
+        output_dir=destination,
+        regenerate_max_z=True,
+        max_workers=1,
+    )
+    np.testing.assert_array_equal(
+        open_image_array(maximum).read().result(), expected.max(axis=2, keepdims=True)
+    )
 
 
 @pytest.mark.parametrize("deconvolve", [False])

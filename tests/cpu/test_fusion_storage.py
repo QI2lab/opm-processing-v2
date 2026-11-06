@@ -9,8 +9,13 @@ from yaozarrs import open_group, v05
 from opm_processing.dataio.position_collection import (
     open_image_array,
     open_position_collection,
+    update_group_attributes,
 )
-from opm_processing.dataio.processing_state import ProcessingState
+from opm_processing.dataio.processing_state import (
+    ProcessingState,
+    image_processing_state_path,
+    processing_state_image_attributes,
+)
 from opm_processing.fuse import app as fuse_app
 from opm_processing.imageprocessing.maxtilefusion import MaxTileFusion
 from opm_processing.imageprocessing.tilefusion import TileFusion
@@ -278,18 +283,36 @@ def test_multiscale_storage_round_trip_matches_reference(
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("external", [False, True])
 def test_regenerate_max_z_flag_preserves_multiscale_pyramid_round_trip(
     registered_projection_case,
+    external,
 ) -> None:
     """All pyramid levels include photons from every full-resolution Z plane."""
     case = registered_projection_case
+    output_path = case.output_path
+    options = []
+    if external:
+        destination = case.state_path.parent / "rendered"
+        destination.mkdir()
+        fused_path = case.output_path.parent / "sample_fused.ome.zarr"
+        fused_path = fused_path.rename(destination / fused_path.name)
+        output_path = case.output_path.rename(destination / case.output_path.name)
+        state = ProcessingState.read(case.state_path)
+        state.complete_registration(
+            case.processed_path, fused_path=fused_path, tiles=()
+        )
+        update_group_attributes(
+            fused_path, processing_state_image_attributes(state.path, fused_path)
+        )
+        options = ["--output-dir", str(destination)]
     result = CliRunner().invoke(
         fuse_app,
-        [str(case.raw_path), "--regenerate-max-z", "--max-workers", "2"],
+        [str(case.raw_path), "--regenerate-max-z", "--max-workers", "2", *options],
     )
     assert result.exit_code == 0, result.output
 
-    reopened = open_group(case.output_path)
+    reopened = open_group(output_path)
     metadata = reopened.ome_metadata()
     assert isinstance(metadata, v05.Image)
     datasets = metadata.multiscales[0].datasets
@@ -308,18 +331,14 @@ def test_regenerate_max_z_flag_preserves_multiscale_pyramid_round_trip(
                 )
             ).astype(case.truth.dtype)
         np.testing.assert_array_equal(actual, expected)
-        expected_scale = [
-            case.scales[level][0],
-            case.scales[level][1],
-            *(round(value, 3) for value in case.scales[level][2:]),
-        ]
-        np.testing.assert_allclose(dataset.scale_transform.scale, expected_scale)
+        np.testing.assert_allclose(
+            dataset.scale_transform.scale,
+            [round(value, 3) for value in case.scales[level]],
+            rtol=0,
+            atol=1e-12,
+        )
         assert dataset.translation_transform is not None
-        expected_translation = [
-            case.translations[level][0],
-            case.translations[level][1],
-            *(round(value, 3) for value in case.translations[level][2:]),
-        ]
+        expected_translation = list(case.translations[level])
         expected_translation[2] = (
             case.translations[0][2]
             + 0.5 * (case.truth.shape[2] - 1) * case.scales[0][2]
@@ -330,12 +349,16 @@ def test_regenerate_max_z_flag_preserves_multiscale_pyramid_round_trip(
         np.testing.assert_allclose(
             dataset.translation_transform.translation,
             expected_translation,
+            rtol=0,
+            atol=1e-12,
         )
-    assert not any(key.startswith("opm_") for key in reopened.attrs)
+    if external:
+        assert image_processing_state_path(output_path, "sample") == case.state_path
+    else:
+        assert not any(key.startswith("opm_") for key in reopened.attrs)
     state = ProcessingState.read(case.state_path)
     assert (
-        state.registered_output_for_max_projection(case.output_path)
-        == case.processed_path
+        state.registered_output_for_max_projection(output_path) == case.processed_path
     )
 
 

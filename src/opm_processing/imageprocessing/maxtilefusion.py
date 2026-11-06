@@ -24,7 +24,8 @@ from opm_processing.dataio.ngff import (
 )
 from opm_processing.dataio.processing_state import (
     ProcessingState,
-    processing_state_path,
+    image_processing_state_path,
+    processing_state_image_attributes,
 )
 from opm_processing.dataio.timing import time_axis
 from opm_processing.imageprocessing.coordinates import (
@@ -62,7 +63,7 @@ def regenerate_fused_max_projection(
     fused_suffix = "_fused.ome.zarr"
     acquisition_name = fused_path.name[: -len(fused_suffix)]
     processing_state = ProcessingState.read(
-        processing_state_path(fused_path.parent, acquisition_name)
+        image_processing_state_path(fused_path, acquisition_name)
     )
     processed_path = processing_state.registered_output_for_fused(fused_path)
 
@@ -152,7 +153,9 @@ def regenerate_fused_max_projection(
         output_path,
         projection_image,
         projection_specs,
-        extra_attributes={},
+        extra_attributes=processing_state_image_attributes(
+            processing_state.path, output_path
+        ),
         chunks=(
             1,
             1,

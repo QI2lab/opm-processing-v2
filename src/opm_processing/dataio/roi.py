@@ -16,7 +16,7 @@ from opm_processing.dataio.ngff import round_spatial, round_spatial_values
 from opm_processing.dataio.position_collection import open_position_collection
 from opm_processing.dataio.processing_state import (
     ProcessingState,
-    processing_state_path,
+    image_processing_state_path,
     resolve_store_path,
 )
 
@@ -49,7 +49,7 @@ def _registered_projection_context(
             "ROI export requires the registered maximum-Z projection created by fuse"
         )
     state = ProcessingState.read(
-        processing_state_path(path.parent, path.name[: -len(suffix)])
+        image_processing_state_path(path, path.name[: -len(suffix)])
     )
     processed_path = state.registered_output_for_max_projection(path)
     registration = state.registration(processed_path)
@@ -119,13 +119,14 @@ def projection_tile_footprints(path: str | Path) -> tuple[dict[str, Any], ...]:
     if suffix is None:
         raise ValueError("ROI selection requires a deskewed maximum-Z preview")
     stem = source.name.removesuffix(suffix)
-    state = ProcessingState.read(processing_state_path(source.parent, stem))
+    state = ProcessingState.read(image_processing_state_path(source, stem))
     preview = open_group(source)
     projection = preview.attrs.get("opm_processing_projection", {})
     registrations = [
         record
         for record in state.document["registration"].values()
-        if record.get("max_projection_path") == source.name
+        if record.get("max_projection_path")
+        and (state.path.parent / record["max_projection_path"]).resolve() == source
     ]
     if registrations and projection.get("placement") != "stage":
         footprints = _registered_tile_footprints(source)
