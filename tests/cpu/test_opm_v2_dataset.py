@@ -47,7 +47,11 @@ def test_singleton_z_stage_mode_writes_2d_name_without_stage_fusion(
     np.testing.assert_array_equal(
         output.arrays[0].read().result(),
         format_processed_output(
-            camera_correct(raw[:, 0], dataset.camera_offset, dataset.camera_conversion),
+            camera_correct(
+                raw[:, 0],
+                dataset.metadata.camera_offset,
+                dataset.metadata.camera_conversion,
+            ),
             False,
         ),
     )
