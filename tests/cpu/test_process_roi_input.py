@@ -18,11 +18,10 @@ def test_process_roi_uses_raw_source_and_processed_directory_defaults(
     processed_directory_factory,
     explicit_paths: bool,
     relocate_acquisition,
+    assert_roi_point_accuracy,
 ) -> None:
     """Resolve CLI inputs and persist the calibrated cropped raw pixels."""
     from dataclasses import replace
-
-    import numpy as np
 
     from opm_processing.dataio.position_collection import open_position_collection
 
@@ -54,8 +53,13 @@ def test_process_roi_uses_raw_source_and_processed_directory_defaults(
         output=expected_output,
     )
     output = open_position_collection(expected_output / f"{stem}_deskewed.ome.zarr")
-    for array, expected in zip(output.arrays, run.expected_tiles, strict=False):
-        np.testing.assert_array_equal(array.read().result(), expected)
+    for index, array in enumerate(output.arrays):
+        assert_roi_point_accuracy(
+            array.read().result(),
+            run.truth,
+            output.spatial_origins_zyx_um[index],
+            output.voxel_size_um,
+        )
     state = ProcessingState.read(expected_output / f"{stem}.processing.json")
     assert state.document["source"]["path"] == str(source)
     assert state.completed_channels(expected_output / f"{stem}_deskewed.ome.zarr") == {

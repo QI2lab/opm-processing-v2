@@ -173,6 +173,7 @@ def test_roi_fusion_keeps_multiple_stage_z_levels_and_crops_only_yx(
     tmp_path: Path,
     external,
     acquisition_factory,
+    simulated_camera,
 ) -> None:
     """Filter arbitrary source positions while preserving their complete Z span."""
     processed_path = tmp_path / "sample_projection.ome.zarr"
@@ -182,15 +183,16 @@ def test_roi_fusion_keeps_multiple_stage_z_levels_and_crops_only_yx(
         (1.0, 1.0, 1.0),
         stage_positions=((0.0, 0.0, 0.0), (5.0, 0.0, 0.0), (0.0, 100.0, 100.0)),
     )
+    observed = simulated_camera((1, 4, 4), geometry="cartesian").raw
     for array in collection.arrays:
-        array.write(np.ones(array.shape, dtype=np.uint16)).result()
+        array.write(observed[None, None]).result()
     tiles = [
         {"time_index": 0, "position_index": 0, "origin_zyx_um": [0, 0, 0]},
         {"time_index": 0, "position_index": 1, "origin_zyx_um": [5, 0, 0]},
         {"time_index": 0, "position_index": 2, "origin_zyx_um": [0, 100, 100]},
     ]
     acquisition_factory(
-        np.ones((1, 3, 1, 1, 4, 4), np.uint16),
+        np.broadcast_to(observed, (1, 3, 1, 1, 4, 4)),
         mode="projection",
         pixel_size_um=1.0,
         scan_axis_step_um=1.0,
@@ -245,7 +247,7 @@ def test_roi_fusion_keeps_multiple_stage_z_levels_and_crops_only_yx(
     fused = fusion.output_dir / "sample_fused.ome.zarr"
     written = open_group(fused)["0"].to_tensorstore()
     expected = np.zeros((1, 1, 6, 5, 4), dtype=np.uint16)
-    expected[..., (0, 5), 2:5, 1:4] = 1
+    expected[..., (0, 5), 2:5, 1:4] = observed[..., :3, :3]
     np.testing.assert_array_equal(written.read().result()[..., :6, :5, :4], expected)
     state = ProcessingState.read(tmp_path / "sample.processing.json")
     assert state.registered_output_for_fused(fused) == processed_path
@@ -263,6 +265,7 @@ def test_variable_roi_tiles_are_stored_cropped_and_reopened(
     record_registration,
     tmp_path: Path,
     acquisition_factory,
+    simulated_camera,
 ) -> None:
     """ROI series retain their independent crop shapes and physical origins."""
     processed_path = tmp_path / "sample_decon_deskewed.ome.zarr"
@@ -294,8 +297,12 @@ def test_variable_roi_tiles_are_stored_cropped_and_reopened(
             (0.0, 12.0, 22.0),
         ),
     )
-    collection.arrays[0].write(np.full(shapes[0], 10, dtype=np.uint16)).result()
-    collection.arrays[1].write(np.full(shapes[1], 30, dtype=np.uint16)).result()
+    observed = tuple(
+        simulated_camera(shape[-3:], geometry="cartesian", exposure=exposure).raw
+        for shape, exposure in zip(shapes, (1.0, 3.0), strict=True)
+    )
+    for array, pixels in zip(collection.arrays, observed, strict=True):
+        array.write(pixels[None, None]).result()
     # Z=0 has no valid deskew interpolation; Z=1 is supported throughout
     # both interior Y crops. Store physically valid synthetic tile data.
     for array in collection.arrays:
@@ -357,9 +364,11 @@ def test_variable_roi_tiles_are_stored_cropped_and_reopened(
     fused = np.asarray(fusion.fused_ts.read().result())
     assert fused.shape == (1, 1, 2, 8, 6)
     expected = np.zeros((1, 1, 2, 8, 6), np.uint16)
-    expected[..., :4, :4] = 10
-    expected[..., 2:7, 2:5] = 30
-    expected[..., 2:4, 2:4] = 20
+    expected[..., :4, :4] = observed[0]
+    expected[..., 2:7, 2:5] = observed[1]
+    expected[..., 2:4, 2:4] = (
+        (observed[0][:, 2:4, 2:4].astype(np.float32) + observed[1][:, :2, :2]) / 2
+    ).astype(np.uint16)
     expected[:, :, 0] = 0
     np.testing.assert_array_equal(fused, expected)
 
