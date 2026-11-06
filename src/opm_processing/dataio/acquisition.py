@@ -401,6 +401,10 @@ def resolve_acquisition_path(path: str | Path) -> Path:
     # the root, so use yaozarrs to disambiguate without opening pixel arrays.
     opm_v2_stores = []
     for store in stores:
+        # A reference-backed acquisition may sit beside its original bare
+        # array. Only groups can carry the current acquisition manifest.
+        if (store / ".zarray").is_file() and not (store / ".zgroup").is_file():
+            continue
         root = yaozarrs.open_group(store)
         if "opm_v2" in root.attrs:
             opm_v2_stores.append(store)

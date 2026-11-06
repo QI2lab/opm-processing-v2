@@ -239,8 +239,17 @@ def inspect_dataset(path: str | Path) -> dict[str, Any]:
     path = Path(path).expanduser().resolve()
     direct = (path / "zarr.json").is_file() or (path / ".zattrs").is_file()
     directory = path.parent if direct else path
-    stores = sorted(item for item in directory.glob("*.zarr") if item.is_dir())
+    stores = sorted(
+        item
+        for item in directory.glob("*.zarr")
+        if item.is_dir()
+        and not ((item / ".zarray").is_file() and not (item / ".zgroup").is_file())
+    )
     if direct and path not in stores:
+        if (path / ".zarray").is_file() and not (path / ".zgroup").is_file():
+            raise ValueError(
+                "Legacy raw array: create a Bio-Formats2Raw mapping with map-legacy-opm"
+            )
         stores.append(path)
     roots = {store: open_group(store) for store in stores}
     raw_paths = [store for store, root in roots.items() if "opm_v2" in root.attrs]
