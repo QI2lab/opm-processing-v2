@@ -116,3 +116,34 @@ Grid placement uses planned AO positions, recorded stage-to-laboratory scan
 compensation, and interpolated registered tile translations for the selected
 depth. The JSON records the resulting full-resolution pupil centers and the
 reference implementation's hash. Existing generated files require `--overwrite`.
+
+## Repair legacy stage coordinates without rewriting pixels
+
+For the uniform, positive, uncropped stage-scan geometry supported by the repair
+validator, prepare a metadata-only plan:
+
+```bash
+uv run python scripts/repair_stage_coordinates.py "/path/to/acquisition" --plan repair-plan.json
+uv run python scripts/repair_stage_coordinates.py --apply repair-plan.json
+```
+
+For data split across acquisition and processing/output directories, name both
+roots explicitly:
+
+```bash
+uv run python scripts/repair_stage_coordinates.py "/path/to/acquisition" --additional-root "/path/to/processing" --plan repair-plan.json
+```
+
+The split-root plan follows the journal's existing artifact links and labels
+every metadata change and dependency with its root. Unreferenced older fused
+stores are reported separately and left untouched. Before any replacement, it
+creates verified metadata backups and manifests on every volume being changed.
+An interrupted repair restores already replaced metadata across those roots.
+
+The plan lists every JSON or OME-XML change and its original and replacement
+hashes. Applying it backs up the original metadata before changing local image
+translations, OME stage labels, registered tile origins, and fused transforms.
+Raw acquisition files, array metadata, image chunks, and TIFF exports are outside
+the write whitelist. Changed inputs invalidate the plan; an applied plan is
+idempotent. Existing TIFF and ROI exports remain historical and are reported
+separately. Create new ROI exports after repair.

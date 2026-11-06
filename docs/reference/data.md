@@ -19,6 +19,17 @@ The OME-Zarr image metadata defines physical scales and translations; positions
 in the acquisition description may use ZXY or XYZ ordering as named by their
 fields. Do not interpret the raw scan-plane dimension as laboratory Z.
 
+Processed stage labels retain the recorded stage reference without orientation
+changes. Spatial values are stored to three decimal places.
+These values are in micrometers; millimeter inputs are converted before rounding,
+preserving the equivalent six decimal places in millimeters.
+`opm_processing_stage_positions` declares their ZXY order;
+OME StageLabels use physical XYZ. `opm_processing_coordinates` separately records
+the placement reference and coordinate version. Local image translations include
+the retained scan endpoint, deskew crop, and averaging offsets. Fused transforms
+and ROI footprints use that same version. Older stage previews must be regenerated
+before their absolute coordinates can be used for ROI selection or AO overlays.
+
 ## Output files
 
 `<stem>` is the acquisition name. Files default to the acquisition directory,
@@ -41,6 +52,13 @@ or to the directory supplied with `process --output`.
 Native planar acquisitions use their planar output naming convention. Inspect
 the command's printed destination and journal to identify its output stores.
 
+`fuse --output-dir` places the fused volume and registered maximum-Z stores in
+another folder or drive. Registration and the depth-intensity gain report
+remain beside the processed input. External fused stores include an
+`opm_processing.processing_state` link to that journal, using a relative path
+when possible and an absolute path for cross-drive access. The link contains
+no duplicate registration measurements.
+
 ## Processing journal
 
 One journal describes the source and outputs for an acquisition. Image stores
@@ -50,8 +68,8 @@ resume. Completion is recorded after writes are durable.
 
 The journal also locates the raw acquisition when processing, fusion, inspection,
 or export starts from an output directory. New journals record a relative source
-link as well as the absolute provenance path. Keep the journal beside its outputs
-and preserve the relative raw/output layout when moving or copying a dataset.
+link as well as the absolute provenance path. Keep the journal beside its processed
+tile collections and preserve the relative raw/output layout when moving or copying a dataset.
 An existing same-named raw store beside the current input takes precedence over
 the recorded absolute location, including when the original copy is accessible.
 Nested ROI journals can also resolve raw data through the matching acquisition
