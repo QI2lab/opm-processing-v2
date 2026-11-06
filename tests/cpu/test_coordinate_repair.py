@@ -373,7 +373,7 @@ def _split_record_path(plan, record):
 
 
 def test_split_repair_changes_only_owned_available_artifacts(split_repair_case):
-    """Plan only owned split outputs while leaving all source and orphan pixels unchanged."""
+    """Repair split outputs once while preserving absolute paths and orphan pixels."""
     case = split_repair_case
     before = _snapshot(case.root)
     plan = plan_stage_coordinate_repair(
@@ -390,7 +390,6 @@ def test_split_repair_changes_only_owned_available_artifacts(split_repair_case):
         str(_split_record_path(plan, record).relative_to(case.root))
         for record in plan["files"]
     }
-    assert len(approved) == len(plan["files"])
     assert all(
         not _split_record_path(plan, record).is_relative_to(
             case.primary / "repair_case.ome.zarr"
@@ -403,4 +402,206 @@ def test_split_repair_changes_only_owned_available_artifacts(split_repair_case):
     )
     assert all("decon" not in record["path"] for record in plan["files"])
     assert "repair_case_fused.ome.zarr" in json.dumps(plan["skipped_artifacts"])
+    result = apply_stage_coordinate_repair(plan)
+    assert result["status"] == "applied"
+    assert set(result["backup_directories"]) == {"root_0", "root_1"}
+    after = _snapshot(case.root)
+    assert {path for path in before if before[path] != after[path]} == approved
+    for path, fingerprint in before.items():
+        if path not in approved:
+            assert after[path] == fingerprint, path
+    journal = json.loads(case.journal_path.read_text())
+    assert journal["source"]["path"] == case.journal["source"]["path"]
+    assert set(journal["registration"]) == {case.owner_key}
+    owner = journal["registration"][case.owner_key]
+    original = case.journal["registration"][case.owner_key]
+    for key in (
+        "fused_path",
+        "max_projection_path",
+        "configuration_sha256",
+        "pairwise_metrics",
+    ):
+        assert owner[key] == original[key]
+    assert owner["tiles"][0]["origin_zyx_um"] == [-2.5, -110, 20]
+    for name in ("repair_case_fused.ome.zarr", "repair_case_max_z_fused.ome.zarr"):
+        group = json.loads((case.primary / name / "zarr.json").read_text())
+        assert (
+            group["attributes"]["opm_processing_coordinates"]["version"]
+            == STAGE_COORDINATE_VERSION
+        )
+        assert (
+            group["attributes"]["ome"]["multiscales"][0]["datasets"][0][
+                "coordinateTransformations"
+            ][1]["translation"][3]
+            == -160
+        )
+    assert not (case.additional / "repair_case_decon_deskewed.ome.zarr").exists()
+    assert apply_stage_coordinate_repair(plan)["status"] == "already_repaired"
+    assert (
+        plan_stage_coordinate_repair(case.primary, additional_roots=(case.additional,))[
+            "status"
+        ]
+        == "already_repaired"
+    )
+
+
+def test_changed_external_dependency_refuses_the_entire_split_repair(split_repair_case):
+    """Raw metadata on the other root is checked before any backup or write."""
+    case = split_repair_case
+    plan = plan_stage_coordinate_repair(
+        case.primary, additional_roots=(case.additional,)
+    )
+    dependency = next(
+        record
+        for record in plan["read_dependencies"]
+        if record["root_id"] == "root_0"
+        and record["path"].startswith("repair_case.ome.zarr")
+    )
+    path = _split_record_path(plan, dependency)
+    path.write_bytes(path.read_bytes() + b"\n")
+    before = _snapshot(case.root)
+    with pytest.raises(ValueError, match="dependency changed"):
+        apply_stage_coordinate_repair(plan)
     assert _snapshot(case.root) == before
+    assert not (case.primary / ".coordinate-repair-backups").exists()
+    assert not (case.additional / ".coordinate-repair-backups").exists()
+
+
+def test_split_repair_backs_up_both_roots_before_writing_and_rolls_back(
+    split_repair_case, monkeypatch
+):
+    """A failure after replacing metadata on both roots restores both preimages."""
+    case = split_repair_case
+    plan = plan_stage_coordinate_repair(
+        case.primary, additional_roots=(case.additional,)
+    )
+    before = _snapshot(case.root)
+    approved = {
+        _split_record_path(plan, record).resolve(): record for record in plan["files"]
+    }
+    original = coordinate_repair._atomic_write
+    touched_roots = set()
+    failed = False
+
+    def fail_after_crossing_roots(path, content):
+        nonlocal failed
+        resolved = Path(path).resolve()
+        if resolved not in approved or failed:
+            return original(path, content)
+        for root_id, root_path in plan["roots"].items():
+            manifests = list(
+                (Path(root_path) / ".coordinate-repair-backups").glob("*/manifest.json")
+            )
+            assert len(manifests) == 1
+            manifest = json.loads(manifests[0].read_text())
+            assert manifest["root_id"] == root_id
+            for record in plan["files"]:
+                if record["root_id"] == root_id:
+                    backup = manifests[0].parent / record["path"]
+                    assert (
+                        hashlib.sha256(backup.read_bytes()).hexdigest()
+                        == record["before_sha256"]
+                    )
+        touched_roots.add(approved[resolved]["root_id"])
+        original(path, content)
+        if len(touched_roots) == 2:
+            failed = True
+            raise OSError("simulated replacement failure across both roots")
+
+    monkeypatch.setattr(coordinate_repair, "_atomic_write", fail_after_crossing_roots)
+    with pytest.raises(OSError, match="across both roots"):
+        apply_stage_coordinate_repair(plan)
+    assert touched_roots == {"root_0", "root_1"}
+    after = _snapshot(case.root)
+    assert all(after[path] == fingerprint for path, fingerprint in before.items())
+
+
+@pytest.mark.parametrize("tampering", ("unknown-root", "escape", "array-metadata"))
+def test_rehashed_split_plan_cannot_expand_its_write_whitelist(
+    split_repair_case, tampering
+):
+    """A recomputed digest does not authorize another root or image-array writes."""
+    case = split_repair_case
+    plan = plan_stage_coordinate_repair(
+        case.primary, additional_roots=(case.additional,)
+    )
+    if tampering == "unknown-root":
+        plan["files"][0]["root_id"] = "unreviewed-root"
+    elif tampering == "escape":
+        plan["files"][0]["path"] = "../outside/zarr.json"
+    else:
+        plan["files"][0].update(
+            root_id="root_1", path="repair_case_deskewed.ome.zarr/0/0/zarr.json"
+        )
+    plan["plan_sha256"] = coordinate_repair._plan_digest(plan)
+    before = _snapshot(case.root)
+    with pytest.raises(ValueError, match=r"root|Unsafe|non-metadata|escape"):
+        apply_stage_coordinate_repair(plan)
+    assert _snapshot(case.root) == before
+
+
+def test_failed_restoration_does_not_skip_the_other_root(
+    split_repair_case, monkeypatch
+):
+    """Continue rollback after one restore fails and report both recovery locations."""
+    case = split_repair_case
+    plan = plan_stage_coordinate_repair(
+        case.primary, additional_roots=(case.additional,)
+    )
+    before = _snapshot(case.root)
+    approved = {
+        _split_record_path(plan, record).resolve(): record for record in plan["files"]
+    }
+    originals = {path: path.read_bytes() for path in approved}
+    original_write = coordinate_repair._atomic_write
+    touched_roots, restored_paths = set(), set()
+    blocked_restore = None
+
+    def fail_apply_and_one_restore(path, content):
+        nonlocal blocked_restore
+        path = Path(path).resolve()
+        if path not in approved:
+            return original_write(path, content)
+        if blocked_restore is not None:
+            if path == blocked_restore and content == originals[path]:
+                raise OSError("simulated blocked restoration")
+            original_write(path, content)
+            if content == originals[path]:
+                restored_paths.add(path)
+            return None
+        original_write(path, content)
+        touched_roots.add(approved[path]["root_id"])
+        if len(touched_roots) == 2:
+            blocked_restore = path
+            raise OSError("simulated apply failure after writing both roots")
+        return None
+
+    monkeypatch.setattr(coordinate_repair, "_atomic_write", fail_apply_and_one_restore)
+    with pytest.raises(RuntimeError, match="complete rollback") as error:
+        apply_stage_coordinate_repair(plan)
+    assert blocked_restore is not None
+    other_roots = set(plan["roots"]) - {approved[blocked_restore]["root_id"]}
+    assert other_roots <= {approved[path]["root_id"] for path in restored_paths}
+    after = _snapshot(case.root)
+    blocked_relative = str(blocked_restore.relative_to(case.root))
+    assert all(
+        after[path] == fingerprint
+        for path, fingerprint in before.items()
+        if path != blocked_relative
+    )
+    assert (
+        hashlib.sha256(blocked_restore.read_bytes()).hexdigest()
+        == approved[blocked_restore]["after_sha256"]
+    )
+    assert "simulated blocked restoration" in str(error.value)
+    normalized_error = str(error.value).replace("\\\\", "/").replace("\\", "/")
+    backup_directories = {}
+    for root_id, root_path in plan["roots"].items():
+        manifest = next(
+            (Path(root_path) / ".coordinate-repair-backups").glob("*/manifest.json")
+        )
+        assert manifest.parent.as_posix() in normalized_error
+        backup_directories[root_id] = manifest.parent
+    blocked_record = approved[blocked_restore]
+    backup = backup_directories[blocked_record["root_id"]] / blocked_record["path"]
+    assert backup.read_bytes() == originals[blocked_restore]

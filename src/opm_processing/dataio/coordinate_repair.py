@@ -511,6 +511,12 @@ def apply_stage_coordinate_repair(plan: dict[str, Any]) -> dict[str, Any]:
     dict
         Applied file count and backup directory, or an idempotent no-op status.
     """
+    if plan.get("schema") == "opm-stage-coordinate-repair-v2":
+        from opm_processing.dataio.coordinate_repair_transaction import (
+            apply_split_stage_coordinate_repair,
+        )
+
+        return apply_split_stage_coordinate_repair(plan)
     if plan.get("schema") != REPAIR_SCHEMA or plan.get("plan_sha256") != _plan_digest(
         plan
     ):
