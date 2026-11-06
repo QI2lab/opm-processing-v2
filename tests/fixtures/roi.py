@@ -210,11 +210,17 @@ def roi_camera_scene(simulated_camera):
 
 @pytest.fixture
 def assert_roi_point_accuracy(assert_roi_point_locations):
-    """Check original-emitter locations and photons on the saved ROI grid."""
+    """Check original emitters against independent native-camera photon bounds.
+
+    The geometric mapper selects native support; SciPy samples its bounds with
+    the independently prescribed 2p/step gain and nominal Z-bin divisor.
+    """
+    from scipy.ndimage import map_coordinates
+
     from opm_processing.imageprocessing.opmpsf import camera_grid_center
     from opm_processing.imageprocessing.opmtools import (
-        deskew_coverage,
-        orthogonal_deskew,
+        deskew_row_coordinates,
+        deskew_shape_estimator,
     )
     from tests.simulation.camera_likelihood import (
         SamplingEnvelope,
@@ -241,6 +247,8 @@ def assert_roi_point_accuracy(assert_roi_point_locations):
         )
         microscope, camera = scene.microscope, scene.microscope.camera
         pixel, scan_step = microscope.pixel_size_um, microscope.scan_step_um
+        angle = np.deg2rad(microscope.angle_deg)
+        step = scan_step / pixel
         origin, raw_origin = np.asarray(origin), np.asarray(raw_origin)
         spacing = np.asarray(spacing)
         factor = round(spacing[0] / pixel)
@@ -260,33 +268,35 @@ def assert_roi_point_accuracy(assert_roi_point_locations):
                 planned, np.broadcast_to(planned[0], planned.shape)
             )
         native_shape = scene.pixels.shape[-3:]
+        native_output_shape, *_ = deskew_shape_estimator(
+            native_shape,
+            microscope.angle_deg,
+            scan_step,
+            pixel,
+            crop_after_deskew=False,
+            divisible_by=1,
+        )
+        row_coordinates = np.vectorize(
+            deskew_row_coordinates,
+            otypes=(bool, np.int64, np.int64, np.int64, float, float, float),
+        )
         output_shape = data.shape[-3:]
         offset = (origin - raw_origin) / pixel
-        offset[0] = (offset[0] - (factor - 1) / 2) / factor
-        # Metadata rounds physical coordinates to 0.001 um. Certify the saved
-        # lattice before using the production mapper; do not fit image shifts.
+        first_z = round(offset[0] - (factor - 1) / 2)
+        assert abs(offset[0] - first_z - (factor - 1) / 2) <= 0.0005 / pixel + 1e-12
+        # The fixtures have coincident integer output grids. This explicitly
+        # rules out an unaccounted fractional fusion resampling pitch.
         np.testing.assert_allclose(
-            (offset - np.rint(offset)) * (factor, 1, 1),
-            0,
-            rtol=0,
-            atol=0.0005 / pixel + 1e-12,
+            offset[1:], np.rint(offset[1:]), rtol=0, atol=0.0005 / pixel + 1e-12
         )
-        start = np.rint(offset).astype(int)
-        geometry = {
-            "theta": microscope.angle_deg,
-            "distance": scan_step,
-            "pixel_size": pixel,
-        }
-        coverage = deskew_coverage(
-            native_shape,
-            output_shape,
-            **geometry,
-            downsample_factor=factor,
-            origin_zy=tuple(start[:2]),
-        )[..., None]
-        columns = start[2] + np.arange(output_shape[2])
-        coverage = coverage * ((columns >= 0) & (columns < native_shape[2]))
+        integer_offset = np.rint(offset[1:])
+        y, x = (
+            integer_offset[0] + np.arange(output_shape[1]),
+            integer_offset[1] + np.arange(output_shape[2]),
+        )
+        z_center = first_z + np.arange(output_shape[0]) * factor + (factor - 1) / 2
         radii = sampling_stencil_radii(microscope, (pixel, pixel, pixel))
+        gain = 2 * pixel / scan_step
         field = np.broadcast_to(np.asarray(illumination), native_shape)
         source_centers = scene.centers_zyx_um + raw_origin
         centers_y = origin[1] + np.arange(output_shape[1]) * spacing[1]
@@ -311,19 +321,24 @@ def assert_roi_point_accuracy(assert_roi_point_locations):
             )
             + raw_origin
         )
-        lower_edge, upper_edge = np.asarray(
-            [(axis[0], axis[-1]) for axis in scene.ground_truth.axes]
-        ).T
-        halo = np.asarray(microscope.psf_half_extent_zyx_um)
-        lower_edge, upper_edge = (
-            camera_center + lower_edge + halo,
-            camera_center + upper_edge - halo,
-        )
+        domain = scene.ground_truth.axes
         interior = (
-            (centers_y[:, None] >= lower_edge[1])
-            & (centers_y[:, None] <= upper_edge[1])
-            & (centers_x[None] >= lower_edge[2])
-            & (centers_x[None] <= upper_edge[2])
+            (
+                centers_y[:, None] - camera_center[1]
+                >= domain[1][0] + microscope.psf_half_extent_zyx_um[1]
+            )
+            & (
+                centers_y[:, None] - camera_center[1]
+                <= domain[1][-1] - microscope.psf_half_extent_zyx_um[1]
+            )
+            & (
+                centers_x[None] - camera_center[2]
+                >= domain[2][0] + microscope.psf_half_extent_zyx_um[2]
+            )
+            & (
+                centers_x[None] - camera_center[2]
+                <= domain[2][-1] - microscope.psf_half_extent_zyx_um[2]
+            )
         )
         apertures = (
             interior & (distance <= rayleigh),
@@ -364,35 +379,64 @@ def assert_roi_point_accuracy(assert_roi_point_locations):
                     source_high = np.maximum.reduce(
                         [bound.upper for bound in view_bounds]
                     )
-                # The input intervals come from independent optical means and
-                # original camera residuals. Deskew is positive: applying its
-                # actual gain/interpolation/binning preserves these inequalities.
-                mapped = np.stack(
-                    [
-                        orthogonal_deskew(
-                            values / field,
-                            **geometry,
-                            divisible_by=1,
-                            downsample_factor=factor,
+                lower = np.zeros(output_shape)
+                upper = np.zeros(output_shape)
+                reference = np.zeros(output_shape)
+                coverage = np.zeros(output_shape)
+                certain = np.ones(output_shape, bool)
+                for within_bin in range(factor):
+                    z = z_center - (factor - 1) / 2 + within_bin
+                    valid_zy, before, _rb, _ra, foot0, foot1, fraction = (
+                        row_coordinates(
+                            z[:, None],
+                            y[None],
+                            native_shape[0],
+                            native_shape[1],
+                            native_output_shape[0],
+                            step,
+                            np.tan(angle),
+                            np.sin(angle),
+                            np.cos(angle),
                         )
-                        for values in (source_low, source_high, means)
-                    ]
-                )
-                lower, upper, reference = np.zeros((3, *output_shape))
-                first = np.maximum(start, 0)
-                last = np.minimum(start + output_shape, mapped.shape[-3:])
-                if np.all(last > first):
-                    source = tuple(
-                        slice(a, b) for a, b in zip(first, last, strict=True)
                     )
-                    target = tuple(
-                        slice(a - shift, b - shift)
-                        for a, b, shift in zip(first, last, start, strict=True)
+                    plane = before + fraction
+                    valid = (
+                        valid_zy[..., None]
+                        & (x >= -1e-8)
+                        & (x <= native_shape[2] - 1 + 1e-8)
                     )
-                    for result, values in zip(
-                        (lower, upper, reference), mapped, strict=True
+                    coordinates = np.stack(
+                        np.broadcast_arrays(
+                            plane[..., None],
+                            z[:, None, None] / np.sin(angle),
+                            x[None, None],
+                        )
+                    )
+                    for target, values in (
+                        (lower, source_low / field),
+                        (upper, source_high / field),
+                        (reference, means / field),
                     ):
-                        result[target] = values[source]
+                        samples = map_coordinates(
+                            values,
+                            coordinates,
+                            order=0,
+                            mode="nearest",
+                            prefilter=False,
+                        )
+                        target += np.where(valid, samples, 0) * gain / factor
+                    coverage += valid / factor
+                    # Three-decimal metadata can perturb an aperture endpoint.
+                    # Exclude only those geometric boundary cells from accuracy;
+                    # exact supported/unsupported pixel checks remain in callers.
+                    boundary = np.isclose(plane, 0, atol=1e-7) | np.isclose(
+                        plane, native_shape[0] - 1, atol=1e-7
+                    )
+                    for foot in (foot0, foot1):
+                        boundary |= np.isclose(foot, 0, atol=1e-7) | np.isclose(
+                            foot, native_shape[1] - 1, atol=1e-7
+                        )
+                    certain &= ~boundary[..., None]
                 if fused:
                     # Fusion's declared coverage contract restores the mean of
                     # acquired samples in partially supported nominal Z bins.
@@ -407,7 +451,7 @@ def assert_roi_point_accuracy(assert_roi_point_locations):
                     np.maximum(lower - numerical, 0), upper + numerical
                 )
                 for aperture in apertures:
-                    mask = (coverage > 0) & aperture[None]
+                    mask = certain & (coverage > 0) & aperture[None]
                     result = camera_sampling_accuracy(
                         data[time, channel], reference, envelope, mask
                     )
