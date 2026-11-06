@@ -293,6 +293,25 @@ def ideal_photon_camera(camera_calibration):
     )
 
 
+@pytest.fixture
+def measured_psf_calibration(tmp_path, optical_setup, psf_format):
+    """Persist a real production optical kernel through its supported file writer."""
+    import tifffile
+
+    path = tmp_path / f"measured_psf.{psf_format}"
+    kernel = optical_setup.psf.copy()
+
+    def write(values):
+        """Replace calibration bytes using the actual NumPy or TIFF serializer."""
+        if psf_format == "npy":
+            np.save(path, values)
+        else:
+            tifffile.imwrite(path, values, photometric="minisblack", metadata=None)
+
+    write(kernel)
+    return SimpleNamespace(path=path, kernel=kernel, write=write)
+
+
 @pytest.fixture(scope="session")
 def planar_point_model(optical_setup):
     """Return two known emitters and the normalized central YX PSF used to blur them."""
@@ -336,123 +355,232 @@ def point_response_model(optical_setup):
     )
 
 
+@pytest.fixture(scope="session")
+def uniform_detector_scene(microscope_parameters):
+    """Form a uniform physical emitter field with the existing optical model."""
+
+    @lru_cache(maxsize=2)
+    def create(projection=False):
+        """Fix the emission dose before applying detector sensitivity and noise."""
+        microscope = replace(
+            microscope_parameters,
+            fine_spacing_um=0.1,
+            scan_step_um=0.4,
+            quantum_efficiency=0.3,
+            camera=replace(microscope_parameters.camera, electrons_per_adu=0.5),
+        )
+        shape = (1 if projection else 8, 24, 256)
+        pixel, angle = microscope.pixel_size_um, np.deg2rad(microscope.angle_deg)
+        half = np.array(
+            (
+                0 if projection else (shape[1] - 1) * pixel * np.sin(angle) / 2,
+                (shape[1] - 1) * pixel / 2
+                if projection
+                else (
+                    (shape[0] - 1) * microscope.scan_step_um
+                    + (shape[1] - 1) * pixel * np.cos(angle)
+                )
+                / 2,
+                (shape[2] - 1) * pixel / 2,
+            )
+        )
+        half += np.array(microscope.psf_half_extent_zyx_um) + pixel
+        axes = tuple(
+            centered_axis(extent, microscope.fine_spacing_um) for extent in half
+        )
+        density = np.ones(tuple(map(len, axes)), np.float32)
+        acquisition = Acquisition(
+            axes,
+            shape,
+            geometry="cartesian" if projection else "oblique",
+            camera_photon_budget=(12000 / microscope.quantum_efficiency, 0),
+            output="object",
+        )
+        dose = forward_model(density, acquisition, microscope)
+        means = forward_model(
+            dose,
+            replace(acquisition, camera_photon_budget=None, output="expectation"),
+            microscope,
+        )
+        np.testing.assert_allclose(means, 12000, rtol=2e-5)
+        return SimpleNamespace(
+            density=dose,
+            axes=axes,
+            microscope=microscope,
+            means=means,
+            shape=shape,
+            nominal=12000.0,
+        )
+
+    return create
+
+
+@pytest.fixture
+def uniform_response_case(scan_planes, detector_shape):
+    """Share prescribed constant fluorescence and an asymmetric detector response."""
+    from scipy import ndimage
+
+    response = np.broadcast_to(
+        np.tile(np.array((0.25, 0.5, 1, 2), np.float32), detector_shape[1] // 4),
+        detector_shape,
+    )
+    truth = np.full((scan_planes, *response.shape), 1200, np.float32)
+    psf = np.ones((1 if scan_planes == 1 else 3, 3, 3), np.float32)
+    psf /= psf.sum()
+    measured = ndimage.convolve(truth, psf, mode="reflect") * response
+    return SimpleNamespace(response=response, truth=truth, psf=psf, measured=measured)
+
+
 @pytest.fixture
 def uniform_detector_acquisition(
     request,
-    acquisition_factory,
     tmp_path,
+    opm_v2_acquisition_factory,
+    uniform_detector_scene,
     roi_mode,
     camera_gain_profile,
-    production_psf_parameters,
-    microscope_parameters,
+    deskew_geometric_support,
 ):
-    """Persist uniform fluorescence with a known nonuniform camera response."""
-    from opm_processing.imageprocessing.opmtools import orthogonal_deskew
-    from opm_processing.process import write_flatfield
+    """Write physical camera frames and real preview coordinates for calibration workflows."""
+    from opm_processing.dataio.acquisition import ChannelMetadata
+    from opm_processing.dataio.roi import PhysicalRoi, projection_tile_footprints
+    from opm_processing.imageprocessing.coordinates import STAGE_COORDINATE_VERSION
+    from opm_processing.process import process_skewed, write_flatfield
+    from tests.simulation.camera import digitize
 
-    generated = isinstance(request.param, tuple)
-    mode = request.param[0] if generated else request.param
-    deconvolution = {}
-    if generated:
-        deconvolution.update(
-            psf_parameters=production_psf_parameters,
-            emission_wavelengths_nm=[microscope_parameters.wavelength_um * 1000],
-        )
-    if mode == "stage":
-        deconvolution["detector_gain_x"] = camera_gain_profile.tolist()
-    shape = (1 if mode == "projection" else 8, 12, 1900)
-    field = np.broadcast_to(
-        np.repeat(np.array((0.25, 0.5, 1.0, 2.0), np.float32), 475), shape[-2:]
+    save_float = not isinstance(request.param, tuple)
+    mode = request.param[0] if not save_float else request.param
+    scene = uniform_detector_scene(mode == "projection")
+    shape = scene.shape
+    response = np.broadcast_to(
+        np.repeat(np.array((0.25, 0.5, 1, 2), np.float32), shape[-1] // 4), shape[-2:]
     ).copy()
-    response = field.copy()
     if mode == "stage":
-        response *= camera_gain_profile
-    truth = np.full(shape, 1200, dtype=np.float32)
-    measured = truth * response
-    raw = np.clip(np.rint(100 + measured / 0.5), 0, 65535).astype(np.uint16)
-    dataset = acquisition_factory(
+        response *= np.interp(
+            np.linspace(0, len(camera_gain_profile) - 1, shape[-1]),
+            np.arange(len(camera_gain_profile)),
+            camera_gain_profile,
+        )
+    # Detector sensitivity changes quantum efficiency after optical integration.
+    # Nominal QE .3 times the largest relative response remains below one.
+    assert scene.microscope.quantum_efficiency * response.max() < 1
+    means = scene.means * response
+    raw = digitize(means, scene.microscope.camera, seed=31)
+    assert raw.max() < np.iinfo(np.uint16).max
+    if mode == "stage":
+        raw = raw[::-1].copy()
+    dataset = opm_v2_acquisition_factory(
         raw[None, None, None],
         name="uniform_detector",
         mode=mode,
-        camera_conversion=0.5,
-        deconvolution=deconvolution or None,
+        camera_offset=scene.microscope.camera.offset_adu,
+        camera_conversion=scene.microscope.camera.electrons_per_adu,
+        channels=(ChannelMetadata(0, "637", 637, 10, 10),),
+        scan_axis_step_um=scene.microscope.scan_step_um,
+        stage_positions_zxy=((0, 0, 0),),
     )
     write_flatfield(
-        tmp_path / "uniform_detector_flatfield.ome.tif", field[None, None], 0.115
+        tmp_path / "uniform_detector_flatfield.ome.tif",
+        response[None, None],
+        scene.microscope.pixel_size_um,
     )
-    psf_path = tmp_path / "uniform_detector_psf.npy"
-    psf = np.ones((3, 3, 3), np.float32)
-    np.save(psf_path, psf / psf.sum())
-    expected = (
-        truth
-        if mode == "projection"
-        else orthogonal_deskew(
-            np.full(shape, 1200, dtype=np.float32),
-            theta=30.0,
-            distance=0.4,
-            pixel_size=0.115,
-            downsample_factor=1,
-        )
-    )
+    output_dir = tmp_path
     options = {
         "deconvolve": True,
         "flatfield_correction": True,
-        "decon_psf_paths": [psf_path],
-        "save_float32": True,
+        "save_float32": save_float,
         "z_downsample_level": 1,
         "max_projection": False,
         "create_fused_max_projection": False,
         "write_fused_max_projection_tiff": False,
     }
-    if generated:
-        options.pop("decon_psf_paths")
-    if roi_mode:
-        from opm_processing.dataio.roi import PhysicalRoi
-
-        y_stop, x_stop = expected.shape[-2] - 3, expected.shape[-1] - 50
-        roi_path = PhysicalRoi(
-            # Bounds lie inside edge voxels: intersecting-voxel selection is
-            # unambiguous despite binary rounding of physical coordinates.
-            bounds_yx_um=(
-                3.25 * 0.115,
-                (y_stop - 0.25) * 0.115,
-                50.25 * 0.115,
-                (x_stop - 0.25) * 0.115,
-            ),
-            source_path=tmp_path / "uniform_detector_fused.ome.zarr",
-            grid_origin_yx_um=(0, 0),
-            pixel_size_yx_um=(0.115, 0.115),
-            position_indices=(0,),
-            tile_footprints=(
+    pixel = scene.microscope.pixel_size_um
+    angle = np.deg2rad(scene.microscope.angle_deg)
+    if mode == "projection":
+        support = np.ones(shape[:2], bool)
+        expected = scene.nominal
+    else:
+        native_shape = (
+            int(np.ceil(shape[1] * np.sin(angle))),
+            int(
+                np.ceil(
+                    (
+                        shape[0] * scene.microscope.scan_step_um / pixel
+                        + shape[1] * np.cos(angle)
+                    )
+                    / 4
+                )
+            )
+            * 4,
+            shape[-1],
+        )
+        support = (
+            deskew_geometric_support(
+                shape,
+                native_shape,
                 {
-                    "time_index": 0,
-                    "position_index": 0,
-                    "origin_zyx_um": [0, 0, 0],
-                    "bounds_yx_um": [
-                        0,
-                        expected.shape[-2] * 0.115,
-                        0,
-                        expected.shape[-1] * 0.115,
-                    ],
+                    "theta": scene.microscope.angle_deg,
+                    "distance": scene.microscope.scan_step_um,
+                    "pixel_size": pixel,
                 },
+            )
+            == 1
+        )
+        expected = (
+            scene.nominal * pixel / (scene.microscope.scan_step_um * np.sin(angle))
+        )
+    if roi_mode:
+        process_skewed(
+            dataset.path,
+            acquisition=dataset.metadata,
+            max_projection=True,
+            create_fused_max_projection=False,
+            save_float32=True,
+            z_downsample_level=1,
+        )
+        preview = tmp_path / "uniform_detector_max_z_deskewed.ome.zarr"
+        footprints = projection_tile_footprints(preview)
+        origin = footprints[0]["origin_zyx_um"]
+        y_stop, x_stop = support.shape[-1] - 3, shape[-1] - 16
+        roi = PhysicalRoi(
+            bounds_yx_um=(
+                origin[1] + 3.25 * pixel,
+                origin[1] + (y_stop - 0.25) * pixel,
+                origin[2] + 16.25 * pixel,
+                origin[2] + (x_stop - 0.25) * pixel,
             ),
-        ).write(tmp_path / "uniform_detector_roi.json")
-        expected = expected[:, 3:y_stop, 50:x_stop]
-        for key in (
-            "max_projection",
-            "create_fused_max_projection",
-            "write_fused_max_projection_tiff",
-        ):
-            options.pop(key)
-        options.update(roi_json=roi_path, output=tmp_path, registration_channel=0)
+            source_path=preview,
+            grid_origin_yx_um=tuple(origin[1:]),
+            pixel_size_yx_um=(pixel, pixel),
+            position_indices=(0,),
+            tile_footprints=tuple(footprints),
+            coordinate_version=STAGE_COORDINATE_VERSION,
+        )
+        roi_path = roi.write(tmp_path / "uniform_detector_roi.json")
+        support = support[:, 3:y_stop]
+        options = {
+            k: v
+            for k, v in options.items()
+            if k
+            not in (
+                "max_projection",
+                "create_fused_max_projection",
+                "write_fused_max_projection_tiff",
+            )
+        }
+        output_dir = tmp_path / "roi"
+        options.update(roi_json=roi_path, output=output_dir, registration_channel=0)
     suffix = "projection" if mode == "projection" else "deskewed"
     return SimpleNamespace(
         dataset=dataset,
-        psf_path=psf_path,
+        scene=scene,
+        means=means,
+        response=response,
+        support=support,
         expected=expected,
         options=options,
         roi_mode=roi_mode,
-        output=tmp_path / f"uniform_detector_decon_{suffix}.ome.zarr",
+        output=output_dir / f"uniform_detector_decon_{suffix}.ome.zarr",
     )
 
 

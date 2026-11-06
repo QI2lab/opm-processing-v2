@@ -319,3 +319,39 @@ def test_collection_reads_ngff_spacing_and_origin_in_physical_units(
     collection = open_position_collection(path)
     np.testing.assert_allclose(collection.voxel_size_um, spacing, atol=1e-14)
     np.testing.assert_allclose(collection.spatial_origins_zyx_um, [origin], atol=1e-14)
+
+
+@pytest.mark.parametrize("psf_format", ["npy", "tif"])
+def test_measured_psf_bytes_resolve_loading_and_resume_identity(
+    measured_psf_calibration, acquisition_metadata, processing_state
+):
+    """Load actual calibration pixels and invalidate durable identity when they change."""
+    from opm_processing.process import file_sha256
+
+    case = measured_psf_calibration
+    kernels, parameters = load_deconvolution_psfs(acquisition_metadata, [case.path])
+    np.testing.assert_array_equal(kernels[0], case.kernel)
+    assert parameters is None
+    configuration = {
+        "deconvolution": {
+            "psf_parameters": parameters,
+            "psf_sha256": [file_sha256(case.path)],
+        }
+    }
+    output = processing_state.path.parent / "calibrated.ome.zarr"
+    processing_state.initialize_run(output, configuration=configuration, overwrite=True)
+    case.write(case.kernel * 2)
+    updated, updated_parameters = load_deconvolution_psfs(
+        acquisition_metadata, [case.path]
+    )
+    np.testing.assert_array_equal(updated[0], case.kernel * 2)
+    resolved = {
+        "deconvolution": {
+            "psf_parameters": updated_parameters,
+            "psf_sha256": [file_sha256(case.path)],
+        }
+    }
+    assert resolved != configuration
+    with pytest.raises(ValueError, match="incompatible"):
+        processing_state.initialize_run(output, configuration=resolved, overwrite=False)
+    assert processing_state.run(output)["configuration"] == configuration

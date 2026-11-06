@@ -5,8 +5,8 @@ from contextlib import nullcontext
 
 import numpy as np
 import pytest
-from scipy import ndimage
 
+from tests.simulation.camera import digitize
 from tests.simulation.metrics import predictive_deviance
 
 
@@ -41,6 +41,7 @@ def test_roi_deconvolves_recorded_sampling(
         max_projection=True,
         create_fused_max_projection=True,
         z_downsample_level=1,
+        crop_after_deskew=False,
     )
     full_tiles = case.dataset.path.parent / "mosaic_deskewed.ome.zarr"
     full_fusion = TileFusion(full_tiles, multiscale_factors=())
@@ -65,6 +66,7 @@ def test_roi_deconvolves_recorded_sampling(
     solver = importlib.import_module("opm_processing.imageprocessing.rlgc")
     stages = []
     deconvolved = []
+    reconstruction_models = []
     deskew_inputs = []
     seeds = []
     corrections = []
@@ -137,6 +139,9 @@ def test_roi_deconvolves_recorded_sampling(
         assert args[0].size < expected.size
         result = deconvolve(*args, **kwargs)
         deconvolved.append(result)
+        reconstruction_models.append(
+            (args[0].copy(), np.asarray(args[1]).copy(), kwargs["boundary"])
+        )
         stages.append("deconvolve")
         return result
 
@@ -196,10 +201,25 @@ def test_roi_deconvolves_recorded_sampling(
     assert stages[2:-1] == ["deconvolve", "deskew"] * len(seeds)
     assert stages[-1] == "registration"
     assert len(seeds) == 2 and measurements
+    # The stage fixture records the first acquisition position and positive
+    # scan step. Reordering starts at its final acquired plane: image Y is
+    # minus stage X. This endpoint displacement belongs to the canonical raw
+    # frame; full factor-one processing introduces no Z-bin or deskew crop.
+    canonical_scan_offset = np.zeros(3)
+    if "stage" in case.dataset.metadata.mode:
+        canonical_scan_offset[1] = (
+            -(case.dataset.raw_data.shape[-3] - 1) * case.microscope.scan_step_um
+        )
+    np.testing.assert_allclose(
+        full_collection.spatial_origins_zyx_um,
+        np.broadcast_to(canonical_scan_offset, (len(full_collection.arrays), 3)),
+        rtol=0,
+        atol=1e-6,
+    )
     for record, initial_origin in seeds:
         position = record["position_index"]
         saved = saved_placements[record["time_index"], position]
-        raw_origin = saved - full_collection.spatial_origins_zyx_um[position]
+        raw_origin = saved
         scan_start, _stop, x_start, _x_stop = record["skewed_bounds_sx"]
         y_crop, _y_stop, x_crop, _x_stop = record["deskew_crop_yx"]
         pixel = case.microscope.pixel_size_um
@@ -235,6 +255,31 @@ def test_roi_deconvolves_recorded_sampling(
             x1 - x0,
         )
         np.testing.assert_array_equal(retained, recovered)
+    from scipy.interpolate import interp1d
+
+    for position, (recovered, raw_crop, model) in enumerate(
+        zip(deconvolved, raw_crops, reconstruction_models, strict=True)
+    ):
+        observed, kernel, boundary = model
+        start, stop, x0, x1 = raw_crop
+        x0 += position * case.parameters["tile_offset_x_pixels"]
+        x1 += position * case.parameters["tile_offset_x_pixels"]
+        expected_native = case.expectation[start:stop, :, x0:x1]
+        expected = np.zeros_like(recovered)
+        expected[::factor] = expected_native
+        baseline = observed
+        if factor > 1:
+            baseline = interp1d(
+                np.arange(observed.shape[0]) * factor, observed, axis=0
+            )(np.arange(recovered.shape[0]))
+        kernel /= kernel.sum()
+        selection = np.s_[::factor]
+        boundary = "constant" if boundary == "zero" else "reflect"
+        assert predictive_deviance(
+            recovered, expected, kernel, boundary=boundary, selection=selection
+        ) < predictive_deviance(
+            baseline, expected, kernel, boundary=boundary, selection=selection
+        )
     assert (
         configuration["configuration"]["deconvolution"].get("scan_upsample_factor", 1)
         == factor
@@ -413,6 +458,7 @@ def test_nonuniform_response_preserves_uniform_fluorescence(
     gpu_budget,
     allocator,
     monkeypatch,
+    uniform_response_case,
 ):
     """Preserve known fluorescence while bounding actual per-chunk solver state."""
     solver = importlib.import_module("opm_processing.imageprocessing.rlgc")
@@ -427,14 +473,8 @@ def test_nonuniform_response_preserves_uniform_fluorescence(
 
     monkeypatch.setattr(solver, "_iterate_rlgc", observe_state)
 
-    response = np.broadcast_to(
-        np.tile(np.array((0.25, 0.5, 1, 2), np.float32), detector_shape[1] // 4),
-        detector_shape,
-    )
-    truth = np.full((scan_planes, *response.shape), 1200, dtype=np.float32)
-    psf = np.ones((1 if scan_planes == 1 else 3, 3, 3), dtype=np.float32)
-    psf /= psf.sum()
-    measured = ndimage.convolve(truth, psf, mode="reflect") * response
+    case = uniform_response_case
+    response, truth, psf, measured = case.response, case.truth, case.psf, case.measured
     successful_crops = []
     pool = (
         cupy_gpu.get_default_memory_pool()
@@ -521,17 +561,14 @@ def test_calibrated_input_preserves_subcount_intensity(
 @pytest.mark.unit
 @pytest.mark.parametrize("crop_scan", (4, 20))
 @pytest.mark.parametrize("seed", (31, 83))
-def test_detector_response_recovers_point_flux(cupy_gpu, crop_scan, seed):
+def test_detector_response_recovers_point_flux(
+    cupy_gpu, point_response_model, ideal_photon_camera, crop_scan, seed
+):
     """Recover known emitters from integer Poisson draws under a varying response."""
     solver = importlib.import_module("opm_processing.imageprocessing.rlgc")
-    z, y, x = np.mgrid[-2:3, -3:4, -3:4]
-    psf = np.exp(-0.5 * (z**2 + (y / 1.5) ** 2 + (x / 1.5) ** 2)).astype(np.float32)
-    psf /= psf.sum()
-    truth = np.zeros((9, 35, 37), np.float32)
-    truth[3, 10, 10], truth[6, 25, 27] = 20000, 30000
-    response = np.broadcast_to(np.linspace(0.25, 2, 37, dtype=np.float32), (35, 37))
-    expectation = response * (ndimage.convolve(truth, psf, mode="reflect") + 0.25)
-    measured = np.random.default_rng(seed).poisson(expectation).astype(np.float32)
+    case = point_response_model
+    psf, response, expectation = case.psf, case.response, case.expectation
+    measured = digitize(expectation, ideal_photon_camera, seed=seed).astype(np.float32)
     actual = solver.rlgc(
         measured, psf, crop_scan=crop_scan, detector_response=response, verbose=0
     )
@@ -540,7 +577,7 @@ def test_detector_response_recovers_point_flux(cupy_gpu, crop_scan, seed):
     ) < predictive_deviance(
         measured / response, expectation, psf, boundary="reflect", response=response
     )
-    for point in ((3, 10, 10), (6, 25, 27)):
+    for point in case.points:
         neighborhood = actual[tuple(slice(p - 1, p + 2) for p in point)]
         assert np.unravel_index(np.argmax(neighborhood), neighborhood.shape) == (
             1,
@@ -549,7 +586,7 @@ def test_detector_response_recovers_point_flux(cupy_gpu, crop_scan, seed):
         )
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 @pytest.mark.parametrize(
     ("uniform_detector_acquisition", "roi_mode"),
     (
@@ -559,17 +596,22 @@ def test_detector_response_recovers_point_flux(cupy_gpu, crop_scan, seed):
         ("mirror", True),
         ("stage", True),
         *[
-            pytest.param((mode, "generated-PSF"), False, id=f"generated-psf-{mode}")
+            pytest.param((mode, "uint16"), False, id=f"uint16-{mode}")
             for mode in ("mirror", "stage", "projection")
         ],
     ),
     indirect=["uniform_detector_acquisition"],
 )
 def test_saved_fluorescence_with_detector_response(
-    cupy_gpu, uniform_detector_acquisition
+    cupy_gpu, uniform_detector_acquisition, monkeypatch, stored_file_bytes
 ):
     """Check calibrated processing orchestration against known absolute fluorescence."""
-    from opm_processing.dataio.position_collection import open_position_collection
+    import copy
+
+    from opm_processing.dataio.position_collection import (
+        open_position_collection,
+        update_group_attributes,
+    )
     from opm_processing.dataio.processing_state import (
         ProcessingState,
         processing_state_path,
@@ -579,9 +621,31 @@ def test_saved_fluorescence_with_detector_response(
 
     case = uniform_detector_acquisition
     run = process_roi if case.roi_mode else process
+    original = stored_file_bytes(case.dataset.path)
+    reconstructions = []
+    solver = importlib.import_module("opm_processing.imageprocessing.rlgc")
+    reconstruct = solver.rlgc
+
+    def observe(image, psf, *args, **kwargs):
+        """Retain actual solutions and their generated optical measurement model."""
+        result = reconstruct(image, psf, *args, **kwargs)
+        reconstructions.append(
+            (result.copy(), np.asarray(psf).copy(), kwargs.get("detector_response", 1))
+        )
+        return result
+
+    monkeypatch.setattr(solver, "rlgc", observe)
     run(case.dataset.path, **case.options)
     saved = open_position_collection(case.output).arrays[0][0, 0].read().result()
-    np.testing.assert_allclose(saved, case.expected, rtol=0.005, atol=1)
+    assert saved.dtype == (np.float32 if case.options["save_float32"] else np.uint16)
+    assert saved.shape[:2] == case.support.shape
+    np.testing.assert_array_equal(saved[~case.support], 0)
+    # In a uniform physical object the photon-volume Jacobian fixes absolute
+    # fluorescence. Average a fixed fully acquired region, not individual
+    # inverse-filtered pixels; the strict deterministic operator unit remains.
+    np.testing.assert_allclose(
+        saved[case.support].mean(), case.expected, rtol=0.005, atol=1
+    )
     state = ProcessingState.read(
         processing_state_path(
             case.output.parent, case.dataset.path.stem.removesuffix(".ome")
@@ -589,21 +653,49 @@ def test_saved_fluorescence_with_detector_response(
     )
     settings = state.run(case.output)["configuration"]["deconvolution"]
     assert settings["read_noise"] == 0
-    if "decon_psf_paths" in case.options:
-        assert settings["psf_parameters"] is None
-        np.save(case.psf_path, np.full((3, 3, 3), 2 / 27, np.float32))
-    else:
-        from yaozarrs import open_group
-
-        from opm_processing.dataio.position_collection import update_group_attributes
-
-        root = open_group(case.dataset.path)
-        calibration = root.attrs["opm_processing"]
-        assert (
-            settings["psf_parameters"] == calibration["deconvolution"]["psf_parameters"]
+    assert settings["psf_parameters"] is not None
+    assert settings["psf_sha256"] is None
+    records = state.roi_series(case.output)
+    assert len(reconstructions) == 1
+    recovered, kernel, response = reconstructions[0]
+    expected = case.means
+    if records:
+        start, stop, x0, x1 = records[0]["skewed_bounds_sx"]
+        expected = expected[start:stop, :, x0:x1]
+    if recovered.ndim == 2:
+        expected = expected[0]
+        kernel = kernel[kernel.shape[0] // 2]
+    kernel /= kernel.sum()
+    assert recovered.shape == expected.shape
+    # D(0 || prediction) = 2*sum(prediction). Reuse the independent SciPy
+    # camera predictor in the existing metric, then test total measured flux
+    # against original photon means. This avoids any per-pixel noise claim
+    # about deconvolution or fitting a gain to the recovered image.
+    predicted_flux = (
+        predictive_deviance(
+            recovered,
+            np.zeros_like(recovered),
+            kernel,
+            boundary="reflect",
+            response=response,
         )
-        calibration["deconvolution"]["psf_parameters"]["support_fwhms"] *= 1.2
-        update_group_attributes(case.dataset.path, {"opm_processing": calibration})
+        / 2
+    )
+    camera = case.scene.microscope.camera
+    variance = expected.sum(dtype=np.float64) + expected.size * (
+        camera.read_noise_e**2 + camera.electrons_per_adu**2 / 12
+    )
+    assert abs(predicted_flux - expected.sum(dtype=np.float64)) <= 6 * np.sqrt(variance)
+    run(case.dataset.path, **case.options, resume=True)
+    assert stored_file_bytes(case.dataset.path) == original
+    # Deliberately change optical calibration only after the successful real
+    # acquisition/processing round trip; resume must reject the new model.
+    parameters = copy.deepcopy(settings["psf_parameters"])
+    parameters["support_fwhms"] *= 1.2
+    update_group_attributes(
+        case.dataset.path,
+        {"opm_processing": {"deconvolution": {"psf_parameters": parameters}}},
+    )
     with pytest.raises(ValueError, match=r"incompatible|configuration"):
         run(case.dataset.path, **case.options, resume=True)
     np.testing.assert_array_equal(

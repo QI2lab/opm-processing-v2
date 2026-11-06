@@ -94,6 +94,7 @@ def pytest_collection_modifyitems(items):
             "simulated_camera",
             "pipeline_optical_data",
             "independent_photon_scene_factory",
+            "uniform_detector_scene",
         }.intersection(item.fixturenames):
             raise pytest.UsageError(
                 f"{item.nodeid}: integration tests require shared forward-model ground truth"
