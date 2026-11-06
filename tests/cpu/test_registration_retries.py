@@ -123,9 +123,23 @@ def test_selective_registration_reads_only_target_pair_and_preserves_raw_outlier
 
 @pytest.mark.unit
 @pytest.mark.parametrize(
-    "depth_error,retries,automatic",
-    [(15, 2, True), (16, 2, True), (15, 0, True), (15, 2, False)],
-    ids=("15px", "16px", "no-retries", "explicit-limits"),
+    "depth_error,retries,automatic,context_limit",
+    [
+        (15, 2, True, None),
+        (16, 2, True, None),
+        (15, 0, True, None),
+        (15, 2, False, None),
+        (15, 2, True, (17, 160, 88)),
+        (15, 2, True, (13, 160, 88)),
+    ],
+    ids=(
+        "15px",
+        "16px",
+        "no-retries",
+        "explicit-limits",
+        "within-read-context",
+        "outside-read-context",
+    ),
 )
 def test_real_depth_peak_outside_guard_band_is_remeasured_and_recovered(
     registration_pair,
@@ -134,6 +148,7 @@ def test_real_depth_peak_outside_guard_band_is_remeasured_and_recovered(
     depth_error,
     retries,
     automatic,
+    context_limit,
 ):
     """Recover a known physical drift only when retries and automatic limits permit it."""
     pair = shifted_slab_pair((64, 160, 88), 51, (-depth_error, -40, 8), seed=20261017)
@@ -142,6 +157,7 @@ def test_real_depth_peak_outside_guard_band_is_remeasured_and_recovered(
         pair.positions,
         ssim_window=7,
         _automatic_registration_limits=automatic,
+        _registration_context_limit_zyx=context_limit,
         registration_retries=retries,
         optimization_rel_threshold=0.5,
         optimization_abs_threshold=1.5,
@@ -150,7 +166,11 @@ def test_real_depth_peak_outside_guard_band_is_remeasured_and_recovered(
     registration_cache(fusion)
     assert fusion.max_registration_shift_zyx[0] == 13
     fusion.register_with_retries()
-    if automatic and retries:
+    if (
+        automatic
+        and retries
+        and (context_limit is None or depth_error < context_limit[0])
+    ):
         assert fusion._registration_retry_count >= 1
         np.testing.assert_allclose(
             fusion.pairwise_metrics[0, 1][:3], pair.expected, atol=1
@@ -160,3 +180,10 @@ def test_real_depth_peak_outside_guard_band_is_remeasured_and_recovered(
         assert fusion._registration_retry_count == 0
         assert (0, 1) not in fusion.pairwise_metrics
         np.testing.assert_array_equal(fusion.global_offsets, np.zeros((2, 3)))
+    if context_limit is not None:
+        assert all(
+            measured <= available
+            for measured, available in zip(
+                fusion.max_registration_shift_zyx, context_limit, strict=True
+            )
+        )

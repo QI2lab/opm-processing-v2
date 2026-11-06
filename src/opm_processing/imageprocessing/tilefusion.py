@@ -1486,6 +1486,7 @@ class TileFusion:
         normalize_depth_intensity: bool = True,
         registration_retries: int = 2,
         output_dir: str | Path | None = None,
+        registration_context_limit_zyx: tuple[int, int, int] | None = None,
     ) -> None:
         """Initialize registration and fusion for a processed acquisition.
 
@@ -1550,6 +1551,10 @@ class TileFusion:
         output_dir : str or pathlib.Path or None
             Destination for fused OME-Zarr images. None writes beside the
             processed tiles. Registration and depth-gain records stay there.
+        registration_context_limit_zyx : tuple[int, int, int] or None
+            Maximum search supported by a preplanned ROI read context. Clamp
+            per-pair automatic limits and retries to this ceiling without
+            changing their geometry-based allowances.
 
         Returns
         -------
@@ -1796,6 +1801,14 @@ class TileFusion:
         self.optimization_rel_threshold = float(optimization_rel_threshold)
         self.optimization_abs_threshold = float(optimization_abs_threshold)
         self._automatic_registration_limits = max_registration_shift_zyx is None
+        if registration_context_limit_zyx is not None and (
+            len(registration_context_limit_zyx) != 3
+            or any(value < 0 for value in registration_context_limit_zyx)
+        ):
+            raise ValueError(
+                "registration_context_limit_zyx must contain three nonnegative values"
+            )
+        self._registration_context_limit_zyx = registration_context_limit_zyx
         if registration_retries < 0:
             raise ValueError("registration_retries must be nonnegative")
         self.registration_retries = int(registration_retries)
@@ -1813,6 +1826,16 @@ class TileFusion:
                     is_2d=self._is_2d,
                     overlap_zyx_um=self.acquisition.registration_overlap_zyx_um,
                 )
+                if registration_context_limit_zyx is not None:
+                    local_limits = {
+                        pair: tuple(
+                            min(value, ceiling)
+                            for value, ceiling in zip(
+                                limits, registration_context_limit_zyx, strict=True
+                            )
+                        )
+                        for pair, limits in local_limits.items()
+                    }
                 self._pair_registration_limits.update(
                     {
                         (tile_indices[left], tile_indices[right]): limits
@@ -1840,7 +1863,10 @@ class TileFusion:
                 "max_registration_shift_zyx must contain three nonnegative values"
             )
         self.max_registration_shift_zyx = tuple(
-            int(value) for value in max_registration_shift_zyx
+            int(value)
+            if registration_context_limit_zyx is None
+            else min(int(value), registration_context_limit_zyx[axis])
+            for axis, value in enumerate(max_registration_shift_zyx)
         )
         self._initial_registration_shift_zyx = self.max_registration_shift_zyx
         self._initial_pair_registration_limits = self._pair_registration_limits.copy()
@@ -3732,6 +3758,12 @@ class TileFusion:
                     peak = abs(correction[axis])
                     margin = max(2, sampling[axis], math.ceil(0.05 * peak))
                     updated[axis] = max(updated[axis], int(peak + margin))
+            context_limit = getattr(self, "_registration_context_limit_zyx", None)
+            if context_limit is not None:
+                updated = [
+                    min(value, ceiling)
+                    for value, ceiling in zip(updated, context_limit, strict=True)
+                ]
             if tuple(updated) != self._pair_registration_limits.get(pair, limits):
                 self._pair_registration_limits[pair] = tuple(updated)
                 expanded.add(pair)
@@ -3880,6 +3912,7 @@ class TileFusion:
         dict
             Output-affecting registration settings fingerprinted in the processing journal.
         """
+        context_limit = getattr(self, "_registration_context_limit_zyx", None)
         return {
             "coordinates": STAGE_COORDINATE_VERSION,
             "channel_index": self.channel_to_use,
@@ -3905,6 +3938,11 @@ class TileFusion:
                 )
             ),
             "registration_retries": getattr(self, "registration_retries", 2),
+            **(
+                {"registration_context_limit_zyx": list(context_limit)}
+                if context_limit is not None
+                else {}
+            ),
             "retry_policy": "selective-pairs-and-global-measured-peak-5pct-2px-bin-v3",
             "shift_limits_policy": (
                 "recorded-overlap-contextual-depth-actual-support-per-pair-v4"

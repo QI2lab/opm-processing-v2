@@ -36,8 +36,8 @@ def roi_with_registration_context(
     roi: PhysicalRoi,
     acquisition: AcquisitionMetadata,
     z_downsample_level: int,
-) -> PhysicalRoi:
-    """Retain registration search and SSIM context around the selected rectangle.
+) -> tuple[PhysicalRoi, tuple[int, int, int] | None]:
+    """Plan local ROI registration limits before adding their read context.
 
     Parameters
     ----------
@@ -50,10 +50,13 @@ def roi_with_registration_context(
 
     Returns
     -------
-    PhysicalRoi
-        Expanded processing rectangle. Context follows the same geometry-based
-        search limits as fusion, including depth-dependent footprint shifts;
-        nearly coincident tiles never request their entire overlap as a halo.
+    tuple
+        Expanded processing rectangle and maximum ZYX corrections in output
+        pixels. Infer local limits once from the selected region's common
+        support and recorded overlap. Added context supplies search and SSIM
+        samples; it does not increase the selected region's search allowance.
+        Full-acquisition fusion retains its acquisition-wide search policy.
+        A single tile has no pairwise registration limits.
     """
     pixel = float(acquisition.pixel_size_um)
     spacing = np.array((pixel * z_downsample_level, pixel, pixel))
@@ -72,57 +75,52 @@ def roi_with_registration_context(
         * pixel
     )
     bounds = np.asarray(roi.bounds_yx_um, dtype=float)
-    margins = np.zeros(2)
     footprints = roi.tile_footprints
     times = sorted({tile["time_index"] for tile in footprints})
-    for _ in range(32):
-        expanded = bounds + np.array((-margins[0], margins[0], -margins[1], margins[1]))
-        needed = np.zeros(2)
-        for time in times:
-            group = [tile for tile in footprints if tile["time_index"] == time]
-            if len(group) < 2 or all(
-                np.array_equal(tile["origin_zyx_um"], group[0]["origin_zyx_um"])
-                for tile in group
-            ):
+    envelope = np.zeros(3, dtype=np.int64)
+    has_pairs = False
+    for time in times:
+        group = [tile for tile in footprints if tile["time_index"] == time]
+        if len(group) < 2:
+            continue
+        origins, shapes = [], []
+        for tile in group:
+            y0, y1, x0, x1 = tile["bounds_yx_um"]
+            y0, y1 = max(y0, bounds[0]), min(y1, bounds[1])
+            x0, x1 = max(x0, bounds[2]), min(x1, bounds[3])
+            if y1 <= y0 or x1 <= x0:
                 continue
-            origins, shapes = [], []
-            for tile in group:
-                y0, y1, x0, x1 = tile["bounds_yx_um"]
-                y0, y1 = max(y0, expanded[0]), min(y1, expanded[1])
-                x0, x1 = max(x0, expanded[2]), min(x1, expanded[3])
-                if y1 <= y0 or x1 <= x0:
-                    continue
-                origins.append((tile["origin_zyx_um"][0], y0, x0))
-                shapes.append(
-                    (
-                        z_count,
-                        math.ceil((y1 - y0) / pixel),
-                        math.ceil((x1 - x0) / pixel),
-                    )
+            origins.append((tile["origin_zyx_um"][0], y0, x0))
+            shapes.append(
+                (
+                    z_count,
+                    math.ceil((y1 - y0) / pixel),
+                    math.ceil((x1 - x0) / pixel),
                 )
-            limits = _infer_registration_limits(
-                origins,
-                shapes,
-                spacing,
-                DEFAULT_REGISTRATION_DOWNSAMPLE,
-                acquisition.angle_deg,
             )
-            for limit in limits.values():
-                needed = np.maximum(needed, np.asarray(limit[1:]) * pixel + support)
-        needed = np.ceil(needed / pixel - 1e-9) * pixel
-        if np.all(needed <= margins):
-            break
-        margins = np.maximum(margins, needed)
-    else:
-        raise RuntimeError(
-            "ROI registration context did not reach a stable search envelope"
+        limits = _infer_registration_limits(
+            origins,
+            shapes,
+            spacing,
+            DEFAULT_REGISTRATION_DOWNSAMPLE,
+            acquisition.angle_deg,
+            overlap_zyx_um=acquisition.registration_overlap_zyx_um,
         )
+        for limit in limits.values():
+            has_pairs = True
+            envelope = np.maximum(envelope, limit)
+    if not has_pairs:
+        return roi, None
+    margins = np.ceil((envelope[1:] * pixel + support) / pixel - 1e-9) * pixel
     print(f"ROI registration context: Y={margins[0]:.3f} um, X={margins[1]:.3f} um")
-    return replace(
-        roi,
-        bounds_yx_um=tuple(
-            bounds + np.array((-margins[0], margins[0], -margins[1], margins[1]))
+    return (
+        replace(
+            roi,
+            bounds_yx_um=tuple(
+                bounds + np.array((-margins[0], margins[0], -margins[1], margins[1]))
+            ),
         ),
+        tuple(int(value) for value in envelope),
     )
 
 
@@ -229,7 +227,9 @@ def process_roi(
     )
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    processing_roi = roi_with_registration_context(roi, acquisition, z_downsample_level)
+    processing_roi, registration_limits = roi_with_registration_context(
+        roi, acquisition, z_downsample_level
+    )
     state_path = processing_state_path(output_dir, stem)
     if resume and deconvolve and state_path.is_file():
         old_state = ProcessingState.read(state_path)
@@ -274,6 +274,7 @@ def process_roi(
     fusion = TileFusion(
         root_path=processed_path,
         channel_to_use=registration_channel,
+        registration_context_limit_zyx=registration_limits,
         roi_selection=fusion_roi,
         multiscale_factors=(),
         resolution_multiples=((1, 1, 1),),
