@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import tempfile
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -464,3 +467,136 @@ def plan_stage_coordinate_repair(root: str | Path) -> dict[str, Any]:
             )
     base_plan["plan_sha256"] = _plan_digest(base_plan)
     return base_plan
+
+
+def _atomic_write(path: Path, content: bytes) -> None:
+    """Replace one approved metadata file atomically on its own filesystem."""
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".coordinate-repair.tmp", dir=path.parent
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if Path(temporary).exists():
+            Path(temporary).unlink()
+
+
+def apply_stage_coordinate_repair(plan: dict[str, Any]) -> dict[str, Any]:
+    """Apply an unchanged reviewed plan after durable backups and preimage checks.
+
+    Parameters
+    ----------
+    plan : dict
+        Saved plan returned by :func:`plan_stage_coordinate_repair`.
+
+    Returns
+    -------
+    dict
+        Applied file count and backup directory, or an idempotent no-op status.
+    """
+    if plan.get("schema") != REPAIR_SCHEMA or plan.get("plan_sha256") != _plan_digest(
+        plan
+    ):
+        raise ValueError("Repair plan fingerprint is invalid")
+    root = Path(plan["root"]).resolve()
+    records = plan["files"]
+    if not records:
+        return {"status": "already_repaired", "changed_files": 0}
+    if not isinstance(plan.get("read_dependencies"), list):
+        raise ValueError(
+            "Repair plan lacks validated input dependencies; generate a fresh plan"
+        )
+    paths: list[Path] = []
+    originals: list[bytes] = []
+    for record in records:
+        if not _metadata_allowed(record["path"], plan["stem"]):
+            raise ValueError("Repair plan includes a non-metadata path")
+        path = _inside(root, record["path"])
+        after = record["after_text"].encode()
+        if _sha(after) != record["after_sha256"]:
+            raise ValueError("Repair postimage fingerprint is invalid")
+        paths.append(path)
+        originals.append(path.read_bytes())
+    hashes = [_sha(value) for value in originals]
+    if all(
+        value == record["after_sha256"]
+        for value, record in zip(hashes, records, strict=True)
+    ):
+        return {"status": "already_repaired", "changed_files": 0}
+    if any(
+        value != record["before_sha256"]
+        for value, record in zip(hashes, records, strict=True)
+    ):
+        raise ValueError(
+            "Repair preimage mismatch; no files changed. Generate a fresh plan."
+        )
+    for dependency in plan.get("read_dependencies", []):
+        if _sha(_inside(root, dependency["path"]).read_bytes()) != dependency["sha256"]:
+            raise ValueError(
+                "Repair input dependency changed; no files changed. Generate a fresh plan."
+            )
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    relative_backup = f".coordinate-repair-backups/{stamp}_{plan['plan_sha256'][:12]}"
+    backup = _inside(root, relative_backup)
+    backup.mkdir(parents=True, exist_ok=False)
+    for record, original in zip(records, originals, strict=True):
+        target = _inside(backup, record["path"])
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("wb") as stream:
+            stream.write(original)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if _sha(target.read_bytes()) != record["before_sha256"]:
+            raise RuntimeError("Repair backup verification failed; no metadata changed")
+    manifest = {
+        "schema": REPAIR_SCHEMA,
+        "plan_sha256": plan["plan_sha256"],
+        "root": str(root),
+        "files": [
+            {key: record[key] for key in ("path", "before_sha256", "after_sha256")}
+            for record in records
+        ],
+    }
+    manifest_content = _json_bytes(manifest)
+    manifest_path = backup / "manifest.json"
+    with manifest_path.open("wb") as stream:
+        stream.write(manifest_content)
+        stream.flush()
+        os.fsync(stream.fileno())
+    if manifest_path.read_bytes() != manifest_content:
+        raise RuntimeError("Repair backup manifest verification failed")
+    completed: list[int] = []
+    try:
+        for index, (path, record) in enumerate(zip(paths, records, strict=True)):
+            if _sha(path.read_bytes()) != record["before_sha256"]:
+                raise ValueError("Metadata changed while applying the reviewed plan")
+            completed.append(index)
+            _atomic_write(path, record["after_text"].encode())
+        if any(
+            _sha(path.read_bytes()) != record["after_sha256"]
+            for path, record in zip(paths, records, strict=True)
+        ):
+            raise RuntimeError("Repair postimage verification failed")
+    except BaseException as error:
+        conflicts = []
+        for index in reversed(completed):
+            current = _sha(paths[index].read_bytes())
+            if current == records[index]["after_sha256"]:
+                _atomic_write(paths[index], originals[index])
+            elif current != records[index]["before_sha256"]:
+                conflicts.append(str(paths[index]))
+        if conflicts:
+            raise RuntimeError(
+                f"Concurrent metadata changes prevented complete rollback; backups: {backup}; conflicts: {conflicts}"
+            ) from error
+        raise
+    return {
+        "status": "applied",
+        "changed_files": len(records),
+        "backup_directory": str(backup),
+        "plan_sha256": plan["plan_sha256"],
+    }
