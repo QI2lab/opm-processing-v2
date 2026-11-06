@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 import tifffile
 from ome_types import from_xml
+from typer.testing import CliRunner
 from yaozarrs import open_group
 
 from opm_processing.export_ome_tiff import app
@@ -15,11 +16,11 @@ pytestmark = pytest.mark.unit
 
 @pytest.mark.parametrize("source_xml,workers", [(True, 1), (False, 3)])
 def test_fused_pair_roundtrip_pixels_and_metadata(
-    tmp_path, fused_export, source_xml, workers, cli_runner
+    tmp_path, fused_export, source_xml, workers
 ):
     """Preserve a calibrated fluorescent object, channel settings, and provenance."""
     destination = tmp_path / "exports"
-    runner = cli_runner
+    runner = CliRunner()
     result = runner.invoke(
         app, [str(tmp_path), "--output", str(destination), "--workers", str(workers)]
     )
@@ -186,10 +187,10 @@ def test_fused_pair_roundtrip_pixels_and_metadata(
     assert not list(destination.glob("*.tmp"))
 
 
-def test_standalone_planar_fused_pair(tmp_path, planar_fused_export, cli_runner):
+def test_standalone_planar_fused_pair(tmp_path, planar_fused_export):
     """A portable singleton TCZ image retains NGFF channels and calibrated time."""
     truth, spacing = planar_fused_export.truth, planar_fused_export.spacing
-    result = cli_runner.invoke(app, [str(tmp_path)])
+    result = CliRunner().invoke(app, [str(tmp_path)])
     assert result.exit_code == 0, result.exception
     for name in ("sample_fused", "sample_max_z_fused"):
         with tifffile.TiffFile(tmp_path / f"{name}.ome.tif") as tif:

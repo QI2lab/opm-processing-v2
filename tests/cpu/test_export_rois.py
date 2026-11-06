@@ -175,11 +175,13 @@ def test_raw_roi_exports_and_resume(
                     metadata.scale_transform.scale[-3:],
                     raw_origin=case.raw_origin_zyx_um,
                 )
-        args = [str(directory), "--registration-channel", "1", "--save-float32"] + (
-            ["--tiff"] if tiff else []
+        invoke_cli(
+            "export-rois",
+            directory,
+            registration_channel=1,
+            save_float32=True,
+            tiff=tiff,
         )
-        result = CliRunner().invoke(export_rois.app, args)
-        assert result.exit_code == 0, result.exception
         assert len(calls) == 1
         if completed is not None:
             assert len(checkpoints) == completed
@@ -290,7 +292,7 @@ def test_missing_preview_explains_creation(tmp_path):
     "mosaic_acquisition", [("mirror", 0.4, 0.001), ("stage", 1.2, 0.001)], indirect=True
 )
 def test_roi_maps_extended_specimen_to_raw_tiles(
-    mosaic_acquisition, monkeypatch, independent_photon_scene_factory
+    mosaic_acquisition, monkeypatch, independent_photon_scene_factory, invoke_cli
 ):
     """Keep the oblique preimage and measure fresh links across a real tile seam."""
     from opm_processing.dataio.position_collection import open_position_collection
@@ -330,10 +332,7 @@ def test_roi_maps_extended_specimen_to_raw_tiles(
         return result
 
     monkeypatch.setattr(TileFusion, "register_and_score", staticmethod(measure))
-    result = CliRunner().invoke(
-        export_rois.app, [str(preview), "--registration-channel", "0", "--save-float32"]
-    )
-    assert result.exit_code == 0, result.exception
+    invoke_cli("export-rois", preview, registration_channel=0, save_float32=True)
     directory = preview.parent / "roi_exports" / "roi_001"
     state = ProcessingState.read(directory / "mosaic.processing.json")
     tiles = directory / "mosaic_deskewed.ome.zarr"

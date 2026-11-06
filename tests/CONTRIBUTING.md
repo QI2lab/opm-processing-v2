@@ -23,11 +23,12 @@ session scope. Parameterize independent settings rather than copying
 tests. Do not import helpers from another test module or `conftest.py`.
 Integration tests must consume shared forward-model ground truth, then process
 the simulated observations through production code. CLI integrations invoke the
-registered applications and their actual parsers; numerical processing, storage,
-and encoders must execute. Collection requires a shared simulation fixture.
-Reuse an existing builder before adding a fixture. Avoid tiny wrappers that only
-rename a call. Use NumPy-style docstrings; Ruff checks test functions and fixtures
-as well as library code.
+registered applications and their actual parsers; numerical processing and storage
+must execute. Collection requires a shared simulation fixture.
+Reuse an existing builder before adding a fixture. Call production functions
+directly instead of adding small pass-through helpers or single-use wrappers.
+Keep fixtures for shared data, setup and cleanup. Use NumPy-style docstrings;
+Ruff checks test functions and fixtures as well as library code.
 
 Every integration must execute this chain:
 

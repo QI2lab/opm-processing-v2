@@ -10,12 +10,6 @@ from typer.testing import CliRunner
 
 
 @pytest.fixture
-def cli_runner():
-    """Share a real Click terminal and registered-command runner."""
-    return CliRunner()
-
-
-@pytest.fixture
 def export_image_input(request, acquisition_factory, fused_store_factory):
     """Persist small real OME-Zarr inputs for individual TIFF writer units.
 
@@ -82,7 +76,7 @@ def relocate_acquisition(tmp_path, integration_pipeline_records):
 
 
 @pytest.fixture
-def invoke_cli(cli_runner):
+def invoke_cli():
     """Invoke a registered CLI with its real parser and processing implementation.
 
     Returns
@@ -118,7 +112,7 @@ def invoke_cli(cli_runner):
             else:
                 values = value if isinstance(value, tuple) else (value,)
                 args.extend((parameter.opts[0], *(str(v) for v in values)))
-        result = cli_runner.invoke(application, args, catch_exceptions=False)
+        result = CliRunner().invoke(application, args, catch_exceptions=False)
         assert result.exit_code == 0, result.output
         return result
 

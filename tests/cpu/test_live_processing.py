@@ -340,7 +340,6 @@ def test_offline_resume_skips_durably_completed_tile_and_default_overwrites(
     action,
     assert_uniform_photon_accuracy,
     relocate_acquisition,
-    cli_runner,
 ):
     """Recover partial real acquisitions across relocation without changing completed photons."""
     process_module = importlib.import_module("opm_processing.process")
@@ -358,7 +357,7 @@ def test_offline_resume_skips_durably_completed_tile_and_default_overwrites(
     dataset.raw_arrays[0].write(case.changed.pixels[:, 0, :, ::-1].copy()).result()
     root = relocate_acquisition(tmp_path, copy=action == "resume")
     source = root / dataset.path.name
-    result = cli_runner.invoke(
+    result = CliRunner().invoke(
         app,
         [
             str(source),

@@ -8,6 +8,7 @@ from contextlib import nullcontext
 
 import pytest
 import typer
+from typer.testing import CliRunner
 
 from opm_processing.dataio.position_collection import create_position_collection
 from opm_processing.process import confirm_partial_output_resume
@@ -34,7 +35,6 @@ pytestmark = pytest.mark.unit
 def test_partial_output_decision_preserves_pixels_and_journal(
     partial_processed_run,
     stored_file_bytes,
-    cli_runner,
     planar,
     answer,
     expected,
@@ -52,7 +52,7 @@ def test_partial_output_decision_preserves_pixels_and_journal(
     elif damage == "metadata":
         (run.output / "0" / "zarr.json").unlink()
     before = stored_file_bytes(run.output_dir)
-    with cli_runner.isolation(input=f"{answer}\n"):
+    with CliRunner().isolation(input=f"{answer}\n"):
         with pytest.raises(typer.Abort) if expected is None else nullcontext():
             assert (
                 confirm_partial_output_resume(
@@ -113,7 +113,7 @@ def test_resume_and_distinct_output_families(partial_processed_run, deconvolve):
 
 @pytest.mark.parametrize("requested", [False, True])
 def test_projection_completion_only_matters_when_requested(
-    partial_processed_run, cli_runner, requested
+    partial_processed_run, requested
 ):
     """Check projection completeness only when that output is requested."""
     run = partial_processed_run(completed=[(t, p) for t in range(2) for p in range(3)])
@@ -125,7 +125,7 @@ def test_projection_completion_only_matters_when_requested(
         overwrite=True,
     )
     run.state.complete_tile(maximum, 0, 0)
-    with cli_runner.isolation(input="resume\n"):
+    with CliRunner().isolation(input="resume\n"):
         assert (
             confirm_partial_output_resume(
                 run.acquisition,

@@ -7,13 +7,11 @@ import numpy as np
 import pytest
 import tensorstore as ts
 from scipy.special import kl_div
-from typer.testing import CliRunner
 
 from opm_processing.dataio.live import read_lifecycle_event
 from opm_processing.dataio.position_collection import open_position_collection
 from opm_processing.imageprocessing.camera import camera_correct, illumination_correct
 from opm_processing.imageprocessing.flatfield import estimate_illuminations
-from opm_processing.process import app
 
 
 @pytest.mark.integration
@@ -251,7 +249,11 @@ def test_invalid_cached_fields_are_not_reused(tmp_path, level):
 
 @pytest.mark.integration
 def test_live_wait_defers_processing_and_selects_flatfield(
-    live_wait_case, monkeypatch, assert_roi_point_accuracy, deskew_uniform_expectation
+    live_wait_case,
+    monkeypatch,
+    assert_roi_point_accuracy,
+    deskew_uniform_expectation,
+    invoke_cli,
 ):
     """Wait for both completion and chunks, then reuse or estimate illumination."""
     processing = importlib.import_module("opm_processing.process")
@@ -281,21 +283,17 @@ def test_live_wait_defers_processing_and_selects_flatfield(
     monkeypatch.setattr(
         processing, "call_estimate_illuminations", estimate_after_completion
     )
-    args = [
-        str(case.dataset.path.parent),
-        "--live-wait",
-        "--save-float32",
-        "--output",
-        str(case.destination),
-        "--no-max-projection",
-        "--no-create-fused-max-projection",
-        "--z-downsample-level",
-        "1",
-    ]
-    if case.kind != "pending-chunks":
-        args.append("--flatfield-correction")
-    result = CliRunner().invoke(app, args)
-    assert result.exit_code == 0, result.exception
+    result = invoke_cli(
+        "process",
+        case.dataset.path.parent,
+        live_wait=True,
+        save_float32=True,
+        output=case.destination,
+        max_projection=False,
+        create_fused_max_projection=False,
+        z_downsample_level=1,
+        flatfield_correction=case.kind != "pending-chunks",
+    )
     assert (
         case.sleeps
         == [30.0] * {"estimate": 2, "pending-chunks": 1, "cached": 0}[case.kind]
