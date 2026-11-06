@@ -1057,6 +1057,10 @@ def open_acquisition_datastore(
         else inspect_acquisition(acquisition)
     )
     root = yaozarrs.open_group(metadata.path)
+    if "opm_processing_refkv" in root.attrs:
+        from opm_processing.dataio.refkv_reader import open_refkv_datastore
+
+        return open_refkv_datastore(metadata)
     arrays = [root[array_path].to_tensorstore() for array_path in metadata.array_paths]
     return ts.stack(arrays, axis=1)
 
