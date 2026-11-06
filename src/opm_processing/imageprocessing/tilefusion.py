@@ -67,7 +67,10 @@ from opm_processing.imageprocessing.coordinates import (
     stage_positions_to_image_coordinates,
     stage_z_level_indices,
 )
-from opm_processing.imageprocessing.opmtools import orthogonal_deskew
+from opm_processing.imageprocessing.opmtools import (
+    deskew_coverage,
+    deskew_shape_estimator,
+)
 
 DEFAULT_REGISTRATION_DOWNSAMPLE = (3, 5, 5)
 DEFAULT_REGISTRATION_SSIM_WINDOW = 15
@@ -2079,18 +2082,24 @@ class TileFusion:
                 scan_step_um = float(reconstruction["scan_axis_step_um"])
         z_downsample = round(float(self._pixel_size[0]) / raw_pixel_size_um)
 
-        support = orthogonal_deskew(
-            np.full(
-                (scan_count, raw_camera_y, 1),
-                1024.0,
-                dtype=np.float32,
-            ),
-            theta=angle_deg,
-            distance=scan_step_um,
-            pixel_size=raw_pixel_size_um,
+        source_shape = (scan_count, raw_camera_y, 1)
+        shape, *_ = deskew_shape_estimator(
+            source_shape,
+            angle_deg,
+            scan_step_um,
+            raw_pixel_size_um,
+            crop_after_deskew=False,
             divisible_by=1 if roi_record is None else 4,
             downsample_factor=z_downsample,
-        )[..., 0]
+        )
+        support = deskew_coverage(
+            source_shape,
+            shape,
+            angle_deg,
+            scan_step_um,
+            raw_pixel_size_um,
+            downsample_factor=z_downsample,
+        )
         configuration = run.get("configuration", {})
         if roi_record is not None:
             crop_y0, crop_y1 = map(int, roi_record["deskew_crop_yx"][:2])
@@ -2098,10 +2107,6 @@ class TileFusion:
         elif configuration.get("crop_after_deskew", False):
             crop_y = int(np.ceil(raw_camera_y * np.cos(np.deg2rad(angle_deg))))
             support = support[:, crop_y:-crop_y]
-        full_response = 2048 * raw_pixel_size_um / scan_step_um
-        support *= np.float32(z_downsample / full_response)
-        np.rint(support, out=support)
-        support /= np.float32(z_downsample)
         if roi_record is not None:
             return np.ascontiguousarray(support)
         padded_support = np.zeros(
