@@ -54,25 +54,6 @@ def test_planar_data_does_not_require_scan_spacing(acquisition_metadata):
     )
 
 
-@pytest.mark.parametrize("suffix", [".npy", ".ome.tif"])
-def test_measured_psfs_preserve_pixels_without_theoretical_calibration(
-    tmp_path, acquisition_metadata, suffix
-):
-    """Load measured optical samples unchanged using NumPy and tifffile readers."""
-    from tifffile import imwrite
-
-    kernel = np.arange(27, dtype=np.float32).reshape(3, 3, 3)
-    kernel /= kernel.sum()
-    path = tmp_path / f"measured_psf{suffix}"
-    if suffix == ".npy":
-        np.save(path, kernel)
-    else:
-        imwrite(path, kernel, photometric="minisblack", metadata={"axes": "ZYX"})
-    kernels, parameters = load_deconvolution_psfs(acquisition_metadata, [path])
-    np.testing.assert_array_equal(kernels[0], kernel)
-    assert parameters is None
-
-
 @pytest.mark.parametrize("count", [0, 2])
 def test_measured_psf_count_must_match_recorded_channels(
     tmp_path, acquisition_metadata, count

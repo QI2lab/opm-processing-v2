@@ -1,4 +1,4 @@
-"""Calibrated fluorescent specimens and provenance for OME-TIFF exports."""
+"""Prescribed Cartesian pixels and provenance for OME-TIFF exports."""
 
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -17,32 +17,11 @@ from opm_processing.dataio.processing_state import ProcessingState
 
 
 @pytest.fixture
-def fused_export(tmp_path, source_xml, fused_store_factory, simulated_camera):
-    """Persist a two-channel object, depth projection and calibrated provenance."""
+def fused_export(tmp_path, source_xml, fused_store_factory, microscope_parameters):
+    """Persist two-channel pixels, a depth projection and calibrated provenance."""
     dtype = np.uint16
-    from opm_processing.imageprocessing.camera import camera_correct
-    from tests.simulation.camera import digitize
-
-    observed = simulated_camera((3, 515, 529), geometry="cartesian")
-    camera = observed.microscope.camera
-    raw_frames = np.stack(
-        [
-            np.stack(
-                [
-                    digitize(
-                        observed.expectation * exposure,
-                        camera,
-                        seed=10 * time + channel,
-                    )
-                    for channel, exposure in enumerate(exposures)
-                ]
-            )
-            for time, exposures in enumerate(((1.0, 2.3), (0.7, 1.4)))
-        ]
-    )
-    truth = camera_correct(
-        raw_frames, camera.offset_adu, camera.electrons_per_adu
-    ).astype(dtype)
+    time, channel, z, y, x = np.ogrid[:2, :2, :3, :515, :529]
+    truth = (1 + 20000 * time + 10000 * channel + 2000 * z + 2 * y + x).astype(dtype)
     projection = truth.max(axis=2, keepdims=True)
     raw_path = tmp_path / "sample.ome.zarr"
     raw = create_position_collection(
@@ -68,7 +47,7 @@ def fused_export(tmp_path, source_xml, fused_store_factory, simulated_camera):
             }
         },
     )
-    raw.arrays[0].write(raw_frames).result()
+    raw.arrays[0].write(truth).result()
     image_metadata = (
         open_group(raw_path)["0"]
         .ome_metadata()
@@ -99,7 +78,7 @@ def fused_export(tmp_path, source_xml, fused_store_factory, simulated_camera):
         )
         source_ome.images[0].pixels.time_increment = 8.5
         source_ome.images[0].pixels.channels[0].emission_wavelength = (
-            observed.microscope.wavelength_um * 1000
+            microscope_parameters.wavelength_um * 1000
         )
         source_ome.structured_annotations.comment_annotations.append(
             CommentAnnotation(id="Annotation:sample", value="Simulated specimen μ")
@@ -148,20 +127,15 @@ def fused_export(tmp_path, source_xml, fused_store_factory, simulated_camera):
 
 
 @pytest.fixture
-def planar_fused_export(fused_store_factory, simulated_camera):
-    """Persist one real single-channel planar object with explicit physical timing."""
-    from opm_processing.imageprocessing.camera import camera_correct
-
-    observed = simulated_camera((1, 17, 19), geometry="cartesian")
-    microscope = observed.microscope
+def planar_fused_export(fused_store_factory, microscope_parameters):
+    """Persist known single-channel planar pixels with explicit physical timing."""
+    microscope = microscope_parameters
     spacing = (
         microscope.scan_step_um,
         microscope.pixel_size_um,
         microscope.pixel_size_um,
     )
-    truth = camera_correct(
-        observed.raw, microscope.camera.offset_adu, microscope.camera.electrons_per_adu
-    ).astype(np.uint16)[None, None]
+    truth = np.arange(1, 1 + 17 * 19, dtype=np.uint16).reshape(1, 1, 1, 17, 19)
     for name in ("sample_fused", "sample_max_z_fused"):
         fused_store_factory(
             truth,

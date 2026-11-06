@@ -15,7 +15,7 @@ from opm_processing.imageprocessing.opmtools import (
 
 
 @pytest.fixture(params=[(0, 14), (8, 0), (8, 14)], ids=["x", "y", "yx"])
-def orthogonal_registration_pair(request, simulation_parameters, registration_scene):
+def orthogonal_registration_pair(request, simulation_parameters, registration_specimen):
     """Observe one shared optical object through two translated oblique cameras."""
     from dataclasses import replace
 
@@ -35,9 +35,8 @@ def orthogonal_registration_pair(request, simulation_parameters, registration_sc
     origins = [np.zeros(3), np.array([0, delta_y, delta_x])]
     # Reuse the registration fixture's known point distribution and production
     # optical model; no separate Gaussian image generator is maintained here.
-    observation = registration_scene((24, 112, 62))
-    scene = observation.ground_truth
-    microscope = replace(observation.microscope, scan_step_um=geometry["distance"])
+    scene = registration_specimen((24, 112, 62))
+    microscope = replace(scene.microscope, scan_step_um=geometry["distance"])
     pixel = microscope.pixel_size_um
     scan, row, column = centered_sensor_axes(
         shape, (microscope.scan_step_um, pixel, pixel)

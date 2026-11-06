@@ -173,7 +173,6 @@ def test_roi_fusion_keeps_multiple_stage_z_levels_and_crops_only_yx(
     tmp_path: Path,
     external,
     acquisition_factory,
-    simulated_camera,
 ) -> None:
     """Filter arbitrary source positions while preserving their complete Z span."""
     processed_path = tmp_path / "sample_projection.ome.zarr"
@@ -183,7 +182,7 @@ def test_roi_fusion_keeps_multiple_stage_z_levels_and_crops_only_yx(
         (1.0, 1.0, 1.0),
         stage_positions=((0.0, 0.0, 0.0), (5.0, 0.0, 0.0), (0.0, 100.0, 100.0)),
     )
-    observed = simulated_camera((1, 4, 4), geometry="cartesian").raw
+    observed = np.arange(100, 116, dtype=np.uint16).reshape(1, 4, 4)
     for array in collection.arrays:
         array.write(observed[None, None]).result()
     tiles = [
@@ -265,7 +264,6 @@ def test_variable_roi_tiles_are_stored_cropped_and_reopened(
     record_registration,
     tmp_path: Path,
     acquisition_factory,
-    simulated_camera,
 ) -> None:
     """ROI series retain their independent crop shapes and physical origins."""
     processed_path = tmp_path / "sample_decon_deskewed.ome.zarr"
@@ -298,8 +296,9 @@ def test_variable_roi_tiles_are_stored_cropped_and_reopened(
         ),
     )
     observed = tuple(
-        simulated_camera(shape[-3:], geometry="cartesian", exposure=exposure).raw
-        for shape, exposure in zip(shapes, (1.0, 3.0), strict=True)
+        np.arange(np.prod(shape[-3:]), dtype=np.uint16).reshape(shape[-3:])
+        + 100 * (index + 1)
+        for index, shape in enumerate(shapes)
     )
     for array, pixels in zip(collection.arrays, observed, strict=True):
         array.write(pixels[None, None]).result()

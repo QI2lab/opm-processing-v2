@@ -399,15 +399,15 @@ def test_roi_maps_extended_specimen_to_raw_tiles(
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize(
-    "roi_preview", [("mirror", 1, False), ("stage", 1, False)], indirect=True
-)
+@pytest.mark.parametrize("origin", [(-2.3, 4.6, 1.15), (-2.3, 1.8, 1.15)])
 def test_single_position_gui_keeps_time_and_global_coordinates(
-    roi_preview, napari_model, monkeypatch
+    origin, fused_store_factory, napari_model, monkeypatch
 ):
     """Draw rectangles on plugin-loaded timelapse layers in stage space."""
     import napari
 
+    data = np.arange(2 * 2 * 32 * 16, dtype=np.uint16).reshape(2, 2, 1, 32, 16)
+    source = fused_store_factory(data, spacing=(0.115,) * 3, origin=origin)
     viewer = napari_model
     monkeypatch.setattr(napari, "Viewer", lambda: viewer)
 
@@ -415,21 +415,19 @@ def test_single_position_gui_keeps_time_and_global_coordinates(
         """Add a rectangle after inspecting the second acquired timepoint."""
         viewer.dims.set_current_step(0, 1)
         layer = viewer.layers[0]
-        np.testing.assert_allclose(layer.translate[-2:], roi_preview.origin[-2:])
+        np.testing.assert_allclose(layer.translate[-2:], origin[-2:])
         vertices = np.asarray(((3, 2), (3, 10), (12, 10), (12, 2)))
         viewer.layers.selection.active.add(vertices, shape_type="rectangle")
         assert viewer.dims.current_step[0] == 1
 
     monkeypatch.setattr(napari, "run", draw)
-    assert export_rois.select_rois(roi_preview.preview, (2, 2, 1, 32, 16)) == [
-        (3, 12, 2, 10)
-    ]
+    assert export_rois.select_rois(source, data.shape) == [(3, 12, 2, 10)]
 
 
 @pytest.mark.unit
 @pytest.mark.parametrize("z_origin", [0.0, -2441.811])
 def test_draw_rois_on_thick_projection(
-    monkeypatch, z_origin, napari_model, fused_store_factory, simulated_camera
+    monkeypatch, z_origin, napari_model, fused_store_factory
 ):
     """Draw level-zero rectangles on a physical full-depth maximum projection."""
     import napari
@@ -442,8 +440,8 @@ def test_draw_rois_on_thick_projection(
     )
 
     viewer = napari_model
-    observed = simulated_camera((226, 32, 48), step=0.23, geometry="cartesian").raw
-    data = np.stack((observed, observed))
+    time, z, row, column = np.indices((2, 226, 32, 48), dtype=np.uint16)
+    data = 100 + time * 20000 + z * 100 + row * 3 + column
     source = fused_store_factory(
         data[:, None],
         spacing=(0.23, 0.115, 0.115),
@@ -523,17 +521,10 @@ def test_multiscale_transform_uses_level_zero(napari_model):
 @pytest.mark.unit
 @pytest.mark.parametrize("z_size", [5, 6])
 def test_thick_projection_preserves_time_and_multiscale_coordinates(
-    z_size, napari_model, simulated_camera
+    z_size, napari_model
 ):
     """Retain time selection and physical coordinates across projected scales."""
-    data = np.stack(
-        [
-            simulated_camera(
-                (z_size, 16, 24), geometry="cartesian", step=0.23, exposure=exposure
-            ).raw
-            for exposure in (1.0, 2.0)
-        ]
-    )
+    data = np.arange(2 * z_size * 16 * 24, dtype=np.uint16).reshape(2, z_size, 16, 24)
     pyramid = [data, data[:, ::2, ::2, ::2]]
     viewer = napari_model
     layers = [

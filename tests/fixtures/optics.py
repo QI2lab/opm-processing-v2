@@ -362,12 +362,13 @@ def camera_adc_case(
 
 
 @pytest.fixture
-def measured_psf_calibration(tmp_path, optical_setup, psf_format):
-    """Persist a real production optical kernel through its supported file writer."""
+def measured_psf_calibration(tmp_path, psf_format):
+    """Persist prescribed normalized calibration pixels through actual file writers."""
     import tifffile
 
     path = tmp_path / f"measured_psf.{psf_format}"
-    kernel = optical_setup.psf.copy()
+    kernel = np.arange(1, 28, dtype=np.float32).reshape(3, 3, 3)
+    kernel /= kernel.sum()
 
     write = (
         partial(np.save, path)
