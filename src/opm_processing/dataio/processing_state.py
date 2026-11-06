@@ -23,8 +23,10 @@ PROCESSING_STATE_SCHEMA = "opm-processing-state"
 PROCESSING_STATE_VERSION = 1
 
 
-def resolve_store_path(recorded_path: str | Path, directory: str | Path) -> Path:
-    """Resolve a recorded store, retaining an existing absolute location.
+def resolve_store_path(
+    recorded_path: str | Path, directory: str | Path, *, prefer_local: bool = False
+) -> Path:
+    """Resolve a recorded store using its explicit or colocated reference policy.
 
     Parameters
     ----------
@@ -32,16 +34,19 @@ def resolve_store_path(recorded_path: str | Path, directory: str | Path) -> Path
         Historical absolute path or directory-relative store link.
     directory : str or pathlib.Path
         Current command input or journal directory.
+    prefer_local : bool
+        Prefer a same-named store beside the current input. Live manifests use
+        this policy so copied acquisitions do not select their original data.
 
     Returns
     -------
     pathlib.Path
-        Existing absolute location, otherwise a same-named local store when
-        available, or the recorded location relative to the current directory.
+        Existing absolute location unless a colocated store is preferred,
+        otherwise a local store or the recorded directory-relative location.
         Windows basenames remain portable when data is moved between platforms.
     """
     recorded = Path(recorded_path).expanduser()
-    if recorded.is_absolute() and recorded.exists():
+    if not prefer_local and recorded.is_absolute() and recorded.exists():
         return recorded.resolve()
     windows_path = PureWindowsPath(recorded_path)
     name = windows_path.name if windows_path.drive else recorded.name

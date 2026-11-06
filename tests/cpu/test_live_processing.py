@@ -24,6 +24,7 @@ from opm_processing.dataio.processing_state import (
     ProcessingState,
     processing_state_path,
 )
+from opm_processing.imageprocessing.coordinates import STAGE_COORDINATE_VERSION
 from opm_processing.imageprocessing.opmtools import orthogonal_deskew
 from opm_processing.process import (
     app,
@@ -335,7 +336,10 @@ def test_live_occupancy_filter_preserves_sample_signal_and_writes_zero(
             level_arrays[0][0, 1].read().result(),
             expected.max(axis=0, keepdims=True)[..., ::factor, ::factor],
         )
-    assert not any(key.startswith("opm_") for key in output.attributes)
+    assert "opm_v2" not in output.attributes
+    coordinates = output.attributes["opm_processing_coordinates"]
+    assert coordinates["version"] == STAGE_COORDINATE_VERSION
+    assert coordinates["stage_positions_zxy_um"] == [[30.0, 100.0, 200.0]]
 
 
 @pytest.mark.unit

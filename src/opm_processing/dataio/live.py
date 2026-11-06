@@ -77,7 +77,9 @@ class LiveManifest:
             )
 
         acquisition_id = document["acquisition_id"]
-        data_path = resolve_store_path(document["data_path"], manifest_path.parent)
+        data_path = resolve_store_path(
+            document["data_path"], manifest_path.parent, prefer_local=True
+        )
 
         sizes_document = document["index_sizes"]
         index_sizes = {
