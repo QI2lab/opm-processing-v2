@@ -481,6 +481,10 @@ def resolve_acquisition_path(path: str | Path) -> Path:
     # the root, so use yaozarrs to disambiguate without opening pixel arrays.
     opm_v2_stores = []
     for store in stores:
+        # A reference-backed acquisition may sit beside its original bare
+        # array. Only groups can carry the current acquisition manifest.
+        if (store / ".zarray").is_file() and not (store / ".zgroup").is_file():
+            continue
         root = yaozarrs.open_group(store)
         if "opm_v2" in root.attrs:
             opm_v2_stores.append(store)
@@ -1157,6 +1161,10 @@ def open_acquisition_datastore(
         else inspect_acquisition(acquisition)
     )
     root = yaozarrs.open_group(metadata.path)
+    if "opm_processing_refkv" in root.attrs:
+        from opm_processing.dataio.refkv_reader import open_refkv_datastore
+
+        return open_refkv_datastore(metadata)
     arrays = [root[array_path].to_tensorstore() for array_path in metadata.array_paths]
     return ts.stack(arrays, axis=1)
 
