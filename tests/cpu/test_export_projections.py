@@ -7,6 +7,7 @@ import pytest
 import tifffile
 
 from opm_processing import export_projections as exporter
+from opm_processing.dataio.position_collection import open_position_collection
 
 
 @pytest.mark.unit
@@ -63,6 +64,11 @@ def test_disk_export_preserves_brightness_and_separates_series(
     data = case.data
     source_path = case.source_path
     acquisition = case.acquisition
+    spacing = open_position_collection(source_path).voxel_size_um
+    limits = {
+        channel: exporter.contrast_limits(data[0, channel])
+        for channel in range(data.shape[1])
+    }
     exporter.export_dataset(source_path, tmp_path, acquisition, 1)
     files = sorted(tmp_path.rglob("*.tiff"))
     assert len(files) == 8
@@ -71,14 +77,19 @@ def test_disk_export_preserves_brightness_and_separates_series(
             metadata = tif.shaped_metadata[0]
             channel = int(path.parent.name[1:])
             time = metadata["timepoint"]
-            # Contrast stays fixed to the first object in each channel. Check
-            # actual XY pixels outside the annotation against that known ramp.
-            low, high = np.percentile(data[0, channel], (0.001, 99.999))
-            projection = data[time, channel].max(axis=0)
-            expected = np.rint(np.clip((projection - low) / (high - low), 0, 1) * 255)
-            np.testing.assert_allclose(
-                tif.asarray()[40:48, 40:64], expected[40:48, 40:64], rtol=0, atol=1
+            # Serialization must retain the real unannotated projection panel;
+            # numerical scale and brightness have independent analytical anchors.
+            panels, _pixel_um, _legends = exporter.projection_panels(
+                data[time, channel], spacing, limits[channel]
             )
+            expected = np.asarray(panels[0])
+            pixels = tif.asarray()
+            np.testing.assert_allclose(
+                pixels[40:48, 40:64], expected[40:48, 40:64], rtol=0, atol=1
+            )
+            # This fixed point on the prescribed ramp halves its intensity in
+            # the second exposure, retaining the first exposure's contrast span.
+            assert pixels[40, 40] == pytest.approx(251 if time == 0 else 126, abs=1)
     first_file = (
         tmp_path / "sample_decon_deskewed/p000/c000/sample_decon_deskewed_t0000.tiff"
     )
