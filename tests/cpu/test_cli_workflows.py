@@ -1,6 +1,7 @@
 """Registered commands process the same simulated ground-truth acquisition."""
 
 import json
+from copy import deepcopy
 
 import numpy as np
 import pytest
@@ -130,10 +131,10 @@ def test_inspection_and_exports_process_simulated_acquisition(
     processed = source / case.processed.name
     state_path = source / "pipeline.processing.json"
     state = ProcessingState.read(state_path)
-    identity = state.run(processed)["dataset_id"]
+    previous_run = deepcopy(state.run(processed))
     invoke_cli("process", dataset_path, resume=True, **case.options)
     state = ProcessingState.read(state_path)
-    assert state.run(processed)["dataset_id"] == identity
+    assert state.run(processed) == previous_run
     assert state.source_path() == dataset_path
     measurements = []
     measure = TileFusion.register_and_score
