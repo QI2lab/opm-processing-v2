@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import json
 import os
-import shutil
 from unittest.mock import Mock
 
 import pytest
@@ -12,36 +10,23 @@ import pytest
 from opm_processing.dataio.processing_state import (
     ProcessingState,
     image_processing_state_path,
-    processing_state_image_attributes,
     processing_state_path,
 )
 
 pytestmark = pytest.mark.unit
 
 
-def test_external_image_journal_link_survives_copying_the_directory_tree(tmp_path):
+def test_external_image_journal_link_survives_copying_the_directory_tree(
+    external_journal_image, relocate_acquisition
+):
     """Prefer the copied relative journal even while original paths still exist."""
-    source = tmp_path / "original" / "sample.ome.zarr"
-    source.mkdir(parents=True)
-    state = ProcessingState.create(source.parent / "sample.processing.json", source)
-    image = source.parent / "rendered" / "sample_fused.ome.zarr"
-    image.mkdir(parents=True)
-    (image / "zarr.json").write_text(
-        json.dumps(
-            {
-                "zarr_format": 3,
-                "node_type": "group",
-                "attributes": processing_state_image_attributes(state.path, image),
-            }
-        )
-    )
-    copied = tmp_path / "copied"
-    shutil.copytree(source.parent, copied)
+    case = external_journal_image
+    copied = relocate_acquisition(case.source.parent, copy=True)
     assert (
-        image_processing_state_path(copied / "rendered" / image.name, "sample")
-        == copied / state.path.name
+        image_processing_state_path(copied / "rendered" / case.image.name, "sample")
+        == copied / case.state.path.name
     )
-    assert state.path.is_file()
+    assert case.state.path.is_file()
 
 
 @pytest.mark.parametrize(

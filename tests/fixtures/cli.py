@@ -10,6 +10,12 @@ from typer.testing import CliRunner
 
 
 @pytest.fixture
+def cli_runner():
+    """Share a real Click terminal and registered-command runner."""
+    return CliRunner()
+
+
+@pytest.fixture
 def cli_file_layout(request, fs):
     """Create mocked discovery inputs without replacing any package APIs.
 
@@ -191,7 +197,7 @@ def cli_export_options(request):
 
 
 @pytest.fixture
-def invoke_cli():
+def invoke_cli(cli_runner):
     """Invoke a registered CLI with its real parser and processing implementation.
 
     Returns
@@ -227,7 +233,7 @@ def invoke_cli():
             else:
                 values = value if isinstance(value, tuple) else (value,)
                 args.extend((parameter.opts[0], *(str(v) for v in values)))
-        result = CliRunner().invoke(application, args, catch_exceptions=False)
+        result = cli_runner.invoke(application, args, catch_exceptions=False)
         assert result.exit_code == 0, result.output
         return result
 

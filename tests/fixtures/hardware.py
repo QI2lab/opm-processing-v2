@@ -18,36 +18,76 @@ def cupy_gpu():
             pytest.fail(message, pytrace=False)
         pytest.skip(message)
 
-    try:
-        import cupy as cp
-    except ImportError:
-        unavailable("CuPy is not installed; install the project's gpu extra")
+    import cupy as cp
 
     try:
-        if cp.cuda.runtime.getDeviceCount() < 1:
-            unavailable("CuPy found no CUDA devices")
-        device = cp.cuda.Device(0)
-        device.use()
-        probe = cp.arange(32, dtype=cp.float32)
-        probe = probe * probe + cp.float32(3)
-        # Verify the installed FFT and linear algebra runtimes as well as CUDA.
-        cp.fft.rfft(probe)
-        cp.tensordot(probe.reshape(4, 8), probe.reshape(8, 4), axes=1)
-        device.synchronize()
-        np.testing.assert_array_equal(
-            cp.asnumpy(probe),
-            np.arange(32, dtype=np.float32) ** 2 + 3,
-        )
-    except pytest.skip.Exception:
-        raise
-    except Exception as error:  # CUDA errors vary with runtime/driver versions.
-        unavailable(f"CUDA execution failed: {error}")
+        device_count = cp.cuda.runtime.getDeviceCount()
+    except cp.cuda.runtime.CUDARuntimeError as error:
+        # Driver/device discovery may legitimately fail on a CPU-only host.
+        # Numerical, allocation, FFT and assertion errors must remain failures.
+        if error.status not in (35, 100):  # insufficient driver / no device
+            raise
+        unavailable(f"CUDA device discovery failed: {error}")
+    if device_count < 1:
+        unavailable("CuPy found no CUDA devices")
+    device = cp.cuda.Device(0)
+    device.use()
+    probe = cp.arange(32, dtype=cp.float32)
+    probe = probe * probe + cp.float32(3)
+    cp.fft.rfft(probe)
+    cp.tensordot(probe.reshape(4, 8), probe.reshape(8, 4), axes=1)
+    device.synchronize()
+    np.testing.assert_array_equal(
+        cp.asnumpy(probe), np.arange(32, dtype=np.float32) ** 2 + 3
+    )
 
     yield cp
 
     cp.cuda.Stream.null.synchronize()
     cp.get_default_memory_pool().free_all_blocks()
     cp.get_default_pinned_memory_pool().free_all_blocks()
+
+
+@pytest.fixture(autouse=True)
+def cpu_registration_backend(monkeypatch, request):
+    """Select the actual CPU operators for cases marked as CPU execution.
+
+    Parameters
+    ----------
+    monkeypatch : pytest.MonkeyPatch
+        Restore the previously selected numerical backend after each case.
+    request : pytest.FixtureRequest
+        Collected CPU/GPU marker supplied by the test directory.
+    """
+    if request.node.get_closest_marker("cpu") is None:
+        return
+    from scipy import ndimage
+    from skimage.exposure import match_histograms
+    from skimage.measure import block_reduce
+    from skimage.metrics import structural_similarity
+    from skimage.registration import phase_cross_correlation
+    from skimage.registration._masked_phase_cross_correlation import (
+        cross_correlate_masked,
+    )
+
+    from opm_processing.imageprocessing import tilefusion
+
+    backend = {
+        "USING_GPU": False,
+        "cp": None,
+        "xp": np,
+        "ssim_cuda": None,
+        "_ssim_cpu": structural_similarity,
+        "match_histograms": match_histograms,
+        "block_reduce": block_reduce,
+        "phase_cross_correlation": phase_cross_correlation,
+        "masked_cross_correlation": cross_correlate_masked,
+        "sobel_filter": ndimage.sobel,
+        "shift_filter": ndimage.shift,
+        "minimum_filter": ndimage.minimum_filter,
+    }
+    for name, operator in backend.items():
+        monkeypatch.setattr(tilefusion, name, operator)
 
 
 @pytest.fixture

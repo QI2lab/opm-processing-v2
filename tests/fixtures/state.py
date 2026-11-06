@@ -10,7 +10,25 @@ import pytest
 
 from opm_processing.dataio.acquisition import inspect_acquisition
 from opm_processing.dataio.position_collection import create_position_collection
-from opm_processing.dataio.processing_state import ProcessingState
+from opm_processing.dataio.processing_state import (
+    ProcessingState,
+    processing_state_image_attributes,
+)
+
+
+@pytest.fixture
+def external_journal_image(acquisition_factory, fused_store_factory):
+    """Write a raw source and linked fused image through the real storage writers."""
+    pixels = np.zeros((1, 1, 1, 1, 2, 2), np.uint16)
+    source = acquisition_factory(pixels, name="original/sample").path
+    state = ProcessingState.create(source.parent / "sample.processing.json", source)
+    image = source.parent / "rendered" / "sample_fused.ome.zarr"
+    path = fused_store_factory(
+        pixels[:, 0],
+        name="original/rendered/sample_fused",
+        attributes=processing_state_image_attributes(state.path, image),
+    )
+    return SimpleNamespace(source=source, state=state, image=path)
 
 
 @pytest.fixture
