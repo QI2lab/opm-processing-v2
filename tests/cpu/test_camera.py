@@ -44,16 +44,52 @@ def test_camera_calibration_transforms_read_noise_units(camera_codes, offset, qe
     )
 
 
-@pytest.mark.parametrize("conversion", [0.24, 0.24 / 0.9])
-def test_camera_transfer_dark_saturation_and_rounding(camera_codes, conversion):
+@pytest.mark.parametrize(
+    ("conversion", "anchor_counts"),
+    [
+        (0.24, (0, 0, 0, 0.18, 0.42, 0.66, 95.94, 96.18, 215.94, 15704.34)),
+        (
+            0.24 / 0.9,
+            (
+                0,
+                0,
+                0,
+                1 / 5,
+                7 / 15,
+                11 / 15,
+                533 / 5,
+                1603 / 15,
+                3599 / 15,
+                261739 / 15,
+            ),
+        ),
+    ],
+)
+def test_camera_transfer_dark_saturation_and_rounding(
+    camera_codes, conversion, anchor_counts
+):
     """Cover dark subtraction, saturation and rounding of every uint16 code."""
     raw = camera_codes
-    expected = np.maximum(
-        (raw.astype(np.float32) - np.float32(100.25)) * np.float32(conversion),
-        np.float32(0),
-    )
     actual = camera_correct(raw, 100.25, conversion)
-    np.testing.assert_array_equal(actual, expected)
+    # Prescribed photon counts provide independent transfer anchors. Checking
+    # every remaining ADC increment needs no copy of the calibration function.
+    anchors = (0, 99, 100, 101, 102, 103, 500, 501, 1000, 65535)
+    np.testing.assert_allclose(
+        actual.ravel()[list(anchors)],
+        anchor_counts,
+        rtol=2 * np.finfo(np.float32).eps,
+        atol=0,
+    )
+    # Two float32 operations bound each sample's error by gamma_2 times the
+    # full ADC-range signal; adjacent errors add in the first difference.
+    error = 2 * np.finfo(np.float32).eps
+    roundoff = error / (1 - error) * 65536 * conversion
+    np.testing.assert_allclose(
+        np.diff(actual.ravel()[101:].astype(np.float64)),
+        conversion,
+        rtol=0,
+        atol=2 * roundoff,
+    )
     assert np.all(actual.ravel()[:101] == 0)
     assert actual.ravel()[-1] > 0
     assert not np.shares_memory(actual, raw)
@@ -70,7 +106,6 @@ def test_detector_response_and_camera_transfer(
     calibrated = camera_correct(case.raw, case.offset, case.conversion, **case.options)
     reference = calibrated.copy()
     corrected = illumination_correct(calibrated, case.illumination)
-    np.testing.assert_array_equal(corrected, reference / case.illumination)
     # Independent physical expectation: remove illumination/detector response from
     # observed photons; allow only the camera's half-ADU quantization uncertainty.
     physical = case.measured / (

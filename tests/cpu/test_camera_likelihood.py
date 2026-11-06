@@ -150,6 +150,7 @@ def test_camera_sampling_bounds_detect_photon_and_spatial_errors(
     camera_sampling_case, artifact
 ):
     """Known detector noise cannot conceal a twenty-percent or mean-preserving stripe error."""
+    from opm_processing.imageprocessing.camera import camera_correct
     from tests.simulation.camera_likelihood import (
         SamplingEnvelope,
         camera_sampling_accuracy,
@@ -168,10 +169,9 @@ def test_camera_sampling_bounds_detect_photon_and_spatial_errors(
     )
     # Identity sampling is an allowed positive interpolation: its central
     # coefficient is one. Its noise is the actual physical camera draw.
-    prediction = np.maximum(
-        (case.raw.astype(np.float64) - camera.offset_adu) * camera.electrons_per_adu,
-        0,
-    )
+    prediction = camera_correct(
+        case.raw, camera.offset_adu, camera.electrons_per_adu
+    ).astype(np.float64)
     original_flux = prediction.sum(dtype=np.float64)
     if artifact == "gain":
         prediction *= 1.2

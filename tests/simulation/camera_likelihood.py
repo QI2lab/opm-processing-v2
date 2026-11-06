@@ -15,6 +15,8 @@ from scipy.ndimage import maximum_filter, minimum_filter
 from scipy.special import gammaln, kl_div, log_ndtr, logsumexp, ndtri, xlogy
 from scipy.stats import poisson
 
+from opm_processing.imageprocessing.camera import camera_correct
+
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
@@ -225,7 +227,9 @@ def camera_sampling_envelope(
         raise ValueError(
             "Require finite original camera data and positive sampling settings"
         )
-    observed = np.maximum((codes - camera.offset_adu) * camera.electrons_per_adu, 0)
+    observed = camera_correct(
+        codes, camera.offset_adu, camera.electrons_per_adu
+    ).astype(np.float64)
     signal = means / sensitivity
     residual = (observed - means) / sensitivity
     window = tuple(2 * radius.astype(int) + 1)

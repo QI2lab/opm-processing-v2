@@ -447,10 +447,11 @@ def test_depth_registration_handles_large_xy_drift(
             rtol=2e-6,
             atol=0,
         )
+        from opm_processing.imageprocessing.camera import camera_correct
         from tests.simulation.camera_likelihood import camera_sampling_accuracy
 
         camera = pair.observation.scene.microscope.camera
-        photons = np.maximum((actual - camera.offset_adu) * camera.electrons_per_adu, 0)
+        photons = camera_correct(actual, camera.offset_adu, camera.electrons_per_adu)
         measured = camera_sampling_accuracy(
             photons, pair.truth, pair.expected_envelope, pair.accuracy_mask
         )

@@ -41,6 +41,7 @@ def test_as_acquired_combined_channel_deconvolution(
 ):
     """Improve true camera likelihood without injecting PSF calibration into raw data."""
     from opm_processing.imageprocessing import rlgc
+    from opm_processing.imageprocessing.camera import camera_correct
     from opm_processing.imageprocessing.opmtools import orthogonal_deskew
 
     observed = simulated_camera((17, 32, 36), step=1.2, budget=(3000, 4000))
@@ -91,19 +92,16 @@ def test_as_acquired_combined_channel_deconvolution(
     assert dict(open_group(dataset.path).attrs) == original_attributes
     ((recovered, psf, boundary),) = reconstructed
     assert recovered.shape == (49, 32, 36)
-    baseline = (
-        observed.raw.astype(np.float32) - microscope.camera.offset_adu
-    ) * microscope.camera.electrons_per_adu
+    baseline = camera_correct(
+        observed.raw, microscope.camera.offset_adu, microscope.camera.electrons_per_adu
+    )
     baseline = interp1d(np.arange(17) * 3, baseline, axis=0)(np.arange(49))
     psf /= psf.sum()
     boundary = "constant" if boundary == "zero" else boundary
     scores = [
         kl_div(
             observed.expectation,
-            np.maximum(
-                camera_prediction(density, psf, boundary=boundary)[::3],
-                np.finfo(float).tiny,
-            ),
+            camera_prediction(density, psf, boundary=boundary)[::3],
         ).sum()
         for density in (recovered, baseline)
     ]

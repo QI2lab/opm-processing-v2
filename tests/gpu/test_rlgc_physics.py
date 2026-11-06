@@ -10,6 +10,7 @@ import pytest
 from scipy.interpolate import interp1d
 from scipy.signal import fftconvolve
 
+from opm_processing.imageprocessing.camera import camera_correct
 from tests.simulation.camera import digitize
 from tests.simulation.metrics import (
     camera_flux_accuracy,
@@ -24,7 +25,6 @@ pytestmark = pytest.mark.unit
 
 def test_generated_psf_camera_reconstruction(cupy_gpu, production_point_acquisition):
     """Apply production GC using the same PSF as the full camera simulation."""
-    from opm_processing.imageprocessing.camera import camera_correct
     from opm_processing.imageprocessing.rlgc import rlgc
 
     case = production_point_acquisition
@@ -52,7 +52,7 @@ def test_generated_psf_camera_reconstruction(cupy_gpu, production_point_acquisit
     score = camera_score_difference(
         digitize(expected, camera, seed=43),
         prediction,
-        np.maximum(fftconvolve(calibrated, case.kernel, mode="same"), 0),
+        camera_prediction(calibrated, case.kernel),
         camera,
     )
     assert score.sum() > 0
@@ -122,10 +122,8 @@ def test_native_gc_directional_rayleigh_pair(
         assert expectation.max() == pytest.approx(3000, rel=2e-15)
         camera = camera_calibration
         observed = digitize(expectation, camera, seed=31)
-        calibrated = np.maximum(
-            (observed.astype(np.float32) - camera.offset_adu)
-            * camera.electrons_per_adu,
-            0,
+        calibrated = camera_correct(
+            observed, camera.offset_adu, camera.electrons_per_adu
         )
     else:
         observed = digitize(expectation, ideal_photon_camera, seed=31).astype(

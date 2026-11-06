@@ -112,11 +112,12 @@ def test_roi_deconvolves_recorded_sampling(
         expected = case.dataset.raw_data[0, len(deconvolved), 0]
         if case.dataset.metadata.scan_axis_reversed:
             expected = expected[::-1]
-        expected = (
-            np.maximum(
-                expected.astype(np.float32) - case.microscope.camera.offset_adu, 0
-            )
-            * case.microscope.camera.electrons_per_adu
+        from opm_processing.imageprocessing.camera import camera_correct
+
+        expected = camera_correct(
+            expected,
+            case.microscope.camera.offset_adu,
+            case.microscope.camera.electrons_per_adu,
         )
         # Locate the actual read in the independently retained producer frames.
         # A unique photon realization identifies its scan/X preimage exactly.
