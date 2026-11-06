@@ -2602,6 +2602,7 @@ class TileFusion:
                 candidate_scores: dict[tuple[int, int], float] = {}
                 rejected_shifts: list[tuple[int, int, int]] = []
                 rejected_links = []
+                low_similarity_links = []
                 pair_specs = []
                 input_itemsize = int(
                     np.dtype(self.position_arrays[0].dtype.numpy_dtype).itemsize
@@ -2986,15 +2987,20 @@ class TileFusion:
                         or abs(dy_s) > max_shift[1]
                         or abs(dx_s) > max_shift[2]
                     ):
-                        rejected_shifts.append((dz_s, dy_s, dx_s))
                         self._rejected_registration_links[i, j] = (
                             (dz_s, dy_s, dx_s),
                             max_shift,
                             score,
                         )
-                        rejected_links.append(
-                            (i, j, (dz_s, dy_s, dx_s), max_shift, score)
-                        )
+                        if th == 0.0 or score >= th:
+                            rejected_shifts.append((dz_s, dy_s, dx_s))
+                            rejected_links.append(
+                                (i, j, (dz_s, dy_s, dx_s), max_shift, score)
+                            )
+                        else:
+                            low_similarity_links.append(
+                                (i, j, (dz_s, dy_s, dx_s), score)
+                            )
                         if self._debug:
                             print(
                                 "Dropping link (%d, %d) shift=%s exceeds max=%s",
@@ -3017,15 +3023,29 @@ class TileFusion:
                     pending_read_bytes -= int(pair_bytes)
                     fill_read_ahead()
                 progress.close()
+                if low_similarity_links:
+                    print(
+                        f"Registration: rejected {len(low_similarity_links)} "
+                        f"low-similarity out-of-range candidates at time index {t} "
+                        f"(SSIM threshold {th:.3f}); these do not trigger "
+                        "shift-limit retries."
+                    )
+                    for i, j, correction, similarity in low_similarity_links:
+                        print(
+                            f"  Low-similarity link ({i}, {j}): "
+                            f"SSIM {similarity:.3f} < {th:.3f}; "
+                            f"candidate ZYX correction {correction}."
+                        )
                 if rejected_shifts:
                     largest = tuple(
                         int(value) for value in np.max(np.abs(rejected_shifts), axis=0)
                     )
                     print(
-                        f"Registration warning: {len(rejected_shifts)} pairs at "
+                        f"Registration warning: {len(rejected_shifts)} "
+                        f"{'pair' if len(rejected_shifts) == 1 else 'pairs'} at "
                         f"time index {t} exceeded the ZYX shift limits "
-                        f"(maximum envelope {self.max_registration_shift_zyx} pixels); largest "
-                        f"measured absolute corrections were {largest}. "
+                        f"(maximum envelope {self.max_registration_shift_zyx} pixels); "
+                        f"largest per-axis absolute candidate corrections were {largest}. "
                         "Check --max-registration-shift-zyx if tiles remain misaligned."
                     )
                     for i, j, correction, limits, similarity in rejected_links:
