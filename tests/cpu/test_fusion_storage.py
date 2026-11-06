@@ -53,7 +53,7 @@ def test_max_projection_fusion_writes_centered_multiscales_and_offsets(
     tmp_path,
     position_store_factory,
 ) -> None:
-    """Persist every fused max level with rounded physical coordinates."""
+    """Persist every fused max level with three-decimal micrometer metadata."""
     source = np.arange(64, dtype=np.uint16).reshape(1, 1, 1, 8, 8)
     output_path = tmp_path / "max_z_fused.ome.zarr"
     collection = position_store_factory(
@@ -176,52 +176,56 @@ def test_multiscale_storage_round_trip_matches_reference(
     assert [dataset.path for dataset in datasets] == ["0", "1", "2"]
 
     expected = source
-    rounded_offset = np.asarray([round(float(value), 3) for value in fusion.offset_um])
-    rounded_pixel_size = np.asarray(
+    recorded_offset = np.asarray([round(float(value), 3) for value in fusion.offset_um])
+    recorded_pixel_size = np.asarray(
         [round(float(value), 3) for value in fusion._pixel_size]
     )
     base_center = (
-        rounded_offset
-        + (np.asarray(padded_shape, dtype=np.float64) - 1.0) * rounded_pixel_size / 2.0
+        recorded_offset
+        + (np.asarray(padded_shape, dtype=np.float64) - 1.0) * recorded_pixel_size / 2.0
     )
     for absolute_factor, dataset in zip((1, 2, 4), datasets, strict=False):
         z_factor = 1 if is_2d else absolute_factor
         expected_scale = np.asarray(
-            [
-                round(float(value), 3)
-                for value in (
-                    1.0,
-                    1.0,
-                    rounded_pixel_size[0] * z_factor,
-                    rounded_pixel_size[1] * absolute_factor,
-                    rounded_pixel_size[2] * absolute_factor,
-                )
-            ]
+            (
+                1.0,
+                1.0,
+                recorded_pixel_size[0] * z_factor,
+                recorded_pixel_size[1] * absolute_factor,
+                recorded_pixel_size[2] * absolute_factor,
+            )
+        )
+        expected_scale = np.asarray(
+            [round(float(value), 3) for value in expected_scale]
         )
         center_shift = 0.5 if downsample_method == "block_mean" else 0.0
         expected_translation = np.asarray(
-            [
-                round(float(value), 3)
-                for value in (
-                    0.0,
-                    0.0,
-                    rounded_offset[0]
-                    + center_shift * (z_factor - 1) * rounded_pixel_size[0],
-                    rounded_offset[1]
-                    + center_shift * (absolute_factor - 1) * rounded_pixel_size[1],
-                    rounded_offset[2]
-                    + center_shift * (absolute_factor - 1) * rounded_pixel_size[2],
-                )
-            ]
+            (
+                0.0,
+                0.0,
+                recorded_offset[0]
+                + center_shift * (z_factor - 1) * recorded_pixel_size[0],
+                recorded_offset[1]
+                + center_shift * (absolute_factor - 1) * recorded_pixel_size[1],
+                recorded_offset[2]
+                + center_shift * (absolute_factor - 1) * recorded_pixel_size[2],
+            )
+        )
+        expected_translation = np.asarray(
+            [round(float(value), 3) for value in expected_translation]
         )
         np.testing.assert_allclose(
             dataset.scale_transform.scale,
             expected_scale,
+            rtol=0,
+            atol=1e-12,
         )
         assert dataset.translation_transform is not None
         np.testing.assert_allclose(
             dataset.translation_transform.translation,
             expected_translation,
+            rtol=0,
+            atol=1e-12,
         )
         reopened_array = reopened[dataset.path].to_tensorstore()
         assert np.dtype(reopened_array.dtype.numpy_dtype) == dtype
@@ -244,10 +248,12 @@ def test_multiscale_storage_round_trip_matches_reference(
             output_coordinate = np.asarray(
                 dataset.translation_transform.translation[-3:]
             ) + output_index * np.asarray(dataset.scale_transform.scale[-3:])
-            source_coordinate = rounded_offset + source_index * rounded_pixel_size
+            source_coordinate = recorded_offset + source_index * recorded_pixel_size
             np.testing.assert_allclose(
                 output_coordinate,
                 source_coordinate,
+                rtol=0,
+                atol=1e-12,
             )
 
         spatial_shape = np.asarray(reopened_array.shape[-3:], dtype=np.float64)
@@ -256,7 +262,7 @@ def test_multiscale_storage_round_trip_matches_reference(
             + (spatial_shape - 1.0) * expected_scale[-3:] / 2.0
         )
         if downsample_method == "block_mean":
-            np.testing.assert_allclose(physical_center, base_center, atol=0.002)
+            np.testing.assert_allclose(physical_center, base_center, rtol=0, atol=0.002)
 
         if dataset.path == "0":
             np.testing.assert_array_equal(
@@ -279,7 +285,10 @@ def test_multiscale_storage_round_trip_matches_reference(
             expected,
         )
 
-    assert not any(key.startswith("opm_") for key in reopened.attrs)
+    assert (
+        reopened.attrs["opm_processing_coordinates"]["version"]
+        == "stage-endpoint-origin-v1"
+    )
 
 
 @pytest.mark.unit

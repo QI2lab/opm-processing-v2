@@ -1,8 +1,80 @@
 """Coordinate transforms shared by projection and volumetric tile fusion."""
 
-from collections.abc import Sequence
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
 
 import numpy as np
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from opm_processing.dataio.acquisition import AcquisitionMetadata
+
+
+STAGE_COORDINATE_VERSION = "stage-endpoint-origin-v1"
+
+
+def deskewed_stage_scan_offsets(acquisition: AcquisitionMetadata) -> np.ndarray:
+    """Anchor deskewed scan pixels to the recorded stage trajectory.
+
+    The deskew input is reordered and then trimmed along its scan dimension.
+    Its first retained plane therefore need not be the first acquired plane.
+    Return the displacement from each recorded stage origin to that retained
+    plane, expressed in image ZYX micrometers. Camera-reference, post-deskew
+    crop, and Z-averaging offsets are separate from this scan displacement.
+
+    Parameters
+    ----------
+    acquisition : AcquisitionMetadata
+        Recorded acquisition geometry and scan trimming settings.
+
+    Returns
+    -------
+    numpy.ndarray
+        One unrounded ZYX displacement per recorded stage position. Non-stage
+        acquisitions have zero displacements.
+
+    Raises
+    ------
+    ValueError
+        Scan trimming removes every plane, scan sampling is invalid, or
+        recorded trajectories require different scan orientations.
+    """
+    offsets = np.zeros((len(acquisition.stage_positions_zxy), 3), dtype=np.float64)
+    if "stage" not in acquisition.mode.lower():
+        return offsets
+
+    count = acquisition.scan_position_count
+    leading = (
+        acquisition.excess_scan_start_positions or acquisition.excess_scan_positions
+    )
+    trailing = acquisition.excess_scan_end_positions
+    if leading < 0 or trailing < 0 or leading + trailing >= count:
+        raise ValueError("Stage scan trimming must retain at least one scan plane")
+    reversed_scan = acquisition.scan_axis_reversed
+    first_index = count - 1 - leading if reversed_scan else leading
+    if first_index == 0:
+        return offsets
+
+    fallback_step = acquisition.scan_axis_step_um
+    for position in range(len(offsets)):
+        step = None
+        if (
+            count > 1
+            and position < len(acquisition.scan_start_positions_xyz)
+            and position < len(acquisition.scan_end_positions_xyz)
+        ):
+            start_x = acquisition.scan_start_positions_xyz[position][0]
+            end_x = acquisition.scan_end_positions_xyz[position][0]
+            if end_x != start_x:
+                step = (end_x - start_x) / (count - 1)
+        if step is None:
+            step = fallback_step
+        if step is None or not np.isfinite(step) or step == 0:
+            raise ValueError("Stage scan origin requires a finite nonzero scan step")
+        offsets[position, 1] = -float(step) * first_index
+    return offsets
 
 
 def stage_z_level_indices(

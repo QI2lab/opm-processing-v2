@@ -29,6 +29,7 @@ from opm_processing.dataio.processing_state import (
 )
 from opm_processing.dataio.timing import time_axis
 from opm_processing.imageprocessing.coordinates import (
+    STAGE_COORDINATE_VERSION,
     stage_positions_to_image_coordinates,
 )
 
@@ -153,9 +154,18 @@ def regenerate_fused_max_projection(
         output_path,
         projection_image,
         projection_specs,
-        extra_attributes=processing_state_image_attributes(
-            processing_state.path, output_path
-        ),
+        extra_attributes={
+            **processing_state_image_attributes(processing_state.path, output_path),
+            **(
+                {
+                    "opm_processing_coordinates": source_root.attrs[
+                        "opm_processing_coordinates"
+                    ]
+                }
+                if "opm_processing_coordinates" in source_root.attrs
+                else {}
+            ),
+        },
         chunks=(
             1,
             1,
@@ -350,6 +360,7 @@ class MaxTileFusion:
         opm_angle_deg: float | None = None,
         time_interval_s: float | None = None,
         source_collection: str | Path | None = None,
+        spatial_offsets_zyx_um: Sequence[Sequence[float]] | None = None,
     ) -> None:
         """Initialize maximum-projection fusion with a bounded source chunk cache.
 
@@ -391,6 +402,8 @@ class MaxTileFusion:
         source_collection : str or pathlib.Path or None
             Source projection collection, recorded to identify the preview's
             tile geometry when multiple processed collections exist.
+        spatial_offsets_zyx_um : sequence of sequence of float or None
+            Per-tile local NGFF offsets, including scan endpoint and deskew crop.
 
         Returns
         -------
@@ -430,6 +443,16 @@ class MaxTileFusion:
             reverse_z=self.reverse_stage_z,
             opm_angle_deg=opm_angle_deg,
         )
+        self._coordinate_attributes = (
+            {"opm_processing_coordinates": {"version": STAGE_COORDINATE_VERSION}}
+            if spatial_offsets_zyx_um is not None
+            else {}
+        )
+        if spatial_offsets_zyx_um is not None:
+            offsets = np.asarray(spatial_offsets_zyx_um, dtype=float)
+            if offsets.shape != placement_coordinates.shape:
+                raise ValueError("Expected one local ZYX image offset per tile")
+            placement_coordinates += offsets
         self.tile_positions = placement_coordinates[:, -2:]
         if source_position_indices is None:
             source_position_indices = range(len(self.tile_positions))
@@ -658,11 +681,12 @@ class MaxTileFusion:
             image,
             specs,
             extra_attributes={
+                **self._coordinate_attributes,
                 "opm_processing_projection": {
                     "placement": "stage",
                     "source_collection": self.source_collection,
                     "source_position_indices": list(self.source_position_indices),
-                }
+                },
             },
             chunks=(1, 1, 1, self.chunk_size, self.chunk_size),
             writer="tensorstore",

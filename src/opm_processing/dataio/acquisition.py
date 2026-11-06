@@ -346,13 +346,6 @@ class AcquisitionMetadata:
         bool
             Whether scan samples must be reversed before production deskewing.
         """
-        # During a stage scan the sample moves opposite the stage trajectory in
-        # the stationary OPM imaging plane. The deskew convention follows sample
-        # coordinates, so stage-scan samples must always be reversed regardless
-        # of whether the recorded stage positions increase or decrease.
-        if "stage" in self.mode.lower():
-            return True
-
         if (
             self.scan_axis is not None
             and self.scan_axis in "xyz"
@@ -369,7 +362,19 @@ class AcquisitionMetadata:
                 if end[axis] != start[axis]
             ]
             if deltas:
+                if "stage" in self.mode.lower():
+                    if min(deltas) < 0 < max(deltas):
+                        raise ValueError(
+                            "Stage trajectories with mixed scan directions are not supported"
+                        )
+                    # Image Y increases opposite physical scan-stage X. A
+                    # positive stage trajectory must therefore be reordered;
+                    # a negative trajectory is already in image order.
+                    return sum(deltas) > 0
                 return sum(deltas) < 0
+        if "stage" in self.mode.lower():
+            # Legacy records without signed endpoints used positive X scans.
+            return True
         orientation_key = (
             "camera_mirror_orientation"
             if "mirror" in self.mode

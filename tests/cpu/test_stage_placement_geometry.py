@@ -15,8 +15,9 @@ pytestmark = pytest.mark.integration
 
 @pytest.mark.parametrize("angle", (30.0, 45.0))
 @pytest.mark.parametrize("mode", ("stage", "mirror"))
+@pytest.mark.parametrize("crop", (False, True))
 def test_physical_stage_z_translation_preserves_registered_xy(
-    processing_options, tmp_path, stage_placement_acquisition
+    processing_options, tmp_path, stage_placement_acquisition, angle, crop
 ):
     """Sample a fixed bead through tilted planes without using placement code.
 
@@ -30,6 +31,7 @@ def test_physical_stage_z_translation_preserves_registered_xy(
     process(
         root_path=path,
         deconvolve=False,
+        crop_after_deskew=crop,
         **processing_options,
     )
     collection = open_position_collection(tmp_path / "physical_stage_deskewed.ome.zarr")
@@ -48,13 +50,18 @@ def test_physical_stage_z_translation_preserves_registered_xy(
     for tile in collection.arrays:
         volume = tile[0, 0].read().result()
         peaks.append(np.unravel_index(np.argmax(volume), volume.shape))
-    # Absolute scan-start conventions add one common Y origin in stage mode.
-    # Relative physical feature positions must agree without registration.
+    # The independent forward model fixes the bead in physical coordinates.
+    # A common scan-length error must not disappear in a relative comparison.
+    expected_peak_um = np.asarray((20, 64, 24)) * pixel_um
     placed_peaks = np.asarray(peaks) * pixel_um + origins
+    np.testing.assert_allclose(
+        (placed_peaks - expected_peak_um) / pixel_um, 0.0, atol=1 + 1e-8
+    )
     np.testing.assert_allclose(
         (placed_peaks - placed_peaks[0]) / pixel_um, 0.0, atol=1 + 1e-8
     )
-    np.testing.assert_allclose(np.asarray(peaks)[:, 1:] - (64, 24), 0, atol=1)
+    crop_y = int(np.ceil(64 * np.cos(np.deg2rad(angle)))) if crop else 0
+    np.testing.assert_allclose(np.asarray(peaks)[:, 1:] - (64 - crop_y, 24), 0, atol=1)
     fusion.run()
     np.testing.assert_allclose(fusion.global_offsets, 0.0, atol=1.0)
     assert len(fusion.pairwise_metrics) >= 2
@@ -63,5 +70,5 @@ def test_physical_stage_z_translation_preserves_registered_xy(
     peak = np.asarray(np.unravel_index(np.argmax(fused), fused.shape))
     physical_peak = peak * pixel_um + fusion.offset_um
     np.testing.assert_allclose(
-        (physical_peak - placed_peaks[0]) / pixel_um, 0.0, atol=2.0
+        (physical_peak - expected_peak_um) / pixel_um, 0.0, atol=2.0
     )

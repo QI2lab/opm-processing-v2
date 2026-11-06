@@ -64,6 +64,8 @@ from opm_processing.dataio.processing_state import (
 )
 from opm_processing.dataio.timing import time_axis
 from opm_processing.imageprocessing.coordinates import (
+    STAGE_COORDINATE_VERSION,
+    deskewed_stage_scan_offsets,
     stage_positions_to_image_coordinates,
     stage_z_level_indices,
 )
@@ -1661,10 +1663,21 @@ class TileFusion:
             self._reuse_registered_roi_placements = False
         else:
             collection_shape = collection.shape
+            coordinate_metadata = collection.attributes.get(
+                "opm_processing_coordinates", {}
+            )
+            coordinate_version = coordinate_metadata.get("version")
+            if coordinate_version not in (None, STAGE_COORDINATE_VERSION):
+                raise ValueError(
+                    "Unsupported processed stage-coordinate version; recreate with process"
+                )
+            placement_positions = coordinate_metadata.get(
+                "placement_stage_positions_zxy_um", collection.stage_positions_zxy
+            )
             stage_positions = [
                 position
                 for _ in range(collection_shape[0])
-                for position in collection.stage_positions_zxy
+                for position in placement_positions
             ]
             stage_origins = stage_positions_to_image_coordinates(
                 stage_positions,
@@ -1672,9 +1685,24 @@ class TileFusion:
                 reverse_z=self.reverse_stage_z,
                 opm_angle_deg=float(self.acquisition.angle_deg),
             )
-            image_origins = np.tile(
-                np.asarray(collection.spatial_origins_zyx_um), (collection_shape[0], 1)
-            )
+            local_origins = np.asarray(collection.spatial_origins_zyx_um)
+            if coordinate_version is None:
+                if (
+                    "stage" in self.acquisition.mode.lower()
+                    and not self.acquisition.scan_axis_reversed
+                ):
+                    raise ValueError(
+                        "Legacy negative stage scans used a different pixel orientation; recreate with process"
+                    )
+                # Legacy deskew pixels already have the correct orientation;
+                # their local NGFF translations omitted the reversed-scan anchor.
+                local_origins = (
+                    local_origins
+                    + deskewed_stage_scan_offsets(self.acquisition)[
+                        : len(local_origins)
+                    ]
+                )
+            image_origins = np.tile(local_origins, (collection_shape[0], 1))
             self._tile_positions = [
                 tuple(position) for position in stage_origins + image_origins
             ]
@@ -3853,6 +3881,7 @@ class TileFusion:
             Output-affecting registration settings fingerprinted in the processing journal.
         """
         return {
+            "coordinates": STAGE_COORDINATE_VERSION,
             "channel_index": self.channel_to_use,
             "stage_y_reversed": self.reverse_stage_y,
             "stage_z_reversed_to_lab": self.reverse_stage_z,
@@ -4111,6 +4140,7 @@ class TileFusion:
                     if hasattr(self, "processing_state")
                     else {}
                 ),
+                "opm_processing_coordinates": {"version": STAGE_COORDINATE_VERSION},
             },
             chunks=codec_chunks,
             writer="tensorstore",
