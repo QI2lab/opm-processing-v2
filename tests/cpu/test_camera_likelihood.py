@@ -43,7 +43,7 @@ def test_adc_likelihood_normalizes_and_predicts_photon_statistics(
         assert probability[100] == pytest.approx(expected, rel=1e-13)
 
 
-@pytest.mark.parametrize("rate", [0.2, 2, 100], scope="module")
+@pytest.mark.parametrize("rate", [0.2, 2, 100])
 @pytest.mark.parametrize("rate_factor", [0.5, 2])
 def test_held_out_camera_likelihood_favors_true_rate_without_brightness_fit(
     rate, rate_factor, camera_calibration, camera_likelihood_sample

@@ -6,13 +6,13 @@ import numpy as np
 import pytest
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture
 def camera_gain_profile():
     """Provide a prescribed nonuniform detector response for calibration tests."""
     return np.linspace(0.7, 1.3, 1900, dtype=np.float32)
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture
 def camera_codes():
     """All recorded uint16 values for physical gain, offset and saturation checks."""
     return np.arange(65536, dtype=np.uint16).reshape(16, 16, 256)
@@ -55,7 +55,7 @@ def detector_response_sample(
     )
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def camera_likelihood_sample(camera_calibration, rate):
     """Share independent camera data and its true-rate score across hypotheses."""
     from tests.simulation.camera import digitize

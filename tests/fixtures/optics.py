@@ -67,17 +67,6 @@ class AnalyticalCameraField:
     center: tuple[float, float, float]
 
 
-@dataclass(frozen=True)
-class PointAcquisition:
-    """Immutable independently refined emitter observations and optical kernels."""
-
-    microscope: Microscope
-    expectations: tuple[np.ndarray, ...]
-    kernels: dict[int, np.ndarray]
-    kernel: np.ndarray
-    apertures: tuple[np.ndarray, ...]
-
-
 @pytest.fixture(scope="session")
 def simulation_parameters():
     """Load the shared physical acquisition and specimen configuration."""
@@ -260,7 +249,7 @@ def optical_setup(microscope_parameters):
         microscope=microscope,
         psf=freeze_metadata(psf.astype(np.float32)),
         axes=freeze_metadata(axes),
-        irradiance=field,
+        irradiance=freeze_metadata(field),
     )
 
 
@@ -468,11 +457,10 @@ def point_response_model(optical_setup):
     )
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture
 def uniform_detector_scene(microscope_parameters, uniform_optical_calibration):
     """Form a uniform physical emitter field with the existing optical model."""
 
-    @lru_cache(maxsize=2)
     def create(projection=False):
         """Fix the emission dose before applying detector sensitivity and noise."""
         microscope = replace(
@@ -890,7 +878,7 @@ def production_point_acquisition(
         + (column * pixel) ** 2
     )
     radius = 0.61 * microscope.wavelength_um / microscope.numerical_aperture
-    return PointAcquisition(
+    return SimpleNamespace(
         microscope=microscope,
         expectations=freeze_metadata(expectations),
         kernels=freeze_metadata(kernels),
