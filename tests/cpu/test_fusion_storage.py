@@ -16,7 +16,6 @@ from opm_processing.imageprocessing.maxtilefusion import (
     MaxTileFusion,
     regenerate_fused_max_projection,
 )
-from opm_processing.imageprocessing.tilefusion import TileFusion
 
 
 @pytest.mark.unit
@@ -131,8 +130,7 @@ def test_max_projection_fusion_writes_centered_multiscales_and_offsets(
     ),
 )
 def test_multiscale_storage_round_trip_matches_reference(
-    fusion_operator,
-    processing_state,
+    tile_fusion,
     tmp_path,
     downsample_method,
     is_2d,
@@ -140,24 +138,24 @@ def test_multiscale_storage_round_trip_matches_reference(
     dtype,
 ):
     """Reopen exact pyramid data and verify its common physical-space center."""
-    fusion = fusion_operator(
-        TileFusion,
-        padded_shape=padded_shape,
-        offset_um=(4.51234, -3.01234, 12.25123),
-        _pixel_size=(0.81234, 0.51234, 0.25123),
-        time_dim=2,
-        channels=2,
+    fusion = tile_fusion(
+        [np.zeros((2, *padded_shape), dtype)] * 2,
+        [(0, 0, 0)] * 2,
+        time_indices=(0, 1),
         multiscale_factors=(2, 4),
-        _is_2d=is_2d,
-        chunk_y=4,
-        chunk_x=4,
+        resolution_multiples=((1, 1, 1), (2, 2, 2), (4, 4, 4)),
+        chunk_shape_yx=(4, 4),
         multiscale_downsample=downsample_method,
-        _max_workers=2,
+        max_workers=2,
         fusion_ram_fraction=0.4,
         max_in_flight_writes=2,
-        _input_chunk_zyx=(2, 4, 4),
-        output_dtype=np.dtype(dtype),
     )
+    # These prescribed serializer inputs include deliberately anisotropic,
+    # sub-millipixel precision independent of the native acquisition fixture.
+    fusion.padded_shape = padded_shape
+    fusion.offset_um = (4.51234, -3.01234, 12.25123)
+    fusion._pixel_size = (0.81234, 0.51234, 0.25123)
+    assert fusion._is_2d == is_2d
 
     path = tmp_path / "sample_fused.ome.zarr"
     scale0, fusion.write_block_shape = fusion._prepare_fused_image(path)
@@ -288,10 +286,9 @@ def test_multiscale_storage_round_trip_matches_reference(
         reopened.attrs["opm_processing_coordinates"]["version"]
         == "stage-endpoint-origin-v1"
     )
-    processed = tmp_path / "sample_deskewed.ome.zarr"
-    processing_state.initialize_run(processed, configuration={}, overwrite=True)
-    processing_state.save_registration(processed, configuration={}, pairwise_metrics={})
-    processing_state.complete_registration(processed, fused_path=path, tiles=())
+    processed, state = fusion.data, fusion.processing_state
+    state.save_registration(processed, configuration={}, pairwise_metrics={})
+    state.complete_registration(processed, fused_path=path, tiles=())
     projected = regenerate_fused_max_projection(
         path, tmp_path / "sample_max_z_fused.ome.zarr", max_workers=2
     )
@@ -326,9 +323,7 @@ def test_multiscale_storage_round_trip_matches_reference(
             level.translation_transform.translation, origin, rtol=0, atol=1e-12
         )
     assert (
-        ProcessingState.read(
-            processing_state.path
-        ).registered_output_for_max_projection(projected)
+        ProcessingState.read(state.path).registered_output_for_max_projection(projected)
         == processed
     )
 

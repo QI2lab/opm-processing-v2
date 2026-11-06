@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 from functools import lru_cache
+from itertools import count
 from types import SimpleNamespace
 
 import numpy as np
@@ -11,44 +12,121 @@ import tensorstore as ts
 from opm_processing.imageprocessing.opmpsf import centered_sensor_axes
 from opm_processing.imageprocessing.tilefusion import (
     TileFusion,
-    _infer_registration_limits,
 )
 
 
 @pytest.fixture
-def fusion_operator():
-    """Return a factory for isolated fusion calculations without file discovery.
+def tile_fusion(tmp_path, opm_v2_acquisition_factory):
+    """Construct real fusion inputs with native geometry and durable ROI records."""
+    from opm_processing.dataio.position_collection import (
+        create_variable_position_collection,
+    )
+    from opm_processing.dataio.processing_state import ProcessingState
 
-    Tests supply only the state consumed by their calculation.
-    """
+    identifiers = count()
 
-    def create(operator=TileFusion, *, source_tiles=None, **attributes):
-        """Construct an operator from a complete, visible unit-test configuration."""
-        if source_tiles is not None:
-            channels, z_dim, y_dim, x_dim = source_tiles[0].shape
-            attributes = {
-                "time_dim": 1,
-                "position_dim": len(source_tiles),
-                "channels": channels,
-                "z_dim": z_dim,
-                "y_dim": y_dim,
-                "x_dim": x_dim,
-                "_is_2d": False,
-                "z_profile": np.ones(z_dim, np.float32),
-                "y_profile": np.ones(y_dim, np.float32),
-                "x_profile": np.ones(x_dim, np.float32),
-                "position_arrays": tuple(ts.array(tile[None]) for tile in source_tiles),
-                **attributes,
-            }
-        instance = operator.__new__(operator)
-        instance.__dict__.update(attributes)
-        return instance
+    def create(
+        tiles,
+        positions,
+        *,
+        spacing=(1, 1, 1),
+        time_indices=None,
+        time_interval_s=None,
+        **options,
+    ):
+        """Persist Cartesian unit objects as physically sized cropped scan tiles."""
+        times = [0] * len(tiles) if time_indices is None else time_indices
+        projection = all(tile.shape[-3] == 1 for tile in tiles)
+        pixel = spacing[1]
+        z_bin = round(spacing[0] / pixel)
+        np.testing.assert_allclose(
+            spacing, (pixel * z_bin, pixel, pixel), rtol=0, atol=1e-12
+        )
+        native_shapes, records, counts = [], [], {}
+        for tile, time in zip(tiles, times, strict=True):
+            z, y, x = tile.shape[-3:]
+            rows = y if projection else 2 * z * z_bin
+            crop = 0 if projection else int(np.ceil(rows * np.cos(np.pi / 6)))
+            native = (1 if projection else y + crop, rows, x)
+            position = counts.get(time, 0)
+            counts[time] = position + 1
+            native_shapes.append(native)
+            records.append(
+                {
+                    "time_index": time,
+                    "position_index": position,
+                    "skewed_shape_syx": native,
+                    "skewed_bounds_sx": (0, native[0], 0, x),
+                    "deskew_crop_yx": (crop, crop + y, 0, x),
+                }
+            )
+        native_shape = np.max(native_shapes, axis=0)
+        fullest_time = max(counts, key=counts.get)
+        source_positions = [
+            positions[index] for index, time in enumerate(times) if time == fullest_time
+        ]
+        stem = f"fusion_{next(identifiers)}"
+        source = opm_v2_acquisition_factory(
+            np.zeros(
+                (
+                    max(times) + 1,
+                    max(counts.values()),
+                    tiles[0].shape[0],
+                    *native_shape,
+                ),
+                np.uint16,
+            ),
+            name=stem,
+            mode="projection" if projection else "mirror",
+            pixel_size_um=pixel,
+            scan_axis_step_um=pixel,
+            stage_positions_zxy=source_positions,
+        )
+        path = tmp_path / f"{stem}_deskewed.ome.zarr"
+        collection = create_variable_position_collection(
+            path,
+            [(1, *tile.shape) for tile in tiles],
+            spacing,
+            spatial_origins_zyx_um=positions,
+            dtype=tiles[0].dtype,
+            time_interval_s=time_interval_s,
+        )
+        state = ProcessingState.create(
+            tmp_path / f"{stem}.processing.json", source.path
+        )
+        state.initialize_run(
+            path,
+            configuration={"crop_after_deskew": True},
+            roi_series=records,
+            overwrite=True,
+        )
+        for array, tile, record in zip(collection.arrays, tiles, records, strict=True):
+            array.write(tile[None]).result()
+            time, position = record["time_index"], record["position_index"]
+            for channel in range(tile.shape[0]):
+                state.complete_channel(
+                    path, time, position, channel, is_zero=not np.any(tile[channel])
+                )
+            state.complete_tile(path, time, position)
+        return TileFusion(
+            path,
+            **{
+                "blend_pixels": (0, 0, 0),
+                "downsample_factors": (1, 1, 1),
+                "ssim_window": 3,
+                "max_workers": 1,
+                "multiscale_factors": (),
+                "resolution_multiples": ((1, 1, 1),),
+                "normalize_depth_intensity": False,
+                **options,
+            },
+        )
 
     return create
 
 
 @pytest.fixture
-def registration_pair(fusion_operator):
+def registration_pair(tile_fusion):
     """Share pair geometry and registration state while keeping pixels explicit."""
 
     def create(
@@ -57,38 +135,31 @@ def registration_pair(fusion_operator):
         *,
         spacing=(0.23, 0.115, 0.115),
         sampling=(3, 2, 2),
-        **settings,
+        **options,
     ):
         """Build a fusion operator from prescribed pixels, support and geometry."""
-        shapes = [volume.shape for volume in volumes]
-        limits = _infer_registration_limits(positions, shapes, spacing, sampling, 30)
-        attributes = {
-            "_tile_positions": positions,
-            "_tile_shapes": shapes,
-            "_tiles_by_time": ((0, 1),),
-            "_tile_time_indices": [0, 0],
-            "_tile_support_zy": [np.ones(shape[:2], np.float32) for shape in shapes],
-            "_pixel_size": spacing,
-            "downsample_factors": sampling,
-            "ssim_window": 15,
-            "threshold": 0.7,
-            "pairwise_metrics": {},
-            "_pair_registration_limits": limits,
-            "max_registration_shift_zyx": limits[0, 1],
-            "_max_workers": 1,
-            "_debug": False,
-            "_tile_channel_nonzero": {(0, 0): True, (1, 0): True},
-        }
-        attributes.update(settings)
-        return fusion_operator(
-            source_tiles=[volume[None] for volume in volumes], **attributes
+        fusion = tile_fusion(
+            [volume[None] for volume in volumes],
+            positions,
+            spacing=spacing,
+            **{
+                "downsample_factors": sampling,
+                "ssim_window": 15,
+                "threshold": 0.7,
+                **options,
+            },
         )
+        # Cartesian optical slabs are fully supported numerical inputs.
+        fusion._tile_support_zy = [
+            np.ones(volume.shape[:2], np.float32) for volume in volumes
+        ]
+        return fusion
 
     return create
 
 
 @pytest.fixture
-def block_fusion(fusion_operator):
+def block_fusion(tile_fusion):
     """Configure bounded block writes shared by mask and channel-weight tests."""
 
     def create(
@@ -99,63 +170,72 @@ def block_fusion(fusion_operator):
         support=None,
         present=None,
         block_shape=None,
-        **settings,
+        output_dtype=np.uint16,
+        time_indices=None,
+        profiles=None,
+        depth_gains=None,
+        x_profile=None,
+        y_profile=None,
+        max_workers=1,
+        max_in_flight_writes=1,
+        fusion_ram_fraction=1,
+        chunk_shape_yx=None,
     ):
         """Build a fusion operator from prescribed pixels, support and geometry."""
-        channels, z_dim, y_dim, _ = tiles[0].shape
-        attributes = {
-            "fused_ts": ts.array(np.zeros((1, channels, *shape), dtype=np.uint16)),
-            "write_block_shape": block_shape or [1, 1, *shape],
-            "offset_um": (0, 0, 0),
-            "padded_shape": shape,
-            "_pixel_size": (1, 1, 1),
-            "_tile_positions": positions,
-            "chunk_y": shape[1],
-            "chunk_x": shape[2],
-            "fusion_ram_fraction": 1.0,
-            "max_in_flight_writes": 1,
-            "_max_workers": 1,
-            "_debug": False,
-            "_deskew_support_zy": np.ones((z_dim, y_dim), bool)
+        fusion = tile_fusion(
+            tiles,
+            positions,
+            time_indices=time_indices,
+            max_workers=max_workers,
+            max_in_flight_writes=max_in_flight_writes,
+            fusion_ram_fraction=fusion_ram_fraction,
+            chunk_shape_yx=shape[1:] if chunk_shape_yx is None else chunk_shape_yx,
+        )
+        fusion.offset_um, fusion.padded_shape = (0, 0, 0), shape
+        fusion.output_dtype = np.dtype(output_dtype)
+        fusion.fused_ts, fusion.write_block_shape = fusion._prepare_fused_image(
+            fusion.output_dir / f"{fusion.acquisition_name}_fused.ome.zarr"
+        )
+        if block_shape is not None:
+            fusion.write_block_shape = block_shape
+        fusion._tile_support_zy = (
+            [np.ones(tile.shape[-3:-1], np.float32) for tile in tiles]
             if support is None
-            else support,
-            "_tile_channel_nonzero": present
-            or {
-                (tile, channel): True
-                for tile in range(len(tiles))
-                for channel in range(channels)
-            },
-        }
-        attributes.update(settings)
-        return fusion_operator(source_tiles=tiles, **attributes)
+            else [support] * len(tiles)
+            if isinstance(support, np.ndarray) and support.ndim == 2
+            else support
+        )
+        if present is not None:
+            fusion._tile_channel_nonzero = present
+        if profiles is not None:
+            fusion._tile_profiles = profiles
+        else:
+            for _z_weights, y_weights, x_weights in fusion._tile_profiles:
+                if y_profile is not None:
+                    y_weights[:] = y_profile
+                if x_profile is not None:
+                    x_weights[:] = x_profile
+        if depth_gains is not None:
+            fusion._depth_intensity_gains = depth_gains
+        return fusion
 
     return create
 
 
 @pytest.fixture
-def retry_fusion(fusion_operator):
+def retry_fusion(tile_fusion):
     """Provide a controlled registration graph with independently specified links."""
-    from opm_processing.imageprocessing.tilefusion import TileFusion
-
     limits = {
         (0, 1): (13, 198, 33),
         (1, 2): (13, 198, 33),
         (3, 4): (9, 202, 31),
         (4, 5): (9, 202, 31),
     }
-    return fusion_operator(
-        TileFusion,
-        _tile_positions=[(0, 0, 0)] * 6,
-        _tile_shapes=[(1, 1, 1)] * 6,
-        _pixel_size=(1, 1, 1),
-        _is_2d=False,
-        _tiles_by_time=((0, 1, 2), (3, 4, 5)),
-        _automatic_registration_limits=True,
-        _pair_registration_limits=limits.copy(),
-        _initial_pair_registration_limits=limits.copy(),
-        _registration_pair_sampling=dict.fromkeys(limits, (1, 5, 5)),
+    fusion = tile_fusion(
+        [np.ones((2, 1, 16, 16), np.uint16)] * 6,
+        [(0, 0, 0)] * 6,
+        time_indices=(0, 0, 0, 1, 1, 1),
         max_registration_shift_zyx=(13, 202, 33),
-        _initial_registration_shift_zyx=(13, 202, 33),
         registration_retries=2,
         downsample_factors=(3, 5, 5),
         ssim_window=15,
@@ -163,11 +243,12 @@ def retry_fusion(fusion_operator):
         threshold=0.7,
         optimization_rel_threshold=0.5,
         optimization_abs_threshold=1.5,
-        pairwise_metrics={},
-        reverse_stage_y=True,
-        reverse_stage_z=True,
-        _tile_channel_nonzero={(index, 1): True for index in range(6)},
     )
+    fusion._automatic_registration_limits = True
+    fusion._pair_registration_limits = limits.copy()
+    fusion._initial_pair_registration_limits = limits.copy()
+    fusion._registration_pair_sampling = dict.fromkeys(limits, (1, 5, 5))
+    return fusion
 
 
 @pytest.fixture(scope="session")
@@ -373,33 +454,24 @@ def shifted_slab_pair(registration_observation_pair):
 
 
 @pytest.fixture
-def projection_fusion(fusion_operator):
+def projection_fusion(tmp_path):
     """Share projection geometry and native TensorStore arrays for chunk tests."""
     from opm_processing.imageprocessing.maxtilefusion import MaxTileFusion
 
     def create(tiles, positions, shape, *, chunk_size=3):
         """Build a bounded projection fuser from explicit TCZYX camera data."""
-        channels, height, width = tiles[0].shape[1], *tiles[0].shape[-2:]
-        return fusion_operator(
-            MaxTileFusion,
-            pad_y=0,
-            pad_x=0,
+        fusion = MaxTileFusion(
             ts_dataset=tuple(ts.array(tile) for tile in tiles),
             tile_positions=np.asarray(positions, float),
-            pixel_size=np.ones(2),
-            offset=(0, 0),
-            time_dim=tiles[0].shape[0],
-            channels=channels,
-            tile_shape=(height, width),
-            fused_shape=shape,
-            time_range=None,
+            output_path=tmp_path / "projection_fused.ome.zarr",
+            pixel_size=(1, 1),
+            blend_pixels=(0, 0),
             chunk_size=chunk_size,
-            weight_mask=np.ones((height, width), np.float32),
-            output_dtype=tiles[0].dtype,
-            fused_ts=ts.array(
-                np.zeros((tiles[0].shape[0], channels, 1, *shape), tiles[0].dtype)
-            ),
+            padding_multiple=1,
+            reverse_stage_y=False,
         )
+        assert fusion.fused_shape == shape
+        return fusion
 
     return create
 
@@ -413,8 +485,7 @@ def fusion_mosaic(registration_scene):
     # explicitly prescribed scalar weights and photon counts.
     field = registration_scene(shape).raw.astype(np.float32) + np.float32(0.375)
     field[:, 2, 4] = 0  # Real darkness inside valid support.
-    tiles, origins, shapes, supports, profiles, gains, present = (
-        [],
+    tiles, origins, supports, profiles, gains, present = (
         [],
         [],
         [],
@@ -458,7 +529,6 @@ def fusion_mosaic(registration_scene):
                 target[mask] = truth[channel][mask]
             tiles.append(pixels.astype(np.float32))
             origins.append(origin)
-            shapes.append(extent)
             supports.append(coverage)
             profiles.append(
                 (
@@ -472,7 +542,6 @@ def fusion_mosaic(registration_scene):
         tiles=tiles,
         origins=origins,
         shape=shape,
-        shapes=shapes,
         supports=supports,
         profiles=profiles,
         gains=np.asarray(gains),

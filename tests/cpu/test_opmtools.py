@@ -2,7 +2,6 @@
 
 import numpy as np
 import pytest
-import tensorstore as ts
 
 from opm_processing.imageprocessing.opmtools import (
     deskew_coverage,
@@ -208,7 +207,6 @@ def test_deskewed_stage_tiles_blend_without_boundary_seams(
         support=case.support,
         x_profile=case.x_profile,
         block_shape=[1, 1, 2, 13, 5],
-        fused_ts=ts.array(np.zeros((1, 1, *case.shape), np.float32)),
         output_dtype=np.dtype(np.float32),
     )
     fusion._fuse_by_blocks()

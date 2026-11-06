@@ -5,13 +5,11 @@ from itertools import combinations
 
 import numpy as np
 import pytest
-import tensorstore as ts
 
 from opm_processing.imageprocessing import tilefusion as tilefusion_module
 from opm_processing.imageprocessing.coordinates import (
     stage_positions_to_image_coordinates,
 )
-from opm_processing.imageprocessing.maxtilefusion import MaxTileFusion
 from opm_processing.imageprocessing.tilefusion import TileFusion
 
 pytestmark = pytest.mark.unit
@@ -149,23 +147,22 @@ def test_uint16_weighted_fusion_preserves_integer_boundary_rounding() -> None:
 
 
 def test_max_projection_pyramid_clamps_partial_source_edge_chunks(
-    fusion_operator,
+    projection_fusion,
 ) -> None:
     """Never request factor-rounded source bounds beyond level-zero shape."""
     source = np.arange(1 * 3 * 1 * 17 * 19, dtype=np.uint16).reshape(1, 3, 1, 17, 19)
-    target = np.zeros((1, 3, 1, 2, 2), dtype=np.uint16)
-    fusion = fusion_operator(
-        MaxTileFusion,
+    fusion = projection_fusion(
+        (source,),
+        ((0, 0),),
+        (17, 19),
         chunk_size=512,
-        multiscale_factors_yx=(1, 16),
-        fused_ts=ts.array(source),
     )
-    fusion.multiscale_arrays = (fusion.fused_ts, ts.array(target))
+    fusion.fused_ts.write(source).result()
 
     fusion.write_multiscales()
 
     np.testing.assert_array_equal(
-        fusion.multiscale_arrays[1].read().result(),
+        fusion.multiscale_arrays[-1].read().result(),
         source[..., ::16, ::16],
     )
 
@@ -275,15 +272,15 @@ def test_registration_pairs_use_each_cropped_tile_shape() -> None:
 
 
 def test_shift_optimization_supports_variable_tiles_per_timepoint(
-    fusion_operator,
+    tile_fusion,
 ) -> None:
     """Optimize global tile IDs without assuming rectangular T-by-P storage."""
-    fusion = fusion_operator(
-        TileFusion,
-        _tile_positions=[(0.0, 0.0, 0.0)] * 5,
-        _tiles_by_time=((0, 1), (2, 3, 4)),
-        pairwise_metrics={(0, 1): (0, 0, 2, 1.0), (2, 4): (0, 3, 0, 1.0)},
+    fusion = tile_fusion(
+        [np.ones((1, 2, 4, 4), np.uint16)] * 5,
+        [(0, 0, 0)] * 5,
+        time_indices=(0, 0, 1, 1, 1),
     )
+    fusion.pairwise_metrics = {(0, 1): (0, 0, 2, 1.0), (2, 4): (0, 3, 0, 1.0)}
 
     fusion.optimize_shifts(method="ONE_ROUND")
 
@@ -309,10 +306,9 @@ def test_block_fusion_does_not_infer_support_from_pixel_values(block_fusion):
         [(0, 0, 0), (0, 0, 2)],
         (2, 3, 6),
         block_shape=[1, 1, 1, 2, 2],
-        chunk_y=2,
-        chunk_x=2,
+        chunk_shape_yx=(2, 2),
         max_in_flight_writes=2,
-        _max_workers=2,
+        max_workers=2,
     )
     fusion._fuse_by_blocks()
 
@@ -379,31 +375,16 @@ def test_zero_channels_keep_single_contributors_and_blend_valid_overlap(
 
 
 def test_zero_registration_channel_is_excluded_before_patch_reads(
-    fusion_operator,
+    tile_fusion,
 ) -> None:
     """Do not schedule registration reads for a pair containing a zero tile."""
-    fusion = fusion_operator(
-        TileFusion,
+    fusion = tile_fusion(
+        [np.ones((1, 4, 4, 4), np.uint16), np.zeros((1, 4, 4, 4), np.uint16)],
+        [(0, 0, 0), (0, 0, 2)],
         downsample_factors=(1, 1, 1),
         ssim_window=3,
         threshold=0.0,
-        pairwise_metrics={},
-        position_dim=2,
-        time_dim=1,
-        z_dim=4,
-        y_dim=4,
-        x_dim=4,
-        _pixel_size=(1.0, 1.0, 1.0),
-        _tile_positions=[(0.0, 0.0, 0.0), (0.0, 0.0, 2.0)],
-        _is_2d=False,
-        _max_workers=1,
         max_registration_shift_zyx=(2, 2, 2),
-        _debug=False,
-        _tile_channel_nonzero={(0, 0): True, (1, 0): False},
-        position_arrays=(
-            ts.array(np.ones((1, 1, 4, 4, 4), np.uint16)),
-            ts.array(np.zeros((1, 1, 4, 4, 4), np.uint16)),
-        ),
     )
 
     fusion.refine_tile_positions_with_cross_correlation(ch_idx=0)
@@ -448,7 +429,6 @@ def test_depth_registration_handles_large_xy_drift(
             origins,
             pair.truth.shape,
             block_shape=[1, 1, 7, 31, 37],
-            fused_ts=ts.array(np.zeros((1, 1, *pair.truth.shape), np.float32)),
             output_dtype=np.dtype(np.float32),
         )
         renderer._fuse_by_blocks()
@@ -487,21 +467,15 @@ def test_fusion_is_independent_of_blocks_and_workers(
         case.tiles,
         case.origins,
         case.shape,
-        support=case.supports[0],
+        support=case.supports,
         present=case.present,
         block_shape=[1, 1, *block_shape],
-        fused_ts=ts.array(np.zeros(case.expected.shape, dtype)),
         output_dtype=np.dtype(dtype),
-        _variable_roi_tiles=True,
-        _tile_shapes=case.shapes,
-        _tile_support_zy=case.supports,
-        _tile_profiles=case.profiles,
-        _depth_intensity_gains=case.gains,
-        _tiles_by_time=((0, 1, 2), (3, 4, 5)),
-        time_dim=2,
-        chunk_y=block_shape[1],
-        chunk_x=block_shape[2],
-        _max_workers=workers,
+        profiles=case.profiles,
+        depth_gains=case.gains,
+        time_indices=(0, 0, 0, 1, 1, 1),
+        chunk_shape_yx=block_shape[1:],
+        max_workers=workers,
         max_in_flight_writes=2,
         fusion_ram_fraction=0.1 if workers == 2 else 1,
     )

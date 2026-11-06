@@ -246,7 +246,7 @@ def test_hardware_channel_periods_sum_once(exposures, period):
 @pytest.mark.unit
 @pytest.mark.parametrize("projection", [False, True])
 def test_fused_writer_preserves_time_axis(
-    tmp_path, fusion_operator, position_store_factory, projection
+    tmp_path, tile_fusion, position_store_factory, projection
 ):
     """Retain the source temporal axis in fused output."""
     import numpy as np
@@ -274,19 +274,18 @@ def test_fused_writer_preserves_time_axis(
         assert provenance["source_collection"] == collection.path.name
         assert provenance["source_position_indices"] == [0]
     else:
-        operator = fusion_operator(
+        operator = tile_fusion(
+            [np.zeros((1, 4, 8, 8), np.uint16)] * 3,
+            [(0, 0, 0)] * 3,
+            time_indices=(0, 1, 2),
+            spacing=(0.23, 0.115, 0.115),
             time_interval_s=0.085,
             multiscale_factors=(2,),
+            resolution_multiples=((1, 1, 1), (2, 2, 2)),
             multiscale_downsample="stride",
-            _pixel_size=(0.23, 0.115, 0.115),
-            offset_um=(0, 0, 0),
-            padded_shape=(4, 8, 8),
-            _is_2d=False,
-            time_dim=3,
-            channels=1,
-            chunk_y=4,
-            chunk_x=4,
+            chunk_shape_yx=(4, 4),
         )
+        operator.offset_um, operator.padded_shape = (0, 0, 0), (4, 8, 8)
         operator._prepare_fused_image(path, z_slices_per_write=2)
     image = open_group(path).ome_metadata()
     assert image.multiscales[0].axes[0].unit == "second"

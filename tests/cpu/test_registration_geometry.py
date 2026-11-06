@@ -244,9 +244,9 @@ def test_recorded_depth_overlap_recovers_lateral_pair_beyond_old_z_budget(
         spacing=(1, 1, 1),
         sampling=(3, 2, 2),
         ssim_window=7,
-        _pair_registration_limits=limits,
         max_registration_shift_zyx=limits[0, 1],
     )
+    fusion._pair_registration_limits = limits
     fusion.refine_tile_positions_with_cross_correlation()
     np.testing.assert_allclose(fusion.pairwise_metrics[0, 1][:3], (9, 0, 4), atol=1)
     assert fusion.pairwise_metrics[0, 1][3] > 0.95

@@ -1,12 +1,9 @@
 """Depth gains are shared across XY fields and fitted separately per channel."""
 
-from dataclasses import replace
-
 import numpy as np
 import pytest
-import tensorstore as ts
 
-from opm_processing.imageprocessing.tilefusion import TileFusion, _fit_depth_gains
+from opm_processing.imageprocessing.tilefusion import _fit_depth_gains
 
 pytestmark = pytest.mark.unit
 
@@ -26,9 +23,8 @@ def test_depth_gain_fit_is_robust_and_anchors_unobserved_depths():
 
 
 def test_normalization_matches_depths_and_preserves_xy_brightness(
-    fusion_operator,
+    tile_fusion,
     registration_scene,
-    acquisition_metadata,
 ):
     """Invert known Beer attenuation while preserving threefold XY contrast."""
     specimen = registration_scene((24, 64, 64), seed=31).raw.astype(np.float32)
@@ -44,28 +40,12 @@ def test_normalization_matches_depths_and_preserves_xy_brightness(
             )
         )
         arrays.append(channels)
-    fusion = fusion_operator(
-        TileFusion,
-        acquisition=replace(
-            acquisition_metadata,
-            stage_positions_zxy=[(0, 0, 0), (0, 0, 100), (8, 0, 0), (8, 0, 100)],
-        ),
-        _tile_positions=[(0, 0, 0), (0, 0, 100), (8, 0, 0), (8, 0, 100)],
-        _tile_source_position_indices=list(range(4)),
-        _tile_time_indices=[0] * 4,
-        _tile_shapes=[(16, 64, 64)] * 4,
-        _pixel_size=(1, 1, 1),
-        _is_2d=False,
-        _variable_roi_tiles=False,
-        position_dim=4,
-        time_dim=1,
-        channels=3,
-        position_arrays=tuple(ts.array(a[None]) for a in arrays),
-        _tile_support_zy=[np.ones((16, 64), dtype=bool)] * 4,
-        _tile_channel_nonzero={(i, c): c < 2 for i in range(4) for c in range(3)},
-        optimized_pairwise_metrics={(0, 2): (0, 0, 0, 1), (1, 3): (0, 0, 0, 1)},
-        _depth_intensity_gains=np.ones((4, 3), dtype=np.float32),
+    fusion = tile_fusion(
+        arrays,
+        [(0, 0, 0), (0, 0, 100), (8, 0, 0), (8, 0, 100)],
     )
+    fusion._tile_support_zy = [np.ones((16, 64), dtype=bool)] * 4
+    fusion.optimized_pairwise_metrics = {(0, 2): (0, 0, 0, 1), (1, 3): (0, 0, 0, 1)}
     fusion.estimate_depth_intensity_gains()
     np.testing.assert_allclose(
         fusion._depth_intensity_gains, [(1, 1, 1)] * 2 + [(2, 4, 1)] * 2, rtol=1e-6
@@ -77,12 +57,11 @@ def test_normalization_matches_depths_and_preserves_xy_brightness(
 
 
 def test_scaled_uint16_output_clips_and_float32_preserves_range(
-    fusion_operator,
+    tile_fusion,
 ):
     """Check saturation, floating-point range, and immutable source intensities."""
-    fusion = fusion_operator(
-        TileFusion, _depth_intensity_gains=np.asarray([(2, 0.5)], dtype=np.float32)
-    )
+    fusion = tile_fusion([np.ones((2, 1, 1, 1), np.uint16)], [(0, 0, 0)])
+    fusion._depth_intensity_gains[:] = (2, 0.5)
     source = np.asarray([40000, 1000], dtype=np.uint16).reshape(2, 1, 1, 1)
     scaled = fusion._scale_depth_source(0, source)
     fusion.output_dtype = np.dtype(np.uint16)
