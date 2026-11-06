@@ -1,6 +1,7 @@
 """Interrupted ROI processing must retain only durably completed channels."""
 
 import importlib
+from copy import copy
 
 import numpy as np
 import pytest
@@ -11,6 +12,7 @@ from opm_processing.dataio.position_collection import (
     open_position_collection,
 )
 from opm_processing.dataio.processing_state import ProcessingState
+from tests.simulation.camera import digitize
 
 
 @pytest.mark.integration
@@ -75,8 +77,12 @@ def test_roi_resumes_at_last_durable_channel(
         for _, position, channel in saved
     }
     # A replay of any completed channel would now produce different pixels.
+    changed = digitize(2 * run.truth.means, run.truth.microscope.camera, seed=73)
+    assert changed.max() < np.iinfo(np.uint16).max
     for _, position, channel in saved:
-        run.raw_arrays[position][0, channel].write(np.uint16(901)).result()
+        run.raw_arrays[position][0, channel].write(
+            changed[0, position, channel]
+        ).result()
     monkeypatch.setattr(ProcessingState, "complete_channel", real_complete)
     monkeypatch.setattr(run.process, "write_checkpointed_roi_channel", real_write)
     roi_command.process_roi(
@@ -111,7 +117,9 @@ def test_empty_roi_channel_is_checkpointed_and_skipped(
 ):
     """Persist an empty channel before interruption and preserve it on resume."""
     run = roi_run
-    run.raw_arrays[1][0, 0].write(np.uint16(100)).result()
+    camera = run.truth.microscope.camera
+    dark = digitize(np.zeros_like(run.truth.means[0, 1, 0]), camera, seed=73)
+    run.raw_arrays[1][0, 0].write(dark).result()
     real_complete = ProcessingState.complete_channel
 
     def stop_after_empty(self, *args, **kwargs):
@@ -126,7 +134,10 @@ def test_empty_roi_channel_is_checkpointed_and_skipped(
         "output_dir": run.output_dir,
         "max_projection": False,
         "create_fused_max_projection": False,
-        "skip_empty_below": 1.0,
+        # Zero exposure retains read noise and ADC quantization. Six calibrated
+        # noise standard deviations separate it from the bright optical sample.
+        "skip_empty_below": 6
+        * np.sqrt(camera.read_noise_e**2 + camera.electrons_per_adu**2 / 12),
         "resume": True,
     }
     with pytest.raises(KeyboardInterrupt):
@@ -138,7 +149,9 @@ def test_empty_roi_channel_is_checkpointed_and_skipped(
     assert state.zero_channels(output) == {(0, 1, 0)}
     assert state.completed_tiles(output) == set()
 
-    run.raw_arrays[1][0, 0].write(np.uint16(901)).result()
+    changed = digitize(2 * run.truth.means[0, 1, 0], camera, seed=131)
+    assert changed.max() < np.iinfo(np.uint16).max
+    run.raw_arrays[1][0, 0].write(changed).result()
     monkeypatch.setattr(ProcessingState, "complete_channel", real_complete)
     run.process.process_skewed(run.source, **options)
     result = open_position_collection(output)
@@ -176,7 +189,15 @@ def test_roi_processing_resumes_by_default(roi_run, resume, assert_roi_point_acc
             collection.voxel_size_um,
             positions=(index + 1,),
         )
-    run.raw_arrays[1].write(np.uint16(901)).result()
+    changed = copy(run.truth)
+    changed.means = run.truth.means.copy()
+    changed.means[:, 1] *= 2
+    changed.pixels = run.truth.pixels.copy()
+    changed.pixels[:, 1] = digitize(
+        changed.means[:, 1], changed.microscope.camera, seed=73
+    )
+    assert changed.pixels.max() < np.iinfo(np.uint16).max
+    run.raw_arrays[1].write(changed.pixels[:, 1]).result()
     roi_command.process_roi(
         run.source, run.roi_path, registration_channel=1, deconvolve=False, **options
     )
@@ -188,11 +209,16 @@ def test_roi_processing_resumes_by_default(roi_run, resume, assert_roi_point_acc
     if resume is not False:
         np.testing.assert_array_equal(after, before)
     else:
-        # A constant camera field has a known 30-degree photon-volume gain.
-        # This fixed interior is covered by both native planes in each Z bin.
-        gain = 2 * run.metadata.pixel_size_um / run.metadata.scan_axis_step_um
-        np.testing.assert_array_equal(after[0, :, 3:5, 7:10, :], np.uint16(801 * gain))
         assert not np.array_equal(after, before)
+    collection = open_position_collection(output_path)
+    for index, array in enumerate(collection.arrays):
+        assert_roi_point_accuracy(
+            array.read().result(),
+            changed if resume is False else run.truth,
+            collection.spatial_origins_zyx_um[index],
+            collection.voxel_size_um,
+            positions=(index + 1,),
+        )
 
 
 @pytest.mark.unit
