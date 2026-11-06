@@ -155,7 +155,11 @@ def test_camera_sampling_bounds_detect_photon_and_spatial_errors(
         camera_sampling_accuracy,
         camera_sampling_envelope,
     )
-    from tests.simulation.metrics import camera_noise_accuracy
+    from tests.simulation.metrics import (
+        camera_flux_accuracy,
+        camera_noise_accuracy,
+        camera_partition_apertures,
+    )
 
     case = camera_sampling_case
     expected, camera = case.expectation, case.camera
@@ -195,6 +199,11 @@ def test_camera_sampling_bounds_detect_photon_and_spatial_errors(
         prediction, expected, camera, np.ones(expected.shape, bool)
     )
     assert inverse_accuracy.accepted == (artifact == "correct"), inverse_accuracy
+    flux_accuracy = [
+        camera_flux_accuracy(prediction, expected, camera, aperture)
+        for aperture in camera_partition_apertures(expected.shape)
+    ]
+    assert all(flux_accuracy) == (artifact == "correct")
     if artifact == "stripes":
         assert measured.flux_lower <= measured.flux <= measured.flux_upper
         assert not measured.inside_envelope
