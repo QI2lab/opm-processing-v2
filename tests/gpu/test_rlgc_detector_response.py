@@ -22,11 +22,19 @@ from tests.simulation.metrics import (
     indirect=True,
 )
 def test_roi_deconvolves_recorded_sampling(
-    cupy_gpu, mosaic_acquisition, monkeypatch, invoke_cli
+    cupy_gpu,
+    mosaic_acquisition,
+    monkeypatch,
+    invoke_cli,
+    pipeline_geometry,
+    assert_reconstruction_storage,
 ):
     """Crop raw camera data with optical support before reconstructing the ROI."""
+    from dataclasses import replace
+
     import tifffile
     from typer.testing import CliRunner
+    from yaozarrs import open_group
 
     from opm_processing import export_rois
     from opm_processing.dataio.position_collection import (
@@ -37,7 +45,13 @@ def test_roi_deconvolves_recorded_sampling(
     from opm_processing.imageprocessing.maxtilefusion import (
         regenerate_fused_max_projection,
     )
+    from opm_processing.imageprocessing.opmpsf import camera_grid_center
     from opm_processing.imageprocessing.tilefusion import TileFusion
+    from tests.simulation.metrics import (
+        camera_object_apertures,
+        camera_volume_samples,
+        reconstruction_storage_accuracy,
+    )
 
     case = mosaic_acquisition
     invoke_cli(
@@ -63,8 +77,26 @@ def test_roi_deconvolves_recorded_sampling(
         for tile in full_state.registration(full_tiles)["tiles"]
     }
     full_collection = open_position_collection(full_tiles)
-    projection = open_image_array(preview).read().result()[0, 0, 0]
-    center = int(np.argmax(projection.max(axis=1)))
+    microscope = case.microscope
+    native_shape = case.dataset.raw_data.shape[-3:]
+    # The original line object is at laboratory Y=0 on the centered sensor.
+    # Place that physical site in the saved preview grid without reading pixels.
+    source_y = (
+        4.6
+        + camera_grid_center(
+            native_shape,
+            microscope.pixel_size_um,
+            microscope.scan_step_um,
+            microscope.angle_deg,
+        )[1]
+    )
+    if case.dataset.metadata.scan_axis_reversed:
+        source_y -= (native_shape[0] - 1) * microscope.scan_step_um
+    grid = open_group(preview).ome_metadata().multiscales[0].datasets[0]
+    center = round(
+        (source_y - grid.translation_transform.translation[-2])
+        / grid.scale_transform.scale[-2]
+    )
     bounds = (center - 16, center + 16, 40, 88)
     monkeypatch.setattr(export_rois, "select_rois", lambda source, shape: [bounds])
     processing = importlib.import_module("opm_processing.process")
@@ -263,6 +295,8 @@ def test_roi_deconvolves_recorded_sampling(
         np.testing.assert_array_equal(retained, recovered)
     from scipy.interpolate import interp1d
 
+    refined = replace(microscope, scan_step_um=microscope.scan_step_um / factor)
+    cropped = open_position_collection(tiles)
     for position, (recovered, raw_crop, model) in enumerate(
         zip(deconvolved, raw_crops, reconstruction_models, strict=True)
     ):
@@ -291,6 +325,30 @@ def test_roi_deconvolves_recorded_sampling(
             assert camera_flux_accuracy(
                 prediction, expected_native, case.microscope.camera, aperture
             ), "ROI reconstruction changed known original photon counts"
+        apertures = camera_object_apertures(
+            case.optical_data.ground_truth,
+            refined,
+            recovered.shape,
+            camera_offset_zyx_um=(
+                0,
+                (start + stop - native_shape[0]) / 2 * microscope.scan_step_um,
+                (x0 + x1 - case.expectation.shape[-1]) / 2 * pixel,
+            ),
+        )
+        assert_reconstruction_storage(
+            cropped.arrays[position][0, 0].read().result(),
+            (recovered,),
+            cropped.spatial_origins_zyx_um[position],
+            cropped.voxel_size_um,
+            np.add(
+                canonical_scan_offset,
+                (0, start * microscope.scan_step_um, raw_crop[2] * pixel),
+            ),
+            refined,
+            apertures[:2],
+        )
+        if position == 0:
+            target_apertures = apertures[:2]
     assert (
         configuration["configuration"]["deconvolution"].get("scan_upsample_factor", 1)
         == factor
@@ -308,6 +366,62 @@ def test_roi_deconvolves_recorded_sampling(
     image = open_image_array(directory / "mosaic_fused.ome.zarr").read().result()
     assert image.shape[-2:] == (bounds[1] - bounds[0], bounds[3] - bounds[2])
     assert np.isfinite(image).all() and np.any(image > 0)
+    fused_grid = (
+        open_group(directory / "mosaic_fused.ome.zarr")
+        .ome_metadata()
+        .multiscales[0]
+        .datasets[0]
+    )
+    origin = fused_grid.translation_transform.translation[-3:]
+    spacing = fused_grid.scale_transform.scale[-3:]
+    # These declared placements link already scored inverse views to storage;
+    # they do not replace the original optical-photon assertions above.
+    raw_frames = np.asarray(
+        [
+            np.asarray(tile["origin_zyx_um"])
+            - (
+                0,
+                record["deskew_crop_yx"][0] * pixel,
+                record["deskew_crop_yx"][2] * pixel,
+            )
+            for (record, _seed), tile in zip(seeds, registration["tiles"], strict=True)
+        ]
+    )
+    dz, dy, dx = (raw_frames - raw_frames[0]).T
+    angle = np.deg2rad(refined.angle_deg)
+    view_offsets = np.column_stack(
+        (
+            (dy - dz / np.tan(angle)) / refined.scan_step_um,
+            dz / (pixel * np.sin(angle)),
+            dx / pixel,
+        )
+    )
+    shape = deconvolved[0].shape
+    sample = (origin, spacing, raw_frames[0], shape, refined)
+    prediction = camera_volume_samples(
+        image[0, 0] / (2 * pixel / refined.scan_step_um), *sample
+    )
+    coverage = camera_volume_samples(np.ones(image.shape[-3:]), *sample)
+    native_support = camera_volume_samples(
+        pipeline_geometry(shape, refined).support.astype(float),
+        (0, 0, 0),
+        (pixel, pixel, pixel),
+        (0, 0, 0),
+        shape,
+        refined,
+    )
+    for aperture in target_apertures:
+        # Fractional fusion adds a second orthogonal interpolation before
+        # sampling the stored volume on the original camera grid.
+        assert reconstruction_storage_accuracy(
+            prediction,
+            deconvolved,
+            np.minimum(coverage, native_support),
+            refined,
+            np.asarray(spacing) * 2,
+            aperture,
+            view_offsets_syx=view_offsets,
+        ), "Fused storage exceeds its independently scored inverse-view bounds"
     with tifffile.TiffFile(directory / "mosaic_roi_001.ome.tiff") as tif:
         assert tif.is_ome and tif.is_bigtiff
         np.testing.assert_array_equal(tif.asarray().reshape(image.shape), image)

@@ -362,24 +362,69 @@ def camera_object_apertures(
 
 
 def reconstruction_storage_accuracy(
-    prediction, reconstructions, coverage, microscope, spacing, mask
+    prediction,
+    reconstructions,
+    coverage,
+    microscope,
+    spacing,
+    mask,
+    *,
+    view_offsets_syx=None,
 ):
     """Certify positive storage/resampling relative to independently scored inverses.
 
     This numerical consistency bound never widens the separate original-photon
-    accuracy target. All views must share the same independently verified grid.
+    accuracy target. Views use one independently verified camera pitch; optional
+    declared SYX offsets locate differently cropped views in the target frame.
+    The supplied spacing includes any extra orthogonal fusion stencil.
     Fixed physical apertures require complete geometric coverage; local extrema
     over the physical contributing stencil bound every positive interpolation.
     """
     from tests.simulation.camera_likelihood import sampling_stencil_radii
 
-    values = np.asarray(reconstructions, np.float64)
-    if values.ndim != 4 or not np.isfinite(values).all() or np.any(values < 0):
+    radii = np.asarray(sampling_stencil_radii(microscope, spacing))
+    values = tuple(np.asarray(view, np.float64) for view in reconstructions)
+    if not values or any(
+        view.ndim != 3 or not np.isfinite(view).all() or np.any(view < 0)
+        for view in values
+    ):
         raise ValueError("Require actual nonnegative reconstructed camera volumes")
-    radii = sampling_stencil_radii(microscope, spacing)
-    window = (1, *(2 * radius + 1 for radius in radii))
-    lower = ndimage.minimum_filter(values, size=window, mode="nearest").min(axis=0)
-    upper = ndimage.maximum_filter(values, size=window, mode="nearest").max(axis=0)
+    offsets = None if view_offsets_syx is None else np.asarray(view_offsets_syx, float)
+    if offsets is None:
+        if any(view.shape != values[0].shape for view in values):
+            raise ValueError("Require a common camera grid without declared offsets")
+    elif offsets.shape != (len(values), 3) or not np.isfinite(offsets).all():
+        raise ValueError("Require a declared finite SYX offset per camera view")
+    lower = upper = None
+    for index, view in enumerate(values):
+        # Nearest alignment needs one extra neighbor only on axes with a
+        # fractional declared displacement. Coincident views need no resampling.
+        guard = (
+            0
+            if offsets is None
+            else ~np.isclose(offsets[index], np.rint(offsets[index]), rtol=0, atol=1e-8)
+        )
+        window = tuple(2 * (radii + guard) + 1)
+        bounds = (
+            ndimage.minimum_filter(view, size=window, mode="nearest"),
+            ndimage.maximum_filter(view, size=window, mode="nearest"),
+        )
+        if offsets is not None:
+            bounds = tuple(
+                ndimage.affine_transform(
+                    bound,
+                    np.eye(3),
+                    offset=-offsets[index],
+                    output_shape=np.shape(prediction),
+                    order=0,
+                    mode="constant",
+                    cval=np.nan,
+                    prefilter=False,
+                )
+                for bound in bounds
+            )
+        lower = bounds[0] if lower is None else np.fmin(lower, bounds[0])
+        upper = bounds[1] if upper is None else np.fmax(upper, bounds[1])
     error = 64 * (len(values) + 1) * np.finfo(np.float32).eps
     numerical = error / (1 - error) * np.maximum(upper, 1)
     selected = np.asarray(mask) & np.isclose(
