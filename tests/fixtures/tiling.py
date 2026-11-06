@@ -326,7 +326,6 @@ def deskew_processing_case(factor, mode, opm_v2_acquisition_factory, roi_camera_
 @pytest.fixture
 def stage_placement_acquisition(
     opm_v2_acquisition_factory,
-    angle,
     mode,
     simulation_parameters,
     microscope_parameters,
@@ -337,10 +336,12 @@ def stage_placement_acquisition(
 
     from opm_processing.dataio.acquisition import ChannelMetadata
     from tests.fixtures.acquisition import opm_v2_frame_metadata
+    from tests.simulation.camera import digitize
     from tests.simulation.forward_model import Acquisition, forward_model
     from tests.simulation.objects import deposit_point
 
     pixel_um = simulation_parameters["microscope"]["pixel_size_um"]
+    angle = simulation_parameters["microscope"]["angle_deg"]
     step_um = 0.23
     scans, camera_height, camera_width = 40, 64, 48
     theta = np.deg2rad(angle)
@@ -350,6 +351,12 @@ def stage_placement_acquisition(
     scene = independent_photon_scene_factory()
     density = np.zeros_like(scene.density)
     deposit_point(density, scene.axes, (0, 0, 0), 1.0)
+    scene = replace(
+        scene,
+        density=density,
+        features={"centers_xyz_um": [[0.0, 0.0, 0.0]]},
+        microscope=microscope,
+    )
     scan_axis = np.arange(scans) * step_um
     if mode == "stage":
         scan_axis = scan_axis[::-1].copy()
@@ -371,6 +378,7 @@ def stage_placement_acquisition(
         microscope,
     )
     raw = np.zeros((1, 3, 1, scans, camera_height, camera_width), dtype=np.uint16)
+    means = np.empty(raw.shape, dtype=np.float64)
     frames = []
     for position, stage_z_um in enumerate(stage_z_values_um):
         sensor_axes = (
@@ -378,10 +386,13 @@ def stage_placement_acquisition(
             nominal_axes[1] - stage_z_um / np.sin(theta),
             column_axis,
         )
-        raw[0, position, 0] = forward_model(
+        means[0, position, 0] = forward_model(
             density,
-            Acquisition(scene.axes, sensor_axes=sensor_axes, seed=position),
+            Acquisition(scene.axes, sensor_axes=sensor_axes, output="expectation"),
             microscope,
+        )
+        raw[0, position, 0] = digitize(
+            means[0, position, 0], microscope.camera, seed=position
         )
         for scan in range(scans):
             if mode == "stage":
@@ -441,4 +452,7 @@ def stage_placement_acquisition(
         camera_conversion=microscope.camera.electrons_per_adu,
         stage_positions_zxy=tuple((value, 0.0, 0.0) for value in stage_z_values_um),
     )
-    return SimpleNamespace(path=dataset.path, pixel_um=pixel_um)
+    dataset.means = means
+    dataset.ground_truth = scene
+    dataset.stage_z_values_um = stage_z_values_um
+    return dataset

@@ -171,17 +171,18 @@ def camera_sampling_envelope(
     response: ArrayLike = 1,
     views: int = 1,
     z_bin_factor: int = 1,
-    view_offsets_x: Sequence[float] | None = None,
+    view_offsets_syx: Sequence[Sequence[float]] | None = None,
 ) -> SamplingEnvelope:
     """Bound positive resampling using original optical truth and detector residuals.
 
-    Write each calibrated input as ``mu/response + residual/response``.
-    Positive normalized interpolation and fusion weights keep each component
-    inside its contributing-pixel extrema. Installed SciPy min/max filters
-    evaluate those extrema over a conservative physical stencil. The measured
-    residual contains the actual Poisson, read-noise, ADC and clipping effects;
-    it is determined before processing, never fitted to its output. This also
-    remains valid when a fitted flatfield depends on the observations.
+    Positive normalized interpolation and fusion weights keep the original
+    calibrated camera inputs divided by detector response inside their local
+    extrema. Installed SciPy min/max filters evaluate those extrema over a
+    conservative physical stencil. The original draws retain actual Poisson,
+    read-noise, ADC and clipping effects; no reconstructed values set bounds.
+    This also remains valid when a fitted flatfield depends on the observations.
+    Original optical means supply the separate likelihood/flux reference and
+    the arithmetic-error scale, rather than a reconstructed brightness fit.
 
     Parameters
     ----------
@@ -201,9 +202,10 @@ def camera_sampling_envelope(
         Maximum number of independently acquired views mixed by fusion.
     z_bin_factor : int
         Native planes per output bin, used to bound arithmetic roundoff.
-    view_offsets_x : sequence of float or None
-        Known integer native-X displacements of stacked views relative to the
-        target camera frame. Combine their bounds in corrected-photon units.
+    view_offsets_syx : sequence of sequence of float or None
+        Known native-camera displacements of stacked views relative to the
+        target frame. Fractional axes require a one-sample nearest-bound guard
+        in radii. Combine bounds in corrected-photon units.
 
     Returns
     -------
@@ -213,15 +215,14 @@ def camera_sampling_envelope(
     means, codes = np.broadcast_arrays(
         np.asarray(expectation, np.float64), np.asarray(raw, np.float64)
     )
-    if view_offsets_x is not None:
-        offsets = np.asarray(view_offsets_x, float)
+    if view_offsets_syx is not None:
+        offsets = np.asarray(view_offsets_syx, float)
         if (
             means.ndim != 4
-            or offsets.shape != (means.shape[0],)
+            or offsets.shape != (means.shape[0], 3)
             or not np.isfinite(offsets).all()
-            or not np.allclose(offsets, np.rint(offsets), rtol=0, atol=1e-8)
         ):
-            raise ValueError("Require stacked camera views and known integer X offsets")
+            raise ValueError("Require stacked camera views and known SYX offsets")
         sensitivity = np.broadcast_to(np.asarray(response, float), means.shape[1:])
         low, high = np.full(means.shape[1:], np.nan), np.full(means.shape[1:], np.nan)
         for mean, raw, offset in zip(means, codes, offsets, strict=True):
@@ -238,7 +239,7 @@ def camera_sampling_envelope(
             aligned = [
                 shift(
                     values / sensitivity,
-                    (0, 0, int(np.rint(offset))),
+                    offset,
                     order=0,
                     mode="constant",
                     cval=np.nan,
@@ -268,8 +269,7 @@ def camera_sampling_envelope(
     observed = camera_correct(
         codes, camera.offset_adu, camera.electrons_per_adu
     ).astype(np.float64)
-    signal = means / sensitivity
-    residual = (observed - means) / sensitivity
+    calibrated = observed / sensitivity
     window = tuple(2 * radius.astype(int) + 1)
     support = None if footprint is None else np.asarray(footprint, bool)
     if support is not None and (
@@ -277,14 +277,8 @@ def camera_sampling_envelope(
     ):
         raise ValueError("Require a centered physical footprint within the stencil")
     filters = {"size": window} if support is None else {"footprint": support}
-    lower = (
-        minimum_filter(signal, mode="nearest", **filters)
-        + minimum_filter(residual, mode="nearest", **filters)
-    ) * sensitivity
-    upper = (
-        maximum_filter(signal, mode="nearest", **filters)
-        + maximum_filter(residual, mode="nearest", **filters)
-    ) * sensitivity
+    lower = minimum_filter(calibrated, mode="nearest", **filters) * sensitivity
+    upper = maximum_filter(calibrated, mode="nearest", **filters) * sensitivity
     # Per view: calibration, four-sample orthogonal interpolation, eight-sample
     # inverse camera interpolation and normalized fusion take fewer than 64
     # positive arithmetic operations. Each extra native Z plane adds eight.

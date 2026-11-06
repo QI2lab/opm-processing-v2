@@ -375,7 +375,9 @@ def test_roi_maps_extended_specimen_to_raw_tiles(
                     microscope, pitch, origin_y_error_um=0.0005
                 ),
                 views=2 if fused else 1,
-                view_offsets_x=(np.arange(2) - position) * offset if fused else None,
+                view_offsets_syx=np.outer((np.arange(2) - position) * offset, (0, 0, 1))
+                if fused
+                else None,
             )
             apertures = camera_object_apertures(
                 case.optical_data.ground_truth,

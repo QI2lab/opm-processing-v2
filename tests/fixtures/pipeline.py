@@ -204,6 +204,10 @@ def pipeline_camera_accuracy(pipeline_geometry):
                         own_bounds,
                         selections,
                     )
+                    native_offsets_x = (offsets_x - offsets_x[position]) / pixel
+                    np.testing.assert_allclose(
+                        native_offsets_x, np.rint(native_offsets_x), rtol=0, atol=1e-8
+                    )
                     fused_bounds = camera_sampling_envelope(
                         means[time, :, channel],
                         original[time, :, channel],
@@ -212,7 +216,7 @@ def pipeline_camera_accuracy(pipeline_geometry):
                         footprint=fused_footprint,
                         response=response,
                         views=positions,
-                        view_offsets_x=(offsets_x - offsets_x[position]) / pixel,
+                        view_offsets_syx=np.outer(np.rint(native_offsets_x), (0, 0, 1)),
                     )
                     frame_origin = (
                         anchor + local_origin + np.array((0, 0, offsets_x[position]))
