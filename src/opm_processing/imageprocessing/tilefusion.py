@@ -515,6 +515,48 @@ def _registration_similarity(
         return -math.inf
 
 
+def _registration_phase_aliases(
+    shift: Sequence[float],
+    shape: Sequence[int],
+    max_shift: Sequence[float],
+    shift_sampling: Sequence[int] | None = None,
+) -> list[tuple[float, ...]]:
+    """Enumerate physically allowed real-space equivalents of one FFT peak.
+
+    Fourier translations are periodic in the registration patch dimensions,
+    including any padding introduced by block reduction. Each axis has at
+    most two equivalents with nonempty real-space overlap. Geometry filters
+    these equivalents; image similarity must still establish a valid match.
+    This does not replace the measured peak with another correlation peak.
+    """
+    choices = []
+    sampling = (None,) * len(shape) if shift_sampling is None else shift_sampling
+    for value, length, limit, factor in zip(
+        shift, shape, max_shift, sampling, strict=True
+    ):
+        if not math.isfinite(float(value)):
+            return []
+        positive = float(value) % int(length)
+        equivalents = (positive, positive - int(length))
+        if factor is not None:
+            # Adding a large float32 period can perturb a boundary value.
+            # Apply limits on the full-resolution grid fusion actually keeps.
+            equivalents = tuple(
+                float(np.rint(value * factor)) / factor for value in equivalents
+            )
+        choices.append(
+            [
+                value
+                for value in equivalents
+                if abs(value) < length and abs(value) <= limit
+            ]
+        )
+    return sorted(
+        itertools.product(*choices),
+        key=lambda candidate: sum(value * value for value in candidate),
+    )
+
+
 def _bounded_phase_correlation_peak(
     fixed: Any,
     moving: Any,
@@ -2123,13 +2165,13 @@ class TileFusion:
             Maximum SSIM window size. Thin aligned overlaps use the largest
             odd window that fits, with at least three voxels per axis.
         max_shift : sequence[float] or None
-            Maximum permitted shift in downsampled patch coordinates. The
-            upstream fully disambiguated result is used when it lies inside
-            these limits; otherwise the strongest bounded phase peak is used.
+            Maximum permitted shift in downsampled patch coordinates. Periodic
+            equivalents of a phase peak are filtered by these limits and scored
+            on common real-space support, independent of upstream unwrapping.
         allow_bounded_peak : bool, default=True
             Whether an out-of-range upstream result may be replaced by the
-            strongest in-range periodic peak. Thin-Z overlaps disable this
-            because their bounded alternatives are underdetermined.
+            strongest different in-range phase peak. Thin-Z overlaps disable
+            this replacement but still resolve equivalents of the measured peak.
         registration_axis : int or None, default=None
             Axis normal to the physical tile boundary. When provided, an
             edge-based phase-correlation candidate is scored alongside the
@@ -2248,6 +2290,24 @@ class TileFusion:
                 and bool(xp.any(xp.abs(result) >= limits * 0.5))
             ):
                 result = measured_phase_shift(fixed, moving, resolve_alias=True)
+            if result is not None and max_shift is not None:
+                # Upstream real-space disambiguation can prefer a tiny strip
+                # at the opposite image edge. Reconsider the same FFT peak's
+                # equivalents using physical bounds and acquisition support.
+                # This also applies to thin depth overlaps: unwrapping a peak
+                # does not introduce a different, potentially ambiguous peak.
+                aliases = _registration_phase_aliases(
+                    result, fixed.shape, max_shift, shift_sampling
+                )
+                if aliases:
+                    result = xp.asarray(aliases[0], dtype=xp.float32)
+                    if len(aliases) > 1:
+                        best_score = score_shift(result)
+                        for alias in aliases[1:]:
+                            candidate = xp.asarray(alias, dtype=xp.float32)
+                            candidate_score = score_shift(candidate)
+                            if candidate_score > best_score:
+                                result, best_score = candidate, candidate_score
             return result
 
         def retained_shift(candidate: Any) -> Any:
@@ -2868,6 +2928,13 @@ class TileFusion:
                                 g1,
                                 g2,
                                 win_size=sw,
+                                # Contextual Z includes the nominal slab
+                                # displacement. Lateral limits remain correction
+                                # limits and must also guide periodic unwrapping.
+                                max_shift=(
+                                    g1.shape[0] - 1,
+                                    *max_shift_ds[1:],
+                                ),
                                 allow_bounded_peak=False,
                                 registration_axis=0,
                                 support_masks=tuple(support_masks),
@@ -3764,7 +3831,9 @@ class TileFusion:
             "acceptance": "reject-constant-threshold-only-no-forced-bridges-v3",
             "overlap_roi": "depth-context-lateral-fallback-axial-contrast-refinement-v4",
             "downsample": ("upstream-block-reduce-with-adaptive-zyx-ssim-support-v2"),
-            "phase_registration": ("phase-edge-and-masked-normalized-correlation-v10"),
+            "phase_registration": (
+                "phase-supported-periodic-aliases-and-masked-normalized-correlation-v11"
+            ),
             "score": ("retained-full-resolution-grid-ssim-supported-window-v8"),
             "downsample_factors_zyx": list(self.downsample_factors),
             "ssim_window": self.ssim_window,
