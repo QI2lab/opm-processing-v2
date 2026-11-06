@@ -11,54 +11,22 @@ from opm_processing.dataio.processing_state import (
     processing_state_path,
 )
 from opm_processing.imageprocessing.camera import camera_correct
-from opm_processing.process import format_processed_output, process
+from opm_processing.process import format_processed_output
+from tests.simulation.camera import digitize
+from tests.simulation.metrics import camera_flux_accuracy, camera_noise_accuracy
 
 pytestmark = pytest.mark.integration
-
-
-def test_singleton_z_stage_mode_writes_2d_name_without_stage_fusion(
-    tmp_path,
-    opm_v2_acquisition_factory,
-    simulated_camera,
-) -> None:
-    """Keep dimensionality and acquisition mode distinct in output names."""
-    raw = np.stack(
-        [
-            simulated_camera((1, 4, 5), geometry="cartesian", exposure=1 + t / 4).raw
-            for t in range(2)
-        ]
-    )[:, None, None]
-    dataset = opm_v2_acquisition_factory(raw, name="single_stage", mode="stage")
-    path = dataset.path
-    process(
-        root_path=path,
-        deconvolve=False,
-        flatfield_correction=False,
-        write_fused_max_projection_tiff=False,
-    )
-
-    output_path = tmp_path / "single_stage_2d.ome.zarr"
-    assert output_path.is_dir()
-    assert not (tmp_path / "single_stage_projection.ome.zarr").exists()
-    assert not (tmp_path / "single_stage_stagefused.ome.zarr").exists()
-    output = open_position_collection(output_path)
-    np.testing.assert_array_equal(
-        output.arrays[0].read().result(),
-        format_processed_output(
-            camera_correct(
-                raw[:, 0],
-                dataset.metadata.camera_offset,
-                dataset.metadata.camera_conversion,
-            ),
-            False,
-        ),
-    )
-    assert "opm_v2" not in output.attributes
 
 
 @pytest.mark.parametrize("save_float32", [False, True], ids=["uint16", "float32"])
 @pytest.mark.parametrize(
     "separate_output", [False, True], ids=["source-dir", "output-dir"]
+)
+@pytest.mark.parametrize(
+    "opm_v2_projection_zarr",
+    [("projection", 1.0), ("stage", 1.0)],
+    indirect=True,
+    ids=["projection", "stage"],
 )
 def test_projection_output_preserves_calibration_geometry_and_provenance(
     opm_v2_projection_zarr, save_float32, separate_output, invoke_cli
@@ -73,7 +41,8 @@ def test_projection_output_preserves_calibration_geometry_and_provenance(
         save_float32=save_float32,
         output=output_dir if separate_output else None,
     )
-    output_path = output_dir / f"{fixture.path.stem}_projection.ome.zarr"
+    label = "2d" if fixture.metadata.mode == "stage" else "projection"
+    output_path = output_dir / f"{fixture.path.stem}_{label}.ome.zarr"
     collection = open_position_collection(output_path)
     assert collection.shape == (2, 1, 2, 1, 16, 18)
     assert collection.channel_names == fixture.metadata.channel_names
@@ -94,7 +63,15 @@ def test_projection_output_preserves_calibration_geometry_and_provenance(
     actual = collection.arrays[0].read().result()
     assert actual.dtype == (np.float32 if save_float32 else np.uint16)
     np.testing.assert_array_equal(actual[:, :, 0], expected)
+    truth = fixture.expectation[:, 0]
+    aperture = np.ones(truth.shape, bool)
+    accuracy = camera_noise_accuracy(actual, truth, fixture.microscope.camera, aperture)
+    assert accuracy.accepted, accuracy
+    assert camera_flux_accuracy(actual, truth, fixture.microscope.camera, aperture)
     assert not (parent / f"{fixture.path.stem}_stagefused.ome.zarr").exists()
+    assert "opm_v2" not in collection.attributes
+    if fixture.metadata.mode == "stage":
+        assert not (output_dir / f"{fixture.path.stem}_projection.ome.zarr").exists()
     if separate_output:
         assert not (parent / output_path.name).exists()
 
@@ -121,16 +98,24 @@ def test_projection_cli_resume_preserves_completed_pixels(
     )
     from opm_processing.dataio.acquisition import open_acquisition_datastore
 
-    open_acquisition_datastore(fixture.path).write(np.uint16(900)).result()
+    changed_truth = 2 * fixture.expectation
+    changed_raw = digitize(changed_truth, fixture.microscope.camera, seed=73)
+    assert changed_raw.max() < np.iinfo(np.uint16).max
+    open_acquisition_datastore(fixture.path).write(changed_raw).result()
     invoke_cli("process", fixture.path, resume=resume)
     after = open_position_collection(output_path).arrays[0].read().result()
     if not resume:
         expected = format_processed_output(
             camera_correct(
-                np.full_like(fixture.raw_data[:, 0, :, 0], 900),
+                changed_raw[:, 0, :, 0],
                 fixture.metadata.camera_offset,
                 fixture.metadata.camera_conversion,
             ),
             False,
         )[:, :, None]
     np.testing.assert_array_equal(after, expected)
+    truth = (fixture.expectation if resume else changed_truth)[:, 0]
+    aperture = np.ones(truth.shape, bool)
+    accuracy = camera_noise_accuracy(after, truth, fixture.microscope.camera, aperture)
+    assert accuracy.accepted, accuracy
+    assert camera_flux_accuracy(after, truth, fixture.microscope.camera, aperture)

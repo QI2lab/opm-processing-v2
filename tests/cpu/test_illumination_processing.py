@@ -15,9 +15,14 @@ from opm_processing.imageprocessing.flatfield import estimate_illuminations
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("output_flatfield", (False, True))
+@pytest.mark.parametrize(
+    "opm_v2_projection_zarr,output_flatfield",
+    [(("projection", 2.0), False), (("projection", 1.25), True)],
+    indirect=["opm_v2_projection_zarr"],
+    ids=["source-field", "output-field"],
+)
 def test_processing_uses_existing_flatfield_with_separate_output(
-    projection_illumination_case,
+    opm_v2_projection_zarr,
     tmp_path: Path,
     output_flatfield: bool,
 ) -> None:
@@ -26,8 +31,7 @@ def test_processing_uses_existing_flatfield_with_separate_output(
     from opm_processing.dataio.position_collection import open_position_collection
     from opm_processing.process import process, write_flatfield
 
-    case = projection_illumination_case
-    acquisition = case.dataset
+    acquisition = opm_v2_projection_zarr
     output_dir = tmp_path / "processed"
     output_dir.mkdir()
     filename = f"{acquisition_stem(acquisition.path)}_flatfield.ome.tif"
@@ -70,7 +74,7 @@ def test_processing_uses_existing_flatfield_with_separate_output(
     np.testing.assert_allclose(saved, expected, rtol=1e-6)
     # The original object and optical model predict the calibrated photons;
     # neither raw counts nor a second processing pass supplies this truth.
-    mean = case.means / selected_field[0]
+    mean = acquisition.source_expectation[:, 0, :, 0]
     observations = saved[:, :, 0]
     true_deviance = (2 * kl_div(observations, mean)).sum()
     for incorrect_brightness in (0.5, 1.5):

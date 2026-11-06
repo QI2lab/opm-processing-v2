@@ -35,13 +35,18 @@ def external_journal_image(acquisition_factory, fused_store_factory):
 
 
 @pytest.fixture
-def partial_processed_run(tmp_path, live_acquisition_factory):
+def partial_processed_run(tmp_path, acquisition_factory):
     """Persist camera input, sentinel output pixels and a partial completion journal."""
 
     def create(*, planar=False, deconvolve=False, completed=None, selection=None):
         """Persist a controlled partial run and its durable completion journal."""
         shape = (2, 3, 1, 1 if planar else 3, 4, 5)
-        dataset = live_acquisition_factory(shape=shape)
+        dataset = acquisition_factory(
+            np.zeros(shape, np.uint16),
+            mode="stage",
+            camera_conversion=0.24,
+            stage_positions_zxy=tuple((30.0, 100.0, 200.0 + 2 * p) for p in range(3)),
+        )
         destination = tmp_path / "processed"
         label = "2d" if planar else "deskewed"
         if deconvolve:

@@ -19,7 +19,6 @@ from tests.simulation.camera import digitize
 from tests.simulation.forward_model import (
     Acquisition,
     Microscope,
-    camera_psf,
     forward_model,
 )
 from tests.simulation.scenes import OpticalScene, prepare_scene
@@ -27,12 +26,11 @@ from tests.simulation.scenes import OpticalScene, prepare_scene
 
 @dataclass(frozen=True)
 class PipelineOpticalData:
-    """Immutable camera expectations and inverse kernel for one sensor grid."""
+    """Immutable camera expectations and source truth for one sensor grid."""
 
     microscope: Microscope
     expectation: np.ndarray
     source_expectation: np.ndarray
-    psf: np.ndarray
     ground_truth: OpticalScene
     source_density: np.ndarray
 
@@ -553,15 +551,13 @@ def pipeline_illumination_calibration(
 
 
 @pytest.fixture(scope="session")
-def pipeline_optical_data(
-    microscope_parameters, simulation_parameters, acquisition_metadata
-):
-    """Cache production optics and camera means for repeated fields and mosaics.
+def pipeline_optical_data(microscope_parameters, simulation_parameters):
+    """Cache physical emission doses and camera means for repeated fields and mosaics.
 
     Returns
     -------
     callable
-        Return immutable camera means, source-only means and production optics
+        Return immutable camera means, source-only means and original optical truth
         for a scan step, illumination selection and extended-mosaic flag.
     """
 
@@ -625,16 +621,9 @@ def pipeline_optical_data(
         acquisition = Acquisition(scene.axes, shape, output="expectation")
         expected = forward_model(dose, acquisition, microscope)
         source = forward_model(source_density, acquisition, microscope)
-        factor = scan_upsample_from_metadata(
-            replace(acquisition_metadata, scan_axis_step_um=step)
-        )
-        psf, _ = camera_psf(replace(microscope, scan_step_um=step / factor))
-        psf = psf.astype(np.float32)
-        for array in (expected, source, psf):
+        for array in (expected, source):
             array.setflags(write=False)
-        return PipelineOpticalData(
-            microscope, expected, source, psf, scene, source_density
-        )
+        return PipelineOpticalData(microscope, expected, source, scene, source_density)
 
     return create
 
@@ -709,10 +698,9 @@ def pipeline_case(
     """
     mode, illumination, step, crop = request.param
     optical_data = pipeline_optical_data(step, illumination)
-    microscope, expectation, psf = (
+    microscope, expectation = (
         optical_data.microscope,
         optical_data.expectation,
-        optical_data.psf,
     )
     raw = np.empty((2, 2, 2, *expectation.shape), dtype=np.uint16)
     for time, position, channel in np.ndindex(raw.shape[:3]):
@@ -773,7 +761,6 @@ def pipeline_case(
         support=geometry.support,
         expectation=expectation,
         source_expectation=optical_data.source_expectation,
-        psf=psf,
         optical_data=optical_data,
     )
 
@@ -791,7 +778,7 @@ def mosaic_acquisition(
     Returns
     -------
     types.SimpleNamespace
-        Raw qi2lab acquisition, physical camera expectation, PSF and the shared
+        Raw qi2lab acquisition, physical camera expectation and the shared
         dimensions used to check scan chunks, deskew tiles and mosaic seams.
     """
     mode, step, *encoder_errors = request.param
@@ -800,10 +787,9 @@ def mosaic_acquisition(
     optical_data = pipeline_optical_data(
         step, mosaic=True, scan_extent_factor=scan_extent_factor
     )
-    microscope, expectation, psf = (
+    microscope, expectation = (
         optical_data.microscope,
         optical_data.expectation,
-        optical_data.psf,
     )
     parameters = simulation_parameters["pipeline_mosaic"]
     height, width = parameters["camera_shape_yx"]
@@ -834,18 +820,11 @@ def mosaic_acquisition(
             (2.3, -4.6 + scan_encoder_error_um, 1.15 + (offset + 1) * pixel),
         ),
     )
-    factor = scan_upsample_from_metadata(dataset.metadata)
-    fine_data = pipeline_optical_data(
-        step / factor, mosaic=True, scan_extent_factor=scan_extent_factor
-    )
     return SimpleNamespace(
         dataset=dataset,
         microscope=microscope,
         expectation=expectation,
         source_expectation=optical_data.source_expectation,
-        psf=psf,
         parameters=parameters,
-        reconstruction_expectation=fine_data.expectation,
-        reconstruction_source_expectation=fine_data.source_expectation,
         optical_data=optical_data,
     )

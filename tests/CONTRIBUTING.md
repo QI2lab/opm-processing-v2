@@ -30,16 +30,21 @@ Every integration must execute the complete chain:
 3. Write camera frames through the installed opm-v2 `OpmDataHandler` lifecycle
    and its real ome-writers TensorStore backend, using
    `opm_v2_acquisition_factory`.
-4. Read the written metadata, generate production optical PSFs and run actual
-   processing functions or registered commands with their real parsers. CUDA
-   deconvolution must generate its kernels inside processing.
+4. Read the written metadata and run actual processing functions or registered
+   commands with their real parsers. Deconvolution must generate its production
+   optical kernels inside processing; other paths do not generate unused inverse
+   kernels merely for test setup.
 5. Reopen final storage and assert pixels, coordinates, completion and accuracy
    against the original simulated truth.
 
-Hand-built acquisition lookalikes, injected processing calibration, cached solver
-outputs and measured-PSF options cannot replace integration stages. Measured-PSF
-loading, explicit optical calibration, metadata-only operations, GUI selection and
-format serialization belong in units. Missing producer dependencies are errors.
+Hand-built acquisition lookalikes, injected processing calibration attributes,
+cached solver outputs and measured-PSF options cannot replace integration stages.
+Measured-PSF loading, explicit optical-parameter calibration, metadata-only
+operations, GUI selection and format serialization belong in units. Missing
+producer dependencies are errors. Calibrated-input workflows may read detector
+fields saved with the production writer from the simulated detector response;
+calibration-estimation integrations must estimate fields from independently
+simulated calibration frames.
 
 Use actual yaozarrs/TensorStore writers and readers. Native I/O needs pytest
 temporary directories; reuse filesystem mocks only where Python can intercept

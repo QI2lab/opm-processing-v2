@@ -326,14 +326,13 @@ def live_wait_case(
     opm_v2_live_acquisition_factory,
     monkeypatch,
     roi_camera_scene,
-    illumination_calibration_ensemble,
 ):
     """Delay real published chunks and lifecycle state for simulated optical input."""
     from opm_processing import process as processing
 
     kind = request.param
     if kind == "estimate":
-        ensemble = illumination_calibration_ensemble
+        ensemble = request.getfixturevalue("illumination_calibration_ensemble")
         scene, pixels = ensemble.scene, ensemble.raw
         sample_timepoint = ensemble.sample_timepoint
     else:

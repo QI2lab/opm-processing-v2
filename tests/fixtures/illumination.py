@@ -151,21 +151,6 @@ def assert_uniform_photon_accuracy():
     return check
 
 
-@pytest.fixture
-def projection_illumination_case(opm_v2_projection_zarr, simulated_camera):
-    """Retain original optical camera means for the actual projection producer."""
-    dataset = opm_v2_projection_zarr
-    means = np.empty_like(dataset.raw_data[:, 0, :, 0], dtype=np.float64)
-    for time, channel in np.ndindex(means.shape[:2]):
-        observation = simulated_camera(
-            (1, *means.shape[-2:]),
-            geometry="cartesian",
-            exposure=1 + time / 4 + channel / 2,
-        )
-        means[time, channel] = observation.expectation[0]
-    return SimpleNamespace(dataset=dataset, means=means)
-
-
 @pytest.fixture(scope="session")
 def uniform_optical_calibration():
     """Share immutable uniform-phantom means with excitation applied before blur."""

@@ -1,6 +1,7 @@
 """Shared complete processing scenarios collected by the CPU and CUDA suites."""
 
 import importlib
+from dataclasses import replace
 from functools import partial
 
 import numpy as np
@@ -15,6 +16,7 @@ from opm_processing.dataio.deconvolution import scan_upsample_from_metadata
 from opm_processing.dataio.processing_state import ProcessingState
 from opm_processing.imageprocessing.camera import camera_correct, illumination_correct
 from opm_processing.imageprocessing.opmtools import orthogonal_deskew
+from tests.simulation.forward_model import camera_psf
 from tests.simulation.metrics import (
     camera_flux_accuracy,
     camera_noise_accuracy,
@@ -141,6 +143,10 @@ def test_qi2lab_acquisition_to_fused_ngff_v05(pipeline_case, deconvolve):
         from scipy.special import kl_div
 
         factor = scan_upsample_from_metadata(metadata)
+        psf, _ = camera_psf(
+            replace(case.microscope, scan_step_um=case.microscope.scan_step_um / factor)
+        )
+        psf = psf.astype(np.float32)
         assert len(case.reconstructions) == np.prod(metadata.shape[:3])
         assert len(case.deconvolution_runs) == len(case.reconstructions)
         for run in case.deconvolution_runs:
@@ -186,7 +192,7 @@ def test_qi2lab_acquisition_to_fused_ngff_v05(pipeline_case, deconvolve):
             scores = [
                 kl_div(
                     expected,
-                    camera_prediction(density, case.psf, response=response)[::factor],
+                    camera_prediction(density, psf, response=response)[::factor],
                 ).sum()
                 for density in (recovered, baseline)
             ]
@@ -282,6 +288,7 @@ def test_extended_mosaic_acquisition_to_fusion(
     pipeline_geometry,
     pipeline_camera_accuracy,
     pipeline_source_image,
+    pipeline_optical_data,
     monkeypatch,
     tmp_path,
 ):
@@ -291,11 +298,7 @@ def test_extended_mosaic_acquisition_to_fusion(
     shape = case.dataset.raw_data.shape[-3:]
     factor = scan_upsample_from_metadata(case.dataset.metadata) if deconvolve else 1
     shape = ((shape[0] - 1) * factor + 1, *shape[1:])
-    expectation = (
-        case.reconstruction_source_expectation
-        if deconvolve
-        else case.source_expectation
-    )
+    expectation = case.source_expectation
     offset = parameters["tile_offset_x_pixels"]
     tile_limits = np.asarray(parameters["deskew_tile_shape_zyx"])
     # The noiseless specimen image crosses Y and X output tile borders, so the
@@ -310,6 +313,12 @@ def test_extended_mosaic_acquisition_to_fusion(
         )
     layouts = []
     if deconvolve:
+        fine_data = pipeline_optical_data(
+            case.microscope.scan_step_um / factor, mosaic=True
+        )
+        expectation = fine_data.source_expectation
+        psf, _ = camera_psf(fine_data.microscope)
+        psf = psf.astype(np.float32)
         solver = importlib.import_module("opm_processing.imageprocessing.rlgc")
         create_convolution = solver._Convolution
 
@@ -320,13 +329,6 @@ def test_extended_mosaic_acquisition_to_fusion(
             return operator
 
         monkeypatch.setattr(solver, "_Convolution", observe_layout)
-        pads = solver._linear_fft_pad_width(shape, case.dataset.psfs[0].shape)
-        padded_shape = tuple(n + sum(p) for n, p in zip(shape, pads, strict=True))
-        # Configure the public planner's memory fraction for a sub-volume budget.
-        # Query actual free memory; do not replace the CUDA runtime or allocator.
-        memory_budget = int(
-            np.prod(padded_shape) * 26 * np.dtype(np.float32).itemsize * 0.76
-        )
 
     options = {
         "deconvolve": deconvolve,
@@ -340,6 +342,15 @@ def test_extended_mosaic_acquisition_to_fusion(
         fusion_chunk=(256, 256),
     )
     if deconvolve:
+        pads = solver._linear_fft_pad_width(
+            shape, full.deconvolution_runs[0]["psf"].shape
+        )
+        padded_shape = tuple(n + sum(p) for n, p in zip(shape, pads, strict=True))
+        # Configure the public planner's memory fraction for a sub-volume budget.
+        # Query actual free memory; do not replace the CUDA runtime or allocator.
+        memory_budget = int(
+            np.prod(padded_shape) * 26 * np.dtype(np.float32).itemsize * 0.76
+        )
         assert layouts and all(
             full_shape == tile_shape for full_shape, tile_shape, _ in layouts
         )
@@ -401,9 +412,7 @@ def test_extended_mosaic_acquisition_to_fusion(
                 zip(result.reconstructions, result.deconvolution_runs, strict=True)
             ):
                 start = position * offset
-                expected = case.reconstruction_expectation[
-                    ..., start : start + shape[-1]
-                ]
+                expected = fine_data.expectation[..., start : start + shape[-1]]
                 raw = case.dataset.raw_data[0, position, 0]
                 if case.dataset.metadata.scan_axis_reversed:
                     raw = raw[::-1]
@@ -420,9 +429,9 @@ def test_extended_mosaic_acquisition_to_fusion(
                 assert predictive_deviance(
                     recovered,
                     expected,
-                    case.psf,
+                    psf,
                     boundary=boundary,
-                ) < predictive_deviance(baseline, expected, case.psf, boundary=boundary)
+                ) < predictive_deviance(baseline, expected, psf, boundary=boundary)
                 if result is tiled:
                     seams = np.zeros(shape[0], dtype=bool)
                     seams[boundaries - 1] = True
@@ -430,13 +439,13 @@ def test_extended_mosaic_acquisition_to_fusion(
                     assert predictive_deviance(
                         recovered,
                         expected,
-                        case.psf,
+                        psf,
                         boundary=boundary,
                         selection=seams,
                     ) < predictive_deviance(
                         baseline,
                         expected,
-                        case.psf,
+                        psf,
                         boundary=boundary,
                         selection=seams,
                     )
