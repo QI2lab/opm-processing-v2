@@ -595,42 +595,15 @@ def processing_options():
 @pytest.fixture(params=("mirror", "stage"))
 def inspection_case(
     request,
-    simulated_camera,
     opm_v2_acquisition_factory,
-    processing_options,
+    position_store_factory,
     selection,
-    small_cpu_kernels,
 ):
-    """Prepare CLI inputs from a simulated object and real deskew processing.
-
-    Parameters
-    ----------
-    request : pytest.FixtureRequest
-        Mirror or stage scan mode.
-    simulated_camera : callable
-        Shared physical forward model for a known fluorescent object.
-    opm_v2_acquisition_factory : callable
-        Native writer for calibrated opm-v2 acquisition metadata and pixels.
-    processing_options : dict
-        Shared settings preserving the laboratory output grid.
-    selection : str
-        Raw, directory, processed, custom-name or unavailable-source scenario.
-    small_cpu_kernels : None
-        Production CPU kernels configured for these small simulated volumes.
-
-    Returns
-    -------
-    types.SimpleNamespace
-        Simulated acquisition, actual processed collection and CLI input path.
-    """
+    """Write prescribed camera and Cartesian grids for metadata/path inspection."""
     from opm_processing.dataio.acquisition import acquisition_stem
     from opm_processing.dataio.processing_state import ProcessingState
-    from opm_processing.process import process
 
-    observed = simulated_camera((16, 32, 32))
-    pixels = np.broadcast_to(observed.raw, (1, 2, 1, *observed.raw.shape)).copy()
-    if request.param == "stage":
-        pixels = pixels[:, :, :, ::-1].copy()
+    pixels = np.arange(2 * 3 * 4 * 5, dtype=np.uint16).reshape(1, 2, 1, 3, 4, 5) + 100
     case = opm_v2_acquisition_factory(
         pixels,
         name="inspection",
@@ -642,11 +615,20 @@ def inspection_case(
     output = path.parent / f"{acquisition_stem(path)}_deskewed.ome.zarr"
     collection = None
     if selection != "raw-only":
-        process(path, **processing_options)
+        position_store_factory(
+            pixels,
+            name=output.name.removesuffix(".ome.zarr"),
+            voxel_size_um=(case.metadata.pixel_size_um,) * 3,
+            channels=case.metadata.channel_names,
+            stage_positions=case.metadata.stage_positions_zxy,
+            time_interval_s=case.metadata.volume_interval_s,
+        )
+        journal = path.parent / "inspection.processing.json"
         if selection == "custom-processed":
             output = output.rename(path.parent / "custom-output.ome.zarr")
-            state = ProcessingState.create(path.parent / "custom.processing.json", path)
-            state.initialize_run(output, configuration={}, overwrite=True)
+            journal = path.parent / "custom.processing.json"
+        state = ProcessingState.create(journal, path)
+        state.initialize_run(output, configuration={}, overwrite=True)
         collection = open_position_collection(output)
     if selection == "processed-only":
         path.rename(path.parent / "offline-raw")

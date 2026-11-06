@@ -252,20 +252,13 @@ def retry_fusion(tile_fusion):
 
 
 @pytest.fixture(scope="session")
-def registration_scene(microscope_parameters):
-    """Render a known fluorescent point specimen with the shared optical model.
-
-    A spatially distributed specimen supplies features throughout thin overlaps.
-    Exact signal units use the original object or noiseless optical means;
-    physical translations obtain independent exposures from the same dose.
-    """
-    from tests.fixtures.optics import CameraObservation
-    from tests.simulation.forward_model import Acquisition, forward_model
-    from tests.simulation.scenes import freeze_metadata, prepare_scene
+def registration_specimen(microscope_parameters):
+    """Share immutable physical landmarks across camera and exact-signal units."""
+    from tests.simulation.scenes import prepare_scene
 
     @lru_cache(maxsize=8)
-    def render(shape, *, seed=51):
-        """Return unsigned camera samples and the object that produced them."""
+    def create(shape, *, seed=51):
+        """Distribute known emitters throughout the prescribed physical field."""
         microscope = replace(
             microscope_parameters, fine_spacing_um=0.1, scan_step_um=0.23
         )
@@ -278,7 +271,7 @@ def registration_scene(microscope_parameters):
         centers = np.random.default_rng(seed).uniform(
             -half_extent, half_extent, (count, 3)
         )
-        scene = prepare_scene(
+        return prepare_scene(
             "points",
             microscope,
             parameters={
@@ -286,6 +279,23 @@ def registration_scene(microscope_parameters):
                 "features": {"centers_xyz_um": centers[:, ::-1].tolist()},
             },
         )
+
+    return create
+
+
+@pytest.fixture(scope="session")
+def registration_scene(registration_specimen):
+    """Render the shared physical landmarks through real optics and camera noise."""
+    from tests.fixtures.optics import CameraObservation
+    from tests.simulation.camera import digitize
+    from tests.simulation.forward_model import Acquisition, forward_model
+    from tests.simulation.scenes import freeze_metadata
+
+    @lru_cache(maxsize=8)
+    def render(shape, *, seed=51):
+        """Return unsigned camera samples and the object that produced them."""
+        scene = registration_specimen(shape, seed=seed)
+        microscope = scene.microscope
         dose = forward_model(
             scene.density,
             Acquisition(
@@ -302,8 +312,6 @@ def registration_scene(microscope_parameters):
             Acquisition(scene.axes, shape, geometry="cartesian", output="expectation"),
             microscope,
         )
-        from tests.simulation.camera import digitize
-
         raw = digitize(means, microscope.camera, seed=seed)
         return CameraObservation(
             ground_truth=scene,
@@ -316,12 +324,12 @@ def registration_scene(microscope_parameters):
 
 
 @pytest.fixture
-def aperiodic_registration_object(registration_scene):
+def aperiodic_registration_object(registration_specimen):
     """Supply a known unblurred object for exact finite-window FFT alias units."""
 
     def create(shape, *, seed, equal_column_histograms=False):
         """Center a declared physical object domain before any camera observation."""
-        scene = registration_scene(shape, seed=seed).ground_truth
+        scene = registration_specimen(shape, seed=seed)
         starts = (np.array(scene.density.shape) - np.asarray(shape)) // 2
         selection = tuple(
             slice(start, start + length)

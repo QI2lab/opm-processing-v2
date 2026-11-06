@@ -34,7 +34,6 @@ pytestmark = pytest.mark.unit
 )
 def test_partial_output_decision_preserves_pixels_and_journal(
     partial_processed_run,
-    stored_file_bytes,
     planar,
     answer,
     expected,
@@ -51,7 +50,11 @@ def test_partial_output_decision_preserves_pixels_and_journal(
         run.state.path.write_text("{invalid json")
     elif damage == "metadata":
         (run.output / "0" / "zarr.json").unlink()
-    before = stored_file_bytes(run.output_dir)
+    before = {
+        path.relative_to(run.output_dir): path.read_bytes()
+        for path in run.output_dir.rglob("*")
+        if path.is_file()
+    }
     with CliRunner().isolation(input=f"{answer}\n"):
         with pytest.raises(typer.Abort) if expected is None else nullcontext():
             assert (
@@ -64,7 +67,11 @@ def test_partial_output_decision_preserves_pixels_and_journal(
                 )
                 is expected
             )
-    assert stored_file_bytes(run.output_dir) == before
+    assert {
+        path.relative_to(run.output_dir): path.read_bytes()
+        for path in run.output_dir.rglob("*")
+        if path.is_file()
+    } == before
 
 
 @pytest.mark.parametrize(

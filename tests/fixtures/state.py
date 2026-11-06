@@ -77,14 +77,6 @@ def partial_processed_run(tmp_path, acquisition_factory):
 
 
 @pytest.fixture
-def stored_file_bytes():
-    """Capture current file bytes to verify a read-only state decision cannot modify saved data."""
-    return lambda root: {
-        p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()
-    }
-
-
-@pytest.fixture
 def processing_state(tmp_path):
     """Create an empty durable journal for isolated processing state transitions."""
     source = tmp_path / "sample.ome.zarr"

@@ -1,4 +1,4 @@
-"""Analytical metadata units and CLI inspection of simulated OPM acquisitions."""
+"""Metadata units and CLI inspection of prescribed acquisition and Cartesian grids."""
 
 import json
 
@@ -111,15 +111,18 @@ def test_processed_volume_dimensions_use_recorded_lab_grid(
     "selection",
     ["raw-only", "directory", "raw", "processed", "custom-processed", "processed-only"],
 )
-def test_inspect_cli_reports_simulated_raw_and_processed_data(
+def test_inspect_cli_reports_prescribed_acquisition_and_processed_metadata(
     inspection_case,
     selection,
     invoke_cli,
 ):
-    """Inspect real processing products of an optically simulated oblique object."""
+    """Inspect real writer metadata on prescribed camera and Cartesian image grids."""
     case, collection = inspection_case.case, inspection_case.collection
     if collection is not None:
-        assert any(np.any(array.read().result() > 0) for array in collection.arrays)
+        for position, array in enumerate(collection.arrays):
+            np.testing.assert_array_equal(
+                array.read().result(), case.raw_data[:, position]
+            )
     report = json.loads(invoke_cli("inspect-opm", inspection_case.selected).output)
     if selection == "processed-only":
         assert report["raw"] is None

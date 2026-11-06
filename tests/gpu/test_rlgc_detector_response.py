@@ -716,7 +716,7 @@ def test_detector_response_recovers_point_flux(
     indirect=["uniform_detector_acquisition"],
 )
 def test_saved_fluorescence_with_detector_response(
-    cupy_gpu, uniform_detector_acquisition, monkeypatch, stored_file_bytes
+    cupy_gpu, uniform_detector_acquisition, monkeypatch
 ):
     """Check calibrated processing orchestration against known absolute fluorescence."""
     import copy
@@ -734,7 +734,11 @@ def test_saved_fluorescence_with_detector_response(
 
     case = uniform_detector_acquisition
     run = process_roi if case.roi_mode else process
-    original = stored_file_bytes(case.dataset.path)
+    original = {
+        path.relative_to(case.dataset.path): path.read_bytes()
+        for path in case.dataset.path.rglob("*")
+        if path.is_file()
+    }
     reconstructions = []
     solver = importlib.import_module("opm_processing.imageprocessing.rlgc")
     reconstruct = solver.rlgc
@@ -818,7 +822,11 @@ def test_saved_fluorescence_with_detector_response(
     )
     assert abs(predicted_flux - expected.sum(dtype=np.float64)) <= 6 * np.sqrt(variance)
     run(case.dataset.path, **case.options, resume=True)
-    assert stored_file_bytes(case.dataset.path) == original
+    assert {
+        path.relative_to(case.dataset.path): path.read_bytes()
+        for path in case.dataset.path.rglob("*")
+        if path.is_file()
+    } == original
     # Deliberately change optical calibration only after the successful real
     # acquisition/processing round trip; resume must reject the new model.
     parameters = copy.deepcopy(settings["psf_parameters"])
