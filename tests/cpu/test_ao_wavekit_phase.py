@@ -1,43 +1,13 @@
 """Check WaveKit modal conventions against analytical Jacobi pupils."""
 
-import json
-from pathlib import Path
-
 import numpy as np
 import pytest
-from scipy.special import eval_jacobi
 from scripts.ao_wavekit_phase import (
-    BASIS_VERSION,
     WAVEKIT_MODE_NM,
     phase_from_modal_coeff,
 )
 
 pytestmark = pytest.mark.unit
-_CONVENTION = Path(__file__).parents[1] / "fixtures" / "ao_wavekit_phase_sdk42.json"
-
-
-@pytest.fixture
-def analytical_basis():
-    """Evaluate prescribed RMS-normalized circular modes with SciPy operators."""
-    header = json.loads(_CONVENTION.read_text("utf-8"))
-    assert header["basis_version"] == BASIS_VERSION
-    modes = tuple(map(tuple, header["modal_basis_nm"]))
-    coordinates = np.linspace(-1, 1, 33)
-    x, y = np.meshgrid(coordinates, coordinates)
-    radius = np.hypot(x, y)
-    angle = np.arctan2(y, x)
-    mask = radius > 1
-    basis = []
-    for n, m in modes:
-        radial = radius ** abs(m) * eval_jacobi(
-            (n - abs(m)) // 2, 0, abs(m), 2 * radius**2 - 1
-        )
-        angular = np.cos(m * angle) if m > 0 else np.sin(abs(m) * angle)
-        if m == 0:
-            angular = np.ones_like(angle)
-        normalization = np.sqrt((n + 1) * (1 if m == 0 else 2))
-        basis.append(normalization * radial * angular)
-    return np.array(basis), mask, modes
 
 
 def test_all_32_modes_match_analytical_phase_and_aperture(analytical_basis):
