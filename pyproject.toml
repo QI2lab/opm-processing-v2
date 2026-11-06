@@ -34,6 +34,7 @@ classifiers = [
 # add your package dependencies here
 dependencies = [
     "numpy",
+    "ijson>=3.6,<4",
     "ome-types[lxml]",
     "tensorstore",
     "zarr>=3",
