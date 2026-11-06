@@ -41,7 +41,7 @@ def test_registration_similarity_uses_acquired_window_support(
 def test_weighted_fusion_rows_preserve_masks_offsets_and_output_range(
     weighted_fusion_case, dtype, strided, shared
 ):
-    """Compare strided weighted pixels with independent separable-weight truth."""
+    """Preserve known affine samples, channel masks and scalar weighted counts."""
     case = weighted_fusion_case
     for source, pixels, channels, gains in zip(
         (case.first, case.second),
@@ -65,24 +65,29 @@ def test_weighted_fusion_rows_preserve_masks_offsets_and_output_range(
             *case.source_origin,
             gains,
         )
-        contribution = case.spatial_weights[None] * channels[:, None, None, None]
-        corrected = pixels if gains is None else pixels * gains[:, None, None, None]
-        case.expected_sum[case.selection] += corrected * contribution
-        case.expected_weight[case.selection] += (
-            contribution * case.support[None, ..., None]
-        )
-    np.testing.assert_array_equal(case.accumulated, case.expected_sum)
+    # Both views have the same prescribed feather weights. Their normalized
+    # mixture has closed-form scalar values: at the first location, a real
+    # black pixel and ten corrected photons give five, not ten. The other
+    # channels exercise absent contributors and a value above uint16 range.
     np.testing.assert_array_equal(
-        case.weights, case.expected_weight[:1] if shared else case.expected_weight
+        case.accumulated[:, 1, 2, 3],
+        np.asarray(case.origin_sum, np.float32) * case.coverage_factor,
     )
-    expected = np.divide(
-        case.expected_sum,
-        case.expected_weight,
-        out=np.zeros_like(case.expected_sum),
-        where=case.expected_weight > 0,
+    negative_position = (1, 2, 3 + case.negative_x)
+    assert case.accumulated[(0, *negative_position)] == (
+        case.negative_sum * case.coverage_factor
     )
-    if dtype == np.uint16:
-        expected = np.clip(expected, 0, 65535).astype(np.uint16)
+    assert case.weights[(0, *negative_position)] == (
+        case.negative_weight * case.coverage_factor
+    )
+    for coordinate, _float_values, _uint_values, weight_values, coverage in case.probes:
+        np.testing.assert_array_equal(
+            case.weights[(slice(None), *coordinate)],
+            np.asarray(weight_values, np.float32) * np.float32(coverage),
+        )
+    np.testing.assert_array_equal(case.accumulated[:, case.untouched], 0)
+    np.testing.assert_array_equal(case.weights[:, case.untouched], 0)
+    unchanged = case.accumulated.copy()
     destination = np.full((3, 4, 7, 12), 173, dtype=dtype)
     if strided:
         tilefusion_module._normalize_block(
@@ -92,9 +97,16 @@ def test_weighted_fusion_rows_preserve_masks_offsets_and_output_range(
         tilefusion_module._normalize_block(
             case.accumulated, case.weights, destination, 0, 0, 1
         )
-    np.testing.assert_array_equal(destination[..., 1:11], expected)
+    normalized = destination[..., 1:11]
+    for coordinate, float_values, uint_values, _weights, _coverage in case.probes:
+        expected = uint_values if dtype == np.uint16 else float_values
+        np.testing.assert_array_equal(normalized[(slice(None), *coordinate)], expected)
+    assert normalized[(0, *negative_position)] == (0 if dtype == np.uint16 else -10)
+    np.testing.assert_array_equal(normalized[:, 1, 3, 3:7], 0)
+    np.testing.assert_array_equal(normalized[:, 2, 2, 3:7], 0)
+    np.testing.assert_array_equal(normalized[:, case.untouched], 0)
     np.testing.assert_array_equal(destination[..., (0, 11)], 173)
-    np.testing.assert_array_equal(case.accumulated, case.expected_sum)
+    np.testing.assert_array_equal(case.accumulated, unchanged)
 
 
 def test_uint16_weighted_fusion_preserves_integer_boundary_rounding() -> None:

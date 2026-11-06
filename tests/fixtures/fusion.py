@@ -525,16 +525,16 @@ def fusion_mosaic(registration_scene):
 
 @pytest.fixture
 def weighted_fusion_case(strided, shared, partial):
-    """Provide strided photon fields, partial coverage and independent feather weights."""
+    """Provide affine photon fields and prescribed scalar mixing/coverage truths."""
     first = np.arange(3 * 4 * 5 * 10, dtype=np.float32).reshape(3, 4, 5, 10)
     first[0, 1, 1, 1] = 0
     first[0, 1, 1, 3] = -20
     first[1, 1, 1, 1] = 90000
-    second = first * np.float32(0.5) + np.float32(10)
-    attenuation_per_um = np.asarray((0.025, 0.05, 0.075), np.float32)
-    optical_path_um = np.float32(8)
-    second *= np.exp(-attenuation_per_um * optical_path_um)[:, None, None, None]
-    depth_gains = (None, np.exp(attenuation_per_um * optical_path_um))
+    gains = np.asarray((2, 4, 8), np.float32)
+    # Exact inverse transmissions isolate the operator's arithmetic from the
+    # separate physical attenuation-estimation tests.
+    second = (first * np.float32(0.5) + np.float32(10)) / gains[:, None, None, None]
+    depth_gains = (None, gains)
     crop = np.s_[:, 1:3, 1:4, 1:9:2] if strided else np.s_[:, 1:3, 1:4, 1:5]
     source_views = (first[crop], second[crop])
     present = (
@@ -551,16 +551,49 @@ def weighted_fusion_case(strided, shared, partial):
     z_weights = np.asarray((0.5, 1), np.float32)
     y_weights = np.asarray((1, 0.25, 0.5), np.float32)
     x_weights = np.asarray((1, 0.5, 0.25, 1), np.float32)
-    spatial_weights = (z_weights[:, None, None] * y_weights[None, :, None]) * x_weights[
-        None, None, :
-    ]
-    spatial_weights *= (support > 0)[..., None]
     accumulated = np.zeros((3, 4, 7, 10), np.float32)
     weights = np.zeros((1 if shared else 3, *accumulated.shape[1:]), np.float32)
-    expected_sum = np.zeros_like(accumulated)
-    expected_weight = np.zeros_like(accumulated)
     selection = np.s_[:, 1:3, 2:5, 3:7]
     source_origin = (0, 0, 0) if strided else (1, 1, 1)
+    coverage_factor = np.float32(0.5 if partial else 1)
+    unit_weights = (1,) if shared else (1, 0.5, 0.5)
+    half_weights = (0.5,) if shared else (0.5, 0.25, 0.25)
+    probes = (
+        (
+            (1, 2, 3),
+            (5, 67505, 350.75) if shared else (5, 90000, 240.5),
+            (5, 65535, 350) if shared else (5, 65535, 240),
+            unit_weights,
+            coverage_factor,
+        ),
+        (
+            (1, 4, 3),
+            (65.75, 215.75, 365.75) if shared else (65.75, 281, 250.5),
+            (65, 215, 365) if shared else (65, 281, 250),
+            half_weights,
+            1,
+        ),
+        (
+            (2, 3, 3),
+            (95.75, 245.75, 395.75) if shared else (95.75, 321, 270.5),
+            (95, 245, 395) if shared else (95, 321, 270),
+            half_weights,
+            1,
+        ),
+        (
+            (2, 4, 6),
+            ((107.75, 257.75, 407.75) if shared else (107.75, 337, 278.5))
+            if strided
+            else ((105.5, 255.5, 405.5) if shared else (105.5, 334, 277)),
+            ((107, 257, 407) if shared else (107, 337, 278))
+            if strided
+            else ((105, 255, 405) if shared else (105, 334, 277)),
+            unit_weights,
+            1,
+        ),
+    )
+    untouched = np.ones(accumulated.shape[1:], bool)
+    untouched[selection[1:]] = False
     return SimpleNamespace(
         first=first,
         second=second,
@@ -571,11 +604,15 @@ def weighted_fusion_case(strided, shared, partial):
         z_weights=z_weights,
         y_weights=y_weights,
         x_weights=x_weights,
-        spatial_weights=spatial_weights,
         accumulated=accumulated,
         weights=weights,
-        expected_sum=expected_sum,
-        expected_weight=expected_weight,
+        origin_sum=(5, 67505, 350.75) if shared else (5, 45000, 120.25),
+        coverage_factor=coverage_factor,
+        negative_x=1 if strided else 2,
+        negative_sum=-5 if strided else -2.5,
+        negative_weight=0.5 if strided else 0.25,
+        probes=probes,
+        untouched=untouched,
         selection=selection,
         source_origin=source_origin,
     )
