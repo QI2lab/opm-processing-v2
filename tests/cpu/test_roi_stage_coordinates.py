@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -17,30 +16,6 @@ from opm_processing.dataio.roi import (
 )
 from opm_processing.imageprocessing.coordinates import STAGE_COORDINATE_VERSION
 from opm_processing.imageprocessing.maxtilefusion import MaxTileFusion
-
-
-@pytest.fixture
-def stage_coordinate_case(acquisition_factory, tmp_path):
-    """Create two physical scan trajectories with a known ten-micrometer span."""
-    positions = ((3.0, 100.0, 20.0), (3.0, 150.0, 20.0))
-    dataset = acquisition_factory(
-        np.zeros((1, 2, 1, 6, 4, 5), np.uint16),
-        mode="stage",
-        pixel_size_um=1.0,
-        scan_axis_step_um=2.0,
-        stage_positions_zxy=positions,
-        scan_start_positions_xyz=((100.0, 20.0, 3.0), (150.0, 20.0, 3.0)),
-        scan_end_positions_xyz=((110.0, 20.0, 3.0), (160.0, 20.0, 3.0)),
-    )
-    return SimpleNamespace(
-        dataset=dataset,
-        directory=tmp_path,
-        positions=positions,
-        marker={
-            "version": STAGE_COORDINATE_VERSION,
-            "placement_stage_positions_zxy_um": positions,
-        },
-    )
 
 
 @pytest.mark.unit

@@ -11,6 +11,20 @@ from yaozarrs.write.v05 import prepare_image
 from opm_processing.dataio.position_collection import create_position_collection
 
 
+@pytest.fixture(params=["stride", "block_mean"])
+def spatial_metadata_collection(request, position_store_factory):
+    """Write one calibrated object with fractional stage positions and a pyramid."""
+    return position_store_factory(
+        np.zeros((1, 1, 1, 1, 17, 21), np.uint16),
+        name="precise_projection",
+        voxel_size_um=(0.34567, 0.11549, 0.11651),
+        stage_positions=((1.23456, 2.34567, 3.45678),),
+        spatial_offset_um=(4.56789, 5.67891, 6.78912),
+        multiscale_factors_yx=(2, 4),
+        multiscale_downsample=request.param,
+    )
+
+
 @pytest.fixture
 def position_store_factory(tmp_path):
     """Return a writer for calibrated processed objects in TPCZYX order."""
