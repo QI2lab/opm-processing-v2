@@ -592,7 +592,7 @@ def opm_v2_acquisition_factory(
 
         metadata = inspect_acquisition(metadata.path)
         source = open_acquisition_datastore(metadata)
-        kernels, parameters = acquisition_psf_cache(metadata)
+        kernels = acquisition_psf_cache(metadata)
         integration_pipeline_records["sources"].append(metadata.path)
         return SimpleNamespace(
             path=metadata.path,
@@ -602,7 +602,6 @@ def opm_v2_acquisition_factory(
                 source[:, position] for position in range(raw_data.shape[1])
             ),
             psfs=kernels,
-            psf_parameters=parameters,
         )
 
     return create
@@ -619,7 +618,6 @@ def acquisition_psf_cache():
         CUDA processing still generates and consumes its own production PSFs.
     """
     import json
-    from copy import deepcopy
 
     from opm_processing.dataio.deconvolution import (
         emission_wavelengths_from_metadata,
@@ -648,16 +646,15 @@ def acquisition_psf_cache():
             json.dumps(parameters, sort_keys=True),
         )
         if key not in cache:
-            kernels, parameters = load_deconvolution_psfs(
+            kernels, _ = load_deconvolution_psfs(
                 metadata,
                 projection=metadata.is_2d,
                 reconstruction_step_um=step,
             )
             for kernel in kernels:
                 kernel.setflags(write=False)
-            cache[key] = (tuple(kernels), deepcopy(parameters))
-        kernels, parameters = cache[key]
-        return list(kernels), deepcopy(parameters)
+            cache[key] = tuple(kernels)
+        return list(cache[key])
 
     return generate
 
@@ -820,6 +817,8 @@ def inspection_case(
 @pytest.fixture
 def calibrated_mirror_timelapse(roi_camera_scene, opm_v2_acquisition_factory):
     """Write independently noisy exposures containing both original optical emitters."""
+    from opm_processing.imageprocessing.opmtools import deskew_shape_estimator
+
     scene = roi_camera_scene(times=3, shape=(4, 32, 32))
     dataset = opm_v2_acquisition_factory(
         scene.pixels,
@@ -828,18 +827,16 @@ def calibrated_mirror_timelapse(roi_camera_scene, opm_v2_acquisition_factory):
         stage_positions_zxy=((0.0, 0.0, 0.0),),
         frame_exposure_ms=5.0021029411764706,
     )
-    microscope = scene.microscope
-    pixel, angle = microscope.pixel_size_um, np.deg2rad(microscope.angle_deg)
-    scans, rows, columns = scene.pixels.shape[-3:]
-    native_y = int(
-        np.ceil(scans * microscope.scan_step_um / pixel + rows * np.cos(angle))
+    metadata = dataset.metadata
+    shape, *_ = deskew_shape_estimator(
+        scene.pixels.shape[-3:],
+        metadata.angle_deg,
+        metadata.scan_axis_step_um,
+        metadata.pixel_size_um,
+        crop_after_deskew=False,
     )
     return SimpleNamespace(
         path=dataset.path,
         truth=scene,
-        shape_zyx=(
-            int(np.ceil(rows * np.sin(angle))),
-            (native_y + 3) // 4 * 4,
-            (columns + 3) // 4 * 4,
-        ),
+        shape_zyx=tuple(shape),
     )

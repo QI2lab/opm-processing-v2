@@ -37,7 +37,7 @@ def test_fused_pair_roundtrip_pixels_and_metadata(
             np.testing.assert_array_equal(
                 tif.asarray().reshape(expected.shape), expected
             )
-            assert tif.series[0].dtype == np.dtype(fused_export.dtype)
+            assert tif.series[0].dtype == expected.dtype
             assert len(tif.pages) == int(np.prod(expected.shape[:3]))
             assert all(
                 page.aspage().is_tiled

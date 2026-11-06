@@ -145,7 +145,7 @@ def record_registration(tmp_path):
         tiles: list[dict[str, object]],
         *,
         roi_series: tuple[dict[str, object], ...] = (),
-    ) -> tuple[Path, ProcessingState]:
+    ) -> None:
         """Persist measured placement and completed series for fusion and ROI selection."""
         identity = _processed_store_identity(processed_path)
         assert identity is not None
@@ -175,6 +175,5 @@ def record_registration(tmp_path):
             processed_path,
             max_projection_path=maximum,
         )
-        return maximum, state
 
     return record

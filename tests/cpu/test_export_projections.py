@@ -13,9 +13,7 @@ from opm_processing.dataio.position_collection import open_position_collection
 @pytest.mark.unit
 def test_physical_sphere_projections_and_scale(projection_sphere):
     """A sphere on anisotropic voxels must display circular in all three views."""
-    case = projection_sphere
-    sphere = case.sphere
-    spacing = case.spacing
+    sphere, spacing = projection_sphere
     images, display_pixel_um, legends = exporter.projection_panels(
         sphere, spacing, (0, 1)
     )

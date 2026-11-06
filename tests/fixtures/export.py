@@ -145,7 +145,6 @@ def fused_export(tmp_path, source_xml, fused_store_factory, simulated_camera):
         origin=origin,
         source_ome=source_ome,
         state=state,
-        dtype=dtype,
     )
 
 
@@ -162,10 +161,7 @@ def projection_sphere():
         indexing="ij",
     )
     sphere = (x * x + y * y + z * z <= 4**2).astype(float)
-    return SimpleNamespace(
-        sphere=sphere,
-        spacing=spacing,
-    )
+    return sphere, spacing
 
 
 @pytest.fixture
