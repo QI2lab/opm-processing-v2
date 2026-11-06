@@ -2,6 +2,7 @@
 
 import hashlib
 from dataclasses import replace
+from threading import Event
 from types import SimpleNamespace
 
 import numpy as np
@@ -58,23 +59,19 @@ def ao_memmap_reads(monkeypatch):
 
 @pytest.fixture
 def phase_case(
-    tmp_path, monkeypatch, ao_memmap_source, ao_geometry_factory, ao_region_factory
+    tmp_path,
+    monkeypatch,
+    ao_memmap_source,
+    ao_geometry_factory,
+    ao_region_factory,
+    ao_rgb_field,
+    ao_quadrant_pupil,
 ):
     """Make predicted RGB tiles with edge pupils, masked holes and existing lines."""
-    yy, xx = np.indices((35, 53))
-    background = np.stack(
-        (
-            (7 * xx + 3 * yy) % 256,
-            (5 * xx + 11 * yy + 17) % 256,
-            (13 * xx + 2 * yy + 41) % 256,
-        ),
-        axis=-1,
-    ).astype(np.uint8)
+    background = ao_rgb_field((35, 53))
     mask = np.zeros((8, 8), dtype=bool)
     mask[3:5, 3:5] = True
-    new_phase = np.repeat(
-        np.repeat([[-np.pi, -np.pi / 2], [np.pi / 2, np.pi]], 4, axis=0), 4, axis=1
-    )
+    new_phase = ao_quadrant_pupil.data.copy()
     old_regions = [
         ao_region_factory(
             depth=0,
@@ -146,4 +143,238 @@ def phase_case(
         regions=new_regions,
         phase=new_phase,
         mask=mask,
+    )
+
+
+@pytest.fixture
+def native_percentile_case(monkeypatch, ao_memmap_source):
+    """Share the prescribed native image, pupils and calibrated rendering setup."""
+    pixels = np.asarray(
+        [
+            0,
+            13,
+            17,
+            40,
+            66,
+            100,
+            223,
+            456,
+            789,
+            1234,
+            2345,
+            4567,
+            6789,
+            9000,
+            12345,
+            23456,
+            45678,
+            56789,
+            60000,
+            65000,
+            65535,
+        ],
+        dtype=np.uint16,
+    ).reshape(3, 7)[:, ::-1]
+    source = ao_memmap_source(pixels)
+    monkeypatch.setattr(ao_tissue_bigtiff, "_HISTOGRAM_BYTES", 14)
+    return SimpleNamespace(
+        pixels=pixels,
+        source=source,
+    )
+
+
+@pytest.fixture
+def native_quadrant_raster_case(
+    ao_memmap_source, ao_geometry_factory, ao_region_factory, ao_quadrant_pupil
+):
+    """Share the prescribed native image, pupils and calibrated rendering setup."""
+    pixels = np.full((79, 1001), 100, np.uint16)
+    pupil = ao_quadrant_pupil.copy()
+    phase, mask = pupil.data.copy(), pupil.mask.copy()
+    regions = [ao_region_factory(depth=0, index=0, pupil=pupil)]
+    geometry = ao_geometry_factory(
+        pixels,
+        shape_yx=pixels.shape,
+        scale_yx_um=(0.5, 0.25),
+        extent_yx_um=(-5, 34.5, 20, 270.25),
+        planned_centers_by_depth_index={0: {0: (12.75, 102.625)}},
+        planned_grid_by_depth_index={
+            0: {"horizontal_y_um": [2.75], "vertical_x_um": [24.375]}
+        },
+    )
+    source = ao_memmap_source(pixels)
+    return SimpleNamespace(
+        pixels=pixels,
+        phase=phase,
+        mask=mask,
+        pupil=pupil,
+        regions=regions,
+        geometry=geometry,
+        source=source,
+    )
+
+
+@pytest.fixture
+def native_gray_tiff_case(
+    monkeypatch, ao_memmap_source, ao_geometry_factory, ao_region_factory
+):
+    """Share the prescribed native image, pupils and calibrated rendering setup."""
+    pixels = np.arange(35 * 53, dtype=np.uint16).reshape(35, 53)
+    source = ao_memmap_source(pixels)
+    mip_hash = hashlib.sha256(pixels.tobytes()).hexdigest()
+    geometry = ao_geometry_factory(
+        pixels,
+        images_by_depth={2: source},
+        shape_yx=pixels.shape,
+        scale_yx_um=(0.5, 0.25),
+        extent_yx_um=(-5, 12.5, 20, 33.25),
+        planned_centers_by_depth_index={2: {0: (3, 26)}},
+        planned_grid_by_depth_index={
+            2: {"horizontal_y_um": [2.75], "vertical_x_um": [24.375]}
+        },
+        layer_projection_rois_by_depth={2: {"mip_sha256": mip_hash}},
+    )
+    regions = [ao_region_factory(depth=2, index=0, pupil=np.ma.zeros((8, 8)))]
+    monkeypatch.setattr(ao_tissue_bigtiff, "TILE_SHAPE", (16, 16))
+    monkeypatch.setattr(ao_tissue_bigtiff, "_HISTOGRAM_BYTES", 212)
+    return SimpleNamespace(
+        pixels=pixels,
+        source=source,
+        mip_hash=mip_hash,
+        geometry=geometry,
+        regions=regions,
+    )
+
+
+@pytest.fixture
+def native_rgb_raster_case(
+    ao_memmap_source, ao_geometry_factory, ao_region_factory, ao_rgb_field
+):
+    """Share the prescribed native image, pupils and calibrated rendering setup."""
+    pixels = ao_rgb_field((41, 67))
+    original = pixels.copy()
+    mask = np.zeros((8, 8), dtype=bool)
+    mask[3:5, 3:5] = True
+    pupil = np.ma.array(np.zeros((8, 8)), mask=mask)
+    regions = [ao_region_factory(depth=0, index=0, pupil=pupil)]
+    geometry = ao_geometry_factory(
+        pixels,
+        shape_yx=(41, 67),
+        scale_yx_um=(0.5, 0.25),
+        extent_yx_um=(0, 20.5, 0, 16.75),
+        planned_centers_by_depth_index={0: {0: (10.25, 8.375)}},
+        planned_grid_by_depth_index={
+            0: {"horizontal_y_um": [6.25], "vertical_x_um": [3.125]}
+        },
+    )
+    source = ao_memmap_source(pixels)
+    return SimpleNamespace(
+        pixels=pixels,
+        original=original,
+        mask=mask,
+        pupil=pupil,
+        regions=regions,
+        geometry=geometry,
+        source=source,
+    )
+
+
+@pytest.fixture
+def native_rgb_tiff_case(
+    monkeypatch, ao_memmap_source, ao_geometry_factory, ao_region_factory
+):
+    """Share the prescribed native image, pupils and calibrated rendering setup."""
+    pixels = np.empty((35, 53, 3), np.uint8)
+    pixels[:, :17] = (255, 0, 255)
+    pixels[:, 17:35] = (0, 255, 255)
+    pixels[:, 35:] = (255, 128, 0)
+    source = ao_memmap_source(pixels)
+    channel_hashes = {"0": "0" * 64, "1": "1" * 64, "3": "3" * 64}
+    composite = {"channels": [0, 1, 3], "colors": ["magenta", "cyan", "orange"]}
+    geometry = ao_geometry_factory(
+        pixels,
+        shape_yx=(35, 53),
+        scale_yx_um=(0.5, 0.25),
+        extent_yx_um=(-5, 12.5, 20, 33.25),
+        images_by_depth={2: source},
+        display_limits_by_depth={2: (100, 101)},
+        planned_centers_by_depth_index={2: {0: (3, 26)}},
+        planned_grid_by_depth_index={
+            2: {"horizontal_y_um": [2.75], "vertical_x_um": [24.375]}
+        },
+        layer_projection_rois_by_depth={2: {"mip_sha256_by_channel": channel_hashes}},
+        provenance={"tissue_composite": composite},
+    )
+    regions = [ao_region_factory(depth=2, index=0, pupil=np.ma.zeros((8, 8)))]
+    contrasts = []
+    real_limits = ao_tissue_bigtiff.native_display_limits
+
+    def observe_contrast(image):
+        """Execute actual contrast calculation if the RGB path incorrectly requests it."""
+        contrasts.append(image)
+        return real_limits(image)
+
+    monkeypatch.setattr(ao_tissue_bigtiff, "native_display_limits", observe_contrast)
+    monkeypatch.setattr(ao_tissue_bigtiff, "TILE_SHAPE", (16, 16))
+    return SimpleNamespace(
+        contrasts=contrasts,
+        pixels=pixels,
+        source=source,
+        channel_hashes=channel_hashes,
+        composite=composite,
+        geometry=geometry,
+        regions=regions,
+    )
+
+
+@pytest.fixture
+def native_parallel_case(
+    monkeypatch, ao_memmap_source, ao_geometry_factory, ao_region_factory
+):
+    """Share the prescribed native image, pupils and calibrated rendering setup."""
+    pixels = {depth: np.empty((43, 61, 3), np.uint8) for depth in (2, 0)}
+    pixels[0][:] = (210, 20, 70)
+    pixels[2][:] = (0, 150, 230)
+    sources = {depth: ao_memmap_source(image) for depth, image in pixels.items()}
+    hashes = {
+        depth: hashlib.sha256(image.tobytes()).hexdigest()
+        for depth, image in pixels.items()
+    }
+    geometry = ao_geometry_factory(
+        pixels[0],
+        shape_yx=(43, 61),
+        scale_yx_um=(1, 0.5),
+        extent_yx_um=(0, 43, 0, 30.5),
+        images_by_depth=sources,
+        planned_centers_by_depth_index={depth: {0: (21.5, 15.25)} for depth in pixels},
+        planned_grid_by_depth_index={
+            depth: {"horizontal_y_um": [10, 30], "vertical_x_um": [8]}
+            for depth in pixels
+        },
+        layer_projection_rois_by_depth={
+            depth: {"mip_sha256": value} for depth, value in hashes.items()
+        },
+    )
+    regions = [
+        ao_region_factory(depth=depth, index=0, pupil=np.ma.zeros((8, 8)))
+        for depth in (2, 0)
+    ]
+    second_depth_started = Event()
+    original_tiles = NativeTissueRaster.iter_tiles
+
+    def overlapping_depth_tiles(raster):
+        if raster.depth == 0:
+            assert second_depth_started.wait(timeout=5), "Depth exports did not overlap"
+        else:
+            second_depth_started.set()
+        yield from original_tiles(raster)
+
+    monkeypatch.setattr(NativeTissueRaster, "iter_tiles", overlapping_depth_tiles)
+    monkeypatch.setattr(ao_tissue_bigtiff, "TILE_SHAPE", (16, 16))
+    return SimpleNamespace(
+        pixels=pixels,
+        sources=sources,
+        hashes=hashes,
+        geometry=geometry,
+        regions=regions,
     )

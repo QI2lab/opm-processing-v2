@@ -16,32 +16,13 @@ pytestmark = pytest.mark.unit
 
 
 def test_native_canvas_retains_full_anisotropic_background_and_grid(
-    tmp_path, ao_geometry_factory, ao_region_factory, ao_figure_observer
+    tmp_path, ao_native_canvas_case, ao_figure_observer
 ):
     """A 2100-pixel-wide source remains native in PNG and embedded SVG images."""
-    centers = {
-        index: (y, x)
-        for index, (y, x) in enumerate(
-            (y, x) for x in (70, 210, 350) for y in (25, 15, 5)
-        )
-    }
-    geometry = ao_geometry_factory(
-        np.zeros((60, 2100), dtype=np.uint16),
-        shape_yx=(60, 2100),
-        preview_scale_yx_um=(0.5, 0.2),
-        preview_origin_yx_um=(0.25, 0.1),
-        extent_yx_um=(0, 30, 0, 420),
-        planned_centers_by_depth_index={0: centers},
-        planned_grid_by_depth_index={
-            0: {"horizontal_y_um": [10, 20], "vertical_x_um": [140, 280]}
-        },
-        depth_offsets={0: 0},
-        provenance={},
-    )
-    regions = [
-        ao_region_factory(depth=0, index=index, pupil=np.ma.zeros((8, 8)))
-        for index in range(9)
-    ]
+    case = ao_native_canvas_case
+    centers = case.centers
+    geometry = case.geometry
+    regions = case.regions
     figures = ao_figure_observer
     record = write_tissue_overlay(
         regions,
@@ -103,28 +84,17 @@ def test_native_canvas_retains_full_anisotropic_background_and_grid(
 
 
 def test_native_pupil_colors_keep_sjs_orientation_without_changing_phase(
-    tmp_path, ao_geometry_factory, ao_region_factory
+    tmp_path, ao_native_orientation_case
 ):
     """Asymmetric phase quadrants retain their linear colors in the native PNG."""
-    phase = np.repeat(
-        np.repeat([[-np.pi, -np.pi / 2], [np.pi / 2, np.pi]], 4, axis=0), 4, axis=1
-    )
-    coordinate = np.linspace(-1, 1, 8)
-    yy, xx = np.meshgrid(coordinate, coordinate, indexing="ij")
-    mask = xx * xx + yy * yy > 1
-    pupil = np.ma.array(phase.copy(), mask=mask.copy())
-    geometry = ao_geometry_factory(
-        np.zeros((120, 240), dtype=np.uint16),
-        shape_yx=(120, 240),
-        preview_scale_yx_um=(1, 0.5),
-        preview_origin_yx_um=(0.5, 0.25),
-        extent_yx_um=(0, 120, 0, 120),
-        centers_by_depth_index={0: {0: (60, 60)}},
-        depth_offsets={0: 0},
-        provenance={},
-    )
+    case = ao_native_orientation_case
+    phase = case.phase
+    mask = case.mask
+    pupil = case.pupil
+    geometry = case.geometry
+    regions = case.regions
     record = write_tissue_overlay(
-        [ao_region_factory(depth=0, index=0, pupil=pupil)],
+        regions,
         geometry,
         tmp_path,
         timepoint=0,

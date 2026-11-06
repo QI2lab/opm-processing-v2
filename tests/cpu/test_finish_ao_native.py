@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 import tifffile
 from scripts import finish_ao_native
-from scripts.ao_wavekit_phase import BASIS_VERSION, phase_from_modal_coeff
+from scripts.ao_wavekit_phase import BASIS_VERSION
 
 pytestmark = pytest.mark.unit
 
@@ -97,7 +97,7 @@ def test_mismatched_preview_cache_provenance_prevents_native_writes(
 
 @pytest.mark.parametrize("state", ("starting", "final", "change"))
 def test_saved_manifest_basis_preserves_legacy_or_reconstructs_sdk_phase(
-    saved_phase_inputs, state
+    saved_phase_inputs, ao_analytical_phase, state
 ):
     """Legacy previews retain their old phase; flagged previews use the corrected basis."""
     case = saved_phase_inputs
@@ -112,18 +112,21 @@ def test_saved_manifest_basis_preserves_legacy_or_reconstructs_sdk_phase(
         "final": case.final,
         "change": case.final - case.starting,
     }[state]
-    expected = phase_from_modal_coeff(
-        selected, samples=512, norm=True, wavelength=0.488, out="radians"
-    )
+    expected = ao_analytical_phase(selected)
     legacy_coefficients = selected.copy()
     legacy_coefficients[5:7] = legacy_coefficients[5:7][::-1]
-    expected_legacy = phase_from_modal_coeff(
-        legacy_coefficients, samples=512, norm=True, wavelength=0.488, out="radians"
-    )
+    expected_legacy = ao_analytical_phase(legacy_coefficients)
     assert legacy.pupil.shape == corrected.pupil.shape == (512, 512)
-    np.testing.assert_array_equal(legacy.pupil.mask, corrected.pupil.mask)
-    np.testing.assert_array_equal(corrected.pupil.data, expected.data)
-    np.testing.assert_array_equal(legacy.pupil.data, expected_legacy.data)
+    np.testing.assert_array_equal(corrected.pupil.mask, expected.mask)
+    np.testing.assert_array_equal(legacy.pupil.mask, expected_legacy.mask)
+    # The independent Jacobi and production radial-polynomial evaluations use
+    # the same established floating-point bound as the all-mode pupil units.
+    np.testing.assert_allclose(
+        corrected.pupil.compressed(), expected.compressed(), rtol=0, atol=4e-12
+    )
+    np.testing.assert_allclose(
+        legacy.pupil.compressed(), expected_legacy.compressed(), rtol=0, atol=4e-12
+    )
     assert not np.array_equal(legacy.pupil.compressed(), corrected.pupil.compressed())
     assert (corrected.depth, corrected.index) == (1, 2)
     assert case.manifest == before

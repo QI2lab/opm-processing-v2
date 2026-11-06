@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -172,3 +173,93 @@ def saved_overlay_svg(tmp_path, ao_geometry_factory, ao_region_factory):
         output_shape_yx=(height, width),
     )["pages"][0]
     return SavedOverlay(tmp_path / "ao_tissue_overlay_t000_z000.svg", pixels, page)
+
+
+@pytest.fixture
+def ao_quadrant_pupil():
+    """Give four known signed phase quadrants inside a circular aperture."""
+    phase = np.repeat(
+        np.repeat([[-np.pi, -np.pi / 2], [np.pi / 2, np.pi]], 4, axis=0), 4, axis=1
+    )
+    coordinate = np.linspace(-1, 1, 8)
+    yy, xx = np.meshgrid(coordinate, coordinate, indexing="ij")
+    return np.ma.array(phase, mask=xx * xx + yy * yy > 1)
+
+
+@pytest.fixture
+def ao_rgb_field():
+    """Construct the shared known RGB concentration ramp at requested dimensions."""
+
+    def create(shape):
+        """Evaluate three prescribed spatial frequencies without rendering pixels."""
+        yy, xx = np.indices(shape)
+        return np.stack(
+            (
+                (7 * xx + 3 * yy) % 256,
+                (5 * xx + 11 * yy + 17) % 256,
+                (13 * xx + 2 * yy + 41) % 256,
+            ),
+            axis=-1,
+        ).astype(np.uint8)
+
+    return create
+
+
+@pytest.fixture
+def ao_native_canvas_case(ao_geometry_factory, ao_region_factory):
+    """Share native tissue pixels, physical landmarks and independently known pupils."""
+    centers = {
+        index: (y, x)
+        for index, (y, x) in enumerate(
+            (y, x) for x in (70, 210, 350) for y in (25, 15, 5)
+        )
+    }
+    geometry = ao_geometry_factory(
+        np.zeros((60, 2100), dtype=np.uint16),
+        shape_yx=(60, 2100),
+        preview_scale_yx_um=(0.5, 0.2),
+        preview_origin_yx_um=(0.25, 0.1),
+        extent_yx_um=(0, 30, 0, 420),
+        planned_centers_by_depth_index={0: centers},
+        planned_grid_by_depth_index={
+            0: {"horizontal_y_um": [10, 20], "vertical_x_um": [140, 280]}
+        },
+        depth_offsets={0: 0},
+        provenance={},
+    )
+    regions = [
+        ao_region_factory(depth=0, index=index, pupil=np.ma.zeros((8, 8)))
+        for index in range(9)
+    ]
+    return SimpleNamespace(
+        centers=centers,
+        geometry=geometry,
+        regions=regions,
+    )
+
+
+@pytest.fixture
+def ao_native_orientation_case(
+    ao_geometry_factory, ao_region_factory, ao_quadrant_pupil
+):
+    """Share native tissue pixels, physical landmarks and independently known pupils."""
+    pupil = ao_quadrant_pupil.copy()
+    phase, mask = pupil.data.copy(), pupil.mask.copy()
+    geometry = ao_geometry_factory(
+        np.zeros((120, 240), dtype=np.uint16),
+        shape_yx=(120, 240),
+        preview_scale_yx_um=(1, 0.5),
+        preview_origin_yx_um=(0.5, 0.25),
+        extent_yx_um=(0, 120, 0, 120),
+        centers_by_depth_index={0: {0: (60, 60)}},
+        depth_offsets={0: 0},
+        provenance={},
+    )
+    regions = [ao_region_factory(depth=0, index=0, pupil=pupil)]
+    return SimpleNamespace(
+        phase=phase,
+        mask=mask,
+        pupil=pupil,
+        geometry=geometry,
+        regions=regions,
+    )
