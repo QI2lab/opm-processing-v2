@@ -150,22 +150,6 @@ def block_fusion(fusion_operator):
 
 
 @pytest.fixture
-def registration_cache(tmp_path, processing_state):
-    """Attach the production durable registration journal to unit operators."""
-
-    def attach(fusion):
-        """Supply persistence paths and retain the real save/load implementations."""
-        fusion.data = tmp_path / "sample_deskewed.ome.zarr"
-        fusion.processing_state = processing_state
-        processing_state.initialize_run(fusion.data, configuration={}, overwrite=True)
-        fusion.__dict__.setdefault("reverse_stage_y", True)
-        fusion.__dict__.setdefault("reverse_stage_z", True)
-        return processing_state
-
-    return attach
-
-
-@pytest.fixture
 def retry_fusion(fusion_operator):
     """Provide a controlled registration graph with independently specified links."""
     from opm_processing.imageprocessing.tilefusion import TileFusion

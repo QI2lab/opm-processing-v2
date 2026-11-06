@@ -153,11 +153,6 @@ def pipeline_camera_accuracy(pipeline_geometry):
             origin_y_error_um=origin_error,
         )
 
-        def response_for(channel):
-            return np.broadcast_to(
-                1 if result.field is None else result.field[0, channel], shape
-            )
-
         def score(
             image, origin, frame_origin, expected, response, envelope, selections
         ):
@@ -183,7 +178,9 @@ def pipeline_camera_accuracy(pipeline_geometry):
 
         for time in range(means.shape[0]):
             for channel in range(means.shape[2]):
-                response = response_for(channel)
+                response = np.broadcast_to(
+                    1 if result.field is None else result.field[0, channel], shape
+                )
                 source_bounds = [
                     camera_sampling_envelope(
                         means[time, position, channel],

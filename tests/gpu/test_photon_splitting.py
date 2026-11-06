@@ -7,11 +7,16 @@ pytestmark = pytest.mark.unit
 
 
 @pytest.mark.parametrize("fractional", [False, True])
+@pytest.mark.parametrize("array_backend", ["gpu", "host"])
 def test_matlab_split_matches_independent_distribution_moments(
-    photon_splitter, cupy_gpu, fractional
+    cupy_gpu, array_backend, fractional
 ):
     # Integer photons and calibrated fractional weights across the count range.
     """Match the reference split mean, variance and fractional-count behavior."""
+    from opm_processing.imageprocessing.rlgc import _split_observed_counts
+
+    xp = cupy_gpu if array_backend == "gpu" else np
+    to_numpy = cupy_gpu.asnumpy if array_backend == "gpu" else np.asarray
     levels = np.array([0, 1, 4, 15, 64, 128, 149, 150, 256, 257, 2048], np.float32)
     if fractional:
         levels = np.r_[
@@ -23,16 +28,18 @@ def test_matlab_split_matches_independent_distribution_moments(
         ]
     count = 200000
     observed = np.broadcast_to(levels[:, None], (levels.size, count))
-    first = photon_splitter.split(observed)
-    np.testing.assert_array_equal(first, photon_splitter.split(observed))
+    counts = xp.asarray(observed, dtype=xp.float32)
+    first = to_numpy(_split_observed_counts(counts, xp.random.default_rng(19)))
+    np.testing.assert_array_equal(
+        first, to_numpy(_split_observed_counts(counts, xp.random.default_rng(19)))
+    )
     if not fractional:
-        xp = photon_splitter.xp
         reference = xp.random.default_rng(19).binomial(
             xp.asarray(np.where(observed >= 150, 1, observed)).astype(xp.int64),
             0.5,
         )
         np.testing.assert_array_equal(
-            first[levels < 150], photon_splitter.to_numpy(reference)[levels < 150]
+            first[levels < 150], to_numpy(reference)[levels < 150]
         )
     second = observed - first
     np.testing.assert_allclose(
@@ -65,11 +72,20 @@ def test_matlab_split_matches_independent_distribution_moments(
     )
 
 
-def test_poisson_thinning_produces_independent_half_rate_processes(photon_splitter):
+@pytest.mark.parametrize("array_backend", ["gpu", "host"])
+def test_poisson_thinning_produces_independent_half_rate_processes(
+    cupy_gpu, array_backend
+):
     """Recover independent half-rate Poisson samples through binomial thinning."""
+    from opm_processing.imageprocessing.rlgc import _split_observed_counts
+
+    xp = cupy_gpu if array_backend == "gpu" else np
+    to_numpy = cupy_gpu.asnumpy if array_backend == "gpu" else np.asarray
     count = 400000
     observed = np.random.default_rng(73).poisson(20, count).astype(np.float32)
-    first = photon_splitter.split(observed, seed=131).astype(np.float64)
+    first = to_numpy(
+        _split_observed_counts(xp.asarray(observed), xp.random.default_rng(131))
+    ).astype(np.float64)
     second = observed - first
     for half in [first, second]:
         assert abs(half.mean() - 10) < 6 * np.sqrt(10 / count)

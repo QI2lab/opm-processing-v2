@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from opm_processing.imageprocessing.opmpsf import centered_sensor_axes
 from opm_processing.imageprocessing.opmtools import (
     deskew_coverage,
     deskew_shape_estimator,
@@ -37,20 +38,10 @@ def orthogonal_registration_pair(request, simulation_parameters, registration_sc
     observation = registration_scene((24, 112, 62))
     scene = observation.ground_truth
     microscope = replace(observation.microscope, scan_step_um=geometry["distance"])
-    pixel, angle = microscope.pixel_size_um, np.deg2rad(microscope.angle_deg)
-    center_z = (shape[1] - 1) * pixel * np.sin(angle) / 2
-    center_y = (
-        (shape[0] - 1) * microscope.scan_step_um
-        + (shape[1] - 1) * pixel * np.cos(angle)
-    ) / 2
-    center_x = (shape[2] - 1) * pixel / 2
-    scan = (
-        np.arange(shape[0]) * microscope.scan_step_um
-        - center_y
-        + center_z / np.tan(angle)
+    pixel = microscope.pixel_size_um
+    scan, row, column = centered_sensor_axes(
+        shape, (microscope.scan_step_um, pixel, pixel)
     )
-    row = np.arange(shape[1]) * pixel - center_z / np.sin(angle)
-    column = np.arange(shape[2]) * pixel - center_x
     dose = forward_model(
         scene.density,
         Acquisition(

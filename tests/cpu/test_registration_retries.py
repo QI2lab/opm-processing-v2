@@ -145,7 +145,8 @@ def test_selective_registration_reads_only_target_pair_and_preserves_raw_outlier
 def test_real_depth_peak_outside_guard_band_is_remeasured_and_recovered(
     registration_pair,
     shifted_slab_pair,
-    registration_cache,
+    processing_state,
+    tmp_path,
     depth_error,
     retries,
     automatic,
@@ -163,8 +164,12 @@ def test_real_depth_peak_outside_guard_band_is_remeasured_and_recovered(
         optimization_rel_threshold=0.5,
         optimization_abs_threshold=1.5,
         channel_to_use=0,
+        data=tmp_path / "sample_deskewed.ome.zarr",
+        processing_state=processing_state,
+        reverse_stage_y=True,
+        reverse_stage_z=True,
     )
-    registration_cache(fusion)
+    processing_state.initialize_run(fusion.data, configuration={}, overwrite=True)
     assert fusion.max_registration_shift_zyx[0] == 13
     fusion.register_with_retries()
     if (

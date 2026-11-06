@@ -1,17 +1,21 @@
 """Camera statistics and independent optical source-to-sensor image formation."""
 
 from dataclasses import replace
+from functools import partial
 from itertools import pairwise
 
 import numpy as np
 import pytest
 
+from opm_processing.imageprocessing.opmpsf import (
+    centered_sensor_axes,
+    integrate_camera_pixels,
+)
 from tests.simulation.forward_model import (
     Acquisition,
     camera_psf,
     excitation_field,
     forward_model,
-    sensor_integral,
 )
 from tests.simulation.scenes import acquisition_shape
 
@@ -117,8 +121,16 @@ def test_tilted_sensor_integrates_area_instead_of_point_sampling(
     """Known quadratic irradiance gives exact midpoint error proportional to n^-2."""
     p = replace(microscope_parameters, pixel_samples=pixel_samples)
     case = quadratic_camera_field
-    actual = sensor_integral(
-        case.field, case.axes, case.shape, p, geometry=geometry
+    actual = integrate_camera_pixels(
+        case.field,
+        case.axes,
+        centered_sensor_axes(
+            case.shape, (p.scan_step_um, p.pixel_size_um, p.pixel_size_um)
+        ),
+        pixel_size_um=p.pixel_size_um,
+        theta_deg=p.angle_deg,
+        samples=p.pixel_samples,
+        geometry=geometry,
     ).item()
     # Rotation preserves y²+z². The exact pixel integral of 10+2x²+y²+z² is
     # 10*p²+p^4/4; n midpoint samples undercount it by exactly p^4/(4*n²).
@@ -147,6 +159,9 @@ def test_point_illumination_precedes_emission_blur(
     scene = independent_photon_scene_factory("points", profile)
     p = scene.microscope
     shape = acquisition_shape(scene)
+    native_sensor_axes = centered_sensor_axes(
+        shape, (p.scan_step_um, p.pixel_size_um, p.pixel_size_um)
+    )
     actual = (
         forward_model(
             scene.density,
@@ -170,8 +185,13 @@ def test_point_illumination_precedes_emission_blur(
         shifted_axes = tuple(
             a + c for a, c in zip(axes_with_halo, center[::-1], strict=True)
         )
-        expected += sensor_integral(
-            optical_field, shifted_axes, shape, p
+        expected += integrate_camera_pixels(
+            optical_field,
+            shifted_axes,
+            native_sensor_axes,
+            pixel_size_um=p.pixel_size_um,
+            theta_deg=p.angle_deg,
+            samples=p.pixel_samples,
         ) * excitation_field(
             np.asarray(center[0]),
             scene.illumination_half_width_um,
@@ -210,13 +230,7 @@ def test_point_illumination_precedes_emission_blur(
         shift_xyz[0],
     )
     sensor_axes = tuple(
-        (np.arange(n) - (n - 1) / 2) * step + shift
-        for n, step, shift in zip(
-            shape,
-            (p.scan_step_um, p.pixel_size_um, p.pixel_size_um),
-            shift_syx,
-            strict=True,
-        )
+        axis + shift for axis, shift in zip(native_sensor_axes, shift_syx, strict=True)
     )
     translated = (
         forward_model(
@@ -309,15 +323,18 @@ def test_oblique_pixel_coordinates_match_linear_field(
         case.center[0],
     )
     sensor_axes = tuple(
-        (np.arange(n) - (n - 1) / 2) * d + offset
-        for n, d, offset in zip(case.shape, (step, 0.13, 0.13), shifts, strict=True)
+        axis + offset
+        for axis, offset in zip(
+            centered_sensor_axes(case.shape, (step, 0.13, 0.13)), shifts, strict=True
+        )
     )
-    actual = sensor_integral(
+    actual = integrate_camera_pixels(
         case.field,
         case.axes,
-        case.shape,
-        p,
-        sensor_axes=sensor_axes,
+        sensor_axes,
+        pixel_size_um=p.pixel_size_um,
+        theta_deg=p.angle_deg,
+        samples=p.pixel_samples,
         area_integral=False,
     )
     expected = np.empty(case.shape)
@@ -336,13 +353,21 @@ def test_oblique_pixel_coordinates_match_linear_field(
 def test_optical_grid_convergence(fine_optical_images, step, microscope_parameters):
     """Refine PSF and finite-object grids at the same physical scan positions."""
     p = replace(microscope_parameters, scan_step_um=step, pixel_samples=1)
+    sensor_axes = centered_sensor_axes(
+        (25, 33, 17), (step, p.pixel_size_um, p.pixel_size_um)
+    )
+    sample = partial(
+        integrate_camera_pixels,
+        pixel_size_um=p.pixel_size_um,
+        theta_deg=p.angle_deg,
+        samples=p.pixel_samples,
+        area_integral=False,
+    )
     sampled_psfs, sampled_images = [], []
     for axes, psf, image in fine_optical_images:
-        sampled = sensor_integral(psf, axes, (25, 33, 17), p, area_integral=False)
+        sampled = sample(psf, axes, sensor_axes)
         sampled_psfs.append(sampled / sampled.sum())
-        sampled_images.append(
-            sensor_integral(image, axes, (25, 33, 17), p, area_integral=False)
-        )
+        sampled_images.append(sample(image, axes, sensor_axes))
     for samples in (sampled_psfs, sampled_images):
         reference = samples[-1]
         errors = [
@@ -362,8 +387,14 @@ def test_optical_grid_convergence(fine_optical_images, step, microscope_paramete
         # conditional continuum estimate instead of only the last difference.
         assert estimated_limit_error < 0.02
     if step == 0.8:
-        dense = sensor_integral(
-            image, axes, (33, 33, 17), replace(p, scan_step_um=0.2), area_integral=False
+        dense = sample(
+            image,
+            axes,
+            centered_sensor_axes((33, 33, 17), (0.2, p.pixel_size_um, p.pixel_size_um)),
         )
-        coarse = sensor_integral(image, axes, (9, 33, 17), p, area_integral=False)
+        coarse = sample(
+            image,
+            axes,
+            centered_sensor_axes((9, 33, 17), (step, p.pixel_size_um, p.pixel_size_um)),
+        )
         np.testing.assert_allclose(coarse, dense[::4], rtol=1e-12, atol=1e-12)

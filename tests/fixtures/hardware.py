@@ -10,15 +10,9 @@ import pytest
 @pytest.fixture(scope="module")
 def cupy_gpu():
     """Return CuPy on available CUDA hardware, or honor GPU skip policy."""
-
-    def unavailable(message: str) -> None:
-        """Fail required GPU runs or skip optional GPU runs."""
-        if os.environ.get("OPM_REQUIRE_GPU") == "1":
-            pytest.fail(message, pytrace=False)
-        pytest.skip(message)
-
     import cupy as cp
 
+    message = "CuPy found no CUDA devices"
     try:
         device_count = cp.cuda.runtime.getDeviceCount()
     except cp.cuda.runtime.CUDARuntimeError as error:
@@ -26,9 +20,12 @@ def cupy_gpu():
         # Numerical, allocation, FFT and assertion errors must remain failures.
         if error.status not in (35, 100):  # insufficient driver / no device
             raise
-        unavailable(f"CUDA device discovery failed: {error}")
+        device_count = 0
+        message = f"CUDA device discovery failed: {error}"
     if device_count < 1:
-        unavailable("CuPy found no CUDA devices")
+        if os.environ.get("OPM_REQUIRE_GPU") == "1":
+            pytest.fail(message, pytrace=False)
+        pytest.skip(message)
     device = cp.cuda.Device(0)
     device.use()
     cp.empty(1)
@@ -58,24 +55,6 @@ def cpu_registration_backend(monkeypatch, request):
 
     for name, operator in tilefusion._cpu_registration_backend().items():
         monkeypatch.setattr(tilefusion, name, operator)
-
-
-@pytest.fixture
-def reconstruct(cupy_gpu):
-    """Reconstruct full-grid measurements with the native or acquired-plane solver."""
-    import importlib
-
-    def run(observed, psf, factor=None, **options):
-        """Apply the shared solver to native or selected acquired scan planes."""
-        return importlib.import_module("opm_processing.imageprocessing.rlgc").rlgc(
-            observed if factor is None else observed[::factor],
-            psf,
-            scan_upsample_factor=1 if factor is None else factor,
-            boundary="reflect" if factor is None else "zero",
-            **options,
-        )
-
-    return run
 
 
 @pytest.fixture(scope="module")

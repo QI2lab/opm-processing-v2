@@ -4,6 +4,7 @@ Numerical assertions use production operators, SciPy and the shared simulator.
 """
 
 import importlib
+from functools import partial
 
 import numpy as np
 import pytest
@@ -37,10 +38,7 @@ def test_full_data_rl_update_preserves_uniform_photon_rates(
     shape = tuple(1 << (2 * size).bit_length() for size in optical_setup.psf.shape)
     convolution = solver._Convolution(optical_setup.psf, shape)
 
-    def adjoint(values):
-        """Execute the actual optical transpose on the selected state backend."""
-        return convolution(values, adjoint=True)
-
+    adjoint = partial(convolution, adjoint=True)
     observed = xp.full(shape, observed_count, dtype=xp.float32)
     denominator = xp.full(shape, 45 + variance, dtype=xp.float32)
     sensitivity = adjoint(xp.ones(shape, dtype=xp.float32))
@@ -102,10 +100,10 @@ def test_generated_psf_camera_reconstruction(cupy_gpu, production_point_acquisit
     ],
 )
 @pytest.mark.parametrize("array_backend", ["gpu", "host"])
-def test_gc_stopping_matches_matlab_reference(
+def test_gc_stopping_uses_prescribed_fraction_and_change_limits(
     cupy_gpu, accepted, change, peak, reason, array_backend
 ):
-    """Lock MATLAB's strict bounds, absolute change, zero gate and denominator floor."""
+    """Apply strict fraction/absolute-change bounds, a zero gate and denominator floor."""
     from opm_processing.imageprocessing.rlgc import (
         GC_RELATIVE_CHANGE_LIMIT,
         GC_UPDATED_FRACTION_LIMIT,
@@ -135,21 +133,21 @@ def test_gc_stopping_matches_matlab_reference(
 @pytest.mark.parametrize("camera_mode", (False, True), ids=("ideal", "camera-3000"))
 def test_native_gc_directional_rayleigh_pair(
     cupy_gpu,
-    reconstruct,
     rayleigh_pair,
     optical_setup,
-    camera_exposure,
     factor,
     camera_mode,
     camera_calibration,
     ideal_photon_camera,
 ):
     """Resolve noisy pairs placed at the directional optical first-minimum spacing."""
+    solver = importlib.import_module("opm_processing.imageprocessing.rlgc")
     case = rayleigh_pair
     psf, microscope = optical_setup.psf, optical_setup.microscope
     expectation = case.expectation
     if camera_mode:
-        expectation = camera_exposure(expectation, 3000)
+        expectation = np.asarray(expectation, dtype=np.float64)
+        expectation = expectation * (3000 / float(expectation.max()))
         assert expectation.max() == pytest.approx(3000, rel=2e-15)
         camera = camera_calibration
         observed = digitize(expectation, camera, seed=31)
@@ -161,10 +159,11 @@ def test_native_gc_directional_rayleigh_pair(
             np.float32
         )
         calibrated = observed
-    recovered = reconstruct(
-        calibrated,
+    recovered = solver.rlgc(
+        calibrated if factor is None else calibrated[::factor],
         psf,
-        factor,
+        scan_upsample_factor=1 if factor is None else factor,
+        boundary="reflect" if factor is None else "zero",
         read_noise=camera.read_noise_e if camera_mode else 0,
     )
     baseline = calibrated

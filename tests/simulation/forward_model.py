@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 
 import numpy as np
 from scipy.signal import fftconvolve
@@ -34,9 +34,6 @@ from opm_processing.imageprocessing.opmpsf import (
 )
 from tests.simulation.camera import Camera, digitize
 from tests.simulation.objects import centered_axis
-
-if TYPE_CHECKING:
-    from collections.abc import Sequence
 
 
 @dataclass(frozen=True)
@@ -208,61 +205,6 @@ def emission_psf(
     return axes, psf
 
 
-def sensor_integral(
-    optical_field: np.ndarray,
-    axes: Sequence[np.ndarray],
-    shape: Sequence[int] | None,
-    microscope: Microscope,
-    *,
-    area_integral: bool = True,
-    sensor_axes: Sequence[np.ndarray] | None = None,
-    geometry: str = "oblique",
-) -> np.ndarray:
-    """Pixel quadrature primitive, also used for analytic sensor unit checks.
-
-    Parameters
-    ----------
-    optical_field : numpy.ndarray
-        Blurred Cartesian emission density.
-    axes : sequence of numpy.ndarray
-        Physical Cartesian ZYX grid axes in micrometers.
-    shape : sequence of int or None
-        Requested detector-grid dimensions; None uses sensor_axes.
-    microscope : Microscope
-        Pixel pitch, scan geometry and quadrature settings.
-    area_integral : bool
-        Integrate pixel area when True; otherwise evaluate sampled intensity.
-    sensor_axes : sequence of numpy.ndarray or None
-        Explicit detector coordinates for analytic sampling checks.
-    geometry : str
-        Oblique acquisition or Cartesian detector sampling.
-
-    Returns
-    -------
-    numpy.ndarray
-        Sensor-integrated intensities on the declared acquisition grid.
-    """
-    p = microscope
-    if sensor_axes is None:
-        if shape is None:
-            raise ValueError("Require sensor dimensions or explicit axes")
-        sensor_axes = centered_sensor_axes(
-            shape, (p.scan_step_um, p.pixel_size_um, p.pixel_size_um)
-        )
-    if shape is not None and tuple(shape) != tuple(map(len, sensor_axes)):
-        raise ValueError("Sensor shape and coordinate axes disagree")
-    return integrate_camera_pixels(
-        optical_field,
-        axes,
-        sensor_axes,
-        pixel_size_um=p.pixel_size_um,
-        theta_deg=p.angle_deg,
-        samples=p.pixel_samples,
-        geometry=geometry,
-        area_integral=area_integral,
-    )
-
-
 def camera_psf(microscope: Microscope) -> tuple[np.ndarray, float]:
     """Integrate the simulation's production optical PSF onto the camera grid.
 
@@ -303,7 +245,14 @@ def camera_psf(microscope: Microscope) -> tuple[np.ndarray, float]:
     )
     sensor_axes = centered_sensor_axes(shape, steps)
     probabilities = (
-        sensor_integral(psf, axes, shape, p, sensor_axes=sensor_axes)
+        integrate_camera_pixels(
+            psf,
+            axes,
+            sensor_axes,
+            pixel_size_um=p.pixel_size_um,
+            theta_deg=p.angle_deg,
+            samples=p.pixel_samples,
+        )
         * p.quantum_efficiency
     )
     total = probabilities.sum(dtype=np.float64)
@@ -375,6 +324,23 @@ def forward_model(
         raise ValueError(
             "An additive detector background has no emission-density truth"
         )
+    sensor_axes = metadata.sensor_axes
+    if metadata.output != "irradiance":
+        if sensor_axes is None:
+            if metadata.shape is None:
+                raise ValueError("Require sensor dimensions or explicit axes")
+            sensor_axes = centered_sensor_axes(
+                metadata.shape,
+                (
+                    microscope.scan_step_um,
+                    microscope.pixel_size_um,
+                    microscope.pixel_size_um,
+                ),
+            )
+        if metadata.shape is not None and tuple(metadata.shape) != tuple(
+            map(len, sensor_axes)
+        ):
+            raise ValueError("Sensor shape and coordinate axes disagree")
     budget = metadata.camera_photon_budget
     if budget is not None and (
         len(budget) != 2
@@ -448,12 +414,13 @@ def forward_model(
                 axes, psf_axes, irradiance.shape, strict=True
             )
         )
-        response = sensor_integral(
+        response = integrate_camera_pixels(
             irradiance,
             optical_axes,
-            metadata.shape,
-            microscope,
-            sensor_axes=metadata.sensor_axes,
+            sensor_axes,
+            pixel_size_um=microscope.pixel_size_um,
+            theta_deg=microscope.angle_deg,
+            samples=microscope.pixel_samples,
             geometry=metadata.geometry,
         )
         dose = 1.0

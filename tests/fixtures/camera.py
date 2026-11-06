@@ -13,53 +13,9 @@ def camera_gain_profile():
 
 
 @pytest.fixture(scope="session")
-def camera_exposure():
-    """Set exposure by peak expected detected photons per camera pixel.
-
-    Each detected photon generates one photoelectron. The supplied expectation
-    already includes QE, optical throughput and sensor integration. Scaling it
-    changes the source exposure before the Poisson camera draw, not noisy data.
-    """
-
-    def at_peak(expectation, peak_detected_photons):
-        """Set the declared mean detector exposure before the Poisson draw."""
-        expectation = np.asarray(expectation, dtype=np.float64)
-        maximum = float(expectation.max())
-        if (
-            not np.isfinite(expectation).all()
-            or np.any(expectation < 0)
-            or maximum <= 0
-            or not np.isfinite(peak_detected_photons)
-            or peak_detected_photons <= 0
-        ):
-            raise ValueError("Require positive exposure and finite nonnegative rates")
-        return expectation * (peak_detected_photons / maximum)
-
-    return at_peak
-
-
-@pytest.fixture(scope="session")
 def camera_codes():
     """All recorded uint16 values for physical gain, offset and saturation checks."""
     return np.arange(65536, dtype=np.uint16).reshape(16, 16, 256)
-
-
-@pytest.fixture(params=["gpu", "host"])
-def photon_splitter(cupy_gpu, request):
-    """Run the production split with installed CuPy or NumPy generators."""
-    from opm_processing.imageprocessing import rlgc
-
-    xp = cupy_gpu if request.param == "gpu" else np
-    to_numpy = cupy_gpu.asnumpy if request.param == "gpu" else np.asarray
-
-    def split(observed, seed=19):
-        """Split prescribed observations with a reproducible GPU random generator."""
-        counts = xp.asarray(observed, dtype=xp.float32)
-        rng = xp.random.default_rng(seed)
-        first = rlgc._split_observed_counts(counts, rng)
-        return to_numpy(first)
-
-    return SimpleNamespace(split=split, xp=xp, to_numpy=to_numpy)
 
 
 @pytest.fixture

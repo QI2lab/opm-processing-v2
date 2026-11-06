@@ -2,7 +2,7 @@
 
 import json
 from dataclasses import dataclass, replace
-from functools import lru_cache
+from functools import lru_cache, partial
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -385,13 +385,11 @@ def measured_psf_calibration(tmp_path, optical_setup, psf_format):
     path = tmp_path / f"measured_psf.{psf_format}"
     kernel = optical_setup.psf.copy()
 
-    def write(values):
-        """Replace calibration bytes using the actual NumPy or TIFF serializer."""
-        if psf_format == "npy":
-            np.save(path, values)
-        else:
-            tifffile.imwrite(path, values, photometric="minisblack", metadata=None)
-
+    write = (
+        partial(np.save, path)
+        if psf_format == "npy"
+        else partial(tifffile.imwrite, path, photometric="minisblack", metadata=None)
+    )
     write(kernel)
     return SimpleNamespace(path=path, kernel=kernel, write=write)
 
