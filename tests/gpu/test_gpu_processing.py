@@ -116,10 +116,10 @@ def test_kld_matches_independent_probability_definition(
 
 
 @pytest.mark.parametrize("applied_shift", ((1.0, -2.0, 3.0), (0.6, -2.3, 3.4)))
-def test_gpu_registration_recovers_known_3d_translation(
+def test_exact_signal_registration_recovers_known_3d_translation(
     cupy_gpu, registration_scene, applied_shift
 ):
-    """Recover integer and fractional translations using cuCIM and CUDA SSIM."""
+    """Register noiseless optical means under declared exact signal transforms."""
     cp = cupy_gpu
     try:
         import cucim  # noqa: F401
@@ -130,7 +130,7 @@ def test_gpu_registration_recovers_known_3d_translation(
     if not tilefusion.USING_GPU or tilefusion.xp is not cp:
         pytest.fail("TileFusion silently selected its CPU registration backend")
 
-    fixed = registration_scene((11, 39, 43), seed=22).raw.astype(np.float32)
+    fixed = registration_scene((11, 39, 43), seed=22).means.astype(np.float32)
     applied_shift = np.array(applied_shift, dtype=np.float32)
     if np.any(applied_shift != np.rint(applied_shift)):
         # The Fourier shift defines an exact periodic fractional translation;

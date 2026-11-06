@@ -440,17 +440,21 @@ def test_depth_registration_handles_large_xy_drift(
             output_dtype=np.dtype(np.float32),
         )
         renderer._fuse_by_blocks()
-        covered = np.zeros(pair.truth.shape, bool)
-        for start, volume in zip(pair.starts, pair.volumes, strict=True):
-            covered[
-                tuple(slice(a, a + n) for a, n in zip(start, volume.shape, strict=True))
-            ] = True
+        actual = renderer.fused_ts.read().result()[0, 0]
         np.testing.assert_allclose(
-            renderer.fused_ts.read().result()[0, 0],
-            np.where(covered, pair.truth, 0),
+            actual,
+            pair.expected_pixels,
             rtol=2e-6,
             atol=0,
         )
+        from tests.simulation.camera_likelihood import camera_sampling_accuracy
+
+        camera = pair.observation.scene.microscope.camera
+        photons = np.maximum((actual - camera.offset_adu) * camera.electrons_per_adu, 0)
+        measured = camera_sampling_accuracy(
+            photons, pair.truth, pair.expected_envelope, pair.accuracy_mask
+        )
+        assert measured.accepted, measured
     else:
         assert fusion.pairwise_metrics == {}
         assert "exceeded the ZYX shift limits" in output

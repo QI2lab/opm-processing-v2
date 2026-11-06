@@ -12,14 +12,16 @@ pytestmark = pytest.mark.unit
 @pytest.mark.parametrize("sampling", [(1, 1, 1), (1, 2, 2)])
 @pytest.mark.parametrize("unrelated", [False, True])
 def test_thin_depth_crops_are_registered_and_rescored(
-    registration_scene, sampling, unrelated
+    aperiodic_registration_object, sampling, unrelated
 ):
-    """Recover specimen crops through the real FFT and score unrelated photons poorly."""
-    truth = registration_scene((8, 73, 101), seed=485).raw
+    """Resolve exact unblurred-object crop aliases, independently of camera resolution."""
+    truth = aperiodic_registration_object((8, 73, 101), seed=485)
     fixed = truth[:7, 8:73, :97].astype(np.float32)
     moving = truth[1:8, :65, 4:101].astype(np.float32)
     if unrelated:
-        moving = registration_scene(moving.shape, seed=492).raw.astype(np.float32)
+        moving = aperiodic_registration_object(moving.shape, seed=492).astype(
+            np.float32
+        )
     expected = np.array((1, -8, 4))
     reduced = tuple(block_reduce(a, sampling, np.mean) for a in (fixed, moving))
     mask = block_reduce(np.ones_like(fixed, bool), sampling, np.min)
@@ -37,10 +39,17 @@ def test_thin_depth_crops_are_registered_and_rescored(
         assert score > 0.99
 
 
-def test_alias_selection_scores_both_allowed_real_space_shifts(registration_scene):
-    """A genuine long translation must not be folded to the nearest zero shift."""
-    truth = registration_scene((15, 65, 116), seed=486).raw.astype(np.float32)
+def test_alias_selection_scores_both_allowed_real_space_shifts(
+    aperiodic_registration_object,
+):
+    """Resolve a long exact-object alias with identity global histogram matching."""
+    truth = aperiodic_registration_object(
+        (15, 65, 116), seed=486, equal_column_histograms=True
+    ).astype(np.float32)
     fixed, moving = truth[..., :64], truth[..., 52:116]
+    np.testing.assert_array_equal(np.sort(fixed, axis=None), np.sort(moving, axis=None))
+    # The false -12 alias would compare these unrelated 52-column arrangements.
+    assert not np.array_equal(fixed[..., :52], moving[..., 12:])
 
     shift, score = tilefusion.TileFusion.register_and_score(
         fixed,
@@ -55,10 +64,10 @@ def test_alias_selection_scores_both_allowed_real_space_shifts(registration_scen
 
 
 def test_peak_without_an_allowed_periodic_equivalent_stays_out_of_range(
-    registration_scene,
+    aperiodic_registration_object,
 ):
     """Unwrapping must not clamp a genuinely excessive translation to a limit."""
-    truth = registration_scene((7, 17, 84), seed=487).raw.astype(np.float32)
+    truth = aperiodic_registration_object((7, 17, 84), seed=487).astype(np.float32)
     fixed, moving = truth[..., :64], truth[..., 20:84]
 
     shift, _ = tilefusion.TileFusion.register_and_score(

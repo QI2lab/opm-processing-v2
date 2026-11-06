@@ -1,6 +1,6 @@
 """Minimal numerical fusion operators with explicitly supplied geometry and data."""
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from types import SimpleNamespace
 
@@ -12,6 +12,23 @@ from opm_processing.imageprocessing.tilefusion import (
     TileFusion,
     _infer_registration_limits,
 )
+
+
+@dataclass(frozen=True)
+class RegistrationScene:
+    """Immutable emitted object, detector axes and one recorded camera exposure."""
+
+    raw: np.ndarray
+    means: np.ndarray
+    dose: np.ndarray
+    ground_truth: object
+    microscope: object
+    sensor_axes: tuple[np.ndarray, ...]
+
+    def __post_init__(self):
+        """Protect camera and optical data reused by multiple registration units."""
+        for array in (self.raw, self.means, self.dose, *self.sensor_axes):
+            array.setflags(write=False)
 
 
 @pytest.fixture
@@ -190,8 +207,8 @@ def registration_scene(microscope_parameters):
     """Render a known fluorescent point specimen with the shared optical model.
 
     A spatially distributed specimen supplies features throughout thin overlaps.
-    Cropping a single detector observation preserves an independently known
-    translation without replacing correlation, SSIM or camera implementations.
+    Exact signal units use the original object or noiseless optical means;
+    physical translations obtain independent exposures from the same dose.
     """
     from tests.simulation.forward_model import Acquisition, forward_model
     from tests.simulation.scenes import prepare_scene
@@ -219,25 +236,118 @@ def registration_scene(microscope_parameters):
                 "features": {"centers_xyz_um": centers[:, ::-1].tolist()},
             },
         )
-        raw = forward_model(
+        sensor_axes = tuple(
+            (np.arange(size) - (size - 1) / 2) * distance
+            for size, distance in zip(shape, spacing, strict=True)
+        )
+        dose = forward_model(
             scene.density,
             Acquisition(
                 scene.axes,
                 shape,
                 geometry="cartesian",
                 camera_photon_budget=(1000, 30),
-                seed=seed,
+                output="object",
             ),
             microscope,
         )
-        return SimpleNamespace(raw=raw, ground_truth=scene, microscope=microscope)
+        means = forward_model(
+            dose,
+            Acquisition(scene.axes, shape, geometry="cartesian", output="expectation"),
+            microscope,
+        )
+        from tests.simulation.camera import digitize
+
+        raw = digitize(means, microscope.camera, seed=seed)
+        return RegistrationScene(raw, means, dose, scene, microscope, sensor_axes)
 
     return render
 
 
 @pytest.fixture
-def shifted_slab_pair(registration_scene):
-    """Crop known translated slabs from one physical camera observation."""
+def aperiodic_registration_object(registration_scene):
+    """Supply a known unblurred object for exact finite-window FFT alias units."""
+
+    def create(shape, *, seed, equal_column_histograms=False):
+        """Center a declared physical object domain before any camera observation."""
+        scene = registration_scene(shape, seed=seed).ground_truth
+        starts = (np.array(scene.density.shape) - np.asarray(shape)) // 2
+        selection = tuple(
+            slice(start, start + length)
+            for start, length in zip(starts, shape, strict=True)
+        )
+        field = scene.density[selection]
+        assert field.shape == shape and np.any(field > 0)
+        if equal_column_histograms:
+            # This exact alias operand uses permutations of the original known
+            # landmark projection. Each column has the same intensity CDF, so
+            # matching the two windows' global histograms is the identity.
+            # Prescribed permutations vary spatial arrangement along X. These
+            # are known landmark intensities, not camera-noise realizations or
+            # another physical observation.
+            landmarks = field.max(axis=2)
+            arrangements = np.random.default_rng(seed)
+            field = np.stack(
+                [
+                    arrangements.permutation(landmarks.ravel()).reshape(shape[:2])
+                    for _ in range(shape[2])
+                ],
+                axis=2,
+            )
+            field.setflags(write=False)
+        return field
+
+    return create
+
+
+@pytest.fixture
+def registration_observation_pair(registration_scene):
+    """Observe one fixed emission dose on independently digitized sensor grids."""
+    from tests.simulation.camera import digitize
+    from tests.simulation.forward_model import Acquisition, forward_model
+
+    def create(shape, delta, *, seed=51):
+        """Translate actual sensor coordinates without copying a camera-noise field."""
+        delta = np.asarray(delta, int)
+        scene = registration_scene(tuple(np.asarray(shape) + abs(delta)), seed=seed)
+        starts = (np.maximum(0, -delta), np.maximum(0, delta))
+        volumes, means = [], []
+        for index, start in enumerate(starts):
+            axes = tuple(
+                axis[offset : offset + length]
+                for axis, offset, length in zip(
+                    scene.sensor_axes, start, shape, strict=True
+                )
+            )
+            expected = forward_model(
+                scene.dose,
+                Acquisition(
+                    scene.ground_truth.axes,
+                    shape,
+                    sensor_axes=axes,
+                    geometry="cartesian",
+                    output="expectation",
+                ),
+                scene.microscope,
+            )
+            means.append(expected)
+            volumes.append(
+                digitize(expected, scene.microscope.camera, seed=seed + index + 1)
+            )
+        return SimpleNamespace(
+            volumes=tuple(volumes), means=tuple(means), starts=starts, scene=scene
+        )
+
+    return create
+
+
+@pytest.fixture
+def shifted_slab_pair(registration_observation_pair):
+    """Share known translated slabs with independent detector realizations."""
+    from tests.simulation.camera_likelihood import (
+        SamplingEnvelope,
+        camera_sampling_envelope,
+    )
 
     def create(
         shape, nominal_step, correction, *, seed=51, spacing=(0.23, 0.115, 0.115)
@@ -245,28 +355,59 @@ def shifted_slab_pair(registration_scene):
         """Return paired pixels, nominal placement and independent exact shifts."""
         shift = np.asarray(correction, dtype=int)
         delta = shift + np.array((nominal_step, 0, 0))
-        observation = registration_scene(
-            tuple(np.asarray(shape) + abs(delta)), seed=seed
+        observation = registration_observation_pair(shape, delta, seed=seed)
+        union_shape = observation.scene.means.shape
+        total = np.zeros(union_shape, np.float64)
+        count = np.zeros(union_shape, np.uint8)
+        low = np.full(union_shape, np.nan)
+        high = np.full(union_shape, np.nan)
+        rounding = np.full(union_shape, np.nan)
+        for start, raw, expected in zip(
+            observation.starts, observation.volumes, observation.means, strict=True
+        ):
+            selection = tuple(
+                slice(offset, offset + length)
+                for offset, length in zip(start, shape, strict=True)
+            )
+            total[selection] += raw
+            count[selection] += 1
+            bounds = camera_sampling_envelope(
+                expected,
+                raw,
+                observation.scene.microscope.camera,
+                radii=(0, 0, 0),
+                views=2,
+            )
+            low[selection] = np.fmin(low[selection], bounds.lower)
+            high[selection] = np.fmax(high[selection], bounds.upper)
+            rounding[selection] = np.fmax(rounding[selection], bounds.roundoff)
+        # With unity feathering, two coincident measurements have the closed
+        # arithmetic-mean expectation; it is independent of the block renderer.
+        expected_pixels = np.divide(
+            total, count, out=np.zeros_like(total), where=count > 0
         )
-        truth = observation.raw
-        starts = (np.maximum(0, -delta), np.maximum(0, delta))
-        volumes = tuple(
-            truth[
-                tuple(
-                    slice(start, start + length)
-                    for start, length in zip(origin, shape, strict=True)
-                )
-            ]
-            for origin in starts
-        )
+        coordinate_axes = observation.scene.sensor_axes
+        extent = tuple(axis[-1] for axis in coordinate_axes)
+        halo = observation.scene.microscope.psf_half_extent_zyx_um
+        interior = np.ones(union_shape, bool)
+        for dimension, (axis, half_extent, margin) in enumerate(
+            zip(coordinate_axes, extent, halo, strict=True)
+        ):
+            reshape = [1, 1, 1]
+            reshape[dimension] = len(axis)
+            interior &= np.abs(axis).reshape(reshape) < half_extent - margin
         return SimpleNamespace(
-            volumes=volumes,
+            volumes=observation.volumes,
             positions=[(0, 0, 0), (nominal_step * spacing[0], 0, 0)],
             spacing=spacing,
             expected=shift,
-            truth=truth,
-            starts=starts,
+            truth=observation.scene.means,
+            starts=observation.starts,
             observation=observation,
+            expected_pixels=expected_pixels,
+            expected_envelope=SamplingEnvelope(low, high, rounding),
+            covered=count > 0,
+            accuracy_mask=interior & (count > 0),
         )
 
     return create

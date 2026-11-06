@@ -113,7 +113,7 @@ def test_zero_energy_directional_edges_keep_valid_intensity_registration(
     ramp_in_fixed,
 ):
     """Retain valid intensity registration when directional edges have zero energy."""
-    plane = registration_scene((1, 25, 31)).raw[0]
+    plane = registration_scene((1, 25, 31)).means[0]
     fixed = np.broadcast_to(plane, (7, 25, 31)).astype(np.float32).copy()
     moving = np.roll(fixed, 3, axis=2).astype(np.float32)
     if ramp_in_fixed:
@@ -224,11 +224,11 @@ def test_recorded_overlap_changes_allowance_without_changing_pair_geometry():
 
 def test_recorded_depth_overlap_recovers_lateral_pair_beyond_old_z_budget(
     registration_pair,
-    registration_scene,
+    registration_observation_pair,
 ):
     """Recover independent slab sampling with a nine-pixel axial stage error."""
-    truth = registration_scene((80, 96, 160), seed=186).raw.astype(np.float32)
-    volumes = [truth[:64, :, :96], truth[9:73, :, 64:160]]
+    observation = registration_observation_pair((64, 96, 96), (9, 0, 64), seed=186)
+    volumes = observation.volumes
     positions = [(0, 0, 0), (0, 0, 60)]
     limits = _infer_registration_limits(
         positions,
@@ -372,7 +372,7 @@ def test_high_ssim_shared_xy_background_cannot_establish_a_z_registration(
     """Shared shading can have almost perfect SSIM without shared axial features."""
     from tests.simulation.camera import digitize
 
-    background = registration_scene((1, 48, 40)).raw[0]
+    background = registration_scene((1, 48, 40)).means[0]
     fixed = np.broadcast_to(background, (48, 48, 40)).copy()
     moving = fixed.copy()
     if noise:
@@ -402,7 +402,7 @@ def test_similarity_scores_common_geometric_support_and_rejects_unrelated_signal
     registration_scene,
 ):
     """Exclude opposing wedge padding while retaining an independent mismatch check."""
-    truth = registration_scene((21, 45, 37), seed=38).raw.astype(np.float32)
+    truth = registration_scene((21, 45, 37), seed=38).means.astype(np.float32)
     truth[:, 23:26, 17:20] = 0  # Supported dark specimen pixels remain eligible.
     z, y, _x = np.indices(truth.shape)
     fixed_support = y >= z
@@ -412,7 +412,7 @@ def test_similarity_scores_common_geometric_support_and_rejects_unrelated_signal
     moving = np.asarray(truth * moving_support)
     assert _ssim(fixed, moving, 7) < 0.7
     assert _ssim(fixed, moving, 7, valid_mask=common) == pytest.approx(1, abs=1e-6)
-    unrelated = registration_scene(truth.shape, seed=39).raw.astype(np.float32)
+    unrelated = registration_scene(truth.shape, seed=39).means.astype(np.float32)
     assert _ssim(fixed, unrelated, 7, valid_mask=common) < 0.7
 
 
@@ -421,12 +421,12 @@ def test_thin_depth_registration_scores_only_common_planes(
     unrelated, registration_scene
 ):
     """Use matched XY samples when geometric gaps prevent a 3D SSIM window."""
-    truth = registration_scene((5, 45, 37), seed=83).raw.astype(np.float32)
+    truth = registration_scene((5, 45, 37), seed=83).means.astype(np.float32)
     support = np.zeros(truth.shape, bool)
     support[[0, 2, 4], 4:-4, 4:-4] = True
     fixed = np.asarray(truth.astype(np.float32))
     moving = np.asarray(
-        registration_scene(truth.shape, seed=84).raw.astype(np.float32)
+        registration_scene(truth.shape, seed=84).means.astype(np.float32)
         if unrelated
         else truth.astype(np.float32)
     )
