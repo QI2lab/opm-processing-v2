@@ -2,6 +2,13 @@
 
 from __future__ import annotations
 
+import argparse
+import copy
+import hashlib
+import json
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import matplotlib
@@ -10,9 +17,27 @@ import numpy as np
 matplotlib.use("Agg")
 
 if __package__:
+    from scripts.ao_publication_style import write_publication_pupil_grid
+    from scripts.ao_saved_viewing_background import read_saved_viewing_background
+    from scripts.ao_tissue_bigtiff import NativeTissueRaster
+    from scripts.ao_tissue_overlay import write_tissue_overlay
+    from scripts.ao_tissue_rephase import rephase_tissue_bigtiff
+    from scripts.ao_wavekit_phase import (
+        BASIS_VERSION,
+        WAVEKIT_MODE_NM,
+        phase_from_modal_coeff,
+    )
     from scripts.export_ao_overview import Region
+    from scripts.finish_ao_native import load_cached_geometry, load_saved_regions
 else:
+    from ao_publication_style import write_publication_pupil_grid
+    from ao_saved_viewing_background import read_saved_viewing_background
+    from ao_tissue_bigtiff import NativeTissueRaster
+    from ao_tissue_overlay import write_tissue_overlay
+    from ao_tissue_rephase import rephase_tissue_bigtiff
+    from ao_wavekit_phase import BASIS_VERSION, WAVEKIT_MODE_NM, phase_from_modal_coeff
     from export_ao_overview import Region
+    from finish_ao_native import load_cached_geometry, load_saved_regions
 
 
 def relative_regions(
@@ -146,3 +171,205 @@ def relative_regions(
             reference_shape="zero modal coefficients about the configured non-flat voltage reference; physical reference shape is not reconstructed",
         )
     return regions, phase_reference, plotted_records
+
+
+def export_relative(
+    source: Path, output: Path, *, workers: int = 3, include_starting: bool = False
+) -> dict[str, Any]:
+    """Reuse clean viewing backgrounds and native tissue tiles; replace pupil phases."""
+    source, output = source.expanduser().resolve(), output.expanduser().resolve()
+    if source == output or output.is_relative_to(source):
+        raise ValueError("Relative figures must be saved separately from their source")
+    if workers not in (1, 2, 3):
+        raise ValueError("Relative export supports one to three native workers")
+    if output.exists() and any(output.iterdir()):
+        raise FileExistsError(f"Select an empty output directory: {output}")
+    source_path = source / "ao_publication.json"
+    source_bytes = source_path.read_bytes()
+    original = json.loads(source_bytes)
+    if not original.get("native_tissue_overlays", {}).get("full_resolution"):
+        raise ValueError("Relative export requires completed original native overlays")
+    saved = load_saved_regions(original)
+    # The historical reader remains the unchanged data loader. New phase maps
+    # use the modal basis independently checked against offline WaveKit.
+    phase_reader = SimpleNamespace(phase_from_modal_coeff=phase_from_modal_coeff)
+    regions, phase_reference, plotted_records = relative_regions(
+        original, saved, phase_reader, include_starting=include_starting
+    )
+    phase_path = Path(__file__).with_name("ao_wavekit_phase.py")
+    phase_reference["reconstruction"] = {
+        "basis_version": BASIS_VERSION,
+        "signed_nm_modes": [list(pair) for pair in WAVEKIT_MODE_NM],
+        "source": str(phase_path),
+        "source_sha256": hashlib.sha256(phase_path.read_bytes()).hexdigest(),
+        "historical_reader_role": "saved coefficient loading and original aperture verification only",
+    }
+    geometry = load_cached_geometry(source, original)
+    geometry.provenance = {**geometry.provenance, "pupil_reference": phase_reference}
+    depths = sorted({region.depth for region in regions})
+    old_pages = {
+        int(page["depth_index"]): page for page in original["tissue_overlay"]["pages"]
+    }
+    native_pages = {
+        int(page["depth_index"]): page
+        for page in original["native_tissue_overlays"]["pages"]
+    }
+    if set(depths) != set(old_pages) or set(depths) != set(native_pages):
+        raise ValueError("Saved figures and source pupils must contain the same depths")
+    backgrounds, background_records = {}, {}
+    for depth in depths:
+        backgrounds[depth], background_records[depth] = read_saved_viewing_background(
+            Path(old_pages[depth]["svg"]), tuple(old_pages[depth]["pixel_shape_yx"])
+        )
+    shapes = {tuple(image.shape[:2]) for image in backgrounds.values()}
+    if len(shapes) != 1:
+        raise ValueError("Viewing-copy layers must share one canvas")
+    preview_geometry = SimpleNamespace(
+        **{
+            **vars(geometry),
+            "image": backgrounds[depths[0]],
+            "images_by_depth": backgrounds,
+            "depth_offsets": {
+                depth: old_pages[depth]["sample_depth_um"] for depth in depths
+            },
+            "provenance": {
+                **geometry.provenance,
+                "reused_viewing_backgrounds": background_records,
+            },
+        }
+    )
+    output.mkdir(parents=True, exist_ok=True)
+    manifest = copy.deepcopy(original)
+    manifest["source_figure_manifest"] = {
+        "path": str(source_path),
+        "sha256": hashlib.sha256(source_bytes).hexdigest(),
+    }
+    manifest["source_coefficient_state"] = original["coefficient_state"]
+    manifest["coefficient_state"] = (
+        "final" if include_starting else "relative_to_acquisition_start"
+    )
+    if include_starting:
+        manifest["pupil_reconstruction"] = {
+            **phase_reference["reconstruction"],
+            "quantity": phase_reference["quantity"],
+            "coefficient_state": "final",
+            "normalization": "RMS",
+            "samples": 512,
+            "wavelength_nm": float(original["wavelength_nm"]),
+        }
+    manifest["pupil_reference"] = phase_reference
+    manifest["regions"] = plotted_records
+    manifest["grids"] = []
+    reference_path = Path(original["grids"][0]["reference"])
+    for depth in depths:
+        manifest["grids"].append(
+            write_publication_pupil_grid(
+                [region for region in regions if region.depth == depth],
+                output / "pupil_grids",
+                timepoint=original["timepoint"],
+                depth=depth,
+                reference_path=reference_path,
+            )
+        )
+    manifest["tissue_overlay"] = write_tissue_overlay(
+        regions,
+        preview_geometry,
+        output / "previews",
+        timepoint=original["timepoint"],
+        pupil_diameter_um=original["tissue_overlay"]["pupil_display_diameter_um"],
+        scale_bar_um=old_pages[depths[0]]["scale_bar"]["length_um"],
+        planned_grid=True,
+        output_shape_yx=shapes.pop(),
+    )
+    manifest["native_tissue_overlays"] = {"status": "rendering"}
+    manifest_path = output / "ao_publication.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    rasters = {}
+    # Build colormaps serially; only independent TIFF I/O runs in the pool.
+    for depth in depths:
+        old = native_pages[depth]
+        with matplotlib.rc_context({"image.cmap": old["pupil_colormap"]}):
+            raster = NativeTissueRaster(
+                geometry,
+                geometry.images_by_depth[depth],
+                [region for region in regions if region.depth == depth],
+                depth=depth,
+                timepoint=original["timepoint"],
+                pupil_diameter_um=old["pupil_display_diameter_um"],
+                scale_bar_um=old["scale_bar"]["length_um"],
+            )
+            # Identical apertures are required for lossless background reuse.
+            old_raster = NativeTissueRaster(
+                geometry,
+                geometry.images_by_depth[depth],
+                [region for region in saved if region.depth == depth],
+                depth=depth,
+                timepoint=original["timepoint"],
+                pupil_diameter_um=old["pupil_display_diameter_um"],
+                scale_bar_um=old["scale_bar"]["length_um"],
+            )
+        for before, after in zip(old_raster._pupils, raster._pupils, strict=True):
+            if (
+                before["index"] != after["index"]
+                or before["bounds"] != after["bounds"]
+                or not np.array_equal(before["rgba"][..., 3], after["rgba"][..., 3])
+            ):
+                raise ValueError(
+                    "Relative native figures must preserve pupil masks and placement"
+                )
+        rasters[depth] = raster
+
+    def native_depth(depth: int) -> dict[str, Any]:
+        old = native_pages[depth]
+        destination = output / "native" / Path(old["tif"]).name
+        result = rephase_tissue_bigtiff(
+            Path(old["tif"]),
+            destination,
+            rasters[depth],
+            phase_provenance=phase_reference,
+        )
+        return {**old, **result}
+
+    with ThreadPoolExecutor(max_workers=min(workers, len(depths))) as executor:
+        native = list(executor.map(native_depth, depths))
+    if source_path.read_bytes() != source_bytes:
+        raise ValueError("The original figure manifest changed during relative export")
+    manifest["native_tissue_overlays"] = {
+        **original["native_tissue_overlays"],
+        "pages": native,
+        "depth_workers": min(workers, len(depths)),
+        "pupil_reference": phase_reference,
+        "tissue_pixels": "original native RGB pixels retained exactly outside pupil masks",
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    print(f"Saved relative AO figures: {output}", flush=True)
+    return manifest
+
+
+def main() -> None:
+    """Make separately saved relative AO figures from completed native overlays."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "source", type=Path, help="Completed original ao_images directory"
+    )
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--workers", type=int, choices=(1, 2, 3), default=3)
+    parser.add_argument(
+        "--include-starting",
+        action="store_true",
+        help="Plot the full final requested modal state, including correction already present at acquisition start.",
+    )
+    args = parser.parse_args()
+    suffix = "_full_corrected" if args.include_starting else "_relative"
+    output = args.output or args.source.with_name(args.source.name + suffix)
+    export_relative(
+        args.source,
+        output,
+        workers=args.workers,
+        include_starting=args.include_starting,
+    )
+
+
+if __name__ == "__main__":
+    main()
