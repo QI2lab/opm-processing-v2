@@ -1,127 +1,36 @@
-"""Exercise composite-export orchestration with real color and image writers."""
+"""Validate real scalar-cache composition and both exported image formats."""
 
-import hashlib
 import json
 from pathlib import Path
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import tifffile
 from PIL import Image
-from scripts import ao_layer_projections, ao_tissue_geometry, export_ao_overview
-from scripts.ao_tissue_geometry import TissueGeometry
+from scripts import export_ao_overview
 
 pytestmark = pytest.mark.unit
 
 
 def test_composite_cli_reuses_channel_one_cache_and_exports_matching_rgb(
-    tmp_path, monkeypatch
+    ao_composite_case, monkeypatch
 ):
-    """Carry local-channel pixels, ROI provenance and cache identity into both formats."""
-    ao_root = tmp_path / "sample_ao_grid_results"
-    store = ao_root / "time_0_z_0_ao_grid_results" / "grid_pos_0" / "ao_results.zarr"
-    store.mkdir(parents=True)
-    reader_path, reference_path = tmp_path / "reader.py", tmp_path / "reference.py"
-    reader_path.write_text("# Approved reader fixture\n", encoding="utf-8")
-    reference_path.write_text("# SJS plotting reference fixture\n", encoding="utf-8")
-    output = tmp_path / "export"
-    starting = np.linspace(-0.1234567, 0.2345678, 32)
-    final = starting + 0.0123456
-
-    class Result:
-        def __init__(self, path, time, position):
-            self.zarr_path = path
-            self.starting_coefficients = starting
-            self.final_coefficients = final
-
-        def get_pupil(self, **kwargs):
-            assert kwargs == {
-                "coefficient_state": "final",
-                "samples": 512,
-                "norm": True,
-                "wavelength": 0.488,
-                "out": "radians",
-            }
-            return np.ma.zeros((8, 8))
-
-    monkeypatch.setattr(
-        export_ao_overview,
-        "load_reference",
-        lambda path: SimpleNamespace(AOOptimizationResult=Result),
-    )
-    geometry = TissueGeometry(
-        image=np.empty((0, 0), np.uint16),
-        shape_yx=(100, 100),
-        origin_yx_um=(0.5, 0.5),
-        scale_yx_um=(1, 1),
-        preview_origin_yx_um=(0.5, 0.5),
-        preview_scale_yx_um=(1, 1),
-        extent_yx_um=(0, 100, 0, 100),
-        centers_by_depth_index={0: {0: (50, 50)}},
-        depth_offsets={0: 0},
-        provenance={"full_resolution": True},
-        planned_centers_by_depth_index={0: {0: (50, 50)}},
-        planned_grid_by_depth_index={0: {"horizontal_y_um": [], "vertical_x_um": []}},
-    )
-    geometry_calls = []
-
-    def read_geometry(root, projection, timepoint, channel, regions, **kwargs):
-        geometry_calls.append((timepoint, channel, kwargs))
-        return geometry
-
-    monkeypatch.setattr(ao_tissue_geometry, "read_tissue_geometry", read_geometry)
-    layers = {channel: np.zeros((100, 100), np.uint16) for channel in (0, 1, 3)}
-    layers[0][:, :30] = 100
-    layers[1][:, 35:65] = 200
-    layers[3][:, 70:] = 400
-    hashes = {
-        str(channel): hashlib.sha256(image.tobytes()).hexdigest()
-        for channel, image in layers.items()
-    }
-    requests = []
-
-    def read_projections(geometry, *, timepoint, channel, depths, cache_dir):
-        assert timepoint == 0 and depths == [0]
-        requests.append((channel, Path(cache_dir)))
-        return {0: layers[channel]}, {
-            0: {
-                "channel": channel,
-                "depth_index": 0,
-                "aggregate_z_start_stop": [2, 8],
-                "tile_rois": [
-                    {
-                        "position_index": 0,
-                        "registered_voxel_box_zyx": [[2, 8], [0, 100], [0, 100]],
-                    }
-                ],
-                "mip_sha256": hashes[str(channel)],
-                "projection_cache": str(Path(cache_dir) / f"layer_c{channel}.npy"),
-                "projection_cache_fingerprint": f"source-and-roi-channel-{channel}",
-                "resumed_xy_blocks": 1 if channel == 1 else 0,
-                "shared_volume_read_bytes": 0
-                if channel == 1
-                else layers[channel].nbytes,
-            }
-        }
-
-    monkeypatch.setattr(
-        ao_layer_projections, "read_layer_projections", read_projections
-    )
+    """Prescribed spectral bands survive local projection, cache reuse and encoding."""
+    case = ao_composite_case
+    output, hashes = case.output, case.hashes
     monkeypatch.setattr(
         "sys.argv",
         [
             "export_ao_overview.py",
-            str(tmp_path),
+            str(case.root),
             "--ao-root",
-            str(ao_root),
-            "--ao-reader",
-            str(reader_path),
-            "--plot-reference",
-            str(reference_path),
+            str(case.ao_root),
+            "--projection",
+            str(case.preview),
             "--output",
             str(output),
             "--planned-grid",
+            "--overwrite",
             "--composite-channels",
             "0",
             "1",
@@ -136,31 +45,24 @@ def test_composite_cli_reuses_channel_one_cache_and_exports_matching_rgb(
     )
     export_ao_overview.main()
 
-    assert geometry_calls == [
-        (0, 0, {"planned_grid": True, "full_resolution": True, "load_image": False})
-    ]
-    assert requests == [
-        (1, output / "projection_cache"),
-        (0, output / "projection_cache_channel_0"),
-        (3, output / "projection_cache_channel_3"),
-    ]
     manifest = json.loads((output / "ao_publication.json").read_text("utf-8"))
     np.testing.assert_array_equal(
-        manifest["regions"][0]["starting_coefficients"], starting
+        manifest["regions"][0]["starting_coefficients"], case.starting
     )
-    np.testing.assert_array_equal(manifest["regions"][0]["final_coefficients"], final)
+    np.testing.assert_array_equal(
+        manifest["regions"][0]["final_coefficients"], case.final
+    )
     preview = manifest["tissue_overlay"]["pages"][0]
     native = manifest["native_tissue_overlays"]["pages"][0]
     roi = preview["projection_roi"]
-    assert roi["aggregate_z_start_stop"] == [2, 8]
-    assert roi["tile_rois"] == [
-        {"position_index": 0, "registered_voxel_box_zyx": [[2, 8], [0, 100], [0, 100]]}
-    ]
+    assert roi["aggregate_z_start_stop"] == [0, 2]
+    assert len(roi["tile_rois"]) == 1
+    tile = roi["tile_rois"][0]
+    assert tile["position_index"] == 0
+    assert tile["registered_voxel_box_zyx"] == [[0, 2], [0, 100], [0, 100]]
     assert roi["mip_sha256_by_channel"] == hashes
     assert roi["resumed_xy_blocks_by_channel"] == {"0": 0, "1": 1, "3": 0}
-    assert roi["projection_cache_by_channel"]["1"] == str(
-        output / "projection_cache" / "layer_c1.npy"
-    )
+    assert Path(roi["projection_cache_by_channel"]["1"]).is_file()
     assert "channel" not in roi and "mip_sha256" not in roi
     assert native["projection_roi"] == roi
     assert native["background_rgb_passthrough"] is True
