@@ -7,7 +7,12 @@ import numpy as np
 import pytest
 
 from tests.simulation.camera import digitize
-from tests.simulation.metrics import predictive_deviance
+from tests.simulation.metrics import (
+    camera_flux_accuracy,
+    camera_partition_apertures,
+    camera_prediction,
+    predictive_deviance,
+)
 
 
 @pytest.mark.integration
@@ -280,6 +285,11 @@ def test_roi_deconvolves_recorded_sampling(
         ) < predictive_deviance(
             baseline, expected, kernel, boundary=boundary, selection=selection
         )
+        prediction = camera_prediction(recovered, kernel, boundary=boundary)[::factor]
+        for aperture in camera_partition_apertures(expected_native.shape):
+            assert camera_flux_accuracy(
+                prediction, expected_native, case.microscope.camera, aperture
+            ), "ROI reconstruction changed known original photon counts"
     assert (
         configuration["configuration"]["deconvolution"].get("scan_upsample_factor", 1)
         == factor
@@ -307,18 +317,39 @@ def test_roi_deconvolves_recorded_sampling(
     "roi_preview", [("mirror", 1, False), ("stage", 2, False)], indirect=True
 )
 def test_roi_cli_deconvolves_every_timepoint_and_channel(
-    cupy_gpu, roi_preview, invoke_cli, monkeypatch, tmp_path
+    cupy_gpu,
+    roi_preview,
+    invoke_cli,
+    monkeypatch,
+    tmp_path,
+    assert_roi_point_locations,
+    assert_reconstruction_storage,
 ):
     """Retain all measured spectral/time samples through physical-PSF ROI RLGC."""
+    from yaozarrs import open_group
+
     from opm_processing import export_rois
     from opm_processing.dataio.deconvolution import scan_upsample_from_metadata
     from opm_processing.dataio.position_collection import open_image_array
     from opm_processing.dataio.processing_state import ProcessingState
+    from tests.simulation.metrics import (
+        camera_noise_accuracy,
+        camera_object_apertures,
+        camera_prediction,
+    )
 
     case = roi_preview
     solver = importlib.import_module("opm_processing.imageprocessing.rlgc")
     solve_chunk = solver._rlgc_once
     chunks = []
+    solutions = []
+    reconstruct = solver.rlgc
+
+    def observe_solution(image, psf, *args, **kwargs):
+        """Retain real inverse solutions and their generated optical kernels."""
+        result = reconstruct(image, psf, *args, **kwargs)
+        solutions.append((result.copy(), np.asarray(psf).copy(), kwargs["boundary"]))
+        return result
 
     def observe_chunk(image, psf, *args, **kwargs):
         """Complete the real chunk solver and check its raw camera-space extent."""
@@ -327,7 +358,10 @@ def test_roi_cli_deconvolves_every_timepoint_and_channel(
         return result
 
     monkeypatch.setattr(solver, "_rlgc_once", observe_chunk)
-    bounds = (3, 12, 2, 10)
+    monkeypatch.setattr(solver, "rlgc", observe_solution)
+    # Both independently prescribed emitters and their surrounding optical
+    # background lie in this selection; the old corner missed both sources.
+    bounds = (8, 44, 0, 32)
     monkeypatch.setattr(export_rois, "select_rois", lambda source, shape: [bounds])
     destination = tmp_path / "selected"
     invoke_cli(
@@ -361,6 +395,78 @@ def test_roi_cli_deconvolves_every_timepoint_and_channel(
             assert shape[0] <= min(raw_shape[0], limit + int(factor > 1))
     settings = state.run(tiles)["configuration"]["deconvolution"]
     assert settings["read_noise"] == 0
+    records = state.roi_series(tiles)
+    assert len(solutions) == 2 * case.positions * 2
+    apertures = camera_object_apertures(
+        case.truth.ground_truth, case.truth.microscope, raw_shape
+    )
+    metadata = open_group(directory / "sample_fused.ome.zarr").ome_metadata()
+    saved_grid = metadata.multiscales[0].datasets[0]
+    origin = saved_grid.translation_transform.translation[-3:]
+    spacing = saved_grid.scale_transform.scale[-3:]
+    assert_roi_point_locations(
+        image, case.truth, origin, spacing, raw_origin=case.raw_origin_zyx_um
+    )
+    for _, generated, _ in solutions:
+        np.testing.assert_array_equal(generated, solutions[0][1])
+    for (record, channel), (recovered, kernel, boundary) in zip(
+        ((record, channel) for record in records for channel in range(2)),
+        solutions,
+        strict=True,
+    ):
+        time, position = record["time_index"], record["position_index"]
+        start, stop, x0, x1 = record["skewed_bounds_sx"]
+        truth = case.truth.means[time, position, channel, start:stop, :, x0:x1]
+        kernel /= kernel.sum()
+        boundary = "constant" if boundary == "zero" else boundary
+        prediction = camera_prediction(recovered, kernel, boundary=boundary)[::factor]
+        for index, aperture in enumerate(apertures):
+            selected = aperture[start:stop, :, x0:x1]
+            if index < 2:
+                assert selected.any(), "ROI must retain known source and background"
+            if selected.any():
+                accuracy = camera_noise_accuracy(
+                    prediction, truth, case.truth.microscope.camera, selected
+                )
+                assert accuracy.accepted, accuracy
+    expected_origin = np.add(
+        case.raw_origin_zyx_um,
+        (0, bounds[0] * case.truth.microscope.pixel_size_um, 0),
+    )
+    np.testing.assert_allclose(
+        [tile["origin_zyx_um"] for tile in state.registration(tiles)["tiles"]],
+        np.broadcast_to(expected_origin, (len(records), 3)),
+        rtol=0,
+        atol=1e-6,
+    )
+    recovered_by_channel = {
+        (record["time_index"], record["position_index"], channel): result[0]
+        for (record, channel), result in zip(
+            ((record, channel) for record in records for channel in range(2)),
+            solutions,
+            strict=True,
+        )
+    }
+    assert factor == 1
+    assert all(
+        tuple(record["skewed_bounds_sx"]) == (0, raw_shape[0], 0, raw_shape[2])
+        for record in records
+    )
+    # Link final stored pixels to the independently scored inverses without
+    # treating lossy interpolation as a second ideal optical inverse.
+    for time, channel in np.ndindex(image.shape[:2]):
+        assert_reconstruction_storage(
+            image[time, channel],
+            tuple(
+                recovered_by_channel[time, position, channel]
+                for position in range(case.positions)
+            ),
+            origin,
+            spacing,
+            case.raw_origin_zyx_um,
+            case.truth.microscope,
+            apertures[:2],
+        )
 
 
 @pytest.mark.unit
@@ -385,7 +491,7 @@ def test_tiled_consensus_recovers_known_blurred_object(
     storage,
     discrete_optical_case,
 ):
-    """Full and tiled GC improve the likelihood of a known blurred 3D object."""
+    """Three GC updates reduce known-object camera loss on each storage layout."""
     solver = importlib.import_module("opm_processing.imageprocessing.rlgc")
     case = discrete_optical_case
     options = {
@@ -419,8 +525,9 @@ def test_tiled_consensus_recovers_known_blurred_object(
         response=case.response,
     )
     # The GC gate is discontinuous at zero: single-precision FFT roundoff can
-    # change an accepted update. Verify physical accuracy against truth for each
-    # layout; forward/adjoint units separately bound convolution seam error.
+    # change an accepted update. This bounded-iteration unit checks update
+    # progress against original optical truth. Converged photon accuracy is
+    # covered by the point/detector units and complete acquisition workflows.
     for recovered in (whole, tiled):
         assert (
             predictive_deviance(
@@ -572,6 +679,11 @@ def test_detector_response_recovers_point_flux(
     actual = solver.rlgc(
         measured, psf, crop_scan=crop_scan, detector_response=response, verbose=0
     )
+    prediction = camera_prediction(actual, psf, boundary="reflect", response=response)
+    for aperture in case.apertures:
+        assert camera_flux_accuracy(
+            prediction, expectation, ideal_photon_camera, aperture
+        ), "Point reconstruction changed known absolute photon counts"
     assert predictive_deviance(
         actual, expectation, psf, boundary="reflect", response=response
     ) < predictive_deviance(
@@ -630,7 +742,12 @@ def test_saved_fluorescence_with_detector_response(
         """Retain actual solutions and their generated optical measurement model."""
         result = reconstruct(image, psf, *args, **kwargs)
         reconstructions.append(
-            (result.copy(), np.asarray(psf).copy(), kwargs.get("detector_response", 1))
+            (
+                result.copy(),
+                np.asarray(psf).copy(),
+                kwargs.get("detector_response", 1),
+                kwargs.get("boundary", "reflect"),
+            )
         )
         return result
 
@@ -657,7 +774,7 @@ def test_saved_fluorescence_with_detector_response(
     assert settings["psf_sha256"] is None
     records = state.roi_series(case.output)
     assert len(reconstructions) == 1
-    recovered, kernel, response = reconstructions[0]
+    recovered, kernel, response, boundary = reconstructions[0]
     expected = case.means
     if records:
         start, stop, x0, x1 = records[0]["skewed_bounds_sx"]
@@ -667,6 +784,20 @@ def test_saved_fluorescence_with_detector_response(
         kernel = kernel[kernel.shape[0] // 2]
     kernel /= kernel.sum()
     assert recovered.shape == expected.shape
+    from tests.simulation.metrics import camera_noise_accuracy, camera_prediction
+
+    boundary = "constant" if boundary == "zero" else boundary
+    prediction = camera_prediction(
+        recovered, kernel, boundary=boundary, response=response
+    )
+    camera = case.scene.microscope.camera
+    # This is a declared high-count measurement-noise accuracy target, not
+    # an uncertainty claim about individual nonlinear reconstructed pixels.
+    # Fixed detector rows and columns prevent local stripes from cancelling
+    # or being diluted by the whole-camera photon count.
+    for mask in camera_partition_apertures(expected.shape):
+        accuracy = camera_noise_accuracy(prediction, expected, camera, mask)
+        assert accuracy.accepted, accuracy
     # D(0 || prediction) = 2*sum(prediction). Reuse the independent SciPy
     # camera predictor in the existing metric, then test total measured flux
     # against original photon means. This avoids any per-pixel noise claim
@@ -676,12 +807,11 @@ def test_saved_fluorescence_with_detector_response(
             recovered,
             np.zeros_like(recovered),
             kernel,
-            boundary="reflect",
+            boundary=boundary,
             response=response,
         )
         / 2
     )
-    camera = case.scene.microscope.camera
     variance = expected.sum(dtype=np.float64) + expected.size * (
         camera.read_noise_e**2 + camera.electrons_per_adu**2 / 12
     )

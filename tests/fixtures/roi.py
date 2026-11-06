@@ -517,7 +517,7 @@ def assert_reconstruction_storage(deskew_geometric_support):
             result = reconstruction_storage_accuracy(
                 sampled, reconstructions, acquired, microscope, spacing, aperture
             )
-            assert result.accepted, result
+            assert result, "Stored camera samples exceed their geometric source bounds"
             results.append(result)
         return tuple(results)
 
