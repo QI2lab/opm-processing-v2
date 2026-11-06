@@ -3,7 +3,6 @@
 import hashlib
 import json
 from threading import Event
-from types import SimpleNamespace
 
 import matplotlib
 import numpy as np
@@ -20,32 +19,9 @@ from scripts.ao_tissue_bigtiff import (
 pytestmark = pytest.mark.unit
 
 
-class _SlicedImage:
-    """Reject whole-image conversion and unexpectedly large source reads."""
-
-    def __init__(self, pixels, max_shape):
-        self.pixels = pixels
-        self.shape, self.dtype = pixels.shape, pixels.dtype
-        self.max_shape = max_shape
-        self.requests = []
-
-    def __array__(self, dtype=None, copy=None):
-        raise AssertionError("Whole-image conversion is forbidden")
-
-    def __getitem__(self, selection):
-        block = self.pixels[selection]
-        assert block.ndim == len(self.shape)
-        if block.ndim == 3:
-            assert block.shape[2] == 3
-        assert all(
-            size <= limit
-            for size, limit in zip(block.shape[:2], self.max_shape, strict=True)
-        )
-        self.requests.append(block.shape)
-        return block
-
-
-def test_streamed_uint16_percentiles_match_interpolated_numpy_quantiles(monkeypatch):
+def test_streamed_uint16_percentiles_match_interpolated_numpy_quantiles(
+    monkeypatch, ao_memmap_source, ao_memmap_reads
+):
     """Histogram rank interpolation agrees with exact percentiles across strips."""
     pixels = np.asarray(
         [
@@ -73,17 +49,19 @@ def test_streamed_uint16_percentiles_match_interpolated_numpy_quantiles(monkeypa
         ],
         dtype=np.uint16,
     ).reshape(3, 7)[:, ::-1]
-    source = _SlicedImage(pixels, (1, 7))
+    source = ao_memmap_source(pixels)
     monkeypatch.setattr(ao_tissue_bigtiff, "_HISTOGRAM_BYTES", 14)
     limits = native_display_limits(source)
     np.testing.assert_allclose(
         limits, np.percentile(pixels, (1, 99.8)), rtol=0, atol=1e-9
     )
     np.testing.assert_allclose(limits, (2.6, 65513.6), rtol=0, atol=1e-9)
-    assert source.requests == [(1, 7)] * 3
+    assert [shape for _, shape in ao_memmap_reads] == [(1, 7)] * 3
 
 
-def test_arbitrary_native_tiles_stitch_without_alpha_or_pupil_seams():
+def test_arbitrary_native_tiles_stitch_without_alpha_or_pupil_seams(
+    ao_memmap_source, ao_memmap_reads, ao_geometry_factory, ao_region_factory
+):
     """Odd render boundaries preserve grid blending and asymmetric SJS colors."""
     pixels = np.full((79, 1001), 100, np.uint16)
     phase = np.repeat(
@@ -93,8 +71,9 @@ def test_arbitrary_native_tiles_stitch_without_alpha_or_pupil_seams():
     yy, xx = np.meshgrid(coordinate, coordinate, indexing="ij")
     mask = xx * xx + yy * yy > 1
     pupil = np.ma.array(phase.copy(), mask=mask.copy())
-    regions = [SimpleNamespace(depth=0, index=0, pupil=pupil)]
-    geometry = SimpleNamespace(
+    regions = [ao_region_factory(depth=0, index=0, pupil=pupil)]
+    geometry = ao_geometry_factory(
+        pixels,
         shape_yx=pixels.shape,
         scale_yx_um=(0.5, 0.25),
         extent_yx_um=(-5, 34.5, 20, 270.25),
@@ -113,7 +92,7 @@ def test_arbitrary_native_tiles_stitch_without_alpha_or_pupil_seams():
         display_limits=(0, 200),
     ).render_tile(0, 79, 0, 1001)
     for block_height, block_width in ((7, 11), (13, 17)):
-        source = _SlicedImage(pixels, (13, 17))
+        source = ao_memmap_source(pixels)
         raster = NativeTissueRaster(
             geometry,
             source,
@@ -129,7 +108,8 @@ def test_arbitrary_native_tiles_stitch_without_alpha_or_pupil_seams():
                 y1, x1 = min(y0 + block_height, 79), min(x0 + block_width, 1001)
                 stitched[y0:y1, x0:x1] = raster.render_tile(y0, y1, x0, x1)
         np.testing.assert_array_equal(stitched, reference)
-        assert source.requests
+        assert all(shape[0] <= 13 and shape[1] <= 17 for _, shape in ao_memmap_reads)
+        assert ao_memmap_reads
         endpoints = np.asarray(raster.metadata()["scale_bar"]["endpoints_yx_um"])
         assert endpoints[1, 1] - endpoints[0, 1] == pytest.approx(10)
 
@@ -154,14 +134,19 @@ def test_arbitrary_native_tiles_stitch_without_alpha_or_pupil_seams():
 
 
 def test_native_tiled_bigtiff_round_trip_preserves_rgb_and_calibration(
-    tmp_path, monkeypatch
+    tmp_path,
+    monkeypatch,
+    ao_memmap_source,
+    ao_memmap_reads,
+    ao_geometry_factory,
+    ao_region_factory,
 ):
     """Lossless edge tiles decode exactly and retain anisotropic pixel calibration."""
     pixels = np.arange(35 * 53, dtype=np.uint16).reshape(35, 53)
-    source = _SlicedImage(pixels, (16, 53))
+    source = ao_memmap_source(pixels)
     mip_hash = hashlib.sha256(pixels.tobytes()).hexdigest()
-    geometry = SimpleNamespace(
-        image=np.empty((0, 0)),
+    geometry = ao_geometry_factory(
+        pixels,
         images_by_depth={2: source},
         shape_yx=pixels.shape,
         scale_yx_um=(0.5, 0.25),
@@ -172,7 +157,7 @@ def test_native_tiled_bigtiff_round_trip_preserves_rgb_and_calibration(
         },
         layer_projection_rois_by_depth={2: {"mip_sha256": mip_hash}},
     )
-    regions = [SimpleNamespace(depth=2, index=0, pupil=np.ma.zeros((8, 8)))]
+    regions = [ao_region_factory(depth=2, index=0, pupil=np.ma.zeros((8, 8)))]
     monkeypatch.setattr(ao_tissue_bigtiff, "TILE_SHAPE", (16, 16))
     monkeypatch.setattr(ao_tissue_bigtiff, "_HISTOGRAM_BYTES", 212)
     expected = NativeTissueRaster(
@@ -216,10 +201,13 @@ def test_native_tiled_bigtiff_round_trip_preserves_rgb_and_calibration(
         assert metadata["AOOverlay"]["source_mip_sha256"] == mip_hash
         assert metadata["AOOverlay"]["depth_index"] == 2
         assert metadata["AOOverlay"]["timepoint"] == 1
-    assert source.requests
+    assert ao_memmap_reads
+    assert all(shape[0] <= 16 and shape[1] <= 53 for _, shape in ao_memmap_reads)
 
 
-def test_rgb_native_tiles_preserve_precomposed_colors_and_transparent_pupil_holes():
+def test_rgb_native_tiles_preserve_precomposed_colors_and_transparent_pupil_holes(
+    ao_memmap_source, ao_memmap_reads, ao_geometry_factory, ao_region_factory
+):
     """Precomposed RGB values survive bounded rendering and arbitrary tile seams."""
     yy, xx = np.indices((41, 67))
     pixels = np.stack(
@@ -234,8 +222,9 @@ def test_rgb_native_tiles_preserve_precomposed_colors_and_transparent_pupil_hole
     mask = np.zeros((8, 8), dtype=bool)
     mask[3:5, 3:5] = True
     pupil = np.ma.array(np.zeros((8, 8)), mask=mask)
-    regions = [SimpleNamespace(depth=0, index=0, pupil=pupil)]
-    geometry = SimpleNamespace(
+    regions = [ao_region_factory(depth=0, index=0, pupil=pupil)]
+    geometry = ao_geometry_factory(
+        pixels,
         shape_yx=(41, 67),
         scale_yx_um=(0.5, 0.25),
         extent_yx_um=(0, 20.5, 0, 16.75),
@@ -248,7 +237,7 @@ def test_rgb_native_tiles_preserve_precomposed_colors_and_transparent_pupil_hole
         geometry, pixels, regions, depth=0, pupil_diameter_um=4, scale_bar_um=3
     ).render_tile(0, 41, 0, 67)
     for block_height, block_width in ((7, 11), (9, 13)):
-        source = _SlicedImage(pixels, (9, 13))
+        source = ao_memmap_source(pixels)
         raster = NativeTissueRaster(
             geometry, source, regions, depth=0, pupil_diameter_um=4, scale_bar_um=3
         )
@@ -258,7 +247,8 @@ def test_rgb_native_tiles_preserve_precomposed_colors_and_transparent_pupil_hole
                 y1, x1 = min(y0 + block_height, 41), min(x0 + block_width, 67)
                 stitched[y0:y1, x0:x1] = raster.render_tile(y0, y1, x0, x1)
         np.testing.assert_array_equal(stitched, expected)
-        assert source.requests
+        assert all(shape[0] <= 9 and shape[1] <= 13 for _, shape in ao_memmap_reads)
+        assert ao_memmap_reads
     for row, column in ((0, 0), (4, 9), (40, 0), (20, 33)):
         # The final point lies in the pupil's explicit transparent central hole.
         np.testing.assert_array_equal(expected[row, column], pixels[row, column])
@@ -266,16 +256,24 @@ def test_rgb_native_tiles_preserve_precomposed_colors_and_transparent_pupil_hole
     np.testing.assert_array_equal(pupil.mask, mask)
 
 
-def test_rgb_native_bigtiff_preserves_composite_channel_colors(tmp_path, monkeypatch):
+def test_rgb_native_bigtiff_preserves_composite_channel_colors(
+    tmp_path,
+    monkeypatch,
+    ao_memmap_source,
+    ao_memmap_reads,
+    ao_geometry_factory,
+    ao_region_factory,
+):
     """Stream magenta, cyan and orange without applying another contrast mapping."""
     pixels = np.empty((35, 53, 3), np.uint8)
     pixels[:, :17] = (255, 0, 255)
     pixels[:, 17:35] = (0, 255, 255)
     pixels[:, 35:] = (255, 128, 0)
-    source = _SlicedImage(pixels, (16, 16))
+    source = ao_memmap_source(pixels)
     channel_hashes = {"0": "0" * 64, "1": "1" * 64, "3": "3" * 64}
     composite = {"channels": [0, 1, 3], "colors": ["magenta", "cyan", "orange"]}
-    geometry = SimpleNamespace(
+    geometry = ao_geometry_factory(
+        pixels,
         shape_yx=(35, 53),
         scale_yx_um=(0.5, 0.25),
         extent_yx_um=(-5, 12.5, 20, 33.25),
@@ -288,17 +286,20 @@ def test_rgb_native_bigtiff_preserves_composite_channel_colors(tmp_path, monkeyp
         layer_projection_rois_by_depth={2: {"mip_sha256_by_channel": channel_hashes}},
         provenance={"tissue_composite": composite},
     )
-    regions = [SimpleNamespace(depth=2, index=0, pupil=np.ma.zeros((8, 8)))]
+    regions = [ao_region_factory(depth=2, index=0, pupil=np.ma.zeros((8, 8)))]
     expected = NativeTissueRaster(
         geometry, pixels, regions, depth=2, pupil_diameter_um=4, scale_bar_um=3
     ).render_tile(0, 35, 0, 53)
 
-    def reject_recontrast(image):
-        raise AssertionError(
-            "Precomposed RGB must bypass grayscale contrast calculation"
-        )
+    contrasts = []
+    real_limits = ao_tissue_bigtiff.native_display_limits
 
-    monkeypatch.setattr(ao_tissue_bigtiff, "native_display_limits", reject_recontrast)
+    def observe_contrast(image):
+        """Execute actual contrast calculation if the RGB path incorrectly requests it."""
+        contrasts.append(image)
+        return real_limits(image)
+
+    monkeypatch.setattr(ao_tissue_bigtiff, "native_display_limits", observe_contrast)
     monkeypatch.setattr(ao_tissue_bigtiff, "TILE_SHAPE", (16, 16))
     record = write_tissue_bigtiffs(
         regions, geometry, tmp_path, timepoint=0, pupil_diameter_um=4, scale_bar_um=3
@@ -318,22 +319,30 @@ def test_rgb_native_bigtiff_preserves_composite_channel_colors(tmp_path, monkeyp
         assert metadata["background_composite"] == composite
         assert metadata["source_channel_mip_sha256"] == channel_hashes
         assert metadata["source_mip_sha256"] is None
-    assert source.requests
+    assert not contrasts
+    assert ao_memmap_reads
+    assert all(shape[0] <= 16 and shape[1] <= 16 for _, shape in ao_memmap_reads)
 
 
 def test_parallel_depth_exports_keep_native_pixels_order_and_source_identity(
-    tmp_path, monkeypatch
+    tmp_path,
+    monkeypatch,
+    ao_memmap_source,
+    ao_memmap_reads,
+    ao_geometry_factory,
+    ao_region_factory,
 ):
     """Independent depth files retain the correct RGB source and stable metadata order."""
     pixels = {depth: np.empty((43, 61, 3), np.uint8) for depth in (2, 0)}
     pixels[0][:] = (210, 20, 70)
     pixels[2][:] = (0, 150, 230)
-    sources = {depth: _SlicedImage(image, (16, 16)) for depth, image in pixels.items()}
+    sources = {depth: ao_memmap_source(image) for depth, image in pixels.items()}
     hashes = {
         depth: hashlib.sha256(image.tobytes()).hexdigest()
         for depth, image in pixels.items()
     }
-    geometry = SimpleNamespace(
+    geometry = ao_geometry_factory(
+        pixels[0],
         shape_yx=(43, 61),
         scale_yx_um=(1, 0.5),
         extent_yx_um=(0, 43, 0, 30.5),
@@ -348,7 +357,7 @@ def test_parallel_depth_exports_keep_native_pixels_order_and_source_identity(
         },
     )
     regions = [
-        SimpleNamespace(depth=depth, index=0, pupil=np.ma.zeros((8, 8)))
+        ao_region_factory(depth=depth, index=0, pupil=np.ma.zeros((8, 8)))
         for depth in (2, 0)
     ]
     second_depth_started = Event()
@@ -394,4 +403,5 @@ def test_parallel_depth_exports_keep_native_pixels_order_and_source_identity(
             assert metadata["timepoint"] == 4
             assert metadata["source_mip_sha256"] == hashes[depth]
         assert page_record["source_mip_sha256"] == hashes[depth]
-        assert sources[depth].requests
+        assert any(name == sources[depth].filename for name, _ in ao_memmap_reads)
+    assert all(shape[0] <= 16 and shape[1] <= 16 for _, shape in ao_memmap_reads)
