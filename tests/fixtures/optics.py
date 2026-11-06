@@ -38,19 +38,12 @@ class CameraObservation:
 
 @dataclass(frozen=True)
 class OpticalSetup:
-    """Immutable calibrated PSF samples, with a fresh installed interpolator."""
+    """Immutable calibrated PSF samples."""
 
     microscope: Microscope
     psf: np.ndarray
     axes: tuple[np.ndarray, ...]
     irradiance: np.ndarray
-
-    @property
-    def field(self):
-        """Build the real interpolator without sharing its mutable configuration."""
-        return RegularGridInterpolator(
-            self.axes, self.irradiance, bounds_error=False, fill_value=0
-        )
 
 
 @dataclass(frozen=True)
@@ -120,13 +113,12 @@ def independent_photon_scene_factory(microscope_parameters, simulation_parameter
     from tests.simulation.scenes import prepare_scene
 
     @lru_cache(maxsize=2)
-    def build(kind="points", profile="uniform"):
+    def build(kind="points"):
         """Reuse physical scenes on the shared calibrated fine grid."""
         return prepare_scene(
             kind,
             microscope_parameters,
             parameters=simulation_parameters["specimens"][kind],
-            illumination_profile=profile,
         )
 
     return build
@@ -292,9 +284,12 @@ def rayleigh_pair(request, optical_setup):
     directions = np.eye(3)
     direction = directions[index]
     radius = np.arange(0, 1.8001, 0.005)
+    field = RegularGridInterpolator(
+        optical_setup.axes, optical_setup.irradiance, bounds_error=False, fill_value=0
+    )
     separations = np.array(
         [
-            first_minimum(radius, optical_setup.field((radius[:, None] * d)[:, ::-1]))
+            first_minimum(radius, field((radius[:, None] * d)[:, ::-1]))
             for d in directions
         ]
     )

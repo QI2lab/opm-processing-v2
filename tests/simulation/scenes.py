@@ -42,7 +42,6 @@ class OpticalScene:
     density: np.ndarray
     psf_axes: tuple[np.ndarray, ...]
     psf_irradiance: np.ndarray
-    illumination_profile: str
     illumination_half_width_um: float
     features: dict
 
@@ -59,7 +58,6 @@ def prepare_scene(
     microscope: Microscope,
     *,
     parameters: dict,
-    illumination_profile: str = "uniform",
 ) -> OpticalScene:
     """Build fine-grid points, paired lines, a hollow sphere or the MATLAB Siemens target.
 
@@ -71,8 +69,6 @@ def prepare_scene(
         Explicit optical and acquisition calibration.
     parameters : dict
         Specimen extent, sampling and feature dimensions.
-    illumination_profile : str
-        Uniform illumination or a positive long-axis edge taper.
 
     Returns
     -------
@@ -90,10 +86,7 @@ def prepare_scene(
         positions = np.column_stack((starts, starts + gaps)).ravel()
         positions -= (positions[0] + positions[-1]) / 2
         features["positions_x_um"] = positions.tolist()
-        if kind == "line-pairs":
-            features["pair_centers_x_um"] = (
-                positions.reshape(-1, 2).mean(axis=1).tolist()
-            )
+        features["pair_centers_x_um"] = positions.reshape(-1, 2).mean(axis=1).tolist()
     elif kind not in ("points", "sphere", "siemens-star"):
         raise ValueError("Unknown specimen kind")
     axes = tuple(centered_axis(extent, spacing) for extent in half_extent)
@@ -135,7 +128,6 @@ def prepare_scene(
         density,
         psf_axes,
         psf,
-        illumination_profile,
         half_width,
         features,
     )

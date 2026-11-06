@@ -156,7 +156,7 @@ def test_point_illumination_precedes_emission_blur(
     independent_photon_scene_factory, profile
 ):
     """Known emitter brightness scales its entire PSF, rather than detected pixels."""
-    scene = independent_photon_scene_factory("points", profile)
+    scene = independent_photon_scene_factory("points")
     p = scene.microscope
     shape = acquisition_shape(scene)
     native_sensor_axes = centered_sensor_axes(

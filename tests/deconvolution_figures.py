@@ -212,7 +212,6 @@ def simulate() -> None:
                         kind,
                         P,
                         parameters=CONFIG["specimens"][kind],
-                        illumination_profile=profile,
                     )
                 shape = acquisition_shape(scene)
                 _, axes = laboratory(np.zeros(shape, np.float32))
