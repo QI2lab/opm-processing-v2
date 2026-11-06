@@ -518,6 +518,76 @@ def _registration_similarity(
         return -math.inf
 
 
+def _registration_rejection_messages(
+    time_index: int,
+    maximum_shift_zyx: Sequence[int],
+    threshold: float,
+    candidates: Sequence[
+        tuple[int, int, tuple[int, int, int], tuple[int, int, int], float]
+    ],
+) -> list[str]:
+    """Describe rejected measurements without conflating bad matches and shift limits.
+
+    Parameters
+    ----------
+    time_index : int
+        Timepoint whose measurements are being reported.
+    maximum_shift_zyx : sequence of int
+        Maximum current correction envelope across the tile pairs.
+    threshold : float
+        Required SSIM, or zero when similarity filtering is disabled.
+    candidates : sequence of tuple
+        Rejected pair indices, measured ZYX correction, pair limits and SSIM.
+
+    Returns
+    -------
+    list of str
+        Separate low-similarity diagnostics and qualifying shift-limit warnings.
+        No registration values or acceptance decisions are modified.
+    """
+    qualifying, low_similarity = [], []
+    for candidate in candidates:
+        (
+            qualifying
+            if threshold == 0 or candidate[-1] >= threshold
+            else low_similarity
+        ).append(candidate)
+    messages = []
+    if low_similarity:
+        messages.append(
+            f"Registration: rejected {len(low_similarity)} "
+            f"low-similarity out-of-range candidates at time index {time_index} "
+            f"(SSIM threshold {threshold:.3f}); these do not trigger shift-limit retries."
+        )
+        for i, j, correction, _limits, similarity in low_similarity:
+            messages.append(
+                f"  Low-similarity link ({i}, {j}): "
+                f"SSIM {similarity:.3f} < {threshold:.3f}; "
+                f"candidate ZYX correction {correction}."
+            )
+    if qualifying:
+        largest = tuple(
+            int(value)
+            for value in np.max(
+                np.abs([candidate[2] for candidate in qualifying]), axis=0
+            )
+        )
+        messages.append(
+            f"Registration warning: {len(qualifying)} "
+            f"{'pair' if len(qualifying) == 1 else 'pairs'} at "
+            f"time index {time_index} exceeded the ZYX shift limits "
+            f"(maximum envelope {tuple(maximum_shift_zyx)} pixels); "
+            f"largest per-axis absolute candidate corrections were {largest}. "
+            "Check --max-registration-shift-zyx if tiles remain misaligned."
+        )
+        for i, j, correction, limits, similarity in qualifying:
+            messages.append(
+                f"  Rejected link ({i}, {j}): ZYX correction {correction}, "
+                f"limits {limits}, SSIM {similarity:.3f}."
+            )
+    return messages
+
+
 def _registration_phase_aliases(
     shift: Sequence[float],
     shape: Sequence[int],
@@ -2665,9 +2735,7 @@ class TileFusion:
                     tuple[int, int, int, float],
                 ] = {}
                 candidate_scores: dict[tuple[int, int], float] = {}
-                rejected_shifts: list[tuple[int, int, int]] = []
                 rejected_links = []
-                low_similarity_links = []
                 pair_specs = []
                 input_itemsize = int(
                     np.dtype(self.position_arrays[0].dtype.numpy_dtype).itemsize
@@ -3057,15 +3125,9 @@ class TileFusion:
                             max_shift,
                             score,
                         )
-                        if th == 0.0 or score >= th:
-                            rejected_shifts.append((dz_s, dy_s, dx_s))
-                            rejected_links.append(
-                                (i, j, (dz_s, dy_s, dx_s), max_shift, score)
-                            )
-                        else:
-                            low_similarity_links.append(
-                                (i, j, (dz_s, dy_s, dx_s), score)
-                            )
+                        rejected_links.append(
+                            (i, j, (dz_s, dy_s, dx_s), max_shift, score)
+                        )
                         if self._debug:
                             print(
                                 "Dropping link (%d, %d) shift=%s exceeds max=%s",
@@ -3088,36 +3150,10 @@ class TileFusion:
                     pending_read_bytes -= int(pair_bytes)
                     fill_read_ahead()
                 progress.close()
-                if low_similarity_links:
-                    print(
-                        f"Registration: rejected {len(low_similarity_links)} "
-                        f"low-similarity out-of-range candidates at time index {t} "
-                        f"(SSIM threshold {th:.3f}); these do not trigger "
-                        "shift-limit retries."
-                    )
-                    for i, j, correction, similarity in low_similarity_links:
-                        print(
-                            f"  Low-similarity link ({i}, {j}): "
-                            f"SSIM {similarity:.3f} < {th:.3f}; "
-                            f"candidate ZYX correction {correction}."
-                        )
-                if rejected_shifts:
-                    largest = tuple(
-                        int(value) for value in np.max(np.abs(rejected_shifts), axis=0)
-                    )
-                    print(
-                        f"Registration warning: {len(rejected_shifts)} "
-                        f"{'pair' if len(rejected_shifts) == 1 else 'pairs'} at "
-                        f"time index {t} exceeded the ZYX shift limits "
-                        f"(maximum envelope {self.max_registration_shift_zyx} pixels); "
-                        f"largest per-axis absolute candidate corrections were {largest}. "
-                        "Check --max-registration-shift-zyx if tiles remain misaligned."
-                    )
-                    for i, j, correction, limits, similarity in rejected_links:
-                        print(
-                            f"  Rejected link ({i}, {j}): ZYX correction {correction}, "
-                            f"limits {limits}, SSIM {similarity:.3f}."
-                        )
+                for message in _registration_rejection_messages(
+                    t, self.max_registration_shift_zyx, th, rejected_links
+                ):
+                    print(message)
                 if self._debug:
                     print(
                         "Registration source cache: TensorStore native LRU, "
