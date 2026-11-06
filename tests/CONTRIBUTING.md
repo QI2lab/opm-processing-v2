@@ -4,6 +4,11 @@ Only unit and integration tests are permitted. Do not add regression checks,
 snapshot tests, or saved outputs from previous runs as expected results. This
 rule applies to test behavior as well as names and markers.
 
+Keep coverage focused on core numerical processing, scientific accuracy and the
+acquisition/storage lifecycle that supports them. Do not test figure generation,
+plot styling, display-image or video rendering, coordinate-repair utilities, or
+legacy-format adapters.
+
 Classify every case as either unit or integration. Unit tests isolate numerical
 operators, decisions, serialization, file formats or GUI coordinate handling.
 Integration tests cover the complete simulated acquisition to final datastore.
@@ -61,8 +66,8 @@ generated optical parameters.
 
 Command integrations must also cover the acquisition's filesystem lifecycle.
 Move or copy real writer outputs before resuming processing, reusing fusion
-registration, regenerating projections, exporting ROIs/TIFFs, inspecting data,
-and encoding movies. Include copies whose original remains accessible, separate
+registration, regenerating numerical projections, exporting ROIs/TIFFs and
+inspecting data. Include copies whose original remains accessible, separate
 raw/output directories, and nested ROI outputs. Preserve the source metadata and
 journals during relocation; reopen the final data at its current location and
 check pixels, physical metadata, and completion. Use the shared relocation
