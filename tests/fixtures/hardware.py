@@ -61,32 +61,9 @@ def cpu_registration_backend(monkeypatch, request):
     """
     if request.node.get_closest_marker("cpu") is None:
         return
-    from scipy import ndimage
-    from skimage.exposure import match_histograms
-    from skimage.measure import block_reduce
-    from skimage.metrics import structural_similarity
-    from skimage.registration import phase_cross_correlation
-    from skimage.registration._masked_phase_cross_correlation import (
-        cross_correlate_masked,
-    )
-
     from opm_processing.imageprocessing import tilefusion
 
-    backend = {
-        "USING_GPU": False,
-        "cp": None,
-        "xp": np,
-        "ssim_cuda": None,
-        "_ssim_cpu": structural_similarity,
-        "match_histograms": match_histograms,
-        "block_reduce": block_reduce,
-        "phase_cross_correlation": phase_cross_correlation,
-        "masked_cross_correlation": cross_correlate_masked,
-        "sobel_filter": ndimage.sobel,
-        "shift_filter": ndimage.shift,
-        "minimum_filter": ndimage.minimum_filter,
-    }
-    for name, operator in backend.items():
+    for name, operator in tilefusion._cpu_registration_backend().items():
         monkeypatch.setattr(tilefusion, name, operator)
 
 

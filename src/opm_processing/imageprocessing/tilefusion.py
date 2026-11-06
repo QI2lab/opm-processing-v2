@@ -99,6 +99,41 @@ _ssim_cpu: Any | None = None
 
 xp: Any = np
 
+
+def _cpu_registration_backend() -> dict[str, Any]:
+    """Load the CPU operators used by registration's production fallback.
+
+    Returns
+    -------
+    dict of str to object
+        Backend flags, NumPy array operations and installed SciPy/skimage
+        operators. Each call returns a fresh set of module bindings.
+    """
+    from scipy import ndimage
+    from skimage.exposure import match_histograms
+    from skimage.measure import block_reduce
+    from skimage.metrics import structural_similarity
+    from skimage.registration import phase_cross_correlation
+    from skimage.registration._masked_phase_cross_correlation import (
+        cross_correlate_masked,
+    )
+
+    return {
+        "USING_GPU": False,
+        "cp": None,
+        "xp": np,
+        "ssim_cuda": None,
+        "_ssim_cpu": structural_similarity,
+        "match_histograms": match_histograms,
+        "block_reduce": block_reduce,
+        "phase_cross_correlation": phase_cross_correlation,
+        "masked_cross_correlation": cross_correlate_masked,
+        "sobel_filter": ndimage.sobel,
+        "shift_filter": ndimage.shift,
+        "minimum_filter": ndimage.minimum_filter,
+    }
+
+
 preload_cuda_libraries()
 
 try:
@@ -129,25 +164,7 @@ try:
 except Exception as error:
     # GPU stack unavailable; fall back to CPU.
     GPU_IMPORT_ERROR = error
-    from scipy.ndimage import minimum_filter as _minimum_filter  # type: ignore
-    from scipy.ndimage import shift as _shift  # type: ignore
-    from scipy.ndimage import sobel as _sobel  # type: ignore
-    from skimage.exposure import match_histograms as _mh  # type: ignore
-    from skimage.measure import block_reduce as _br  # type: ignore
-    from skimage.metrics import structural_similarity as _cpu_ssim  # type: ignore
-    from skimage.registration import phase_cross_correlation as _pcc  # type: ignore
-    from skimage.registration._masked_phase_cross_correlation import (
-        cross_correlate_masked as masked_cross_correlation,
-    )
-
-    match_histograms = _mh
-    block_reduce = _br
-    phase_cross_correlation = _pcc
-    sobel_filter = _sobel
-    shift_filter = _shift
-    minimum_filter = _minimum_filter
-    _ssim_cpu = _cpu_ssim
-    USING_GPU = False
+    globals().update(_cpu_registration_backend())
 
 
 def _default_fusion_workers() -> int:
