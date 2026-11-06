@@ -14,7 +14,6 @@ from opm_processing.dataio.acquisition import (
     open_acquisition_datastore,
 )
 from opm_processing.dataio.position_collection import (
-    create_position_collection,
     open_position_collection,
     update_group_attributes,
 )
@@ -75,22 +74,13 @@ def test_scan_metadata_retains_all_physical_scan_planes(
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("downsample", ["stride", "block_mean"])
 def test_position_collection_multiscales_preserve_spatial_metadata(
-    tmp_path: Path,
-    downsample,
+    spatial_metadata_collection,
 ) -> None:
     """Round micrometer metadata to three decimals and preserve block centers."""
-    path = tmp_path / "precise_projection.ome.zarr"
-    collection = create_position_collection(
-        path,
-        (1, 1, 1, 1, 17, 21),
-        (0.34567, 0.11549, 0.11651),
-        stage_positions=((1.23456, 2.34567, 3.45678),),
-        spatial_offset_um=(4.56789, 5.67891, 6.78912),
-        multiscale_factors_yx=(2, 4),
-        multiscale_downsample=downsample,
-    )
+    collection = spatial_metadata_collection
+    path = collection.path
+    downsample = collection.multiscale_downsample
 
     assert collection.multiscale_factors_yx == (1, 2, 4)
     reduction = np.ceil if downsample == "stride" else np.floor
@@ -293,18 +283,29 @@ def test_single_position_root_image_opens_as_virtual_tpczyx(
 @pytest.mark.integration
 @pytest.mark.parametrize("save_float32", [False, True])
 def test_single_position_mirror_timelapse_preserves_calibrated_fluorescence(
-    calibrated_mirror_timelapse, processing_options, save_float32
+    calibrated_mirror_timelapse,
+    processing_options,
+    save_float32,
+    assert_roi_point_accuracy,
 ):
-    """Reopen all timepoints and compare with the analytical 30-degree Jacobian."""
+    """Reopen each exposure and retain original optical sources in physical coordinates."""
     run = calibrated_mirror_timelapse
     process(root_path=run.path, save_float32=save_float32, **processing_options)
     output = open_position_collection(
         run.path.parent / "single_mirror_deskewed.ome.zarr"
     )
-    assert output.shape[:3] == (3, 1, 1)
+    assert output.shape == (3, 1, 1, *run.shape_zyx)
+    actual = output.arrays[0].read().result()
     dtype = np.float32 if save_float32 else np.uint16
-    for time, expected in enumerate(run.expected):
-        actual = output.arrays[0][time, 0].read().result()
-        assert actual.dtype == dtype
-        np.testing.assert_allclose(actual, expected.astype(dtype), rtol=2e-6, atol=1e-5)
+    assert actual.dtype == dtype
+    np.testing.assert_array_equal(
+        open_acquisition_datastore(run.path).read().result(), run.truth.pixels
+    )
+    assert output.spatial_origins_zyx_um == ((0.0, 0.0, 0.0),)
+    assert_roi_point_accuracy(
+        actual,
+        run.truth,
+        output.spatial_origins_zyx_um[0],
+        output.voxel_size_um,
+    )
     assert "opm_v2" not in output.attributes

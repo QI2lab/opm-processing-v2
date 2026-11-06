@@ -816,26 +816,28 @@ def inspection_case(
 
 
 @pytest.fixture
-def calibrated_mirror_timelapse(simulated_camera, opm_v2_acquisition_factory):
-    """Write three simulated exposures through opm-v2's single-position layout."""
-    from opm_processing.imageprocessing.opmtools import orthogonal_deskew
-
-    raw = np.stack(
-        [simulated_camera((4, 5, 6), exposure=1 + time / 4).raw for time in range(3)]
-    )[:, None, None]
+def calibrated_mirror_timelapse(roi_camera_scene, opm_v2_acquisition_factory):
+    """Write independently noisy exposures containing both original optical emitters."""
+    scene = roi_camera_scene(times=3, shape=(4, 32, 32))
     dataset = opm_v2_acquisition_factory(
-        raw,
+        scene.pixels,
         name="single_mirror",
+        camera_conversion=1.0,
+        stage_positions_zxy=((0.0, 0.0, 0.0),),
         frame_exposure_ms=5.0021029411764706,
     )
-    expected = [
-        orthogonal_deskew(
-            np.maximum(volume.astype(np.float32) - 100, 0) * 0.25,
-            theta=30.0,
-            distance=0.4,
-            pixel_size=0.115,
-            downsample_factor=1,
-        )
-        for volume in raw[:, 0, 0]
-    ]
-    return SimpleNamespace(path=dataset.path, expected=expected)
+    microscope = scene.microscope
+    pixel, angle = microscope.pixel_size_um, np.deg2rad(microscope.angle_deg)
+    scans, rows, columns = scene.pixels.shape[-3:]
+    native_y = int(
+        np.ceil(scans * microscope.scan_step_um / pixel + rows * np.cos(angle))
+    )
+    return SimpleNamespace(
+        path=dataset.path,
+        truth=scene,
+        shape_zyx=(
+            int(np.ceil(rows * np.sin(angle))),
+            (native_y + 3) // 4 * 4,
+            (columns + 3) // 4 * 4,
+        ),
+    )

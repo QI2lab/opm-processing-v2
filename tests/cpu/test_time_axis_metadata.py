@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 
+import numpy as np
 import pytest
 from yaozarrs import open_group
 
@@ -83,7 +84,7 @@ def test_unknown_time_does_not_become_one_second(tmp_path):
 
 @pytest.mark.integration
 def test_processing_propagates_hardware_cadence(
-    calibrated_mirror_timelapse, invoke_cli
+    calibrated_mirror_timelapse, invoke_cli, assert_roi_point_accuracy
 ):
     """Preserve hardware cadence through processing and projection output."""
     raw = calibrated_mirror_timelapse.path
@@ -94,19 +95,26 @@ def test_processing_propagates_hardware_cadence(
         create_fused_max_projection=False,
         z_downsample_level=1,
     )
+    volume = open_position_collection(raw.parent / "single_mirror_deskewed.ome.zarr")
+    pixels = volume.arrays[0].read().result()
+    assert volume.shape == (3, 1, 1, *calibrated_mirror_timelapse.shape_zyx)
+    assert pixels.dtype == np.uint16
+    assert_roi_point_accuracy(
+        pixels,
+        calibrated_mirror_timelapse.truth,
+        volume.spatial_origins_zyx_um[0],
+        volume.voxel_size_um,
+    )
     for name in (
         "single_mirror_deskewed.ome.zarr",
         "single_mirror_max_z_deskewed.ome.zarr",
     ):
         result = open_position_collection(raw.parent / name)
-        import numpy as np
-
-        for time, expected in enumerate(calibrated_mirror_timelapse.expected):
-            expected = expected.astype(np.uint16)
-            if "max_z" in name:
-                expected = expected.max(axis=0, keepdims=True)
+        if "max_z" in name:
+            # The volume first passes original-object accuracy; projection is
+            # then an independent NumPy reduction of those stored observations.
             np.testing.assert_array_equal(
-                result.arrays[0][time, 0].read().result(), expected
+                result.arrays[0].read().result(), np.max(pixels, axis=2, keepdims=True)
             )
         assert result.time_interval_s == pytest.approx(0.020)
         timing = result.attributes["opm_processing"]["timing"]
