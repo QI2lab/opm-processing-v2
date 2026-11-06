@@ -18,6 +18,7 @@ from opm_processing.dataio.processing_state import (
     processing_state_path,
 )
 from opm_processing.dataio.roi import PhysicalRoi
+from opm_processing.imageprocessing.coordinates import STAGE_COORDINATE_VERSION
 from opm_processing.imageprocessing.maxtilefusion import (
     regenerate_fused_max_projection,
 )
@@ -214,6 +215,13 @@ def process_roi(
         else Path(roi_json).expanduser().resolve()
     )
     roi = PhysicalRoi.read(resolved_roi_json)
+    if (
+        "stage" in acquisition.mode.lower()
+        and roi.coordinate_version != STAGE_COORDINATE_VERSION
+    ):
+        raise ValueError(
+            "Stage ROI uses earlier image coordinates. Regenerate the preview and export the ROI again."
+        )
     output_dir = (
         Path(output).expanduser().resolve()
         if output is not None
