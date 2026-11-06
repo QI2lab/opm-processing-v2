@@ -22,83 +22,6 @@ pytestmark = pytest.mark.integration
 
 
 @pytest.mark.parametrize("deconvolve", [False])
-@pytest.mark.parametrize("pipeline_case", [("stage", False, 0.4, None)], indirect=True)
-def test_fuse_output_dir_keeps_registration_with_processed(
-    pipeline_case, invoke_cli, tmp_path, monkeypatch
-):
-    """Render elsewhere from cached registration, preserving pixels and provenance."""
-    case = pipeline_case
-    source = case.processed.parent
-    destination = tmp_path.parent / f"{tmp_path.name}-rendered" / "nested"
-    state_path = source / "pipeline.processing.json"
-    before = ProcessingState.read(state_path).registration(case.processed)
-    expected = open_image_array(case.output).read().result()
-    measurements = []
-    measure = TileFusion.register_and_score
-
-    def observe_measurement(*args, **kwargs):
-        result = measure(*args, **kwargs)
-        measurements.append(result)
-        return result
-
-    monkeypatch.setattr(
-        TileFusion, "register_and_score", staticmethod(observe_measurement)
-    )
-    invoke_cli(
-        "fuse",
-        case.processed,
-        output_dir=destination,
-        blend_pixels=(0, 0, 0),
-        downsample_factors=(1, 1, 1),
-        registration_channel=case.dataset.metadata.shape[2] - 1,
-        ssim_window=3,
-        registration_threshold=0.1,
-        max_registration_shift_zyx=(2, 2, 2),
-        chunk_shape_yx=(16, 16),
-        max_workers=1,
-        normalize_depth_intensity=False,
-    )
-    assert not measurements
-    fused = destination / case.output.name
-    maximum = destination / "pipeline_max_z_fused.ome.zarr"
-    np.testing.assert_array_equal(open_image_array(fused).read().result(), expected)
-    np.testing.assert_array_equal(
-        open_image_array(maximum).read().result(), expected.max(axis=2, keepdims=True)
-    )
-    assert not (destination / state_path.name).exists()
-    assert (source / "pipeline_depth_intensity_gains.json").is_file()
-    assert not (destination / "pipeline_depth_intensity_gains.json").exists()
-    state = ProcessingState.read(state_path)
-    after = state.registration(case.processed)
-    assert after["configuration_sha256"] == before["configuration_sha256"]
-    assert after["pairwise_metrics"] == before["pairwise_metrics"]
-    assert after["tiles"] == before["tiles"]
-    assert state.registered_output_for_fused(fused) == case.processed
-    assert state.registered_output_for_max_projection(maximum) == case.processed
-    footprints = projection_tile_footprints(maximum)
-    assert (
-        len(footprints)
-        == case.dataset.metadata.shape[0] * case.dataset.metadata.shape[1]
-    )
-    _, provenance = load_export_metadata(fused)
-    assert json.loads(provenance["Acquisition"])["path"] == str(case.dataset.path)
-    inspection = json.loads(invoke_cli("inspect-opm", fused).output)
-    assert inspection["raw"]["path"] == str(case.dataset.path)
-    inspection = json.loads(invoke_cli("inspect-opm", destination).output)
-    assert inspection["raw"]["path"] == str(case.dataset.path)
-    invoke_cli(
-        "fuse",
-        case.processed,
-        output_dir=destination,
-        regenerate_max_z=True,
-        max_workers=1,
-    )
-    np.testing.assert_array_equal(
-        open_image_array(maximum).read().result(), expected.max(axis=2, keepdims=True)
-    )
-
-
-@pytest.mark.parametrize("deconvolve", [False])
 @pytest.mark.parametrize(
     "pipeline_case",
     [
@@ -119,6 +42,7 @@ def test_inspection_and_exports_process_simulated_acquisition(
     """Parse real commands and reopen pixels, physical coordinates and timestamps."""
     case = pipeline_case
     metadata = case.dataset.metadata
+    expected_fused = open_image_array(case.output).read().result()
     source = relocate_acquisition(case.dataset.path.parent, copy=copied)
     assert case.dataset.path.exists() == copied
     dataset_path = source / case.dataset.path.name
@@ -126,6 +50,7 @@ def test_inspection_and_exports_process_simulated_acquisition(
     state_path = source / "pipeline.processing.json"
     state = ProcessingState.read(state_path)
     previous_run = deepcopy(state.run(processed))
+    previous_registration = deepcopy(state.registration(processed))
     invoke_cli("process", dataset_path, resume=True, **case.options)
     state = ProcessingState.read(state_path)
     assert state.run(processed) == previous_run
@@ -142,9 +67,11 @@ def test_inspection_and_exports_process_simulated_acquisition(
     monkeypatch.setattr(
         TileFusion, "register_and_score", staticmethod(observe_measurement)
     )
+    output_dir = tmp_path / "rendered/nested" if copied else source
     invoke_cli(
         "fuse",
         source if copied else processed,
+        output_dir=output_dir if copied else None,
         blend_pixels=(0, 0, 0),
         downsample_factors=(1, 1, 1),
         registration_channel=metadata.shape[2] - 1,
@@ -158,13 +85,37 @@ def test_inspection_and_exports_process_simulated_acquisition(
     invoke_cli(
         "fuse",
         source if copied else dataset_path,
+        output_dir=output_dir if copied else None,
         regenerate_max_z=True,
         max_workers=1,
     )
     assert not measurements
-    fused = open_image_array(source / "pipeline_fused.ome.zarr").read().result()
-    maximum = open_image_array(source / "pipeline_max_z_fused.ome.zarr").read().result()
+    fused_path = output_dir / "pipeline_fused.ome.zarr"
+    maximum_path = output_dir / "pipeline_max_z_fused.ome.zarr"
+    fused = open_image_array(fused_path).read().result()
+    maximum = open_image_array(maximum_path).read().result()
+    assert fused.dtype == expected_fused.dtype
+    np.testing.assert_array_equal(fused, expected_fused)
     np.testing.assert_array_equal(maximum, fused.max(axis=2, keepdims=True))
+    state = ProcessingState.read(state_path)
+    registration = state.registration(processed)
+    for key in ("configuration_sha256", "pairwise_metrics", "tiles"):
+        assert registration[key] == previous_registration[key]
+    assert state.registered_output_for_fused(fused_path) == processed
+    assert state.registered_output_for_max_projection(maximum_path) == processed
+    assert (
+        len(projection_tile_footprints(maximum_path))
+        == metadata.shape[0] * metadata.shape[1]
+    )
+    if copied:
+        assert not (output_dir / state_path.name).exists()
+        assert (source / "pipeline_depth_intensity_gains.json").is_file()
+        assert not (output_dir / "pipeline_depth_intensity_gains.json").exists()
+        _, provenance = load_export_metadata(fused_path)
+        assert json.loads(provenance["Acquisition"])["path"] == str(dataset_path)
+        for path in (fused_path, output_dir):
+            report = json.loads(invoke_cli("inspect-opm", path).output)
+            assert report["raw"]["path"] == str(dataset_path)
     assert not confirm_partial_output_resume(
         inspect_acquisition(dataset_path),
         output_dir=source,
@@ -184,12 +135,12 @@ def test_inspection_and_exports_process_simulated_acquisition(
     destination = tmp_path / "ome-tiff"
     invoke_cli(
         "export-ome-tiff",
-        source / case.output.name,
+        fused_path,
         output=destination,
         workers=1 if copied else 2,
     )
     for suffix in ("fused", "max_z_fused"):
-        image = source / f"pipeline_{suffix}.ome.zarr"
+        image = output_dir / f"pipeline_{suffix}.ome.zarr"
         expected = open_image_array(image).read().result()
         with tifffile.TiffFile(destination / f"pipeline_{suffix}.ome.tif") as tif:
             np.testing.assert_array_equal(

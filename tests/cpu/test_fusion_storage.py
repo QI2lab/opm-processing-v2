@@ -3,21 +3,19 @@
 import numpy as np
 import pytest
 from skimage.measure import block_reduce as block_reduce_cpu
-from typer.testing import CliRunner
 from yaozarrs import open_group, v05
 
 from opm_processing.dataio.position_collection import (
     open_image_array,
     open_position_collection,
-    update_group_attributes,
 )
 from opm_processing.dataio.processing_state import (
     ProcessingState,
-    image_processing_state_path,
-    processing_state_image_attributes,
 )
-from opm_processing.fuse import app as fuse_app
-from opm_processing.imageprocessing.maxtilefusion import MaxTileFusion
+from opm_processing.imageprocessing.maxtilefusion import (
+    MaxTileFusion,
+    regenerate_fused_max_projection,
+)
 from opm_processing.imageprocessing.tilefusion import TileFusion
 
 
@@ -134,6 +132,7 @@ def test_max_projection_fusion_writes_centered_multiscales_and_offsets(
 )
 def test_multiscale_storage_round_trip_matches_reference(
     fusion_operator,
+    processing_state,
     tmp_path,
     downsample_method,
     is_2d,
@@ -146,8 +145,8 @@ def test_multiscale_storage_round_trip_matches_reference(
         padded_shape=padded_shape,
         offset_um=(4.51234, -3.01234, 12.25123),
         _pixel_size=(0.81234, 0.51234, 0.25123),
-        time_dim=1,
-        channels=1,
+        time_dim=2,
+        channels=2,
         multiscale_factors=(2, 4),
         _is_2d=is_2d,
         chunk_y=4,
@@ -160,9 +159,9 @@ def test_multiscale_storage_round_trip_matches_reference(
         output_dtype=np.dtype(dtype),
     )
 
-    path = tmp_path / "multiscale.ome.zarr"
+    path = tmp_path / "sample_fused.ome.zarr"
     scale0, fusion.write_block_shape = fusion._prepare_fused_image(path)
-    source_shape = (1, 1, *padded_shape)
+    source_shape = (2, 2, *padded_shape)
     source = np.arange(np.prod(source_shape), dtype=dtype).reshape(source_shape)
     if dtype == np.float32:
         source = source / 4 + np.float32(0.25)
@@ -289,85 +288,48 @@ def test_multiscale_storage_round_trip_matches_reference(
         reopened.attrs["opm_processing_coordinates"]["version"]
         == "stage-endpoint-origin-v1"
     )
-
-
-@pytest.mark.unit
-@pytest.mark.parametrize("external", [False, True])
-def test_regenerate_max_z_flag_preserves_multiscale_pyramid_round_trip(
-    registered_projection_case,
-    external,
-) -> None:
-    """All pyramid levels include photons from every full-resolution Z plane."""
-    case = registered_projection_case
-    output_path = case.output_path
-    options = []
-    if external:
-        destination = case.state_path.parent / "rendered"
-        destination.mkdir()
-        fused_path = case.output_path.parent / "sample_fused.ome.zarr"
-        fused_path = fused_path.rename(destination / fused_path.name)
-        output_path = case.output_path.rename(destination / case.output_path.name)
-        state = ProcessingState.read(case.state_path)
-        state.complete_registration(
-            case.processed_path, fused_path=fused_path, tiles=()
-        )
-        update_group_attributes(
-            fused_path, processing_state_image_attributes(state.path, fused_path)
-        )
-        options = ["--output-dir", str(destination)]
-    result = CliRunner().invoke(
-        fuse_app,
-        [str(case.raw_path), "--regenerate-max-z", "--max-workers", "2", *options],
+    processed = tmp_path / "sample_deskewed.ome.zarr"
+    processing_state.initialize_run(processed, configuration={}, overwrite=True)
+    processing_state.save_registration(processed, configuration={}, pairwise_metrics={})
+    processing_state.complete_registration(processed, fused_path=path, tiles=())
+    projected = regenerate_fused_max_projection(
+        path, tmp_path / "sample_max_z_fused.ome.zarr", max_workers=2
     )
-    assert result.exit_code == 0, result.output
-
-    reopened = open_group(output_path)
-    metadata = reopened.ome_metadata()
-    assert isinstance(metadata, v05.Image)
-    datasets = metadata.multiscales[0].datasets
-    assert [dataset.path for dataset in datasets] == ["0", "1"]
-    projection = case.truth.max(axis=2, keepdims=True)
-    for level, dataset in enumerate(datasets):
-        actual = reopened[dataset.path].to_tensorstore().read().result()
-        factor = 2**level
+    projection = source.max(axis=2, keepdims=True)
+    result = open_group(projected)
+    projected_levels = result.ome_metadata().multiscales[0].datasets
+    assert [level.path for level in projected_levels] == ["0", "1", "2"]
+    for factor, original, level in zip(
+        (1, 2, 4), datasets, projected_levels, strict=True
+    ):
         expected = projection[..., ::factor, ::factor]
-        if case.downsample == "block_mean":
+        if downsample_method == "block_mean":
             expected = np.rint(
                 block_reduce_cpu(
-                    projection,
-                    block_size=(1, 1, 1, factor, factor),
-                    func=np.mean,
+                    projection, block_size=(1, 1, 1, factor, factor), func=np.mean
                 )
-            ).astype(case.truth.dtype)
-        np.testing.assert_array_equal(actual, expected)
+            ).astype(dtype)
+        np.testing.assert_array_equal(
+            result[level.path].to_tensorstore().read().result(), expected
+        )
         np.testing.assert_allclose(
-            dataset.scale_transform.scale,
-            [round(value, 3) for value in case.scales[level]],
+            level.scale_transform.scale,
+            original.scale_transform.scale,
             rtol=0,
             atol=1e-12,
         )
-        assert dataset.translation_transform is not None
-        expected_translation = list(case.translations[level])
-        expected_translation[2] = (
-            case.translations[0][2]
-            + 0.5 * (case.truth.shape[2] - 1) * case.scales[0][2]
+        origin = original.translation_transform.translation.copy()
+        origin[2] = round(
+            recorded_offset[0] + 0.5 * (padded_shape[0] - 1) * recorded_pixel_size[0], 3
         )
-        expected_translation[2:] = [
-            round(value, 3) for value in expected_translation[2:]
-        ]
         np.testing.assert_allclose(
-            dataset.translation_transform.translation,
-            expected_translation,
-            rtol=0,
-            atol=1e-12,
+            level.translation_transform.translation, origin, rtol=0, atol=1e-12
         )
-    if external:
-        assert image_processing_state_path(output_path, "sample") == case.state_path
-    else:
-        assert not any(key.startswith("opm_") for key in reopened.attrs)
-    state = ProcessingState.read(case.state_path)
     assert (
-        state.registered_output_for_max_projection(output_path) == case.processed_path
+        ProcessingState.read(
+            processing_state.path
+        ).registered_output_for_max_projection(projected)
+        == processed
     )
 
 

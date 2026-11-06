@@ -19,62 +19,6 @@ from opm_processing.dataio.processing_state import (
 from opm_processing.imageprocessing.tilefusion import _processed_store_identity
 
 
-@pytest.fixture(
-    params=[
-        ("absolute", True, True, False),
-        ("absolute", True, True, True),
-        ("absolute", False, True, False),
-        ("absolute", False, False, False),
-        ("relative", True, False, False),
-        ("nested", True, False, False),
-        ("nested", False, True, False),
-        ("windows", False, True, False),
-    ],
-    ids=(
-        "external-priority",
-        "copied-live-local-priority",
-        "relocated-absolute",
-        "unavailable-absolute",
-        "relative",
-        "nested-relative",
-        "relocated-nested",
-        "portable-windows-basename",
-    ),
-)
-def store_link_case(request, fs):
-    """Prescribe link provenance and available stores on a shared fake filesystem."""
-    kind, original_exists, local_exists, prefer_local = request.param
-    directory = Path("/store-links/current").resolve()
-    fs.create_dir(directory)
-    local = directory / "sample.ome.zarr"
-    if kind == "absolute":
-        recorded = directory.parent / "original" / local.name
-        original = recorded
-    elif kind == "windows":
-        recorded = Path(r"Z:\unavailable\sample.ome.zarr")
-        original = recorded
-    else:
-        recorded = Path(local.name if kind == "relative" else f"nested/{local.name}")
-        original = directory / recorded
-    if original_exists:
-        fs.create_dir(original)
-        fs.create_file(original / "identity", contents="recorded")
-    if local_exists:
-        fs.create_dir(local)
-        fs.create_file(local / "identity", contents="colocated")
-    expected = (
-        local if local_exists and (prefer_local or not original_exists) else original
-    )
-    return SimpleNamespace(
-        directory=directory,
-        recorded=recorded,
-        prefer_local=prefer_local,
-        expected=expected.resolve(),
-        identity="colocated" if expected == local and local_exists else "recorded",
-        available=original_exists or local_exists,
-    )
-
-
 @pytest.fixture
 def external_journal_image(acquisition_factory, fused_store_factory):
     """Write a raw source and linked fused image through the real storage writers."""

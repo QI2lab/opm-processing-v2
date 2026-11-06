@@ -1,10 +1,7 @@
 """Persist known objects as processed position collections or fused NGFF images."""
 
-from types import SimpleNamespace
-
 import numpy as np
 import pytest
-from skimage.measure import block_reduce
 from yaozarrs.write.v05 import prepare_image
 
 from opm_processing.dataio.ngff import tczyx_image_metadata
@@ -57,8 +54,6 @@ def fused_store_factory(tmp_path):
         name="sample_fused",
         spacing=(1.0, 1.0, 1.0),
         origin=(0.0, 0.0, 0.0),
-        level_origins=None,
-        downsample="stride",
         time_step_s=None,
         time_origin_s=0.0,
         factors=(1,),
@@ -68,22 +63,10 @@ def fused_store_factory(tmp_path):
     ):
         """Write a root image with explicit physical coordinates at each scale."""
         path = tmp_path / f"{name}.ome.zarr"
-        levels = [
-            data[..., ::factor, ::factor, ::factor]
-            if downsample == "stride"
-            else block_reduce(
-                data,
-                block_size=(1, 1, factor, factor, factor),
-                func=np.mean,
-            ).astype(data.dtype)
-            for factor in factors
-        ]
+        levels = [data[..., ::factor, ::factor, ::factor] for factor in factors]
         image = tczyx_image_metadata(
             [tuple(factor * value for value in spacing) for factor in factors],
-            [
-                origin if level_origins is None else level_origins[index]
-                for index in range(len(factors))
-            ],
+            [origin] * len(factors),
             time_interval_s=time_step_s,
             time_origin_s=time_origin_s,
             omero=omero,
@@ -120,59 +103,3 @@ def processed_directory_factory(tmp_path):
         return output_dir
 
     return create
-
-
-@pytest.fixture(params=["stride", "block_mean"])
-def registered_projection_case(
-    request, tmp_path, fused_store_factory, simulated_camera
-):
-    """Persist raw, registered and stale projection pyramids with distinct origins."""
-    downsample = request.param
-    shape = (2, 2, 5, 7, 9) if downsample == "stride" else (2, 2, 6, 8, 10)
-    spacing = (0.81234, 0.51234, 0.25123)
-    origin = (4.51234, -3.01234, 12.25123)
-    origins = (
-        origin,
-        tuple(
-            np.asarray(origin)
-            + (0.5 * np.asarray(spacing) if downsample == "block_mean" else 0)
-        ),
-    )
-    registered = np.broadcast_to(
-        simulated_camera(shape[-3:], geometry="cartesian").raw, shape
-    ).copy()
-    paths = [
-        fused_store_factory(
-            data,
-            name=name,
-            spacing=spacing,
-            level_origins=origins,
-            downsample=downsample,
-            factors=(1, 2),
-            chunks=(1, 1, 2, 4, 5),
-        )
-        for name, data in (
-            ("sample", np.zeros(shape, np.uint16)),
-            ("sample_fused", registered),
-            ("sample_max_z_fused", np.zeros((*shape[:2], 1, *shape[-2:]), np.uint16)),
-        )
-    ]
-    from opm_processing.dataio.processing_state import ProcessingState
-
-    processed_path = tmp_path / "sample_projection.ome.zarr"
-    state = ProcessingState.create(tmp_path / "sample.processing.json", paths[0])
-    state.initialize_run(processed_path, configuration={}, overwrite=True)
-    state.save_registration(processed_path, configuration={}, pairwise_metrics={})
-    state.complete_registration(processed_path, fused_path=paths[1], tiles=())
-    return SimpleNamespace(
-        raw_path=paths[0],
-        output_path=paths[2],
-        processed_path=processed_path,
-        truth=registered,
-        downsample=downsample,
-        scales=tuple(
-            [1.0, 1.0, *(factor * value for value in spacing)] for factor in (1, 2)
-        ),
-        translations=tuple([0.0, 0.0, *origin] for origin in origins),
-        state_path=state.path,
-    )
