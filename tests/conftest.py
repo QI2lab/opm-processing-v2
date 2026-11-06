@@ -10,7 +10,6 @@ pytest_plugins = (
     "tests.fixtures.ao_storage",
     "tests.fixtures.ao_rendering",
     "tests.fixtures.coordinates",
-    "tests.fixtures.legacy",
     "tests.fixtures.acquisition",
     "tests.fixtures.tiling",
     "tests.fixtures.roi",
