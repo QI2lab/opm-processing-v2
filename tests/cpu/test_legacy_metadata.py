@@ -5,8 +5,8 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
-from typing import TYPE_CHECKING
 
+import numpy as np
 import pytest
 
 from opm_processing.dataio.acquisition import (
@@ -15,86 +15,14 @@ from opm_processing.dataio.acquisition import (
 )
 from opm_processing.dataio.legacy_metadata import read_legacy_metadata
 
-if TYPE_CHECKING:
-    from pathlib import Path
-
-
-def _write_raw(
-    path: Path, *, channels: int = 1, direction: int = 1, interleaved: bool = False
-) -> tuple[Path, list[dict]]:
-    """Write only a small legacy journal plus an untouched pixel sentinel."""
-    path.mkdir()
-    shape = [1, 2, channels, 3, 4, 5]
-    states = [False, True, False, channels == 2, False]
-    names = ["488nm", "561nm"][:channels]
-    descriptor = {
-        "zarr_format": 2,
-        "shape": shape,
-        "chunks": [1, 1, 1, 1, 4, 5],
-        "dtype": "<u2",
-        "compressor": {"id": "blosc", "cname": "lz4", "clevel": 5, "shuffle": -1},
-        "fill_value": None,
-        "order": "C",
-        "filters": None,
-        "dimension_separator": "/",
-    }
-    (path / ".zarray").write_text(json.dumps(descriptor))
-    frames = []
-    for p in range(2):
-        pairs = (
-            [(c, z) for z in range(3) for c in range(channels)]
-            if interleaved
-            else [(c, z) for c in range(channels) for z in range(3)]
-        )
-        for c, z in pairs:
-            frames.append(
-                {
-                    "format": "frame-dict",
-                    "exposure_ms": (10.0303823529, 15.02)[c],
-                    "pixel_size_um": 0.115,
-                    "mda_event": {
-                        "index": {"t": 0, "p": p, "c": c, "z": z},
-                        "metadata": {
-                            "DAQ": {
-                                "mode": "stage",
-                                "scan_axis_step_um": 0.4,
-                                "active_channels": states,
-                                "laser_powers": [0, 20, 0, 35, 0],
-                                "exposure_channels_ms": [5, 10.03, 5, 15.02, 5],
-                                "current_channel": names[c],
-                            },
-                            "Camera": {
-                                "exposure_ms": (10.03, 15.02)[c],
-                                "camera_crop_x": 5,
-                                "camera_crop_y": 4,
-                                "offset": 100,
-                                "e_to_ADU": 0.24,
-                            },
-                            "OPM": {
-                                "angle_deg": 30,
-                                "camera_Zstage_orientation": "negative",
-                                "camera_XYstage_orientation": "positive",
-                                "camera_mirror_orientation": "positive",
-                                "excess_scan_positions": 0,
-                            },
-                            "Stage": {
-                                "x_pos": 100.123456 + p * 20 + direction * z * 0.4,
-                                "y_pos": 200.987654,
-                                "z_pos": 30.123456,
-                            },
-                        },
-                    },
-                }
-            )
-    (path / ".zattrs").write_text(json.dumps({"frame_metadatas": frames}))
-    (path / "pixel_sentinel").write_bytes(b"original compressed pixels")
-    return path, frames
-
 
 @pytest.mark.unit
-def test_legacy_frame_mapping_preserves_calibration_geometry_and_source(tmp_path: Path):
+def test_legacy_frame_mapping_preserves_calibration_geometry_and_source(
+    legacy_raw_factory,
+):
     """Correctly label stored C0 from enabled hardware channel 1, without a copy."""
-    raw, original_frames = _write_raw(tmp_path / "legacy.zarr")
+    case = legacy_raw_factory()
+    raw, original_frames = case.path, case.frames
     original_attrs = (raw / ".zattrs").read_bytes()
     result = read_legacy_metadata(raw)
     assert result["shape_tpczyx"] == [1, 2, 1, 3, 4, 5]
@@ -140,18 +68,16 @@ def test_legacy_frame_mapping_preserves_calibration_geometry_and_source(tmp_path
     )
     assert result["report"]["metadata_bytes_read"] == len(original_attrs)
     assert (raw / ".zattrs").read_bytes() == original_attrs
-    assert (raw / "pixel_sentinel").read_bytes() == b"original compressed pixels"
+    np.testing.assert_array_equal(case.array.read().result(), case.data)
 
 
 @pytest.mark.unit
 @pytest.mark.parametrize("interleaved", [False, True])
 def test_legacy_mapping_infers_actual_multichannel_acquisition_order(
-    tmp_path: Path, interleaved
+    legacy_raw_factory, interleaved
 ):
     """Preserve signed scan motion and derive moving-axis order from event order."""
-    raw, _ = _write_raw(
-        tmp_path / "legacy.zarr", channels=2, direction=-1, interleaved=interleaved
-    )
+    raw = legacy_raw_factory(channels=2, direction=-1, interleaved=interleaved).path
     result = read_legacy_metadata(raw)
     order = ["t", "p", "z", "c"] if interleaved else ["t", "p", "c", "z"]
     assert result["root_attributes"]["opm_v2"]["acquisition_order"] == order
@@ -182,10 +108,11 @@ def test_legacy_mapping_infers_actual_multichannel_acquisition_order(
     ],
 )
 def test_legacy_mapping_rejects_metadata_that_cannot_describe_existing_pixels(
-    tmp_path: Path, mutation, message
+    legacy_raw_factory, mutation, message
 ):
     """Do not silently publish a plausible but incorrect acquisition mapping."""
-    raw, frames = _write_raw(tmp_path / "legacy.zarr")
+    case = legacy_raw_factory()
+    raw, frames = case.path, case.frames
     if mutation == "missing":
         frames.pop()
     elif mutation == "duplicate":
@@ -206,9 +133,9 @@ def test_legacy_mapping_rejects_metadata_that_cannot_describe_existing_pixels(
 
 
 @pytest.mark.unit
-def test_legacy_mapping_rejects_unimplemented_multiple_timepoints(tmp_path: Path):
+def test_legacy_mapping_rejects_unimplemented_multiple_timepoints(legacy_raw_factory):
     """Stop explicitly instead of assigning one timepoint's geometry to another."""
-    raw, _ = _write_raw(tmp_path / "legacy.zarr")
+    raw = legacy_raw_factory().path
     descriptor = json.loads((raw / ".zarray").read_text())
     descriptor["shape"][0] = 2
     (raw / ".zarray").write_text(json.dumps(descriptor))

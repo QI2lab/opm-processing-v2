@@ -6,6 +6,7 @@ import pytest
 
 pytest_plugins = (
     "tests.fixtures.hardware",
+    "tests.fixtures.legacy",
     "tests.fixtures.acquisition",
     "tests.fixtures.tiling",
     "tests.fixtures.roi",

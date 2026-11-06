@@ -1,7 +1,5 @@
 """Bio-Formats2Raw virtualization preserves legacy raw image bytes and geometry."""
 
-import hashlib
-import itertools
 import json
 
 import numpy as np
@@ -9,7 +7,6 @@ import pytest
 import refkv
 import refkv.zarr
 import zarr
-from numcodecs import Blosc
 from yaozarrs import open_group, v05
 
 from opm_processing.dataio.acquisition import (
@@ -19,34 +16,16 @@ from opm_processing.dataio.acquisition import (
 )
 from opm_processing.dataio.inspection import inspect_dataset
 from opm_processing.dataio.legacy_reference import map_legacy_acquisition
-from tests.cpu.test_legacy_metadata import _write_raw
-
-
-def _source(tmp_path):
-    raw, _ = _write_raw(tmp_path / "legacy.zarr", channels=2, interleaved=True)
-    shape = (1, 2, 2, 3, 4, 5)
-    data = np.arange(np.prod(shape), dtype=np.uint16).reshape(shape) + 100
-    codec = Blosc(cname="lz4", clevel=5, shuffle=-1)
-    for t, p, c, z in itertools.product(*(range(n) for n in shape[:4])):
-        path = raw / f"{t}/{p}/{c}/{z}/0/0"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(codec.encode(data[t, p, c, z]))
-    return raw, data
-
-
-def _hash_files(root):
-    return {
-        str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
-        for p in root.rglob("*")
-        if p.is_file()
-    }
 
 
 @pytest.mark.unit
-def test_bioformats2raw_mapping_works_through_pipeline_and_refkv(tmp_path):
+def test_reference_archive_preserves_native_pixels_and_bioformats2raw_geometry(
+    tmp_path, legacy_raw_factory, stored_file_bytes
+):
     """Standard virtual hierarchy and the pipeline read identical native pixels."""
-    raw, data = _source(tmp_path)
-    original = _hash_files(raw)
+    case = legacy_raw_factory(channels=2, interleaved=True)
+    raw, data = case.path, case.data
+    original = stored_file_bytes(raw)
     mapped = map_legacy_acquisition(raw, workers=2)
     root = open_group(mapped)
     assert isinstance(root.ome_metadata(), v05.Bf2Raw)
@@ -77,16 +56,18 @@ def test_bioformats2raw_mapping_works_through_pipeline_and_refkv(tmp_path):
     ):
         zarr.open_array(str(mapped / "0/0"), mode="r")
     assert not list(mapped.glob("*/0/c"))
-    assert _hash_files(raw) == original
+    assert stored_file_bytes(raw) == original
     report = json.loads((mapped / "mapping_report.json").read_text())
     assert report["pixel_payload_bytes_copied"] == 0
     assert report["referenced_chunks"] == 12
 
 
 @pytest.mark.unit
-def test_mapper_rejects_missing_raw_chunk_without_publishing(tmp_path):
+def test_mapper_rejects_missing_raw_chunk_without_publishing(
+    tmp_path, legacy_raw_factory
+):
     """Missing data with legacy null fill must never become invented zeros."""
-    raw, _ = _source(tmp_path)
+    raw = legacy_raw_factory(channels=2, interleaved=True).path
     (raw / "0/1/1/2/0/0").unlink()
     with pytest.raises(FileNotFoundError):
         map_legacy_acquisition(raw, workers=2)
@@ -94,9 +75,9 @@ def test_mapper_rejects_missing_raw_chunk_without_publishing(tmp_path):
 
 
 @pytest.mark.unit
-def test_mapper_does_not_overwrite_existing_mapping(tmp_path):
+def test_mapper_does_not_overwrite_existing_mapping(tmp_path, legacy_raw_factory):
     """An existing destination stays unchanged on an accidental second import."""
-    raw, _ = _source(tmp_path)
+    raw = legacy_raw_factory(channels=2, interleaved=True).path
     mapped = tmp_path / "legacy.ome.zarr"
     mapped.mkdir()
     sentinel = mapped / "keep"
