@@ -1,6 +1,6 @@
 """Minimal numerical fusion operators with explicitly supplied geometry and data."""
 
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from functools import lru_cache
 from types import SimpleNamespace
 
@@ -13,23 +13,6 @@ from opm_processing.imageprocessing.tilefusion import (
     TileFusion,
     _infer_registration_limits,
 )
-
-
-@dataclass(frozen=True)
-class RegistrationScene:
-    """Immutable emitted object, detector axes and one recorded camera exposure."""
-
-    raw: np.ndarray
-    means: np.ndarray
-    dose: np.ndarray
-    ground_truth: object
-    microscope: object
-    sensor_axes: tuple[np.ndarray, ...]
-
-    def __post_init__(self):
-        """Protect camera and optical data reused by multiple registration units."""
-        for array in (self.raw, self.means, self.dose, *self.sensor_axes):
-            array.setflags(write=False)
 
 
 @pytest.fixture
@@ -195,8 +178,9 @@ def registration_scene(microscope_parameters):
     Exact signal units use the original object or noiseless optical means;
     physical translations obtain independent exposures from the same dose.
     """
+    from tests.fixtures.optics import CameraObservation
     from tests.simulation.forward_model import Acquisition, forward_model
-    from tests.simulation.scenes import prepare_scene
+    from tests.simulation.scenes import freeze_metadata, prepare_scene
 
     @lru_cache(maxsize=8)
     def render(shape, *, seed=51):
@@ -221,7 +205,6 @@ def registration_scene(microscope_parameters):
                 "features": {"centers_xyz_um": centers[:, ::-1].tolist()},
             },
         )
-        sensor_axes = centered_sensor_axes(shape, spacing)
         dose = forward_model(
             scene.density,
             Acquisition(
@@ -241,7 +224,12 @@ def registration_scene(microscope_parameters):
         from tests.simulation.camera import digitize
 
         raw = digitize(means, microscope.camera, seed=seed)
-        return RegistrationScene(raw, means, dose, scene, microscope, sensor_axes)
+        return CameraObservation(
+            ground_truth=scene,
+            microscope=microscope,
+            expectation=freeze_metadata(means),
+            raw=freeze_metadata(raw),
+        )
 
     return render
 
@@ -286,7 +274,6 @@ def aperiodic_registration_object(registration_scene):
 def registration_observation_pair(registration_scene):
     """Observe one fixed emission dose on independently digitized sensor grids."""
     from tests.simulation.camera import digitize
-    from tests.simulation.forward_model import Acquisition, forward_model
 
     def create(shape, delta, *, seed=51):
         """Translate actual sensor coordinates without copying a camera-noise field."""
@@ -295,23 +282,13 @@ def registration_observation_pair(registration_scene):
         starts = (np.maximum(0, -delta), np.maximum(0, delta))
         volumes, means = [], []
         for index, start in enumerate(starts):
-            axes = tuple(
-                axis[offset : offset + length]
-                for axis, offset, length in zip(
-                    scene.sensor_axes, start, shape, strict=True
-                )
+            selection = tuple(
+                slice(offset, offset + length)
+                for offset, length in zip(start, shape, strict=True)
             )
-            expected = forward_model(
-                scene.dose,
-                Acquisition(
-                    scene.ground_truth.axes,
-                    shape,
-                    sensor_axes=axes,
-                    geometry="cartesian",
-                    output="expectation",
-                ),
-                scene.microscope,
-            )
+            # These are windows on the same calibrated sensor grid. Reuse the
+            # optical means, then draw independent camera noise for each view.
+            expected = scene.expectation[selection]
             means.append(expected)
             volumes.append(
                 digitize(expected, scene.microscope.camera, seed=seed + index + 1)
@@ -338,7 +315,7 @@ def shifted_slab_pair(registration_observation_pair):
         shift = np.asarray(correction, dtype=int)
         delta = shift + np.array((nominal_step, 0, 0))
         observation = registration_observation_pair(shape, delta, seed=seed)
-        union_shape = observation.scene.means.shape
+        union_shape = observation.scene.expectation.shape
         total = np.zeros(union_shape, np.float64)
         count = np.zeros(union_shape, np.uint8)
         low = np.full(union_shape, np.nan)
@@ -366,7 +343,10 @@ def shifted_slab_pair(registration_observation_pair):
         expected_pixels = np.divide(
             total, count, out=np.zeros_like(total), where=count > 0
         )
-        coordinate_axes = observation.scene.sensor_axes
+        microscope = observation.scene.microscope
+        coordinate_axes = centered_sensor_axes(
+            union_shape, (microscope.scan_step_um, *[microscope.pixel_size_um] * 2)
+        )
         extent = tuple(axis[-1] for axis in coordinate_axes)
         halo = observation.scene.microscope.psf_half_extent_zyx_um
         interior = np.ones(union_shape, bool)
@@ -381,7 +361,7 @@ def shifted_slab_pair(registration_observation_pair):
             positions=[(0, 0, 0), (nominal_step * spacing[0], 0, 0)],
             spacing=spacing,
             expected=shift,
-            truth=observation.scene.means,
+            truth=observation.scene.expectation,
             starts=observation.starts,
             observation=observation,
             expected_pixels=expected_pixels,

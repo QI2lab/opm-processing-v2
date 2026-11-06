@@ -93,9 +93,9 @@ def assert_uniform_photon_accuracy():
         native = scene.pixels.shape[-3:]
         if scene.projection:
             assert data.shape[-3:] == native
-            coverage = np.ones(data.shape[-3:])
+            coverage = np.ones(native)
         else:
-            expected_shape, _, _, _ = deskew_shape_estimator(
+            expected_shape, *_ = deskew_shape_estimator(
                 native,
                 microscope.angle_deg,
                 microscope.scan_step_um,
@@ -103,15 +103,17 @@ def assert_uniform_photon_accuracy():
                 crop_after_deskew=False,
             )
             assert data.shape[-3:] == tuple(expected_shape)
-            geometry = {
-                "theta": microscope.angle_deg,
-                "distance": microscope.scan_step_um,
-                "pixel_size": pixel,
-            }
             coverage = np.zeros(data.shape[-3:])
             coverage[..., : native[2]] = deskew_coverage(
-                native, data.shape[-3:], **geometry
+                native,
+                data.shape[-3:],
+                microscope.angle_deg,
+                microscope.scan_step_um,
+                pixel,
             )[..., None]
+        # Gain is the independent 30-degree photon-volume normalization;
+        # coverage only describes the acquisition's geometric support.
+        support = gain * coverage
         camera = microscope.camera
         selected = range(data.shape[1]) if channels is None else channels
         for time in range(data.shape[0]):
@@ -128,23 +130,23 @@ def assert_uniform_photon_accuracy():
                     field,
                 ).astype(np.float64)
                 residual = observed - truth
-                expected = float(truth.flat[0]) * gain * coverage
+                expected = float(truth.flat[0]) * support
                 operations = 64
                 error = operations * np.finfo(np.float32).eps
                 roundoff = error / (1 - error) * max(float(observed.max()), 1) * gain
                 quantum = 0 if data.dtype.kind == "f" else 1
-                low = (float(truth.min()) + residual.min()) * gain * coverage
-                high = (float(truth.max()) + residual.max()) * gain * coverage
+                low = (float(truth.min()) + residual.min()) * support
+                high = (float(truth.max()) + residual.max()) * support
                 envelope = SamplingEnvelope(
                     np.maximum(low - roundoff - quantum, 0),
                     high + roundoff + quantum,
                 )
                 actual = data[time, channel]
                 result = camera_sampling_accuracy(
-                    actual, expected, envelope, coverage > 0
+                    actual, expected, envelope, support > 0
                 )
                 assert result.accepted, result
-                np.testing.assert_array_equal(actual[coverage == 0], 0)
+                np.testing.assert_array_equal(actual[support == 0], 0)
 
     return check
 
@@ -169,22 +171,36 @@ def uniform_optical_calibration():
     """Share immutable uniform-phantom means with excitation applied before blur."""
     from functools import lru_cache
 
+    from opm_processing.imageprocessing.opmpsf import centered_sensor_axes
     from tests.simulation.forward_model import Acquisition, forward_model
     from tests.simulation.objects import centered_axis
 
     @lru_cache(maxsize=12)
-    def create(microscope, shape, profile="uniform", photon_budget=(2000, 0)):
+    def create(
+        microscope,
+        shape,
+        profile="uniform",
+        photon_budget=(2000, 0),
+        *,
+        geometry="oblique",
+    ):
         """Cover the entire sensor footprint and emission-PSF support before sampling."""
-        scans, rows, columns = shape
         pixel = microscope.pixel_size_um
         angle = np.deg2rad(microscope.angle_deg)
-        camera_half_extent = (
-            rows * pixel * np.sin(angle) / 2,
-            ((scans - 1) * microscope.scan_step_um + rows * pixel * np.cos(angle)) / 2,
-            columns * pixel / 2,
+        scan, row, column = centered_sensor_axes(
+            shape, (microscope.scan_step_um, pixel, pixel)
         )
+        if geometry == "oblique":
+            camera_half_extent = (
+                abs(row[0] * np.sin(angle)),
+                abs(scan[0]) + abs(row[0] * np.cos(angle)),
+                abs(column[0]),
+            )
+        else:
+            assert geometry == "cartesian"
+            camera_half_extent = tuple(abs(axis[0]) for axis in (scan, row, column))
         axes = tuple(
-            centered_axis(extent + halo, microscope.fine_spacing_um)
+            centered_axis(extent + halo + pixel, microscope.fine_spacing_um)
             for extent, halo in zip(
                 camera_half_extent, microscope.psf_half_extent_zyx_um, strict=True
             )
@@ -194,6 +210,7 @@ def uniform_optical_calibration():
             Acquisition(
                 axes,
                 shape,
+                geometry=geometry,
                 illumination_profile=profile,
                 camera_photon_budget=photon_budget,
                 output="expectation",

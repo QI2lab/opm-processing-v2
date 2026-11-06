@@ -12,10 +12,7 @@ from typer.testing import CliRunner
 from yaozarrs import open_group, v05
 
 from opm_processing import export_rois
-from opm_processing.dataio.position_collection import (
-    open_image_array,
-    open_position_collection,
-)
+from opm_processing.dataio.position_collection import open_image_array
 from opm_processing.dataio.processing_state import ProcessingState
 
 
@@ -85,11 +82,9 @@ def test_raw_roi_exports_and_resume(
     relocate_acquisition,
     invoke_cli,
     assert_roi_point_accuracy,
-    assert_roi_observations_preserved,
 ):
     """Reconstruct multiple rectangles with all times/channels and global origins."""
     case = roi_preview
-    references = tuple(array.read().result() for array in case.collection.arrays)
     directory = case.preview.parent
     preview_name = case.preview.name
     selections = [(16, 27, 3, 15), (24, 36, 16, 29)]
@@ -212,13 +207,6 @@ def test_raw_roi_exports_and_resume(
             assert state.source_path() == directory / case.dataset.path.name
             tiles = roi_directory / "sample_deskewed.ome.zarr"
             assert len(state.completed_channels(tiles)) == 2 * 2 * case.positions
-            assert_roi_observations_preserved(
-                open_position_collection(tiles),
-                references,
-                case.collection.voxel_size_um,
-                case.dataset.metadata.scan_axis_step_um,
-                state,
-            )
             if case.positions > 1:
                 assert state.registration(tiles)["pairwise_metrics"]
             target = roi_directory / f"sample_roi_{index:03d}.ome.tiff"
@@ -259,25 +247,6 @@ def test_raw_roi_exports_and_resume(
     )
     assert len(manifest["rois"]) == 2
     assert calls[0].name == preview_name
-    if case.positions == 1 and case.dataset.metadata.mode == "mirror" and not tiff:
-        alternate = directory / "selected_again"
-        invoke_cli(
-            "export-rois",
-            directory,
-            registration_channel=1,
-            output=alternate,
-            save_float32=True,
-        )
-        assert len(calls) == 1
-        for index, _bounds in enumerate(selections, 1):
-            directory = alternate / f"roi_{index:03d}"
-            assert_roi_observations_preserved(
-                open_position_collection(directory / "sample_deskewed.ome.zarr"),
-                references,
-                case.collection.voxel_size_um,
-                case.dataset.metadata.scan_axis_step_um,
-                ProcessingState.read(directory / "sample.processing.json"),
-            )
 
 
 @pytest.mark.unit

@@ -57,11 +57,15 @@ def test_selective_registration_reads_only_target_pair_and_preserves_raw_outlier
     fusion_operator, registration_scene, monkeypatch, failed_retry
 ):
     """Read selected pairs while preserving raw links outside the selection."""
-    specimen = registration_scene((1, 16, 16), seed=481).means[None].astype(np.float32)
+    specimen = (
+        registration_scene((1, 16, 16), seed=481).expectation[None].astype(np.float32)
+    )
     source_tiles = [specimen.copy() for _ in range(6)]
     if failed_retry:
         source_tiles[5] = (
-            registration_scene((1, 16, 16), seed=482).means[None].astype(np.float32)
+            registration_scene((1, 16, 16), seed=482)
+            .expectation[None]
+            .astype(np.float32)
         )
     raw = {
         (0, 1): (0, 2, 3, 0.99),

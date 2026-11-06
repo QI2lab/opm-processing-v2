@@ -132,7 +132,7 @@ def test_exact_signal_registration_recovers_known_3d_translation(
     if not tilefusion.USING_GPU or tilefusion.xp is not cp:
         pytest.fail("TileFusion silently selected its CPU registration backend")
 
-    fixed = registration_scene((11, 39, 43), seed=22).means.astype(np.float32)
+    fixed = registration_scene((11, 39, 43), seed=22).expectation.astype(np.float32)
     applied_shift = np.array(applied_shift, dtype=np.float32)
     if np.any(applied_shift != np.rint(applied_shift)):
         # The Fourier shift defines an exact periodic fractional translation;

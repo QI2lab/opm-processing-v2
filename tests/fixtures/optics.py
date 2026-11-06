@@ -474,7 +474,7 @@ def point_response_model(optical_setup):
 
 
 @pytest.fixture(scope="session")
-def uniform_detector_scene(microscope_parameters):
+def uniform_detector_scene(microscope_parameters, uniform_optical_calibration):
     """Form a uniform physical emitter field with the existing optical model."""
 
     @lru_cache(maxsize=2)
@@ -488,40 +488,13 @@ def uniform_detector_scene(microscope_parameters):
             camera=replace(microscope_parameters.camera, electrons_per_adu=0.5),
         )
         shape = (1 if projection else 8, 24, 256)
-        pixel, angle = microscope.pixel_size_um, np.deg2rad(microscope.angle_deg)
-        half = np.array(
-            (
-                0 if projection else (shape[1] - 1) * pixel * np.sin(angle) / 2,
-                (shape[1] - 1) * pixel / 2
-                if projection
-                else (
-                    (shape[0] - 1) * microscope.scan_step_um
-                    + (shape[1] - 1) * pixel * np.cos(angle)
-                )
-                / 2,
-                (shape[2] - 1) * pixel / 2,
-            )
-        )
-        half += np.array(microscope.psf_half_extent_zyx_um) + pixel
-        axes = tuple(
-            centered_axis(extent, microscope.fine_spacing_um) for extent in half
-        )
-        density = np.ones(tuple(map(len, axes)), np.float32)
-        acquisition = Acquisition(
-            axes,
+        means = uniform_optical_calibration(
+            microscope,
             shape,
             geometry="cartesian" if projection else "oblique",
-            camera_photon_budget=(12000 / microscope.quantum_efficiency, 0),
-            output="object",
-        )
-        dose = forward_model(density, acquisition, microscope)
-        means = forward_model(
-            dose,
-            replace(acquisition, camera_photon_budget=None, output="expectation"),
-            microscope,
+            photon_budget=(12000 / microscope.quantum_efficiency, 0),
         )
         np.testing.assert_allclose(means, 12000, rtol=2e-5)
-        means.setflags(write=False)
         return SimpleNamespace(
             microscope=microscope,
             means=means,

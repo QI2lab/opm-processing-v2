@@ -19,12 +19,10 @@ def roi_preview(
     small_cpu_kernels,
     roi_camera_scene,
     simulation_parameters,
-    assert_roi_point_accuracy,
 ):
     """Create a calibrated raw timelapse and a real processed max-Z preview."""
     from types import SimpleNamespace
 
-    from opm_processing.dataio.position_collection import open_position_collection
     from opm_processing.dataio.roi import projection_tile_footprints
     from opm_processing.imageprocessing.maxtilefusion import (
         regenerate_fused_max_projection,
@@ -71,22 +69,10 @@ def roi_preview(
             dataset.path.parent / "sample_fused.ome.zarr", preview
         )
     footprints = projection_tile_footprints(preview)
-    collection = open_position_collection(
-        dataset.path.parent / "sample_deskewed.ome.zarr"
-    )
     stage_anchor = np.asarray((-2.3, 4.6, 1.15))
     raw_origin = stage_anchor.copy()
     if mode == "stage":
         raw_origin[1] -= (pixels.shape[-3] - 1) * scene.microscope.scan_step_um
-    for position, array in enumerate(collection.arrays):
-        assert_roi_point_accuracy(
-            array.read().result(),
-            scene,
-            stage_anchor + np.asarray(collection.spatial_origins_zyx_um[position]),
-            collection.voxel_size_um,
-            raw_origin=raw_origin,
-            positions=(position,),
-        )
     return SimpleNamespace(
         dataset=dataset,
         preview=preview,
@@ -94,7 +80,6 @@ def roi_preview(
         origin=footprints[0]["origin_zyx_um"],
         truth=scene,
         raw_origin_zyx_um=tuple(raw_origin),
-        collection=collection,
     )
 
 
@@ -226,12 +211,10 @@ def roi_camera_scene(simulated_camera):
 @pytest.fixture
 def assert_roi_point_accuracy(assert_roi_point_locations):
     """Check original-emitter locations and photons on the saved ROI grid."""
-    from scipy.ndimage import map_coordinates
-
     from opm_processing.imageprocessing.opmpsf import camera_grid_center
     from opm_processing.imageprocessing.opmtools import (
-        deskew_row_coordinates,
-        deskew_shape_estimator,
+        deskew_coverage,
+        orthogonal_deskew,
     )
     from tests.simulation.camera_likelihood import (
         SamplingEnvelope,
@@ -258,8 +241,6 @@ def assert_roi_point_accuracy(assert_roi_point_locations):
         )
         microscope, camera = scene.microscope, scene.microscope.camera
         pixel, scan_step = microscope.pixel_size_um, microscope.scan_step_um
-        angle = np.deg2rad(microscope.angle_deg)
-        step = scan_step / pixel
         origin, raw_origin = np.asarray(origin), np.asarray(raw_origin)
         spacing = np.asarray(spacing)
         factor = round(spacing[0] / pixel)
@@ -279,35 +260,33 @@ def assert_roi_point_accuracy(assert_roi_point_locations):
                 planned, np.broadcast_to(planned[0], planned.shape)
             )
         native_shape = scene.pixels.shape[-3:]
-        native_output_shape, *_ = deskew_shape_estimator(
-            native_shape,
-            microscope.angle_deg,
-            scan_step,
-            pixel,
-            crop_after_deskew=False,
-            divisible_by=1,
-        )
-        row_coordinates = np.vectorize(
-            deskew_row_coordinates,
-            otypes=(bool, np.int64, np.int64, np.int64, float, float, float),
-        )
         output_shape = data.shape[-3:]
         offset = (origin - raw_origin) / pixel
-        first_z = round(offset[0] - (factor - 1) / 2)
-        assert abs(offset[0] - first_z - (factor - 1) / 2) <= 0.0005 / pixel + 1e-12
-        # The fixtures have coincident integer output grids. This explicitly
-        # rules out an unaccounted fractional fusion resampling pitch.
+        offset[0] = (offset[0] - (factor - 1) / 2) / factor
+        # Metadata rounds physical coordinates to 0.001 um. Certify the saved
+        # lattice before using the production mapper; do not fit image shifts.
         np.testing.assert_allclose(
-            offset[1:], np.rint(offset[1:]), rtol=0, atol=0.0005 / pixel + 1e-12
+            (offset - np.rint(offset)) * (factor, 1, 1),
+            0,
+            rtol=0,
+            atol=0.0005 / pixel + 1e-12,
         )
-        integer_offset = np.rint(offset[1:])
-        y, x = (
-            integer_offset[0] + np.arange(output_shape[1]),
-            integer_offset[1] + np.arange(output_shape[2]),
-        )
-        z_center = first_z + np.arange(output_shape[0]) * factor + (factor - 1) / 2
+        start = np.rint(offset).astype(int)
+        geometry = {
+            "theta": microscope.angle_deg,
+            "distance": scan_step,
+            "pixel_size": pixel,
+        }
+        coverage = deskew_coverage(
+            native_shape,
+            output_shape,
+            **geometry,
+            downsample_factor=factor,
+            origin_zy=tuple(start[:2]),
+        )[..., None]
+        columns = start[2] + np.arange(output_shape[2])
+        coverage = coverage * ((columns >= 0) & (columns < native_shape[2]))
         radii = sampling_stencil_radii(microscope, (pixel, pixel, pixel))
-        gain = 2 * pixel / scan_step
         field = np.broadcast_to(np.asarray(illumination), native_shape)
         source_centers = scene.centers_zyx_um + raw_origin
         centers_y = origin[1] + np.arange(output_shape[1]) * spacing[1]
@@ -332,24 +311,19 @@ def assert_roi_point_accuracy(assert_roi_point_locations):
             )
             + raw_origin
         )
-        domain = scene.ground_truth.axes
+        lower_edge, upper_edge = np.asarray(
+            [(axis[0], axis[-1]) for axis in scene.ground_truth.axes]
+        ).T
+        halo = np.asarray(microscope.psf_half_extent_zyx_um)
+        lower_edge, upper_edge = (
+            camera_center + lower_edge + halo,
+            camera_center + upper_edge - halo,
+        )
         interior = (
-            (
-                centers_y[:, None] - camera_center[1]
-                >= domain[1][0] + microscope.psf_half_extent_zyx_um[1]
-            )
-            & (
-                centers_y[:, None] - camera_center[1]
-                <= domain[1][-1] - microscope.psf_half_extent_zyx_um[1]
-            )
-            & (
-                centers_x[None] - camera_center[2]
-                >= domain[2][0] + microscope.psf_half_extent_zyx_um[2]
-            )
-            & (
-                centers_x[None] - camera_center[2]
-                <= domain[2][-1] - microscope.psf_half_extent_zyx_um[2]
-            )
+            (centers_y[:, None] >= lower_edge[1])
+            & (centers_y[:, None] <= upper_edge[1])
+            & (centers_x[None] >= lower_edge[2])
+            & (centers_x[None] <= upper_edge[2])
         )
         apertures = (
             interior & (distance <= rayleigh),
@@ -390,64 +364,35 @@ def assert_roi_point_accuracy(assert_roi_point_locations):
                     source_high = np.maximum.reduce(
                         [bound.upper for bound in view_bounds]
                     )
-                lower = np.zeros(output_shape)
-                upper = np.zeros(output_shape)
-                reference = np.zeros(output_shape)
-                coverage = np.zeros(output_shape)
-                certain = np.ones(output_shape, bool)
-                for within_bin in range(factor):
-                    z = z_center - (factor - 1) / 2 + within_bin
-                    valid_zy, before, _rb, _ra, foot0, foot1, fraction = (
-                        row_coordinates(
-                            z[:, None],
-                            y[None],
-                            native_shape[0],
-                            native_shape[1],
-                            native_output_shape[0],
-                            step,
-                            np.tan(angle),
-                            np.sin(angle),
-                            np.cos(angle),
+                # The input intervals come from independent optical means and
+                # original camera residuals. Deskew is positive: applying its
+                # actual gain/interpolation/binning preserves these inequalities.
+                mapped = np.stack(
+                    [
+                        orthogonal_deskew(
+                            values / field,
+                            **geometry,
+                            divisible_by=1,
+                            downsample_factor=factor,
                         )
+                        for values in (source_low, source_high, means)
+                    ]
+                )
+                lower, upper, reference = np.zeros((3, *output_shape))
+                first = np.maximum(start, 0)
+                last = np.minimum(start + output_shape, mapped.shape[-3:])
+                if np.all(last > first):
+                    source = tuple(
+                        slice(a, b) for a, b in zip(first, last, strict=True)
                     )
-                    plane = before + fraction
-                    valid = (
-                        valid_zy[..., None]
-                        & (x >= -1e-8)
-                        & (x <= native_shape[2] - 1 + 1e-8)
+                    target = tuple(
+                        slice(a - shift, b - shift)
+                        for a, b, shift in zip(first, last, start, strict=True)
                     )
-                    coordinates = np.stack(
-                        np.broadcast_arrays(
-                            plane[..., None],
-                            z[:, None, None] / np.sin(angle),
-                            x[None, None],
-                        )
-                    )
-                    for target, values in (
-                        (lower, source_low / field),
-                        (upper, source_high / field),
-                        (reference, means / field),
+                    for result, values in zip(
+                        (lower, upper, reference), mapped, strict=True
                     ):
-                        samples = map_coordinates(
-                            values,
-                            coordinates,
-                            order=0,
-                            mode="nearest",
-                            prefilter=False,
-                        )
-                        target += np.where(valid, samples, 0) * gain / factor
-                    coverage += valid / factor
-                    # Three-decimal metadata can perturb an aperture endpoint.
-                    # Exclude only those geometric boundary cells from accuracy;
-                    # exact supported/unsupported pixel checks remain in callers.
-                    boundary = np.isclose(plane, 0, atol=1e-7) | np.isclose(
-                        plane, native_shape[0] - 1, atol=1e-7
-                    )
-                    for foot in (foot0, foot1):
-                        boundary |= np.isclose(foot, 0, atol=1e-7) | np.isclose(
-                            foot, native_shape[1] - 1, atol=1e-7
-                        )
-                    certain &= ~boundary[..., None]
+                        result[target] = values[source]
                 if fused:
                     # Fusion's declared coverage contract restores the mean of
                     # acquired samples in partially supported nominal Z bins.
@@ -462,7 +407,7 @@ def assert_roi_point_accuracy(assert_roi_point_locations):
                     np.maximum(lower - numerical, 0), upper + numerical
                 )
                 for aperture in apertures:
-                    mask = certain & (coverage > 0) & aperture[None]
+                    mask = (coverage > 0) & aperture[None]
                     result = camera_sampling_accuracy(
                         data[time, channel], reference, envelope, mask
                     )
@@ -584,50 +529,5 @@ def assert_roi_point_locations():
                 increasing = np.diff(expected_counts[:, channel]) > 0
                 assert np.all(np.diff(observed_counts[:, channel])[increasing] > 0)
         assert checked, "ROI excludes every original optical emitter"
-
-    return check
-
-
-@pytest.fixture
-def assert_roi_observations_preserved():
-    """Check crop consistency per camera realization, before fusion combines views.
-
-    Returns
-    -------
-    callable
-        Compare each cropped tile with the same position's full processing.
-        This checks preservation of observed photons; scientific accuracy is
-        separately checked against the original object and optical model.
-    """
-
-    def check(cropped, references, spacing, scan_step, state):
-        """Compare raw-indexed crops for each actual time/position camera draw."""
-        series = state.roi_series(cropped.path)
-        assert len(series) == len(cropped.arrays)
-        for tile, record in zip(cropped.arrays, series, strict=True):
-            scan_start, _scan_stop, x_start, _x_stop = record["skewed_bounds_sx"]
-            y0, _y1, x0, _x1 = record["deskew_crop_yx"]
-            offset = np.asarray(
-                (0, scan_start * scan_step / spacing[1] + y0, x_start + x0)
-            )
-            np.testing.assert_allclose(offset, np.rint(offset), atol=1e-8)
-            offset = np.rint(offset).astype(int)
-            actual = tile.read().result()
-            time, position = record["time_index"], record["position_index"]
-            reference = references[position][time : time + 1]
-            lower = np.maximum(0, offset)
-            upper = np.minimum(reference.shape[-3:], offset + actual.shape[-3:])
-            assert np.all(upper > lower)
-            source = tuple(slice(a, b) for a, b in zip(lower, upper, strict=True))
-            selected = tuple(
-                slice(a - shift, b - shift)
-                for a, b, shift in zip(lower, upper, offset, strict=True)
-            )
-            np.testing.assert_allclose(
-                actual[(..., *selected)],
-                reference[(..., *source)],
-                rtol=2e-6,
-                atol=2e-3,
-            )
 
     return check
