@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 
 from opm_processing.dataio.deconvolution import scan_upsample_from_metadata
+from opm_processing.imageprocessing.opmpsf import camera_grid_center
 from opm_processing.imageprocessing.opmtools import (
     deskew_coverage,
     deskew_shape_estimator,
@@ -853,14 +854,12 @@ def pipeline_source_image(pipeline_geometry):
         geometry = pipeline_geometry(
             data.expectation.shape, microscope, scan_factor=scan_factor
         )
-        scans, rows, columns = data.expectation.shape
         pixel = microscope.pixel_size_um
-        angle = np.deg2rad(microscope.angle_deg)
-        center = (
-            (rows - 1) * pixel * np.sin(angle) / 2,
-            ((scans - 1) * microscope.scan_step_um + (rows - 1) * pixel * np.cos(angle))
-            / 2,
-            (columns - 1) * pixel / 2,
+        center = camera_grid_center(
+            data.expectation.shape,
+            pixel_size_um=pixel,
+            scan_axis_step_um=microscope.scan_step_um,
+            theta_deg=microscope.angle_deg,
         )
         axes = tuple(
             np.arange(size) * pixel - origin

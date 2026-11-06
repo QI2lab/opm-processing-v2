@@ -53,10 +53,7 @@ class TranslationObservations(FrozenOpticalData):
     """Independent camera realizations with a prescribed physical displacement."""
 
     images: tuple[np.ndarray, ...]
-    means: tuple[np.ndarray, ...]
     expected: np.ndarray
-    ground_truth: OpticalScene
-    microscope: Microscope
 
 
 @dataclass(frozen=True)
@@ -65,7 +62,6 @@ class OpticalSetup(FrozenOpticalData):
 
     microscope: Microscope
     psf: np.ndarray
-    density_scale: float
     axes: tuple[np.ndarray, ...]
     irradiance: np.ndarray
 
@@ -260,7 +256,7 @@ def physical_translation_pair(independent_photon_scene_factory):
             ),
             microscope,
         )
-        images, means = [], []
+        images = []
         for index, displacement in enumerate((np.zeros(3), np.array(applied_shift))):
             sensor_axes = tuple(
                 axis - shift * step
@@ -277,16 +273,12 @@ def physical_translation_pair(independent_photon_scene_factory):
                 ),
                 microscope,
             )
-            means.append(mean)
             images.append(
                 digitize(mean, microscope.camera, seed=42 + index).astype(np.float32)
             )
         return TranslationObservations(
             images=tuple(images),
-            means=tuple(means),
             expected=-np.array(applied_shift),
-            ground_truth=scene,
-            microscope=microscope,
         )
 
     return render
@@ -301,11 +293,10 @@ def optical_setup(microscope_parameters):
         psf_half_extent_zyx_um=(3.0, 2.0, 2.0),
     )
     axes, field = emission_psf(microscope, microscope.fine_spacing_um)
-    psf, scale = camera_psf(microscope)
+    psf, _ = camera_psf(microscope)
     return OpticalSetup(
         microscope=microscope,
         psf=psf.astype(np.float32),
-        density_scale=scale,
         axes=axes,
         irradiance=field,
     )
