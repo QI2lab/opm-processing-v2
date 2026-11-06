@@ -23,6 +23,35 @@ from tests.simulation.metrics import (
 pytestmark = pytest.mark.unit
 
 
+@pytest.mark.parametrize("array_backend", ["gpu", "host"])
+@pytest.mark.parametrize("variance, observed_count", [(0, 90), (4, 94)])
+def test_full_data_rl_update_preserves_uniform_photon_rates(
+    cupy_gpu, optical_setup, array_backend, variance, observed_count
+):
+    """Apply the shared optical adjoint to analytically known uniform rates."""
+    solver = importlib.import_module("opm_processing.imageprocessing.rlgc")
+    xp = cupy_gpu if array_backend == "gpu" else np
+    # A power-of-two constant field has only a DC Fourier coefficient. This
+    # isolates scalar calibration arithmetic from mixed-radix FFT roundoff;
+    # nonconstant optical-adjoint tests cover the general convolution operator.
+    shape = tuple(1 << (2 * size).bit_length() for size in optical_setup.psf.shape)
+    convolution = solver._Convolution(optical_setup.psf, shape)
+
+    def adjoint(values):
+        """Execute the actual optical transpose on the selected state backend."""
+        return convolution(values, adjoint=True)
+
+    observed = xp.full(shape, observed_count, dtype=xp.float32)
+    denominator = xp.full(shape, 45 + variance, dtype=xp.float32)
+    sensitivity = adjoint(xp.ones(shape, dtype=xp.float32))
+    actual = solver._full_data_update(
+        observed, denominator, adjoint, sensitivity, np.float32(variance)
+    )
+    if array_backend == "gpu":
+        actual = cupy_gpu.asnumpy(actual)
+    np.testing.assert_allclose(actual, 2, rtol=8 * np.finfo(np.float32).eps)
+
+
 def test_generated_psf_camera_reconstruction(cupy_gpu, production_point_acquisition):
     """Apply production GC using the same PSF as the full camera simulation."""
     from opm_processing.imageprocessing.rlgc import rlgc
