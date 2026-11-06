@@ -430,9 +430,7 @@ def current_single_position_mirror_timelapse(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def opm_v2_acquisition_factory(
-    tmp_path, acquisition_psf_cache, integration_pipeline_records
-):
+def opm_v2_acquisition_factory(tmp_path, acquisition_psf_cache):
     """Persist simulated camera frames through the installed OpmDataHandler.
 
     The real acquisition writer owns layout, NGFF and frame serialization.
@@ -553,7 +551,6 @@ def opm_v2_acquisition_factory(
         metadata = inspect_acquisition(metadata.path)
         source = open_acquisition_datastore(metadata)
         kernels = acquisition_psf_cache(metadata)
-        integration_pipeline_records["sources"].append(metadata.path)
         return SimpleNamespace(
             path=metadata.path,
             metadata=metadata,

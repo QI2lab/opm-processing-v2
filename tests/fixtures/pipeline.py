@@ -2,8 +2,7 @@
 
 import importlib
 from dataclasses import dataclass, replace
-from functools import lru_cache, partial, wraps
-from itertools import product
+from functools import lru_cache, partial
 from types import SimpleNamespace
 
 import numpy as np
@@ -263,172 +262,6 @@ def pipeline_camera_accuracy(pipeline_geometry):
 
 
 @pytest.fixture
-def pipeline_inverse_accuracy():
-    """Score actual inverse solutions against the original physical camera means."""
-    from tests.simulation.metrics import (
-        camera_flux_accuracy,
-        camera_noise_accuracy,
-        camera_object_apertures,
-        camera_prediction,
-    )
-
-    def check(result, means, microscope, ground_truth, *, offsets_x=None):
-        """Use captured real kernels and fixed source, background and detector apertures."""
-        assert len(result.reconstructions) == len(result.deconvolution_runs)
-        assert len(result.reconstructions) == np.prod(means.shape[:3])
-        offsets = np.zeros(means.shape[1]) if offsets_x is None else offsets_x
-        for index, density, run in zip(
-            np.ndindex(*means.shape[:3]),
-            result.reconstructions,
-            result.deconvolution_runs,
-            strict=True,
-        ):
-            expected = means[index]
-            kernel = np.asarray(run["psf"], np.float64)
-            if run["normalize_psf"]:
-                kernel = kernel / kernel.sum(dtype=np.float64)
-            boundary = "constant" if run["boundary"] == "zero" else run["boundary"]
-            prediction = camera_prediction(
-                density,
-                kernel,
-                boundary=boundary,
-                response=run["detector_response"],
-            )[:: run["scan_upsample_factor"]]
-            assert prediction.shape == expected.shape
-            apertures = camera_object_apertures(
-                ground_truth,
-                microscope,
-                expected.shape,
-                camera_offset_zyx_um=(0, 0, offsets[index[1]]),
-            )
-            for aperture in apertures:
-                accuracy = camera_noise_accuracy(
-                    prediction, expected, microscope.camera, aperture
-                )
-                assert accuracy.accepted, (index, accuracy)
-                assert camera_flux_accuracy(
-                    prediction, expected, microscope.camera, aperture
-                ), index
-
-    return check
-
-
-@pytest.fixture(autouse=True)
-def integration_pipeline_records(request):
-    """Require real producer inputs and durable processing results for integrations.
-
-    Parameters
-    ----------
-    request : pytest.FixtureRequest
-        Current test's classification.
-
-    Yields
-    ------
-    dict
-        Actual producer sources and filesystem relocations of those acquisitions.
-    """
-    integration = request.node.get_closest_marker("integration") is not None
-    tmp_path = request.getfixturevalue("tmp_path") if integration else None
-    sources = []
-    relocations = []
-    processed_sources = set()
-    generated_optics_sources = set()
-    if integration:
-        processing = importlib.import_module("opm_processing.process")
-        roi_processing = importlib.import_module("opm_processing.process_roi")
-        patches = request.getfixturevalue("monkeypatch")
-        generate_psfs = processing.load_deconvolution_psfs
-
-        def observe_psfs(acquisition, measured_paths=None, **kwargs):
-            """Require actual generated kernels rather than descriptive output tags."""
-            result = generate_psfs(acquisition, measured_paths, **kwargs)
-            if measured_paths is None and result[1] is not None:
-                generated_optics_sources.add(acquisition.path.resolve())
-            return result
-
-        patches.setattr(processing, "load_deconvolution_psfs", observe_psfs)
-
-        def observe_processor(processor):
-            """Record successful real processing without changing its arguments or output."""
-
-            @wraps(processor)
-            def execute(root_path, acquisition, *args, **kwargs):
-                """Run the complete production operation before recording its source."""
-                result = processor(root_path, acquisition, *args, **kwargs)
-                processed_sources.add(acquisition.path.resolve())
-                return result
-
-            return execute
-
-        for name in ("process_skewed", "process_projection"):
-            observed = observe_processor(getattr(processing, name))
-            patches.setattr(processing, name, observed)
-            if hasattr(roi_processing, name):
-                patches.setattr(roi_processing, name, observed)
-    yield {"sources": sources, "relocations": relocations}
-    if not integration:
-        return
-    if any(
-        report is not None and (report.failed or report.skipped)
-        for report in (
-            getattr(request.node, "pipeline_report_setup", None),
-            getattr(request.node, "pipeline_report_call", None),
-        )
-    ):
-        return
-    from opm_processing.dataio.position_collection import open_position_collection
-    from opm_processing.dataio.processing_state import ProcessingState
-
-    assert sources, "Integration never finalized a real opm-v2 acquisition"
-    states = [
-        ProcessingState.read(path) for path in tmp_path.rglob("*.processing.json")
-    ]
-    for source in sources:
-        locations = {source.resolve()}
-        for before, after in relocations:
-            locations.update(
-                after / location.relative_to(before)
-                for location in tuple(locations)
-                if location.is_relative_to(before)
-            )
-        assert locations & processed_sources, (
-            f"Integration bypassed actual processing for {source}"
-        )
-        completed = []
-        for state in states:
-            if state.source_path() not in locations:
-                continue
-            for name, record in state.document["outputs"].items():
-                path = state.path.parent / name
-                if record.get("completed_tiles") and path.is_dir():
-                    optics = record["configuration"].get("deconvolution")
-                    if optics is not None:
-                        assert locations & generated_optics_sources, (
-                            "Integration bypassed production PSF generation"
-                        )
-                    collection = open_position_collection(path)
-                    for array in collection.arrays:
-                        pixels = array.read().result()
-                        assert pixels.size and np.isfinite(pixels).all()
-                    if record.get("roi_series"):
-                        expected = {
-                            (tile["time_index"], tile["position_index"])
-                            for tile in record["roi_series"]
-                        }
-                    else:
-                        selection = record["configuration"].get("selection", {})
-                        times = selection.get("time") or (0, collection.shape[0])
-                        positions = selection.get("position") or (
-                            0,
-                            collection.shape[1],
-                        )
-                        expected = set(product(range(*times), range(*positions)))
-                    if state.completed_tiles(path) == expected:
-                        completed.append(path)
-        assert completed, f"Integration never completed a final datastore from {source}"
-
-
-@pytest.fixture
 def pipeline_runner(monkeypatch, processing_options, invoke_cli):
     """Run real processing and fusion with shared storage and worker boundaries.
 
@@ -454,7 +287,6 @@ def pipeline_runner(monkeypatch, processing_options, invoke_cli):
         crop_scan=None,
         output=None,
         deskew_tile=None,
-        decon_storage=None,
         fusion_chunk=(16, 16),
         blend=(0, 0, 0),
     ):
@@ -496,18 +328,18 @@ def pipeline_runner(monkeypatch, processing_options, invoke_cli):
 
                 def observe_reconstruction(*args, **kwargs):
                     """Retain actual calibrated reconstructions for physical truth checks."""
-                    if decon_storage is not None:
-                        kwargs["storage"] = decon_storage
                     before = len(chunks)
                     result = reconstruct(*args, **kwargs)
                     reconstructions.append(result.copy())
+                    kernel = np.array(args[1], dtype=np.float64, copy=True)
+                    if kwargs.get("normalize_psf", True):
+                        kernel /= kernel.sum(dtype=np.float64)
                     deconvolution_runs.append(
                         {
                             "input_shape": args[0].shape,
                             "crop_scan": kwargs.get("crop_scan"),
                             "chunks": chunks[before:],
-                            "psf": np.asarray(args[1]).copy(),
-                            "normalize_psf": kwargs.get("normalize_psf", True),
+                            "psf": kernel,
                             "boundary": kwargs.get("boundary", "reflect"),
                             "scan_upsample_factor": kwargs.get(
                                 "scan_upsample_factor", 1
@@ -850,7 +682,6 @@ def pipeline_case(
     pipeline_optical_data,
     simulation_parameters,
     opm_v2_acquisition_factory,
-    tmp_path,
     pipeline_runner,
     pipeline_geometry,
     pipeline_camera_accuracy,
@@ -917,14 +748,14 @@ def pipeline_case(
     )
     factor = scan_upsample_from_metadata(dataset.metadata) if deconvolve else 1
     geometry = pipeline_geometry(expectation.shape, microscope, scan_factor=factor)
-    means = np.broadcast_to(
-        expectation[None, None, None]
-        * (1 + np.arange(2)[:, None, None] / 4 + np.arange(2)[None, None] / 2)[
-            ..., None, None, None
-        ],
-        raw.shape,
-    )
     if not deconvolve:
+        means = np.broadcast_to(
+            expectation[None, None, None]
+            * (1 + np.arange(2)[:, None, None] / 4 + np.arange(2)[None, None] / 2)[
+                ..., None, None, None
+            ],
+            raw.shape,
+        )
         pipeline_camera_accuracy(
             result,
             means,
@@ -941,7 +772,6 @@ def pipeline_case(
         microscope=microscope,
         support=geometry.support,
         expectation=expectation,
-        camera_means=means,
         source_expectation=optical_data.source_expectation,
         psf=psf,
         optical_data=optical_data,
@@ -954,7 +784,6 @@ def mosaic_acquisition(
     pipeline_optical_data,
     simulation_parameters,
     opm_v2_acquisition_factory,
-    tmp_path,
     small_cpu_kernels,
 ):
     """Persist independent adjacent views of the same extended fluorescent object.

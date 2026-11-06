@@ -15,12 +15,16 @@ from opm_processing.dataio.deconvolution import scan_upsample_from_metadata
 from opm_processing.dataio.processing_state import ProcessingState
 from opm_processing.imageprocessing.camera import camera_correct, illumination_correct
 from opm_processing.imageprocessing.opmtools import orthogonal_deskew
-from tests.simulation.metrics import camera_prediction, predictive_deviance
+from tests.simulation.metrics import (
+    camera_flux_accuracy,
+    camera_noise_accuracy,
+    camera_object_apertures,
+    camera_prediction,
+    predictive_deviance,
+)
 
 
-def test_qi2lab_acquisition_to_fused_ngff_v05(
-    pipeline_case, deconvolve, pipeline_inverse_accuracy
-):
+def test_qi2lab_acquisition_to_fused_ngff_v05(pipeline_case, deconvolve):
     """Retain calibrated pixels, registered coordinates and pyramids across stages."""
     case = pipeline_case
     raw = open_group(case.dataset.path)
@@ -158,8 +162,11 @@ def test_qi2lab_acquisition_to_fused_ngff_v05(
                     (chunk["input_shape"][0] - 1) * factor + 1,
                     *metadata.shape[-2:],
                 )
-        for index, recovered in zip(
-            np.ndindex(*metadata.shape[:3]), case.reconstructions, strict=True
+        for index, recovered, run in zip(
+            np.ndindex(*metadata.shape[:3]),
+            case.reconstructions,
+            case.deconvolution_runs,
+            strict=True,
         ):
             time, _position, channel = index
             observed = case.dataset.raw_data[index]
@@ -184,6 +191,23 @@ def test_qi2lab_acquisition_to_fused_ngff_v05(
                 for density in (recovered, baseline)
             ]
             assert scores[0] < scores[1]
+            prediction = camera_prediction(
+                recovered,
+                run["psf"],
+                boundary="constant" if run["boundary"] == "zero" else run["boundary"],
+                response=run["detector_response"],
+            )[:: run["scan_upsample_factor"]]
+            assert prediction.shape == expected.shape
+            for aperture in camera_object_apertures(
+                case.optical_data.ground_truth, case.microscope, expected.shape
+            ):
+                accuracy = camera_noise_accuracy(
+                    prediction, expected, case.microscope.camera, aperture
+                )
+                assert accuracy.accepted, (index, accuracy)
+                assert camera_flux_accuracy(
+                    prediction, expected, case.microscope.camera, aperture
+                ), index
 
     base = assert_fused_ngff(case)
     # Coincident independently exposed tiles have equal weights. This checks
@@ -204,13 +228,6 @@ def test_qi2lab_acquisition_to_fused_ngff_v05(
         )
         expected_fused[(time, slice(None), *slices)] = exposures.mean(axis=0)
     np.testing.assert_allclose(base, expected_fused, rtol=5e-6, atol=5e-6)
-    if deconvolve:
-        pipeline_inverse_accuracy(
-            case,
-            case.camera_means,
-            case.microscope,
-            case.optical_data.ground_truth,
-        )
 
 
 def assert_fused_ngff(case):
@@ -265,7 +282,6 @@ def test_extended_mosaic_acquisition_to_fusion(
     pipeline_geometry,
     pipeline_camera_accuracy,
     pipeline_source_image,
-    pipeline_inverse_accuracy,
     monkeypatch,
     tmp_path,
 ):
@@ -380,7 +396,10 @@ def test_extended_mosaic_acquisition_to_fusion(
 
         for result in (full, tiled):
             assert len(result.reconstructions) == case.dataset.raw_data.shape[1]
-            for position, recovered in enumerate(result.reconstructions):
+            assert len(result.reconstructions) == len(result.deconvolution_runs)
+            for position, (recovered, run) in enumerate(
+                zip(result.reconstructions, result.deconvolution_runs, strict=True)
+            ):
                 start = position * offset
                 expected = case.reconstruction_expectation[
                     ..., start : start + shape[-1]
@@ -421,6 +440,32 @@ def test_extended_mosaic_acquisition_to_fusion(
                         boundary=boundary,
                         selection=seams,
                     )
+                native_expected = case.expectation[..., start : start + shape[-1]]
+                prediction = camera_prediction(
+                    recovered,
+                    run["psf"],
+                    boundary="constant"
+                    if run["boundary"] == "zero"
+                    else run["boundary"],
+                    response=run["detector_response"],
+                )[:: run["scan_upsample_factor"]]
+                assert prediction.shape == native_expected.shape
+                camera_x = (
+                    start - (case.expectation.shape[-1] - shape[-1]) / 2
+                ) * case.microscope.pixel_size_um
+                for aperture in camera_object_apertures(
+                    case.optical_data.ground_truth,
+                    case.microscope,
+                    native_expected.shape,
+                    camera_offset_zyx_um=(0, 0, camera_x),
+                ):
+                    accuracy = camera_noise_accuracy(
+                        prediction, native_expected, case.microscope.camera, aperture
+                    )
+                    assert accuracy.accepted, (position, accuracy)
+                    assert camera_flux_accuracy(
+                        prediction, native_expected, case.microscope.camera, aperture
+                    ), position
 
     # Independent GC chunks have their own initialization and stopping histories.
     # Their accuracy is checked against camera truth above, not another solver
@@ -534,21 +579,3 @@ def test_extended_mosaic_acquisition_to_fusion(
             assert np.any(foreground[:, y_borders - 1] & foreground[:, y_borders])
     if not deconvolve:
         np.testing.assert_array_equal(fused[1], fused[0])
-    else:
-        means = np.stack(
-            [
-                case.expectation[..., position * offset : position * offset + shape[-1]]
-                for position in range(2)
-            ]
-        )[None, :, None]
-        offsets_x = (
-            np.arange(2) * offset - (case.expectation.shape[-1] - shape[-1]) / 2
-        ) * case.microscope.pixel_size_um
-        for result in (full, tiled):
-            pipeline_inverse_accuracy(
-                result,
-                means,
-                case.microscope,
-                case.optical_data.ground_truth,
-                offsets_x=offsets_x,
-            )

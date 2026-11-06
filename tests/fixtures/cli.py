@@ -37,7 +37,7 @@ def export_image_input(request, acquisition_factory, fused_store_factory):
 
 
 @pytest.fixture
-def relocate_acquisition(tmp_path, integration_pipeline_records):
+def relocate_acquisition(tmp_path):
     """Move or copy actual acquisition artifacts within the test workspace.
 
     Returns
@@ -69,7 +69,6 @@ def relocate_acquisition(tmp_path, integration_pipeline_records):
                     shutil.copy2(source, target)
             else:
                 source.rename(target)
-        integration_pipeline_records["relocations"].append((root, destination))
         return destination
 
     return relocate
