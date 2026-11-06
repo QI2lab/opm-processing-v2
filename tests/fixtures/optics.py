@@ -10,6 +10,11 @@ import numpy as np
 import pytest
 from scipy.interpolate import RegularGridInterpolator
 
+from opm_processing.imageprocessing.opmpsf import centered_sensor_axes
+from opm_processing.imageprocessing.opmtools import (
+    deskew_coverage,
+    deskew_shape_estimator,
+)
 from tests.simulation.forward_model import (
     Acquisition,
     Microscope,
@@ -243,10 +248,7 @@ def physical_translation_pair(independent_photon_scene_factory):
                 microscope.pixel_size_um,
             )
         )
-        axes = tuple(
-            (np.arange(n) - (n - 1) / 2) * step
-            for n, step in zip(shape, spacing, strict=True)
-        )
+        axes = centered_sensor_axes(shape, spacing)
         dose = forward_model(
             scene.density,
             Acquisition(
@@ -623,7 +625,6 @@ def uniform_detector_acquisition(
     uniform_detector_scene,
     roi_mode,
     camera_gain_profile,
-    deskew_geometric_support,
 ):
     """Write physical camera frames and real preview coordinates for calibration workflows."""
     from opm_processing.dataio.acquisition import ChannelMetadata
@@ -684,29 +685,20 @@ def uniform_detector_acquisition(
         support = np.ones(shape[:2], bool)
         expected = scene.nominal
     else:
-        native_shape = (
-            int(np.ceil(shape[1] * np.sin(angle))),
-            int(
-                np.ceil(
-                    (
-                        shape[0] * scene.microscope.scan_step_um / pixel
-                        + shape[1] * np.cos(angle)
-                    )
-                    / 4
-                )
-            )
-            * 4,
-            shape[-1],
+        native_shape, _, _, _ = deskew_shape_estimator(
+            shape,
+            scene.microscope.angle_deg,
+            scene.microscope.scan_step_um,
+            pixel,
+            crop_after_deskew=False,
         )
         support = (
-            deskew_geometric_support(
+            deskew_coverage(
                 shape,
                 native_shape,
-                {
-                    "theta": scene.microscope.angle_deg,
-                    "distance": scene.microscope.scan_step_um,
-                    "pixel_size": pixel,
-                },
+                theta=scene.microscope.angle_deg,
+                distance=scene.microscope.scan_step_um,
+                pixel_size=pixel,
             )
             == 1
         )

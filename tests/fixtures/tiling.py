@@ -7,14 +7,18 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from opm_processing.imageprocessing.opmtools import (
+    deskew_coverage,
+    deskew_shape_estimator,
+)
+
 
 @pytest.fixture(params=[(0, 14), (8, 0), (8, 14)], ids=["x", "y", "yx"])
-def orthogonal_registration_pair(
-    request, simulation_parameters, registration_scene, deskew_geometric_support
-):
+def orthogonal_registration_pair(request, simulation_parameters, registration_scene):
     """Observe one shared optical object through two translated oblique cameras."""
     from dataclasses import replace
 
+    from opm_processing.imageprocessing.camera import camera_correct
     from opm_processing.imageprocessing.opmtools import orthogonal_deskew
     from tests.simulation.forward_model import Acquisition, forward_model
 
@@ -70,13 +74,11 @@ def orthogonal_registration_pair(
             ),
             microscope,
         )
-        photons = np.maximum(
-            (raw.astype(np.float32) - microscope.camera.offset_adu)
-            * microscope.camera.electrons_per_adu,
-            0,
+        photons = camera_correct(
+            raw, microscope.camera.offset_adu, microscope.camera.electrons_per_adu
         )
         images.append(orthogonal_deskew(photons, **geometry, downsample_factor=1))
-    support = deskew_geometric_support(shape, images[0].shape, geometry) > 0
+    support = deskew_coverage(shape, images[0].shape, **geometry) > 0
     nominal = origins[1].astype(int) + error
     left = tuple(
         slice(max(0, d), min(n, n + d))
@@ -174,52 +176,7 @@ def deskew_analytic_truth(deskew_field):
 
 
 @pytest.fixture
-def deskew_geometric_support():
-    """Evaluate a uniform object's bounded scan-plane footprint by dot products.
-
-    Returns
-    -------
-    callable
-        The fraction of a nominal Z bin whose two perpendicular detector feet
-        both fall inside acquired planes. This contains no image interpolation
-        or reconstruction, only the independent physical aperture geometry.
-    """
-
-    def evaluate(input_shape, output_shape, geometry, *, factor=1, reverse=False):
-        """Project Cartesian sample coordinates onto two physical camera planes."""
-        planes, height, _ = input_shape
-        angle = np.deg2rad(geometry["theta"])
-        step = geometry["distance"] / geometry["pixel_size"]
-        tangent = np.asarray((np.sin(angle), np.cos(angle)))
-        normal = np.asarray((np.cos(angle), -np.sin(angle)))
-        z = np.arange(output_shape[0] * factor)
-        points = np.stack(
-            np.broadcast_arrays(z[:, None], np.arange(output_shape[1])[None, :]),
-            axis=-1,
-        )
-        separation = np.asarray((0.0, step)) @ normal
-        before = np.floor((points @ normal) / separation)
-        feet = []
-        for index in (before, before + 1):
-            origin = np.stack((np.zeros_like(index), index * step), axis=-1)
-            feet.append(np.sum((points - origin) * tangent, axis=-1))
-        inside = (
-            (before >= 0)
-            & (before + 1 < planes)
-            & (feet[0] >= 0)
-            & (feet[0] < height - 1)
-            & (feet[1] >= 0)
-            & (feet[1] < height - 1)
-            & (z[:, None] < np.ceil(height * np.sin(angle)))
-        )
-        support = inside.reshape(output_shape[0], factor, output_shape[1]).mean(axis=1)
-        return support[::-1] if reverse else support
-
-    return evaluate
-
-
-@pytest.fixture
-def deskew_uniform_expectation(deskew_geometric_support, simulation_parameters):
+def deskew_uniform_expectation(simulation_parameters):
     """Provide exact full-image photon truth for a uniform calibrated camera field."""
 
     def evaluate(input_shape, photons, *, factor=1, dtype=np.uint16):
@@ -230,16 +187,14 @@ def deskew_uniform_expectation(deskew_geometric_support, simulation_parameters):
             "distance": calibration["scan_step_um"],
             "pixel_size": calibration["pixel_size_um"],
         }
-        angle = np.deg2rad(geometry["theta"])
         step = geometry["distance"] / geometry["pixel_size"]
-        nz = int(np.ceil(input_shape[1] * np.sin(angle)))
-        ny = int(np.ceil(input_shape[0] * step + input_shape[1] * np.cos(angle)))
-        shape = (
-            (nz + factor - 1) // factor,
-            (ny + 3) // 4 * 4,
-            (input_shape[2] + 3) // 4 * 4,
+        shape, *_ = deskew_shape_estimator(
+            input_shape, **geometry, crop_after_deskew=False, downsample_factor=factor
         )
-        support = deskew_geometric_support(input_shape, shape, geometry, factor=factor)
+        shape = tuple(shape)
+        support = deskew_coverage(
+            input_shape, shape, **geometry, downsample_factor=factor
+        )
         expected = np.zeros(shape, np.float64)
         expected[..., : input_shape[2]] = support[..., None] * (
             float(photons) * 2 / step
@@ -263,28 +218,23 @@ def deskew_roundoff(factor):
 
 @pytest.fixture
 def deskew_output(deskew_field, factor):
-    """Provide a dirty strided output view with independently calculated dimensions."""
+    """Provide a dirty strided output view on the actual production grid."""
     data, geometry = deskew_field.data, deskew_field.geometry
-    angle = np.deg2rad(geometry["theta"])
-    nz = int(np.ceil(data.shape[1] * np.sin(angle)))
-    ny = int(np.ceil(data.shape[0] * deskew_field.step + data.shape[1] * np.cos(angle)))
-    shape = (
-        (nz + factor - 1) // factor,
-        ((ny + 3) // 4) * 4,
-        ((data.shape[2] + 3) // 4) * 4,
+    shape, *_ = deskew_shape_estimator(
+        data.shape, **geometry, crop_after_deskew=False, downsample_factor=factor
     )
     storage = np.full((2 * shape[0], shape[1] + 2, shape[2] + 2), np.nan, np.float32)
     return storage, storage[::2, 1:-1, 1:-1]
 
 
 @pytest.fixture
-def deskew_mosaic(deskew_field, deskew_geometric_support, deskew_output, factor):
+def deskew_mosaic(deskew_field, deskew_output, factor):
     """Provide independent coverage and fluorescence for overlapping oblique tiles."""
     data = deskew_field.data
     gain = 2 / deskew_field.step
     response_shape = deskew_output[1].shape
-    support = deskew_geometric_support(
-        data.shape, response_shape, deskew_field.geometry, factor=factor
+    support = deskew_coverage(
+        data.shape, response_shape, **deskew_field.geometry, downsample_factor=factor
     )
     positions = ((0, 0, 0), (0, 13, 3))
     shape = (response_shape[0], response_shape[1] + 13, response_shape[2] + 3)
@@ -308,9 +258,7 @@ def deskew_mosaic(deskew_field, deskew_geometric_support, deskew_output, factor)
 
 
 @pytest.fixture
-def deskew_processing_case(
-    factor, mode, opm_v2_acquisition_factory, roi_camera_scene, deskew_geometric_support
-):
+def deskew_processing_case(factor, mode, opm_v2_acquisition_factory, roi_camera_scene):
     """Provide original optical emitters, actual producer files and physical bounds."""
     from opm_processing.dataio.roi import PhysicalRoi
 
@@ -327,20 +275,15 @@ def deskew_processing_case(
         camera_conversion=1.0,
         stage_positions_zxy=((0, 0, 0),),
     )
-    scans, rows, columns = scene.pixels.shape[-3:]
+    source_shape = scene.pixels.shape[-3:]
+    _scans, _rows, columns = source_shape
     pixel = microscope.pixel_size_um
-    angle = np.deg2rad(microscope.angle_deg)
-    native_z = int(np.ceil(rows * np.sin(angle)))
-    native_y = int(
-        np.ceil(scans * microscope.scan_step_um / pixel + rows * np.cos(angle))
+    full_shape, *_ = deskew_shape_estimator(
+        source_shape, **geometry, crop_after_deskew=False, downsample_factor=factor
     )
-    full_shape = (
-        (native_z + factor - 1) // factor,
-        (native_y + 3) // 4 * 4,
-        (columns + 3) // 4 * 4,
-    )
-    full_support = deskew_geometric_support(
-        scene.pixels.shape[-3:], full_shape, geometry, factor=factor
+    full_shape = tuple(full_shape)
+    full_support = deskew_coverage(
+        scene.pixels.shape[-3:], full_shape, **geometry, downsample_factor=factor
     )
     z_origin = round(float(np.mean(np.arange(factor))) * pixel, 3)
     roi = None
@@ -367,12 +310,14 @@ def deskew_processing_case(
         support = full_support[:, 2:]
         origin = (z_origin, round(2 * pixel, 3), round(2 * pixel, 3))
     if mode == "cropped":
-        crop_y = int(np.ceil(rows * np.cos(angle)))
-        retained_y = native_y - 2 * crop_y
-        expected_shape = (full_shape[0], (retained_y + 3) // 4 * 4, full_shape[2])
+        cropped_shape, pad_y, _pad_x, crop_y = deskew_shape_estimator(
+            source_shape, **geometry, crop_after_deskew=True, downsample_factor=factor
+        )
+        expected_shape = tuple(cropped_shape)
+        retained_y = expected_shape[1] - pad_y
         support = np.pad(
-            full_support[:, crop_y : native_y - crop_y],
-            ((0, 0), (0, (-retained_y) % 4)),
+            full_support[:, crop_y : crop_y + retained_y],
+            ((0, 0), (0, pad_y)),
         )
         origin = (z_origin, round(crop_y * pixel, 3), 0)
     return SimpleNamespace(

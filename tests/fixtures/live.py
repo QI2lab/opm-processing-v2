@@ -15,6 +15,7 @@ from opm_processing.dataio.live import (
     LiveManifest,
 )
 from opm_processing.dataio.position_collection import create_position_collection
+from opm_processing.imageprocessing.camera import camera_correct, illumination_correct
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -248,13 +249,12 @@ def live_occupancy_case(
         detector_artifacts=True,
     )
     camera = scene.microscope.camera
-    detector = np.maximum(
-        (scene.pixels[0, 0, 0].astype(np.float64) - camera.offset_adu)
-        * camera.electrons_per_adu,
-        0,
-    )
+    detector = camera_correct(
+        scene.pixels[0, 0, 0], camera.offset_adu, camera.electrons_per_adu
+    ).astype(np.float64)
     assert np.count_nonzero(detector >= threshold) / detector.size < 0.1
-    assert np.count_nonzero(detector / fields[0] >= threshold) / detector.size >= 0.1
+    wrong_order = illumination_correct(detector, fields[0])
+    assert np.count_nonzero(wrong_order >= threshold) / detector.size >= 0.1
     dataset = opm_v2_live_acquisition_factory(
         scene.pixels[..., ::-1, :, :].copy(),
         name="live_empty",

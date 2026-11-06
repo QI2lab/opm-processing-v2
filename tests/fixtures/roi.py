@@ -175,6 +175,8 @@ def roi_camera_scene(simulated_camera):
     """
     from types import SimpleNamespace
 
+    from opm_processing.imageprocessing.opmpsf import camera_grid_center
+
     def create(
         *, times=1, positions=1, channels=1, vary_positions=False, shape=(8, 32, 32)
     ):
@@ -196,20 +198,15 @@ def roi_camera_scene(simulated_camera):
             means[time, position, channel] = observation.expectation
         microscope = observation.microscope
         pixel = microscope.pixel_size_um
-        angle = np.deg2rad(microscope.angle_deg)
-        scans, rows, columns = pixels.shape[-3:]
         # The simulator centers all sensor axes. Translate the original object
         # into the acquisition's first-pixel coordinate frame, independently
         # of any processing metadata or reconstructed image.
         center = np.asarray(
-            (
-                (rows - 1) * pixel * np.sin(angle) / 2,
-                (
-                    (scans - 1) * microscope.scan_step_um
-                    + (rows - 1) * pixel * np.cos(angle)
-                )
-                / 2,
-                (columns - 1) * pixel / 2,
+            camera_grid_center(
+                pixels.shape[-3:],
+                pixel_size_um=pixel,
+                scan_axis_step_um=microscope.scan_step_um,
+                theta_deg=microscope.angle_deg,
             )
         )
         centers = (
@@ -231,9 +228,14 @@ def roi_camera_scene(simulated_camera):
 
 @pytest.fixture
 def roi_photon_accuracy():
-    """Certify ROI photons from physical source-plane bounds without deskew weights."""
+    """Certify original camera photons using the production source-plane mapper."""
     from scipy.ndimage import map_coordinates
 
+    from opm_processing.imageprocessing.opmpsf import camera_grid_center
+    from opm_processing.imageprocessing.opmtools import (
+        deskew_row_coordinates,
+        deskew_shape_estimator,
+    )
     from tests.simulation.camera_likelihood import (
         SamplingEnvelope,
         camera_sampling_accuracy,
@@ -258,8 +260,6 @@ def roi_photon_accuracy():
         microscope, camera = scene.microscope, scene.microscope.camera
         pixel, scan_step = microscope.pixel_size_um, microscope.scan_step_um
         angle = np.deg2rad(microscope.angle_deg)
-        tangent = np.asarray((np.sin(angle), np.cos(angle)))
-        normal = np.asarray((np.cos(angle), -np.sin(angle)))
         step = scan_step / pixel
         origin, raw_origin = np.asarray(origin), np.asarray(raw_origin)
         spacing = np.asarray(spacing)
@@ -285,6 +285,18 @@ def roi_photon_accuracy():
                     planned, np.broadcast_to(planned[0], planned.shape)
                 )
         native_shape = scene.pixels.shape[-3:]
+        native_output_shape, *_ = deskew_shape_estimator(
+            native_shape,
+            microscope.angle_deg,
+            scan_step,
+            pixel,
+            crop_after_deskew=False,
+            divisible_by=1,
+        )
+        row_coordinates = np.vectorize(
+            deskew_row_coordinates,
+            otypes=(bool, np.int64, np.int64, np.int64, float, float, float),
+        )
         output_shape = data.shape[-3:]
         offset = (origin - raw_origin) / pixel
         first_z = round(offset[0] - (factor - 1) / 2)
@@ -316,14 +328,11 @@ def roi_photon_accuracy():
         # the optical halo, never from the reconstructed signal or contrast.
         camera_center = (
             np.asarray(
-                (
-                    (native_shape[1] - 1) * pixel * np.sin(angle) / 2,
-                    (
-                        (native_shape[0] - 1) * scan_step
-                        + (native_shape[1] - 1) * pixel * np.cos(angle)
-                    )
-                    / 2,
-                    (native_shape[2] - 1) * pixel / 2,
+                camera_grid_center(
+                    native_shape,
+                    pixel_size_um=pixel,
+                    scan_axis_step_um=scan_step,
+                    theta_deg=microscope.angle_deg,
                 )
             )
             + raw_origin
@@ -395,23 +404,20 @@ def roi_photon_accuracy():
                 certain = np.ones(output_shape, bool)
                 for within_bin in range(factor):
                     z = z_center - (factor - 1) / 2 + within_bin
-                    points = np.stack(np.broadcast_arrays(z[:, None], y[None]), axis=-1)
-                    plane = (points @ normal) / (np.asarray((0.0, step)) @ normal)
-                    before = np.floor(plane)
-                    feet = []
-                    for index in (before, before + 1):
-                        anchor = np.stack((np.zeros_like(index), index * step), axis=-1)
-                        feet.append(np.sum((points - anchor) * tangent, axis=-1))
-                    valid_zy = (
-                        (before >= 0)
-                        & (before + 1 < native_shape[0])
-                        & (feet[0] >= 0)
-                        & (feet[0] < native_shape[1] - 1)
-                        & (feet[1] >= 0)
-                        & (feet[1] < native_shape[1] - 1)
-                        & (z[:, None] >= 0)
-                        & (z[:, None] < np.ceil(native_shape[1] * np.sin(angle)))
+                    valid_zy, before, _rb, _ra, foot0, foot1, fraction = (
+                        row_coordinates(
+                            z[:, None],
+                            y[None],
+                            native_shape[0],
+                            native_shape[1],
+                            native_output_shape[0],
+                            step,
+                            np.tan(angle),
+                            np.sin(angle),
+                            np.cos(angle),
+                        )
                     )
+                    plane = before + fraction
                     valid = (
                         valid_zy[..., None]
                         & (x >= -1e-8)
@@ -444,7 +450,7 @@ def roi_photon_accuracy():
                     boundary = np.isclose(plane, 0, atol=1e-7) | np.isclose(
                         plane, native_shape[0] - 1, atol=1e-7
                     )
-                    for foot in feet:
+                    for foot in (foot0, foot1):
                         boundary |= np.isclose(foot, 0, atol=1e-7) | np.isclose(
                             foot, native_shape[1] - 1, atol=1e-7
                         )
@@ -475,15 +481,16 @@ def roi_photon_accuracy():
 
 
 @pytest.fixture
-def assert_reconstruction_storage(deskew_geometric_support):
-    """Link reopened pixels to already scored inverses using independent geometry."""
+def assert_reconstruction_storage():
+    """Link reopened pixels to already scored inverses using production geometry."""
+    from opm_processing.imageprocessing.opmtools import deskew_coverage
     from tests.simulation.metrics import (
         camera_volume_samples,
         reconstruction_storage_accuracy,
     )
 
     def check(volume, reconstructions, origin, spacing, raw_origin, microscope, masks):
-        """Certify complete physical apertures without duplicating deskew weights."""
+        """Certify complete apertures with the actual geometric mapper."""
         shape = reconstructions[0].shape
         assert all(reconstruction.shape == shape for reconstruction in reconstructions)
         pixel = microscope.pixel_size_um
@@ -500,7 +507,7 @@ def assert_reconstruction_storage(deskew_geometric_support):
             "distance": microscope.scan_step_um,
             "pixel_size": pixel,
         }
-        footprint = deskew_geometric_support(shape, tuple(stop), geometry)
+        footprint = deskew_coverage(shape, tuple(stop), **geometry)
         coverage = np.broadcast_to(
             footprint[start[0] : stop[0], start[1] : stop[1], None], volume.shape
         ).copy()

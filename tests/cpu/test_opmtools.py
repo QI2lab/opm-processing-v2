@@ -4,7 +4,11 @@ import numpy as np
 import pytest
 import tensorstore as ts
 
-from opm_processing.imageprocessing.opmtools import deskew_row, orthogonal_deskew
+from opm_processing.imageprocessing.opmtools import (
+    deskew_coverage,
+    deskew_row,
+    orthogonal_deskew,
+)
 
 pytestmark = pytest.mark.usefixtures("small_cpu_kernels")
 
@@ -29,14 +33,12 @@ def test_deskew_recovers_analytic_fluorescence(deskew_field, deskew_analytic_tru
 @pytest.mark.unit
 @pytest.mark.parametrize("factor", [1, 2, 3, 20])
 @pytest.mark.parametrize("deskew_field", [("x", 0.4)], indirect=True)
-def test_deskew_x_ramp_retains_partial_z_bins(
-    deskew_field, factor, deskew_roundoff, deskew_geometric_support
-):
+def test_deskew_x_ramp_retains_partial_z_bins(deskew_field, factor, deskew_roundoff):
     """Keep every Z bin and its full divisor, including a partly supported last bin."""
     case = deskew_field
     actual = orthogonal_deskew(case.data, **case.geometry, downsample_factor=factor)
-    support = deskew_geometric_support(
-        case.data.shape, actual.shape, case.geometry, factor=factor
+    support = deskew_coverage(
+        case.data.shape, actual.shape, **case.geometry, downsample_factor=factor
     )
     ramp = np.pad(case.data[0, 0], (0, actual.shape[-1] - case.data.shape[-1]))
     np.testing.assert_allclose(
@@ -45,6 +47,44 @@ def test_deskew_x_ramp_retains_partial_z_bins(
     if factor in (3, 20):
         assert np.any(actual[-1] > 0)
     np.testing.assert_array_equal(actual[:, 0], 0)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("factor", [1, 2, 3, 20])
+@pytest.mark.parametrize(
+    "deskew_field, supported_y, width",
+    [
+        (("constant", 0.115, (4, 4, 1)), (2, 3, 4), 8),
+        (("constant", 0.23, (4, 4, 1)), (2, 4, 6), 12),
+    ],
+    indirect=["deskew_field"],
+)
+def test_constant_box_has_prescribed_coverage(
+    deskew_field, factor, supported_y, width, deskew_roundoff
+):
+    """Retain a known constant box's three interior rows and zero every other cell.
+
+    At 30 degrees, four detector rows span exactly two laboratory-Z samples.
+    Z=0 has its following foot outside the sensor. At Z=1, projecting onto
+    the two acquired planes leaves both detector feet within [0,3) only at
+    the three prescribed Y coordinates. This supplies a complete analytical
+    image, independent of the production mapper used by workflow fixtures.
+    """
+    case = deskew_field
+    actual = orthogonal_deskew(case.data, **case.geometry, downsample_factor=factor)
+    shape = (2 if factor == 1 else 1, width, 4)
+    assert actual.shape == shape
+    coverage = np.zeros(shape[:2], np.float32)
+    coverage[1 if factor == 1 else 0, supported_y] = np.float32(1 / factor)
+    expected = np.zeros(shape, np.float32)
+    expected[..., 0] = coverage * np.float32(0.24 * 2 / case.step)
+    np.testing.assert_allclose(actual, expected, **deskew_roundoff)
+    np.testing.assert_array_equal(
+        deskew_coverage(
+            case.data.shape, shape, **case.geometry, downsample_factor=factor
+        ),
+        coverage,
+    )
 
 
 @pytest.mark.unit

@@ -11,6 +11,10 @@ import numpy as np
 import pytest
 
 from opm_processing.dataio.deconvolution import scan_upsample_from_metadata
+from opm_processing.imageprocessing.opmtools import (
+    deskew_coverage,
+    deskew_shape_estimator,
+)
 from opm_processing.imageprocessing.tilefusion import TileFusion
 from tests.simulation.camera import digitize
 from tests.simulation.forward_model import (
@@ -55,8 +59,8 @@ class PipelineOpticalData:
 
 
 @pytest.fixture
-def pipeline_geometry(deskew_geometric_support):
-    """Define the independent physical aperture and padded orthogonal canvas."""
+def pipeline_geometry():
+    """Use production geometry for the physical aperture and orthogonal canvas."""
 
     def create(shape, microscope, *, scan_factor=1):
         """Cover the oblique scan planes without evaluating an image interpolator."""
@@ -64,18 +68,16 @@ def pipeline_geometry(deskew_geometric_support):
         fine_shape = ((scans - 1) * scan_factor + 1, rows, columns)
         step = microscope.scan_step_um / scan_factor
         pixel = microscope.pixel_size_um
-        angle = np.deg2rad(microscope.angle_deg)
-        output_shape = (
-            int(np.ceil(rows * np.sin(angle))),
-            (int(np.ceil(fine_shape[0] * step / pixel + rows * np.cos(angle))) + 3)
-            // 4
-            * 4,
-            (columns + 3) // 4 * 4,
+        output_shape, _, _, _ = deskew_shape_estimator(
+            fine_shape, microscope.angle_deg, step, pixel, crop_after_deskew=False
         )
-        support = deskew_geometric_support(
+        output_shape = tuple(output_shape)
+        support = deskew_coverage(
             fine_shape,
             output_shape,
-            {"theta": microscope.angle_deg, "distance": step, "pixel_size": pixel},
+            theta=microscope.angle_deg,
+            distance=step,
+            pixel_size=pixel,
         )
         aperture = (support[..., None] > 0) & (np.arange(output_shape[2]) < columns)
         return SimpleNamespace(shape=output_shape, support=aperture)

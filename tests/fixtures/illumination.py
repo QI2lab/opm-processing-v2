@@ -6,6 +6,12 @@ import numpy as np
 import pytest
 import tensorstore as ts
 
+from opm_processing.imageprocessing.camera import camera_correct, illumination_correct
+from opm_processing.imageprocessing.opmtools import (
+    deskew_coverage,
+    deskew_shape_estimator,
+)
+
 
 @pytest.fixture
 def uniform_camera_scene(uniform_detector_scene):
@@ -73,7 +79,7 @@ def uniform_camera_scene(uniform_detector_scene):
 
 
 @pytest.fixture
-def assert_uniform_photon_accuracy(deskew_geometric_support):
+def assert_uniform_photon_accuracy():
     """Bound positive CPU interpolation using the original phantom and camera noise."""
     from tests.simulation.camera_likelihood import (
         SamplingEnvelope,
@@ -90,31 +96,22 @@ def assert_uniform_photon_accuracy(deskew_geometric_support):
             assert data.shape[-3:] == native
             coverage = np.ones(data.shape[-3:])
         else:
-            angle = np.deg2rad(microscope.angle_deg)
-            expected_shape = (
-                int(np.ceil(native[1] * np.sin(angle))),
-                (
-                    int(
-                        np.ceil(
-                            native[0] * microscope.scan_step_um / pixel
-                            + native[1] * np.cos(angle)
-                        )
-                    )
-                    + 3
-                )
-                // 4
-                * 4,
-                (native[2] + 3) // 4 * 4,
+            expected_shape, _, _, _ = deskew_shape_estimator(
+                native,
+                microscope.angle_deg,
+                microscope.scan_step_um,
+                pixel,
+                crop_after_deskew=False,
             )
-            assert data.shape[-3:] == expected_shape
+            assert data.shape[-3:] == tuple(expected_shape)
             geometry = {
                 "theta": microscope.angle_deg,
                 "distance": microscope.scan_step_um,
                 "pixel_size": pixel,
             }
             coverage = np.zeros(data.shape[-3:])
-            coverage[..., : native[2]] = deskew_geometric_support(
-                native, data.shape[-3:], geometry
+            coverage[..., : native[2]] = deskew_coverage(
+                native, data.shape[-3:], **geometry
             )[..., None]
         camera = microscope.camera
         selected = range(data.shape[1]) if channels is None else channels
@@ -123,17 +120,14 @@ def assert_uniform_photon_accuracy(deskew_geometric_support):
                 truth = scene.source_means[time, position, channel]
                 np.testing.assert_allclose(truth, truth.flat[0], rtol=2e-5)
                 field = scene.fields[channel]
-                observed = (
-                    np.maximum(
-                        (
-                            scene.pixels[time, position, channel].astype(np.float64)
-                            - camera.offset_adu
-                        )
-                        * camera.electrons_per_adu,
-                        0,
-                    )
-                    / field
-                )
+                observed = illumination_correct(
+                    camera_correct(
+                        scene.pixels[time, position, channel],
+                        camera.offset_adu,
+                        camera.electrons_per_adu,
+                    ),
+                    field,
+                ).astype(np.float64)
                 residual = observed - truth
                 expected = float(truth.flat[0]) * gain * coverage
                 operations = 64
