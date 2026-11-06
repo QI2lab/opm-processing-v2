@@ -43,7 +43,6 @@ import psutil
 import tensorstore as ts
 from numba import njit
 from tqdm import tqdm
-from yaozarrs import v05
 from yaozarrs.write.v05 import prepare_image
 
 from opm_processing.cuda import preload_cuda_libraries
@@ -54,7 +53,7 @@ from opm_processing.dataio.acquisition import (
 )
 from opm_processing.dataio.ngff import (
     round_spatial_values,
-    round_tczyx_transform,
+    tczyx_image_metadata,
 )
 from opm_processing.dataio.position_collection import open_position_collection
 from opm_processing.dataio.processing_state import (
@@ -62,7 +61,6 @@ from opm_processing.dataio.processing_state import (
     processing_state_image_attributes,
     processing_state_path,
 )
-from opm_processing.dataio.timing import time_axis
 from opm_processing.imageprocessing.coordinates import (
     STAGE_COORDINATE_VERSION,
     deskewed_stage_scan_offsets,
@@ -4150,48 +4148,21 @@ class TileFusion:
         factors = (1, *self.multiscale_factors)
         dz, dy, dx = round_spatial_values(self._pixel_size)
         offset_z, offset_y, offset_x = round_spatial_values(self.offset_um)
-        t_axis, t_scale = time_axis(getattr(self, "time_interval_s", None))
-        axes = [
-            t_axis,
-            {"name": "c", "type": "channel"},
-            {"name": "z", "type": "space", "unit": "micrometer"},
-            {"name": "y", "type": "space", "unit": "micrometer"},
-            {"name": "x", "type": "space", "unit": "micrometer"},
-        ]
-        datasets = []
+        spatial_scales = []
+        spatial_origins = []
         specs = []
         z0, y0, x0 = (int(value) for value in self.padded_shape)
-        for level, factor in enumerate(factors):
+        for factor in factors:
             z_factor = 1 if self._is_2d else int(factor)
             center_shift = 0.5 if self.multiscale_downsample == "block_mean" else 0.0
-            translation = round_tczyx_transform(
+            spatial_origins.append(
                 (
-                    0,
-                    0,
                     offset_z + center_shift * (z_factor - 1) * dz,
                     offset_y + center_shift * (factor - 1) * dy,
                     offset_x + center_shift * (factor - 1) * dx,
                 )
             )
-            datasets.append(
-                {
-                    "path": str(level),
-                    "coordinateTransformations": [
-                        {
-                            "scale": round_tczyx_transform(
-                                (
-                                    t_scale,
-                                    1,
-                                    dz * z_factor,
-                                    dy * factor,
-                                    dx * factor,
-                                )
-                            )
-                        },
-                        {"translation": translation},
-                    ],
-                }
-            )
+            spatial_scales.append((dz * z_factor, dy * factor, dx * factor))
             specs.append(
                 (
                     (
@@ -4205,8 +4176,11 @@ class TileFusion:
                 )
             )
 
-        image = v05.Image(
-            multiscales=[v05.Multiscale(name="fused", axes=axes, datasets=datasets)]
+        image = tczyx_image_metadata(
+            spatial_scales,
+            spatial_origins,
+            time_interval_s=getattr(self, "time_interval_s", None),
+            name="fused",
         )
         # Keep storage chunks shallow enough for interactive plane viewing.
         # Rendering uses a separate, much deeper RAM block chosen below.

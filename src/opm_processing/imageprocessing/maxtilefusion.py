@@ -21,6 +21,7 @@ from opm_processing.dataio.ngff import (
     round_spatial,
     round_spatial_values,
     round_tczyx_transform,
+    tczyx_image_metadata,
 )
 from opm_processing.dataio.processing_state import (
     ProcessingState,
@@ -610,50 +611,24 @@ class MaxTileFusion:
         )
         self.multiscale_factors_yx = factors
         interval_s = getattr(self, "time_interval_s", None)
-        t_axis, t_scale = time_axis(interval_s)
         t_origin = (
             0
             if self.time_range is None or interval_s is None
-            else self.time_range[0] * t_scale
+            else self.time_range[0] * interval_s
         )
-        axes = [
-            t_axis,
-            {"name": "c", "type": "channel"},
-            {"name": "z", "type": "space", "unit": "micrometer"},
-            {"name": "y", "type": "space", "unit": "micrometer"},
-            {"name": "x", "type": "space", "unit": "micrometer"},
-        ]
-        datasets = []
+        spatial_scales = []
+        spatial_origins = []
         specs = []
-        for level, factor in enumerate(factors):
-            datasets.append(
-                v05.Dataset(
-                    path=str(level),
-                    coordinateTransformations=[
-                        v05.ScaleTransformation(
-                            scale=round_tczyx_transform(
-                                (
-                                    t_scale,
-                                    1,
-                                    self.z_pixel_size,
-                                    self.pixel_size[0] * factor,
-                                    self.pixel_size[1] * factor,
-                                )
-                            )
-                        ),
-                        v05.TranslationTransformation(
-                            translation=round_tczyx_transform(
-                                (
-                                    t_origin,
-                                    0,
-                                    self.spatial_offset_z_um,
-                                    self.offset[0],
-                                    self.offset[1],
-                                )
-                            )
-                        ),
-                    ],
+        for factor in factors:
+            spatial_scales.append(
+                (
+                    self.z_pixel_size,
+                    self.pixel_size[0] * factor,
+                    self.pixel_size[1] * factor,
                 )
+            )
+            spatial_origins.append(
+                (self.spatial_offset_z_um, self.offset[0], self.offset[1])
             )
             specs.append(
                 (
@@ -667,14 +642,12 @@ class MaxTileFusion:
                     self.output_dtype,
                 )
             )
-        image = v05.Image(
-            multiscales=[
-                v05.Multiscale(
-                    name="fused-max-projection",
-                    axes=axes,
-                    datasets=datasets,
-                )
-            ]
+        image = tczyx_image_metadata(
+            spatial_scales,
+            spatial_origins,
+            time_interval_s=interval_s,
+            time_origin_s=t_origin,
+            name="fused-max-projection",
         )
         _, arrays = prepare_image(
             self.output_path,

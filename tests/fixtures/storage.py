@@ -5,9 +5,9 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 from skimage.measure import block_reduce
-from yaozarrs import v05
 from yaozarrs.write.v05 import prepare_image
 
+from opm_processing.dataio.ngff import tczyx_image_metadata
 from opm_processing.dataio.position_collection import create_position_collection
 
 
@@ -78,49 +78,16 @@ def fused_store_factory(tmp_path):
             ).astype(data.dtype)
             for factor in factors
         ]
-        datasets = [
-            v05.Dataset(
-                path=str(index),
-                coordinateTransformations=[
-                    v05.ScaleTransformation(
-                        scale=[
-                            1 if time_step_s is None else time_step_s,
-                            1,
-                            *(factor * value for value in spacing),
-                        ]
-                    ),
-                    v05.TranslationTransformation(
-                        translation=[
-                            time_origin_s,
-                            0,
-                            *(
-                                origin
-                                if level_origins is None
-                                else level_origins[index]
-                            ),
-                        ]
-                    ),
-                ],
-            )
-            for index, factor in enumerate(factors)
-        ]
-        image = v05.Image(
-            multiscales=[
-                v05.Multiscale(
-                    axes=[
-                        v05.TimeAxis(
-                            name="t", unit=None if time_step_s is None else "second"
-                        ),
-                        v05.ChannelAxis(name="c"),
-                        *(
-                            v05.SpaceAxis(name=axis, unit="micrometer")
-                            for axis in "zyx"
-                        ),
-                    ],
-                    datasets=datasets,
-                )
+        image = tczyx_image_metadata(
+            [tuple(factor * value for value in spacing) for factor in factors],
+            [
+                origin if level_origins is None else level_origins[index]
+                for index in range(len(factors))
             ],
+            time_interval_s=time_step_s,
+            time_origin_s=time_origin_s,
             omero=omero,
+            round_coordinates=False,
         )
         _, arrays = prepare_image(
             path,
