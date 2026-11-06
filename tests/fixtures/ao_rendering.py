@@ -3,20 +3,10 @@
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
 
 import numpy as np
 import pytest
 from scripts.ao_tissue_overlay import write_tissue_overlay
-
-
-@dataclass
-class OverlayCase:
-    """Production geometry and region records with prescribed visual landmarks."""
-
-    geometry: Any
-    regions: list
-    pupil: Any = None
 
 
 @pytest.fixture
@@ -42,7 +32,7 @@ def ao_overlay_case(ao_geometry_factory, ao_region_factory):
         for depth in range(4)
         for index in range(2)
     ]
-    return OverlayCase(geometry, regions, pupil)
+    return geometry, regions, pupil
 
 
 @pytest.fixture
@@ -64,13 +54,10 @@ def ao_planned_overlay_case(ao_geometry_factory, ao_region_factory):
         },
         depth_offsets={0: 0},
     )
-    return OverlayCase(
-        geometry,
-        [
-            ao_region_factory(index=index, pupil=np.ma.array([[0, 1], [2, 3]]))
-            for index in range(9)
-        ],
-    )
+    return geometry, [
+        ao_region_factory(index=index, pupil=np.ma.array([[0, 1], [2, 3]]))
+        for index in range(9)
+    ]
 
 
 @pytest.fixture
@@ -91,13 +78,9 @@ def ao_local_overlay_case(ao_geometry_factory, ao_region_factory):
             1: {"z_bounds_um": [-40, -30]},
         },
     )
-    return OverlayCase(
-        geometry,
-        [
-            ao_region_factory(depth=depth, pupil=np.ma.zeros((4, 4)))
-            for depth in range(2)
-        ],
-    )
+    return geometry, [
+        ao_region_factory(depth=depth, pupil=np.ma.zeros((4, 4))) for depth in range(2)
+    ]
 
 
 @pytest.fixture

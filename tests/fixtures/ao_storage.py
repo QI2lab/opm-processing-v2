@@ -25,12 +25,7 @@ def ao_memmap_source(tmp_path):
     def create(pixels):
         """Persist calibrated display input without a custom array adapter."""
         path = tmp_path / f"native-cache-{next(counter)}.npy"
-        output = np.lib.format.open_memmap(
-            path, mode="w+", shape=pixels.shape, dtype=pixels.dtype
-        )
-        output[...] = pixels
-        output.flush()
-        del output
+        np.save(path, pixels)
         return np.load(path, mmap_mode="r")
 
     return create
@@ -68,7 +63,7 @@ def phase_case(
     ao_quadrant_pupil,
 ):
     """Make predicted RGB tiles with edge pupils, masked holes and existing lines."""
-    background = ao_rgb_field((35, 53))
+    background = ao_memmap_source(ao_rgb_field((35, 53)))
     mask = np.zeros((8, 8), dtype=bool)
     mask[3:5, 3:5] = True
     new_phase = ao_quadrant_pupil.data.copy()
@@ -103,8 +98,6 @@ def phase_case(
             0: {"mip_sha256": hashlib.sha256(background.tobytes()).hexdigest()}
         },
     )
-    background = ao_memmap_source(background)
-    geometry = replace(geometry, image=background, images_by_depth={0: background})
     monkeypatch.setattr(ao_tissue_bigtiff, "TILE_SHAPE", (16, 16))
     original = write_tissue_bigtiffs(
         old_regions,
@@ -151,30 +144,12 @@ def native_percentile_case(monkeypatch, ao_memmap_source):
     """Share the prescribed native image, pupils and calibrated rendering setup."""
     pixels = np.asarray(
         [
-            0,
-            13,
-            17,
-            40,
-            66,
-            100,
-            223,
-            456,
-            789,
-            1234,
-            2345,
-            4567,
-            6789,
-            9000,
-            12345,
-            23456,
-            45678,
-            56789,
-            60000,
-            65000,
-            65535,
+            [0, 13, 17, 40, 66, 100, 223],
+            [456, 789, 1234, 2345, 4567, 6789, 9000],
+            [12345, 23456, 45678, 56789, 60000, 65000, 65535],
         ],
         dtype=np.uint16,
-    ).reshape(3, 7)[:, ::-1]
+    )[:, ::-1]
     source = ao_memmap_source(pixels)
     monkeypatch.setattr(ao_tissue_bigtiff, "_HISTOGRAM_BYTES", 14)
     return SimpleNamespace(
@@ -239,7 +214,6 @@ def native_gray_tiff_case(
     monkeypatch.setattr(ao_tissue_bigtiff, "_HISTOGRAM_BYTES", 212)
     return SimpleNamespace(
         pixels=pixels,
-        source=source,
         mip_hash=mip_hash,
         geometry=geometry,
         regions=regions,
@@ -280,9 +254,7 @@ def native_rgb_raster_case(
 
 
 @pytest.fixture
-def native_rgb_tiff_case(
-    monkeypatch, ao_memmap_source, ao_geometry_factory, ao_region_factory
-):
+def native_rgb_tiff_case(monkeypatch, ao_memmap_source, native_gray_tiff_case):
     """Share the prescribed native image, pupils and calibrated rendering setup."""
     pixels = np.empty((35, 53, 3), np.uint8)
     pixels[:, :17] = (255, 0, 255)
@@ -291,21 +263,14 @@ def native_rgb_tiff_case(
     source = ao_memmap_source(pixels)
     channel_hashes = {"0": "0" * 64, "1": "1" * 64, "3": "3" * 64}
     composite = {"channels": [0, 1, 3], "colors": ["magenta", "cyan", "orange"]}
-    geometry = ao_geometry_factory(
-        pixels,
-        shape_yx=(35, 53),
-        scale_yx_um=(0.5, 0.25),
-        extent_yx_um=(-5, 12.5, 20, 33.25),
+    geometry = replace(
+        native_gray_tiff_case.geometry,
+        image=pixels,
         images_by_depth={2: source},
         display_limits_by_depth={2: (100, 101)},
-        planned_centers_by_depth_index={2: {0: (3, 26)}},
-        planned_grid_by_depth_index={
-            2: {"horizontal_y_um": [2.75], "vertical_x_um": [24.375]}
-        },
         layer_projection_rois_by_depth={2: {"mip_sha256_by_channel": channel_hashes}},
         provenance={"tissue_composite": composite},
     )
-    regions = [ao_region_factory(depth=2, index=0, pupil=np.ma.zeros((8, 8)))]
     contrasts = []
     real_limits = ao_tissue_bigtiff.native_display_limits
 
@@ -315,15 +280,13 @@ def native_rgb_tiff_case(
         return real_limits(image)
 
     monkeypatch.setattr(ao_tissue_bigtiff, "native_display_limits", observe_contrast)
-    monkeypatch.setattr(ao_tissue_bigtiff, "TILE_SHAPE", (16, 16))
     return SimpleNamespace(
         contrasts=contrasts,
         pixels=pixels,
-        source=source,
         channel_hashes=channel_hashes,
         composite=composite,
         geometry=geometry,
-        regions=regions,
+        regions=native_gray_tiff_case.regions,
     )
 
 

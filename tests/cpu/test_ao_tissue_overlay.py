@@ -38,11 +38,7 @@ def test_tissue_overlay_preserves_pupil_orientation_centers_and_full_extent(
     tmp_path, ao_overlay_case, ao_figure_observer
 ):
     """Asymmetric pupils retain orientation over an inverted physical tissue Y axis."""
-    geometry, regions, pupil = (
-        ao_overlay_case.geometry,
-        ao_overlay_case.regions,
-        ao_overlay_case.pupil,
-    )
+    geometry, regions, pupil = ao_overlay_case
     centers = geometry.centers_by_depth_index
     figures = ao_figure_observer
     record = write_tissue_overlay(
@@ -111,10 +107,7 @@ def test_planned_grid_evenly_divides_the_full_acquisition_area(
     tmp_path, ao_planned_overlay_case, ao_figure_observer
 ):
     """Nine correction symbols occupy independent known physical grid centers."""
-    geometry, regions = (
-        ao_planned_overlay_case.geometry,
-        ao_planned_overlay_case.regions,
-    )
+    geometry, regions = ao_planned_overlay_case
     planned = geometry.planned_centers_by_depth_index[0]
     boundaries = geometry.planned_grid_by_depth_index[0]
     figures = ao_figure_observer
@@ -166,7 +159,7 @@ def test_each_depth_uses_its_local_projection_and_reports_its_roi(
     tmp_path, ao_local_overlay_case, ao_figure_observer
 ):
     """Distinct known layer structures survive their own display normalization."""
-    geometry, regions = ao_local_overlay_case.geometry, ao_local_overlay_case.regions
+    geometry, regions = ao_local_overlay_case
     first, second = (geometry.images_by_depth[depth] for depth in (0, 1))
     rois = geometry.layer_projection_rois_by_depth
     figures = ao_figure_observer

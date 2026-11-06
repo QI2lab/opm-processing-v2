@@ -370,11 +370,9 @@ def ao_geometry_case(
     state.set_registered_max_projection(collection.path, max_projection_path=preview)
     return SimpleNamespace(
         root=tmp_path,
-        preview=preview,
         pixels=pixels,
         native=native[0, 0, 0],
         regions=regions,
-        state=state,
     )
 
 
@@ -402,14 +400,13 @@ def ao_cache_export_factory(tmp_path, ao_result_factory, ao_geometry_factory):
         native=False,
         center=None,
         pupil_diameter_um=8,
-        scale_bar_um=5,
         grid=None,
     ):
         output = tmp_path / name
         output.mkdir()
         channels = tuple(images)
         depths = tuple(sorted(next(iter(images.values()))))
-        shape = tuple(next(iter(next(iter(images.values())).values())).shape)
+        shape = images[channels[0]][depths[0]].shape
         center = center or (shape[0] / 2, shape[1] / 2)
         cache_paths, fingerprints, hashes = {}, {}, {}
         for channel in channels:
@@ -480,7 +477,7 @@ def ao_cache_export_factory(tmp_path, ao_result_factory, ao_geometry_factory):
                 {
                     "depth_index": depth,
                     "sample_depth_um": 11.76 * depth,
-                    "scale_bar": {"length_um": scale_bar_um},
+                    "scale_bar": {"length_um": 5},
                     "planned_grid": grid
                     or {"horizontal_y_um": [], "vertical_x_um": []},
                     "regions": [{"region_index": 0, "center_yx_um": list(center)}],
@@ -554,7 +551,7 @@ def ao_cache_export_factory(tmp_path, ao_result_factory, ao_geometry_factory):
             output / "previews",
             timepoint=0,
             pupil_diameter_um=pupil_diameter_um,
-            scale_bar_um=scale_bar_um,
+            scale_bar_um=5,
             planned_grid=True,
             output_shape_yx=shape,
         )
@@ -567,7 +564,7 @@ def ao_cache_export_factory(tmp_path, ao_result_factory, ao_geometry_factory):
                 output / "native",
                 timepoint=0,
                 pupil_diameter_um=pupil_diameter_um,
-                scale_bar_um=scale_bar_um,
+                scale_bar_um=5,
             )
             manifest["native_tissue_overlays"] = native_result
         (output / "ao_publication.json").write_text(json.dumps(manifest, indent=2))
@@ -577,7 +574,6 @@ def ao_cache_export_factory(tmp_path, ao_result_factory, ao_geometry_factory):
             cache_paths=cache_paths,
             hashes=hashes,
             colors=colors,
-            regions=regions,
             geometry=geometry,
             previews=previews,
             native=native_result,
@@ -632,9 +628,7 @@ def saved_phase_inputs(ao_result_factory):
             }
         ],
     }
-    return SimpleNamespace(
-        manifest=manifest, starting=starting, final=final, result=case.result
-    )
+    return SimpleNamespace(manifest=manifest, starting=starting, final=final)
 
 
 @pytest.fixture
@@ -671,8 +665,6 @@ def ao_modal_sequence_factory():
             )
             saved.append(Region(depth, index, None, pupil))
         return SimpleNamespace(
-            baseline=baseline,
-            commands=commands,
             saved=saved,
             manifest={
                 "coefficient_state": "final",
@@ -687,25 +679,21 @@ def ao_modal_sequence_factory():
 @pytest.fixture
 def ao_modal_chain(ao_modal_sequence_factory):
     """Provide inherited physical modal states for two sites and three depths."""
-
-    def create():
-        reference = np.array([0.3, -0.2, 0.1])
-        commands = {
-            (depth, index): reference
-            + np.array(
-                [
-                    (0.01, 0.04, 0.09)[depth] * (index + 1),
-                    -0.02 * (depth + 1),
-                    0.03 * (depth + 1),
-                ]
-            )
-            for index in range(2)
-            for depth in range(3)
-        }
-        case = ao_modal_sequence_factory(reference, commands)
-        return case.manifest, case.saved, reference
-
-    return create
+    reference = np.array([0.3, -0.2, 0.1])
+    commands = {
+        (depth, index): reference
+        + np.array(
+            [
+                (0.01, 0.04, 0.09)[depth] * (index + 1),
+                -0.02 * (depth + 1),
+                0.03 * (depth + 1),
+            ]
+        )
+        for index in range(2)
+        for depth in range(3)
+    }
+    case = ao_modal_sequence_factory(reference, commands)
+    return case.manifest, case.saved, reference
 
 
 @pytest.fixture

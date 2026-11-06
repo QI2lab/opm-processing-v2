@@ -18,7 +18,7 @@ def test_every_depth_subtracts_original_common_start_and_preserves_sources(
     ao_modal_chain, ao_analytical_phase
 ):
     """Later inherited starts must never replace the original shared baseline."""
-    manifest, saved, reference = ao_modal_chain()
+    manifest, saved, reference = ao_modal_chain
     original_manifest = copy.deepcopy(manifest)
     original_pupils = [region.pupil.copy() for region in saved]
     regions, provenance, records = relative_regions(
@@ -103,7 +103,7 @@ def test_shrinking_full_command_can_require_growing_cumulative_correction(
 
 def test_signed_layer_changes_cancel_in_the_cumulative_command(ao_modal_chain):
     """Adding absolute mode amplitudes or layer RMS values would overcount."""
-    manifest, saved, _ = ao_modal_chain()
+    manifest, saved, _ = ao_modal_chain
     commands = ([0.4, -0.2, 0.1], [0.2, -0.2, 0.1], [0.35, -0.2, 0.1])
     prior = [0.3, -0.2, 0.1]
     for depth, final in enumerate(commands):
@@ -170,7 +170,7 @@ def test_full_command_preserves_nonzero_initial_spherical_correction(
 
 def test_full_command_is_starting_state_plus_signed_layer_changes_once(ao_modal_chain):
     """Including the starting state changes the plot, not the accumulated deltas."""
-    manifest, saved, baseline = ao_modal_chain()
+    manifest, saved, baseline = ao_modal_chain
     commands = {
         (record["depth_index"], record["region_index"]): np.asarray(
             record["final_coefficients"]
@@ -205,7 +205,7 @@ def test_full_command_is_starting_state_plus_signed_layer_changes_once(ao_modal_
 
 def test_broken_per_position_warm_start_chain_is_rejected(ao_modal_chain):
     """A prior command from another grid site is not a valid inherited state."""
-    manifest, saved, _ = ao_modal_chain()
+    manifest, saved, _ = ao_modal_chain
     manifest["regions"][1]["starting_coefficients"] = list(
         manifest["regions"][3]["final_coefficients"]
     )
@@ -215,7 +215,7 @@ def test_broken_per_position_warm_start_chain_is_rejected(ao_modal_chain):
 
 def test_noncommon_original_start_is_rejected(ao_modal_chain):
     """A distinct initial vector at one grid position cannot be silently reused."""
-    manifest, saved, _ = ao_modal_chain()
+    manifest, saved, _ = ao_modal_chain
     manifest["regions"][3]["starting_coefficients"][0] += 0.001
     with pytest.raises(ValueError, match="single common"):
         relative_regions(manifest, saved, ao_wavekit_phase)
@@ -224,7 +224,7 @@ def test_noncommon_original_start_is_rejected(ao_modal_chain):
 @pytest.mark.parametrize("bad_coefficients", ([0.1, 0.2], [0.1, np.nan, 0.2]))
 def test_invalid_final_modal_basis_is_rejected(bad_coefficients, ao_modal_chain):
     """Every reconstructed final command must use the original finite basis."""
-    manifest, saved, _ = ao_modal_chain()
+    manifest, saved, _ = ao_modal_chain
     manifest["regions"][0]["final_coefficients"] = bad_coefficients
     with pytest.raises(ValueError, match="common modal basis"):
         relative_regions(manifest, saved, ao_wavekit_phase)
@@ -232,7 +232,7 @@ def test_invalid_final_modal_basis_is_rejected(bad_coefficients, ao_modal_chain)
 
 def test_reconstruction_cannot_change_original_pupil_aperture(ao_modal_chain):
     """A changed reader mask would invalidate the tissue-background reuse."""
-    manifest, saved, _ = ao_modal_chain()
+    manifest, saved, _ = ao_modal_chain
 
     saved[0].pupil = np.ma.array(saved[0].pupil.data, mask=False)
 
