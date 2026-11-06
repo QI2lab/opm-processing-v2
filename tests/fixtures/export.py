@@ -1,5 +1,6 @@
 """Calibrated fluorescent specimens and provenance for OME-TIFF exports."""
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
@@ -146,3 +147,83 @@ def fused_export(tmp_path, source_xml, fused_store_factory, simulated_camera):
         state=state,
         dtype=dtype,
     )
+
+
+@pytest.fixture
+def projection_sphere():
+    """Share an analytical physical display object and its real storage setup."""
+    spacing = (0.4, 0.2, 0.1)
+    shape = (31, 61, 121)
+    z, y, x = np.meshgrid(
+        *[
+            (np.arange(n) - (n - 1) / 2) * d
+            for n, d in zip(shape, spacing, strict=False)
+        ],
+        indexing="ij",
+    )
+    sphere = (x * x + y * y + z * z <= 4**2).astype(float)
+    return SimpleNamespace(
+        sphere=sphere,
+        spacing=spacing,
+    )
+
+
+@pytest.fixture
+def projection_export_case(position_store_factory, acquisition_metadata, stored_timing):
+    """Share an analytical physical display object and its real storage setup."""
+    first = np.linspace(0, 100, 10 * 48 * 64).reshape(10, 48, 64)
+    data = np.stack([np.stack([first, first * 2]), np.stack([first * 0.5, first])])
+    collection = position_store_factory(
+        np.repeat(data[:, None], 2, axis=1).astype(np.float32),
+        name="sample_decon_deskewed",
+        voxel_size_um=(0.1, 0.1, 0.1),
+        channels=("488", "637"),
+        time_interval_s=0.5 if stored_timing else None,
+    )
+    source_path = collection.path
+    acquisition = replace(
+        acquisition_metadata,
+        acquired_plane_count=None if stored_timing else 25,
+        plane_period_s=None if stored_timing else 0.02,
+    )
+    return SimpleNamespace(
+        data=data,
+        source_path=source_path,
+        acquisition=acquisition,
+    )
+
+
+@pytest.fixture
+def planar_fused_export(fused_store_factory, simulated_camera):
+    """Persist one real single-channel planar object with explicit physical timing."""
+    from opm_processing.imageprocessing.camera import camera_correct
+
+    observed = simulated_camera((1, 17, 19), geometry="cartesian")
+    microscope = observed.microscope
+    spacing = (
+        microscope.scan_step_um,
+        microscope.pixel_size_um,
+        microscope.pixel_size_um,
+    )
+    truth = camera_correct(
+        observed.raw, microscope.camera.offset_adu, microscope.camera.electrons_per_adu
+    ).astype(np.uint16)[None, None]
+    for name in ("sample_fused", "sample_max_z_fused"):
+        fused_store_factory(
+            truth,
+            name=name,
+            spacing=spacing,
+            time_step_s=3.5,
+            time_origin_s=9.75,
+            chunks=(1, 1, 1, 17, 19),
+            omero=v05.Omero(
+                channels=[
+                    v05.OmeroChannel(
+                        label="simulated points",
+                        color="00FF00",
+                        window=v05.OmeroWindow(start=0, end=100, min=0, max=100),
+                    )
+                ]
+            ),
+        )
+    return SimpleNamespace(truth=truth, spacing=spacing)

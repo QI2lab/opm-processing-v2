@@ -10,18 +10,11 @@ from opm_processing import export_projections as exporter
 
 
 @pytest.mark.unit
-def test_physical_sphere_projections_and_scale():
+def test_physical_sphere_projections_and_scale(projection_sphere):
     """A sphere on anisotropic voxels must display circular in all three views."""
-    spacing = (0.4, 0.2, 0.1)
-    shape = (31, 61, 121)
-    z, y, x = np.meshgrid(
-        *[
-            (np.arange(n) - (n - 1) / 2) * d
-            for n, d in zip(shape, spacing, strict=False)
-        ],
-        indexing="ij",
-    )
-    sphere = (x * x + y * y + z * z <= 4**2).astype(float)
+    case = projection_sphere
+    sphere = case.sphere
+    spacing = case.spacing
     images, display_pixel_um, legends = exporter.projection_panels(
         sphere, spacing, (0, 1)
     )
@@ -63,24 +56,13 @@ def test_acquired_volume_timing(acquisition_metadata, planes, period):
 @pytest.mark.unit
 @pytest.mark.parametrize("stored_timing", [False, True])
 def test_disk_export_preserves_brightness_and_separates_series(
-    tmp_path, position_store_factory, acquisition_metadata, stored_timing
+    projection_export_case, tmp_path
 ):
     """Known linear intensities retain the same mapping over time in each series."""
-    first = np.linspace(0, 100, 10 * 48 * 64).reshape(10, 48, 64)
-    data = np.stack([np.stack([first, first * 2]), np.stack([first * 0.5, first])])
-    collection = position_store_factory(
-        np.repeat(data[:, None], 2, axis=1).astype(np.float32),
-        name="sample_decon_deskewed",
-        voxel_size_um=(0.1, 0.1, 0.1),
-        channels=("488", "637"),
-        time_interval_s=0.5 if stored_timing else None,
-    )
-    source_path = collection.path
-    acquisition = replace(
-        acquisition_metadata,
-        acquired_plane_count=None if stored_timing else 25,
-        plane_period_s=None if stored_timing else 0.02,
-    )
+    case = projection_export_case
+    data = case.data
+    source_path = case.source_path
+    acquisition = case.acquisition
     exporter.export_dataset(source_path, tmp_path, acquisition, 1)
     files = sorted(tmp_path.rglob("*.tiff"))
     assert len(files) == 8
