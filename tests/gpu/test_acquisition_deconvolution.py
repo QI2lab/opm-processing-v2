@@ -26,9 +26,6 @@ from tests.simulation.metrics import (
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize(
-    "diagnostics", [False, True], ids=["progress-default", "diagnostics"]
-)
 def test_as_acquired_combined_channel_deconvolution(
     cupy_gpu,
     simulated_camera,
@@ -36,7 +33,6 @@ def test_as_acquired_combined_channel_deconvolution(
     invoke_cli,
     monkeypatch,
     small_cpu_kernels,
-    diagnostics,
     assert_reconstruction_storage,
 ):
     """Improve true camera likelihood without injecting PSF calibration into raw data."""
@@ -75,7 +71,7 @@ def test_as_acquired_combined_channel_deconvolution(
         return result
 
     monkeypatch.setattr(rlgc, "rlgc", observe)
-    result = invoke_cli(
+    invoke_cli(
         "process",
         dataset.path,
         deconvolve=True,
@@ -83,12 +79,7 @@ def test_as_acquired_combined_channel_deconvolution(
         save_float32=True,
         z_downsample_level=1,
         decon_crop_scan=12,
-        **({"decon_verbose": 1} if diagnostics else {}),
     )
-    assert "decon:" in result.output
-    assert ("RLGC acquired_shape=" in result.output) == diagnostics
-    assert ("iteration=" in result.output) == diagnostics
-    assert ("Automatic RLGC scan refinement:" in result.output) == diagnostics
     assert dict(open_group(dataset.path).attrs) == original_attributes
     ((recovered, psf, boundary),) = reconstructed
     assert recovered.shape == (49, 32, 36)

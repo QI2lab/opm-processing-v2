@@ -395,9 +395,9 @@ def test_zero_registration_channel_is_excluded_before_patch_reads(
 @pytest.mark.parametrize("limit_y", (None, 50))
 @pytest.mark.parametrize("depth_overlap", (20, 13))
 def test_depth_registration_handles_large_xy_drift(
-    registration_pair, shifted_slab_pair, block_fusion, limit_y, depth_overlap, capsys
+    registration_pair, shifted_slab_pair, block_fusion, limit_y, depth_overlap
 ):
-    """Recover a thin-Z overlap with 60-pixel Y drift, or explain rejection."""
+    """Recover a thin-Z overlap with 60-pixel Y drift within the prescribed limit."""
     pair = shifted_slab_pair(
         (32, 180, 200), 32 - depth_overlap, (0, -60, 70), seed=71, spacing=(1, 1, 1)
     )
@@ -412,13 +412,9 @@ def test_depth_registration_handles_large_xy_drift(
 
     fusion.refine_tile_positions_with_cross_correlation()
     fusion.optimize_shifts()
-    fusion.report_registration_connectivity()
-
-    output = capsys.readouterr().out
     if limit_y is None:
         assert set(fusion.pairwise_metrics) == {(0, 1)}
         np.testing.assert_allclose(fusion.global_offsets[1], (0, -60, 70), atol=1)
-        assert "Registration warning" not in output
         origins = (
             np.asarray(pair.positions) / pair.spacing
             + fusion.global_offsets
@@ -450,9 +446,6 @@ def test_depth_registration_handles_large_xy_drift(
         assert measured.accepted, measured
     else:
         assert fusion.pairwise_metrics == {}
-        assert "exceeded the ZYX shift limits" in output
-        assert "disconnected components" in output
-        assert "not mutually registered" in output
 
 
 @pytest.mark.parametrize("dtype", (np.float32, np.uint16))

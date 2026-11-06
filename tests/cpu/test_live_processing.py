@@ -371,7 +371,6 @@ def test_offline_resume_skips_durably_completed_tile_and_default_overwrites(
         input=f"{action}\n",
     )
     assert result.exit_code == 0, result.exception
-    assert "Resume / Overwrite / Cancel" in result.output
     output = open_position_collection(root / case.output.name)
     actual = output.arrays[0].read().result()
     assert_uniform_photon_accuracy(

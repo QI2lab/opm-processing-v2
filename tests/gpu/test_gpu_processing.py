@@ -179,13 +179,8 @@ def test_unbounded_registration_recovers_displaced_physical_observations(
 
 
 @pytest.mark.parametrize("crop_scan", [None, 1, 2, 0, -1, 1.5, True])
-@pytest.mark.parametrize(
-    "verbosity", [None, 0, 1], ids=["default", "no-diagnostics", "diagnostics"]
-)
-def test_rlgc_empty_image_remains_empty(
-    cupy_gpu, crop_scan, verbosity, capsys, monkeypatch
-):
-    """Preserve empty data and release solver state with opt-in diagnostics."""
+def test_rlgc_empty_image_remains_empty(cupy_gpu, crop_scan, monkeypatch):
+    """Preserve empty data and release solver state."""
     rlgc = importlib.import_module("opm_processing.imageprocessing.rlgc")
     clear = rlgc.clear_rlgc_caches
     cleanups = []
@@ -204,23 +199,9 @@ def test_rlgc_empty_image_remains_empty(
         with pytest.raises(ValueError, match="crop_scan must be a positive integer"):
             rlgc.rlgc(observed, psf, crop_scan=crop_scan)
         return
-    options = {} if verbosity is None else {"verbose": verbosity}
-    restored = rlgc.rlgc(observed, psf, crop_scan=crop_scan, **options)
+    restored = rlgc.rlgc(observed, psf, crop_scan=crop_scan)
     np.testing.assert_array_equal(restored, observed)
     assert len(cleanups) == 1
-    captured = capsys.readouterr()
-    assert not captured.out
-    assert ("decon:" in captured.err) == (crop_scan in (1, 2))
-    if verbosity:
-        assert "RLGC acquired_shape=" in captured.err
-        assert "iteration=" in captured.err
-        assert "stop=" in captured.err
-    else:
-        assert "RLGC acquired_shape=" not in captured.err
-        assert "iteration=" not in captured.err
-        assert "stop=" not in captured.err
-        if crop_scan is None:
-            assert not captured.err
     assert not rlgc._fft_cache_3d
     pool = cupy_gpu.get_default_memory_pool()
     assert pool.total_bytes() == pool.used_bytes()

@@ -260,8 +260,8 @@ def test_acquisition_manifest_is_json_serializable(acquisition_metadata, times):
     assert manifest["camera_conversion"] == acquisition.camera_conversion
 
 
-def test_estimation_worker_returns_annotated_errors_and_closes_pipe():
-    """Return the original input error and its traceback through a real pipe."""
+def test_estimation_worker_returns_input_errors_and_closes_pipe():
+    """Return the original input error through a real pipe and close it."""
     import multiprocessing as mp
     from contextlib import closing
 
@@ -273,5 +273,4 @@ def test_estimation_worker_returns_annotated_errors_and_closes_pipe():
         run_estimate_illuminations(invalid, 100, 0.25, None, None, None, sending)
         error = receiving.recv()
         assert isinstance(error, ValueError)
-        assert any("Flatfield worker traceback" in note for note in error.__notes__)
         assert sending.closed

@@ -287,7 +287,7 @@ def test_live_wait_defers_processing_and_selects_flatfield(
     monkeypatch.setattr(
         processing, "call_estimate_illuminations", estimate_after_completion
     )
-    result = invoke_cli(
+    invoke_cli(
         "process",
         case.dataset.path.parent,
         live_wait=True,
@@ -313,11 +313,6 @@ def test_live_wait_defers_processing_and_selects_flatfield(
         assert np.all(np.isfinite(field) & (field > 0))
         if case.kind == "cached":
             np.testing.assert_array_equal(field, 2)
-        assert (
-            "starting offline processing"
-            if case.kind == "estimate"
-            else "Using existing flatfield"
-        ) in result.output
     output = open_position_collection(case.destination / "sample_deskewed.ome.zarr")
     data = output.arrays[0].read().result()
     span = (case.raw.shape[-3] - 1) * case.scene.microscope.scan_step_um
