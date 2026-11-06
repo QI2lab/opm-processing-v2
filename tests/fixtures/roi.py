@@ -219,16 +219,14 @@ def roi_camera_scene(simulated_camera):
             centers_zyx_um=centers,
             microscope=microscope,
             ground_truth=observation.ground_truth,
-            coincident_views=True,
-            varying_positions=vary_positions,
         )
 
     return create
 
 
 @pytest.fixture
-def roi_photon_accuracy():
-    """Certify original camera photons using the production source-plane mapper."""
+def assert_roi_point_accuracy(assert_roi_point_locations):
+    """Check original-emitter locations and photons on the saved ROI grid."""
     from scipy.ndimage import map_coordinates
 
     from opm_processing.imageprocessing.opmpsf import camera_grid_center
@@ -253,10 +251,12 @@ def roi_photon_accuracy():
         channels=None,
         illumination=1.0,
         positions=None,
-        equal_weights=False,
-        coverage_normalized=False,
+        fused=False,
     ):
         """Check fixed original-object apertures including partly supported Z bins."""
+        assert_roi_point_locations(
+            data, scene, origin, spacing, raw_origin=raw_origin, channels=channels
+        )
         microscope, camera = scene.microscope, scene.microscope.camera
         pixel, scan_step = microscope.pixel_size_um, microscope.scan_step_um
         angle = np.deg2rad(microscope.angle_deg)
@@ -272,18 +272,13 @@ def roi_photon_accuracy():
             else tuple(positions)
         )
         assert selected_positions
-        if len(selected_positions) > 1:
+        if fused and len(selected_positions) > 1:
             # These simulations explicitly expose the same physical camera field;
             # identically placed equal-support tiles have equal fusion weights.
-            assert scene.coincident_views
-            assert not scene.varying_positions or equal_weights
-            if equal_weights:
-                planned = np.asarray(scene.stage_positions_zxy)[
-                    list(selected_positions)
-                ]
-                np.testing.assert_array_equal(
-                    planned, np.broadcast_to(planned[0], planned.shape)
-                )
+            planned = np.asarray(scene.stage_positions_zxy)[list(selected_positions)]
+            np.testing.assert_array_equal(
+                planned, np.broadcast_to(planned[0], planned.shape)
+            )
         native_shape = scene.pixels.shape[-3:]
         native_output_shape, *_ = deskew_shape_estimator(
             native_shape,
@@ -314,6 +309,7 @@ def roi_photon_accuracy():
         z_center = first_z + np.arange(output_shape[0]) * factor + (factor - 1) / 2
         radii = sampling_stencil_radii(microscope, (pixel, pixel, pixel))
         gain = 2 * pixel / scan_step
+        field = np.broadcast_to(np.asarray(illumination), native_shape)
         source_centers = scene.centers_zyx_um + raw_origin
         centers_y = origin[1] + np.arange(output_shape[1]) * spacing[1]
         centers_x = origin[2] + np.arange(output_shape[2]) * spacing[2]
@@ -360,12 +356,10 @@ def roi_photon_accuracy():
             interior & (distance <= rayleigh),
             interior & (distance >= 2 * rayleigh),
         )
-        results = []
         selected_channels = range(data.shape[1]) if channels is None else channels
         for time in range(data.shape[0]):
             for channel in selected_channels:
                 means = scene.means[time, selected_positions, channel].mean(axis=0)
-                field = np.broadcast_to(np.asarray(illumination), native_shape)
                 view_bounds = [
                     camera_sampling_envelope(
                         scene.means[time, position, channel],
@@ -378,7 +372,7 @@ def roi_photon_accuracy():
                     )
                     for position in selected_positions
                 ]
-                if equal_weights:
+                if fused:
                     source_low = np.mean([bound.lower for bound in view_bounds], axis=0)
                     source_high = np.mean(
                         [bound.upper for bound in view_bounds], axis=0
@@ -455,7 +449,7 @@ def roi_photon_accuracy():
                             foot, native_shape[1] - 1, atol=1e-7
                         )
                     certain &= ~boundary[..., None]
-                if coverage_normalized:
+                if fused:
                     # Fusion's declared coverage contract restores the mean of
                     # acquired samples in partially supported nominal Z bins.
                     # Raw deskew stores retain the full nominal bin divisor.
@@ -474,8 +468,6 @@ def roi_photon_accuracy():
                         data[time, channel], reference, envelope, mask
                     )
                     assert result.accepted, result
-                    results.append(result)
-        return tuple(results)
 
     return check
 
@@ -519,14 +511,11 @@ def assert_reconstruction_storage():
         acquired = camera_volume_samples(
             coverage, origin, spacing, raw_origin, shape, microscope
         )
-        results = []
         for aperture in masks:
             result = reconstruction_storage_accuracy(
                 sampled, reconstructions, acquired, microscope, spacing, aperture
             )
             assert result, "Stored camera samples exceed their geometric source bounds"
-            results.append(result)
-        return tuple(results)
 
     return check
 
@@ -550,7 +539,6 @@ def assert_roi_point_locations():
         *,
         raw_origin=(0, 0, 0),
         channels=None,
-        illumination=1.0,
     ):
         """Measure actual stored values against fixed physical source locations."""
         origin, spacing = np.asarray(origin), np.asarray(spacing)
@@ -597,49 +585,6 @@ def assert_roi_point_locations():
                 increasing = np.diff(expected_counts[:, channel]) > 0
                 assert np.all(np.diff(observed_counts[:, channel])[increasing] > 0)
         assert checked, "ROI excludes every original optical emitter"
-
-    return check
-
-
-@pytest.fixture
-def assert_roi_point_accuracy(assert_roi_point_locations, roi_photon_accuracy):
-    """Combine original-emitter localization with absolute photon accuracy."""
-
-    def check(
-        data,
-        scene,
-        origin,
-        spacing,
-        *,
-        raw_origin=(0, 0, 0),
-        channels=None,
-        illumination=1.0,
-        positions=None,
-        equal_weights=False,
-        coverage_normalized=False,
-    ):
-        """Score stored pixels using the shared physical location and photon checks."""
-        assert_roi_point_locations(
-            data,
-            scene,
-            origin,
-            spacing,
-            raw_origin=raw_origin,
-            channels=channels,
-            illumination=illumination,
-        )
-        return roi_photon_accuracy(
-            data,
-            scene,
-            origin,
-            spacing,
-            raw_origin=raw_origin,
-            channels=channels,
-            illumination=illumination,
-            positions=positions,
-            equal_weights=equal_weights,
-            coverage_normalized=coverage_normalized,
-        )
 
     return check
 

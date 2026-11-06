@@ -269,8 +269,7 @@ def test_roi_command_fuses_selected_tiles_and_projects_pixels(
         dataset.translation_transform.translation[-3:],
         dataset.scale_transform.scale[-3:],
         positions=run.roi.position_indices,
-        equal_weights=True,
-        coverage_normalized=True,
+        fused=True,
     )
     # Projection is a separate numerical reduction, checked with NumPy after
     # the stored fused volume passes the original-object accuracy requirement.
