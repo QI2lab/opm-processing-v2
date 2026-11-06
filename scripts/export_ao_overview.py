@@ -1,9 +1,10 @@
 """Export saved AO pupils with SJS formatting and optional tissue overlays.
 
 Run: uv run python scripts/export_ao_overview.py /path/to/acquisition-directory
-The SJS reader loads saved results; the local SDK-validated WaveKit basis
-reconstructs their pupils. The publication reference supplies the two-column
-layout and linear plus/minus 2-pi colors.
+The portable local reader loads saved coefficients; the SDK-validated WaveKit
+basis reconstructs their pupils. Publication formatting follows the SJS
+two-column layout and linear plus/minus 2-pi colors. Explicit reader and
+plot-reference paths retain support for external SJS files.
 """
 
 from __future__ import annotations
@@ -145,8 +146,7 @@ def main() -> None:
     parser.add_argument(
         "--ao-reader",
         type=Path,
-        default=Path(__file__).resolve().parents[2]
-        / "sjs_opm_scripts/ao_scripts/parse_ao_grid_results.py",
+        default=Path(__file__).with_name("ao_saved_results.py"),
     )
     parser.add_argument("--plot-reference", type=Path)
     parser.add_argument("--timepoint", type=int, default=0)
@@ -208,7 +208,7 @@ def main() -> None:
     parser.add_argument(
         "--coefficients",
         action="store_true",
-        help="Also save native SJS coefficient plots.",
+        help="Also save coefficient plots with the selected reader (local default: starting/final/change bars).",
     )
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
@@ -235,8 +235,7 @@ def main() -> None:
     root = args.root.expanduser().resolve()
     ao_root = resolve_ao_root(args.ao_root or root)
     plot_reference = (
-        args.plot_reference
-        or args.ao_reader.resolve().parent.parent / "analysis/ao_grid_phase_plots.py"
+        args.plot_reference or Path(__file__).with_name("ao_publication_style.py")
     ).resolve()
     if not plot_reference.is_file():
         parser.error(f"Publication plotting reference not found: {plot_reference}")

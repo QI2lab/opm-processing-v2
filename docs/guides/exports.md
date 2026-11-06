@@ -102,17 +102,20 @@ one PNG and SVG per depth in `ao_publication`. The figures follow
 canvas per row, 0.2 subplot spacing, normalized circular pupils, linear plus/minus
 2-pi colors, and per-panel colorbars with 30-point text and pi ticks.
 
-Saved coefficients are read through
-`sjs_opm_scripts/ao_scripts/parse_ao_grid_results.py`. Pupil reconstruction uses
-the local WaveKit modal convention and RMS normalization, checked against
-analytical circular modes. The default state is final phase at 488 nm.
+Saved coefficients are read through the portable local
+`scripts/ao_saved_results.py`; an external SJS checkout is optional.
+Pupil reconstruction uses the local WaveKit modal convention and RMS
+normalization, checked against analytical circular modes. The default state is
+final phase at 488 nm.
 `--coefficient-state`, `--wavelength-nm`, `--timepoint`, and `--depth-index`
-select the saved data. `--ao-reader` and `--plot-reference` select other reference
-locations. `--output` selects the destination; `--overwrite` replaces generated
+select the saved data. `--ao-reader` and `--plot-reference` accept explicit reader
+and formatting reference paths, including the original SJS files.
+`--output` selects the destination; `--overwrite` replaces generated
 outputs there.
 
-Use `--coefficients` to additionally save native SJS coefficient plots. That path
-calls the reader's own plotting and save method. `ao_publication.json` records
+Use `--coefficients` to additionally save starting, final and signed-change
+coefficient bars with the local reader. An explicit external reader uses its own
+plotting and save method. `ao_publication.json` records
 source/reference provenance and the original starting and final coefficients.
 
 To also place the pupils over the fused tissue projection:
