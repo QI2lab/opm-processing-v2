@@ -46,7 +46,10 @@ class CompositeLayerProxy:
                 raise ValueError(
                     "Composite channels must share one nonempty native XY shape"
                 )
-            if np.dtype(image.dtype).kind not in "uif":
+            if (
+                np.dtype(getattr(image.dtype, "numpy_dtype", image.dtype)).kind
+                not in "uif"
+            ):
                 raise ValueError(
                     "Composite source channels must contain real numeric intensities"
                 )
