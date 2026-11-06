@@ -201,7 +201,8 @@ def emission_psf(
     psf /= psf.sum()
     psf *= microscope.detection_efficiency / (psf[len(axes[0]) // 2].sum() * spacing**2)
     psf = psf.astype(np.float32)
-    psf.setflags(write=False)
+    for array in (*axes, psf):
+        array.setflags(write=False)
     return axes, psf
 
 
