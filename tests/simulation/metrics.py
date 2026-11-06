@@ -9,6 +9,12 @@ from scipy.signal import find_peaks
 from scipy.special import j1, jn_zeros, kl_div, xlogy
 from scipy.stats import chi2
 
+from opm_processing.imageprocessing.opmpsf import (
+    camera_grid_center,
+    centered_sensor_axes,
+    get_skewed_coords,
+)
+
 
 @dataclass(frozen=True)
 class CameraNoiseAccuracy:
@@ -252,14 +258,7 @@ def camera_volume_samples(
 
     shape = tuple(native_shape)
     pixel, step = microscope.pixel_size_um, microscope.scan_step_um
-    angle = np.deg2rad(microscope.angle_deg)
-    center = np.asarray(
-        (
-            (shape[1] - 1) * pixel * np.sin(angle) / 2,
-            ((shape[0] - 1) * step + (shape[1] - 1) * pixel * np.cos(angle)) / 2,
-            (shape[2] - 1) * pixel / 2,
-        )
-    )
+    center = camera_grid_center(shape, pixel, step, microscope.angle_deg)
     reference = np.asarray(frame_origin_zyx) + center
     axes = tuple(
         float(origin) + np.arange(size) * float(spacing) - target
@@ -267,10 +266,7 @@ def camera_volume_samples(
             origin_zyx, spacing_zyx, volume.shape, reference, strict=True
         )
     )
-    native_axes = tuple(
-        (np.arange(size) - (size - 1) / 2) * spacing
-        for size, spacing in zip(shape, (step, pixel, pixel), strict=True)
-    )
+    native_axes = centered_sensor_axes(shape, (step, pixel, pixel))
     return sensor_integral(
         volume,
         axes,
@@ -292,16 +288,15 @@ def camera_object_apertures(
     """
     pixel, step = microscope.pixel_size_um, microscope.scan_step_um
     angle = np.deg2rad(microscope.angle_deg)
-    scan, row, column = np.meshgrid(
-        *[(np.arange(size) - (size - 1) / 2) for size in shape], indexing="ij"
-    )
+    x, y, z = get_skewed_coords(shape, pixel, step, angle)
+    center = camera_grid_center(shape, pixel, step, microscope.angle_deg)
     coordinates = tuple(
         coordinate + offset
         for coordinate, offset in zip(
             (
-                row * pixel * np.sin(angle),
-                scan * step + row * pixel * np.cos(angle),
-                column * pixel,
+                np.broadcast_to(z - center[0], shape),
+                np.broadcast_to(y - center[1], shape),
+                np.broadcast_to(x - center[2], shape),
             ),
             camera_offset_zyx_um,
             strict=True,
@@ -367,14 +362,10 @@ def camera_object_apertures(
     if not source.any() or not background.any():
         raise ValueError("The physical camera field must acquire source and background")
     masks = [source, background]
-    for axis in (-2, -1):
-        for index in range(shape[axis]):
-            selected = np.zeros(shape, bool)
-            section = [slice(None)] * len(shape)
-            section[axis] = index
-            selected[tuple(section)] = interior[tuple(section)]
-            if selected.any():
-                masks.append(selected)
+    for partition in camera_partition_apertures(shape)[1:]:
+        selected = partition & interior
+        if selected.any():
+            masks.append(selected)
     return tuple(masks)
 
 

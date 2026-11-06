@@ -28,6 +28,7 @@ import numpy as np
 from scipy.signal import fftconvolve
 
 from opm_processing.imageprocessing.opmpsf import (
+    centered_sensor_axes,
     create_psf_silicone_100x,
     integrate_camera_pixels,
 )
@@ -242,32 +243,12 @@ def sensor_integral(
         Sensor-integrated intensities on the declared acquisition grid.
     """
     p = microscope
-    if not isinstance(p.pixel_samples, int) or p.pixel_samples < 1:
-        raise ValueError("Pixel quadrature samples must be positive integers")
-    if geometry not in ("oblique", "cartesian"):
-        raise ValueError("Require oblique or cartesian sensor geometry")
     if sensor_axes is None:
-        if (
-            shape is None
-            or len(shape) != 3
-            or any(
-                isinstance(n, bool) or not isinstance(n, (int, np.integer)) or n < 1
-                for n in shape
-            )
-        ):
-            raise ValueError(
-                "Require three positive sensor dimensions or explicit axes"
-            )
-        sensor_axes = tuple(
-            (np.arange(n) - (n - 1) / 2) * step
-            for n, step in zip(
-                shape, (p.scan_step_um, p.pixel_size_um, p.pixel_size_um), strict=True
-            )
+        if shape is None:
+            raise ValueError("Require sensor dimensions or explicit axes")
+        sensor_axes = centered_sensor_axes(
+            shape, (p.scan_step_um, p.pixel_size_um, p.pixel_size_um)
         )
-    if len(sensor_axes) != 3 or any(
-        np.ndim(a) != 1 or not len(a) or not np.isfinite(a).all() for a in sensor_axes
-    ):
-        raise ValueError("Sensor axes must be three nonempty finite coordinate arrays")
     if shape is not None and tuple(shape) != tuple(map(len, sensor_axes)):
         raise ValueError("Sensor shape and coordinate axes disagree")
     return integrate_camera_pixels(
@@ -320,10 +301,7 @@ def camera_psf(microscope: Microscope) -> tuple[np.ndarray, float]:
             strict=True,
         )
     )
-    sensor_axes = tuple(
-        (np.arange(n) - (n - 1) / 2) * step
-        for n, step in zip(shape, steps, strict=True)
-    )
+    sensor_axes = centered_sensor_axes(shape, steps)
     probabilities = (
         sensor_integral(psf, axes, shape, p, sensor_axes=sensor_axes)
         * p.quantum_efficiency
