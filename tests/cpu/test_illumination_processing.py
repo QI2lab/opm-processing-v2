@@ -18,7 +18,7 @@ from opm_processing.process import app
 @pytest.mark.integration
 @pytest.mark.parametrize("output_flatfield", (False, True))
 def test_processing_uses_existing_flatfield_with_separate_output(
-    opm_v2_projection_zarr,
+    projection_illumination_case,
     tmp_path: Path,
     output_flatfield: bool,
 ) -> None:
@@ -27,7 +27,8 @@ def test_processing_uses_existing_flatfield_with_separate_output(
     from opm_processing.dataio.position_collection import open_position_collection
     from opm_processing.process import process, write_flatfield
 
-    acquisition = opm_v2_projection_zarr
+    case = projection_illumination_case
+    acquisition = case.dataset
     output_dir = tmp_path / "processed"
     output_dir.mkdir()
     filename = f"{acquisition_stem(acquisition.path)}_flatfield.ome.tif"
@@ -64,6 +65,16 @@ def test_processing_uses_existing_flatfield_with_separate_output(
     ) * acquisition.camera_conversion
     expected = (calibrated / selected_field[0])[:, :, np.newaxis]
     np.testing.assert_allclose(saved, expected, rtol=1e-6)
+    # The original object and optical model predict the calibrated photons;
+    # neither raw counts nor a second processing pass supplies this truth.
+    mean = case.means / selected_field[0]
+    observations = saved[:, :, 0]
+    true_deviance = (2 * kl_div(observations, mean)).sum()
+    for incorrect_brightness in (0.5, 1.5):
+        assert (
+            true_deviance
+            < (2 * kl_div(observations, mean * incorrect_brightness)).sum()
+        )
 
 
 @pytest.mark.unit
@@ -122,10 +133,9 @@ def test_old_per_depth_flatfield_is_not_reused(tmp_path):
 @pytest.mark.unit
 @pytest.mark.parametrize("scan_planes", [1, 4])
 def test_processing_applies_the_same_field_at_every_depth(
-    tmp_path, constant_illumination_acquisition, scan_planes
+    tmp_path, constant_illumination_acquisition, scan_planes, deskew_uniform_expectation
 ):
     """Calibrate every channel and depth against analytically known photons."""
-    from opm_processing.imageprocessing.opmtools import orthogonal_deskew
     from opm_processing.process import process, write_flatfield
 
     case = constant_illumination_acquisition
@@ -158,12 +168,8 @@ def test_processing_applies_the_same_field_at_every_depth(
             expected = (
                 np.full((1, 8, 12), value, np.float32)
                 if scan_planes == 1
-                else orthogonal_deskew(
-                    np.full((scan_planes, 8, 12), value, dtype=np.float32),
-                    distance=acquisition.metadata.scan_axis_step_um,
-                    pixel_size=acquisition.metadata.pixel_size_um,
-                    theta=acquisition.metadata.angle_deg,
-                    downsample_factor=1,
+                else deskew_uniform_expectation(
+                    (scan_planes, 8, 12), value, dtype=np.float32
                 )
             )
             np.testing.assert_allclose(
@@ -236,8 +242,10 @@ def test_invalid_cached_fields_are_not_reused(tmp_path, level):
     assert read_current_flatfield(path, field.shape) is None
 
 
-@pytest.mark.unit
-def test_live_wait_defers_processing_and_selects_flatfield(live_wait_case, monkeypatch):
+@pytest.mark.integration
+def test_live_wait_defers_processing_and_selects_flatfield(
+    live_wait_case, monkeypatch, assert_roi_point_accuracy, deskew_uniform_expectation
+):
     """Wait for both completion and chunks, then reuse or estimate illumination."""
     processing = importlib.import_module("opm_processing.process")
 
@@ -301,28 +309,39 @@ def test_live_wait_defers_processing_and_selects_flatfield(live_wait_case, monke
             if case.kind == "estimate"
             else "Using existing flatfield"
         ) in result.output
-    actual = (
-        open_position_collection(case.destination / "sample_deskewed.ome.zarr")
-        .arrays[0][0, 0]
-        .read()
-        .result()
-    )
-    expected = case.expected
-    if case.kind == "estimate":
-        from opm_processing.imageprocessing.opmtools import orthogonal_deskew
-
-        expected = orthogonal_deskew(
-            np.maximum(case.raw[0, 0, 0, ::-1].astype(np.float32) - 100, 0)
-            * 0.24
-            / field[0, 0],
-            theta=30,
-            distance=0.4,
-            pixel_size=0.115,
-            downsample_factor=1,
-        )
+    output = open_position_collection(case.destination / "sample_deskewed.ome.zarr")
+    data = output.arrays[0].read().result()
+    span = (case.raw.shape[-3] - 1) * case.scene.microscope.scan_step_um
     np.testing.assert_allclose(
-        actual,
-        expected,
-        rtol=4 * np.finfo(np.float32).eps,
-        atol=1e-5 if case.kind == "estimate" else 0,
+        output.spatial_origins_zyx_um[0], (0, -span, 0), atol=0.0005, rtol=0
+    )
+    np.testing.assert_allclose(
+        output.voxel_size_um, (0.115, 0.115, 0.115), atol=0, rtol=0
+    )
+    if case.calibration_photons is not None:
+        expected_calibration = deskew_uniform_expectation(
+            case.raw.shape[-3:], case.calibration_photons, dtype=np.float32
+        )
+        camera = case.scene.microscope.camera
+        sigma = np.sqrt(
+            case.calibration_photons
+            + camera.read_noise_e**2
+            + camera.electrons_per_adu**2 / 12
+        )
+        gain = (
+            2 * case.scene.microscope.pixel_size_um / case.scene.microscope.scan_step_um
+        )
+        # Positive interpolation cannot exceed the variance of one input
+        # camera sample. Use the declared dose and six shot/read-noise SDs.
+        np.testing.assert_allclose(
+            data[0, 0], expected_calibration, rtol=0, atol=6 * gain * sigma
+        )
+        np.testing.assert_array_equal(data[0, 0][expected_calibration == 0], 0)
+    assert_roi_point_accuracy(
+        data[case.sample_timepoint : case.sample_timepoint + 1],
+        case.scene,
+        output.spatial_origins_zyx_um[0],
+        output.voxel_size_um,
+        raw_origin=(0, -span, 0),
+        illumination=2.0 if case.kind == "cached" else 1.0,
     )

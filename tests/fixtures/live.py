@@ -15,7 +15,6 @@ from opm_processing.dataio.live import (
     LiveManifest,
 )
 from opm_processing.dataio.position_collection import create_position_collection
-from opm_processing.imageprocessing.opmtools import orthogonal_deskew
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -97,11 +96,12 @@ def opm_v2_live_acquisition_factory(tmp_path, opm_v2_acquisition_factory):
     """
     from opm_processing.dataio.acquisition import ChannelMetadata
 
-    def create(raw_data, *, name="sample", illumination=None):
+    def create(raw_data, *, name="sample", illumination=None, camera_conversion=0.24):
         """Deliver actual frames through the upstream publisher and TensorStore writer."""
         path = tmp_path / f"{name}.ome.zarr"
         document = manifest_document(path, timepoints=raw_data.shape[0])
         document["data_path"] = str(path)
+        document["camera_e_to_adu"] = camera_conversion
         document["index_sizes"] = dict(zip("tpcz", raw_data.shape[:4], strict=True))
         document["channels"] = [
             {
@@ -211,71 +211,87 @@ def live_acquisition_factory(tmp_path):
 
 @pytest.fixture(params=["estimate", "pending-chunks", "cached"])
 def live_wait_case(
-    request, tmp_path, live_acquisition_factory, monkeypatch, simulated_camera
+    request,
+    tmp_path,
+    opm_v2_live_acquisition_factory,
+    monkeypatch,
+    roi_camera_scene,
+    illumination_calibration_ensemble,
 ):
-    """Share camera input and controlled completion for offline live-wait decisions."""
+    """Delay real published chunks and lifecycle state for simulated optical input."""
     from opm_processing import process as processing
 
     kind = request.param
-    shape = (
-        1,
-        1,
-        1,
-        12 if kind == "estimate" else 4,
-        8,
-        16 if kind == "estimate" else 5,
-    )
-    raw = (
-        simulated_camera(shape[-3:], conversion=0.24).raw[None, None, None, ::-1].copy()
-    )
-    dataset = live_acquisition_factory(
-        raw if kind == "cached" else None, shape=shape, completed=kind != "estimate"
+    if kind == "estimate":
+        ensemble = illumination_calibration_ensemble()
+        scene, pixels = ensemble.scene, ensemble.raw
+        sample_timepoint = ensemble.sample_timepoint
+    else:
+        scene = roi_camera_scene(shape=(24, 33, 33))
+        pixels, sample_timepoint = scene.pixels, 0
+    raw = pixels[..., ::-1, :, :].copy()
+    produced = opm_v2_live_acquisition_factory(raw, camera_conversion=1.0)
+    acquisition, manifest, log = processing.open_live_acquisition(tmp_path)
+    dataset = SimpleNamespace(
+        path=produced.path,
+        manifest=manifest,
+        log=log,
+        illumination_path=produced.illumination_path,
     )
     dataset.illumination_path.unlink()
     destination = tmp_path / "processed"
     field_path = tmp_path / "sample_flatfield.ome.tif"
     if kind == "cached":
         processing.write_flatfield(
-            field_path, np.full((1, 1, *shape[-2:]), 2, np.float32), 0.115
+            field_path, np.full((1, 1, *raw.shape[-2:]), 2, np.float32), 0.115
         )
+    completed_log = log.read_bytes()
+    if kind == "estimate":
+        log.write_text(
+            json.dumps(
+                {
+                    "event": "started",
+                    "acquisition_id": manifest.acquisition_id,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    pending = None
+    if kind != "cached":
+        array_root = produced.path / acquisition.array_paths[0]
+        chunk = next(
+            path
+            for path in array_root.rglob("*")
+            if path.is_file() and path.name != "zarr.json"
+        )
+        pending = tmp_path / "pending_camera_chunk"
+        chunk.replace(pending)
     sleeps = []
 
     def finish(seconds):
-        """Write the acquisition completion event during the wait callback."""
+        """Publish actual writer bytes and the controller's real completion event."""
         assert not destination.exists()
         assert not (destination / field_path.name).exists()
         sleeps.append(seconds)
-        if len(sleeps) == 1:
-            dataset.collection.arrays[0].write(raw[:, 0]).result()
-            assert kind != "cached"
+        if len(sleeps) == 1 and pending is not None:
+            pending.replace(chunk)
         elif len(sleeps) == 2 and kind == "estimate":
-            dataset.log.write_text(
-                json.dumps(
-                    {
-                        "event": "completed",
-                        "acquisition_id": dataset.manifest.acquisition_id,
-                    }
-                )
-                + "\n",
-                encoding="utf-8",
-            )
+            log.write_bytes(completed_log)
         else:
             pytest.fail("Processing kept waiting after acquisition completion")
 
     monkeypatch.setattr(processing.time, "sleep", finish)
-    calibrated = np.maximum(raw[0, 0, 0, ::-1].astype(np.float32) - 100, 0) * 0.24
     return SimpleNamespace(
         kind=kind,
         dataset=dataset,
         raw=raw,
+        scene=scene,
+        sample_timepoint=sample_timepoint,
+        calibration_photons=ensemble.calibration_photons
+        if kind == "estimate"
+        else None,
         destination=destination,
         sleeps=sleeps,
-        expected=orthogonal_deskew(
-            calibrated / (2 if kind == "cached" else 1),
-            theta=30.0,
-            distance=0.4,
-            pixel_size=0.115,
-            downsample_factor=1,
-        ),
         field_path=field_path if kind == "cached" else destination / field_path.name,
     )

@@ -25,7 +25,6 @@ from opm_processing.dataio.processing_state import (
     processing_state_path,
 )
 from opm_processing.imageprocessing.coordinates import STAGE_COORDINATE_VERSION
-from opm_processing.imageprocessing.opmtools import orthogonal_deskew
 from opm_processing.process import (
     app,
     is_empty_tile,
@@ -218,31 +217,29 @@ def test_empty_tile_detection_uses_global_occupancy() -> None:
     ("save_float32", "expected_dtype"),
     ((False, np.dtype(np.uint16)), (True, np.dtype(np.float32))),
 )
-def test_live_process_matches_direct_deskew_without_estimating(
+def test_live_processing_preserves_original_optical_emitters(
     tmp_path,
     opm_v2_live_acquisition_factory,
     save_float32,
     expected_dtype,
-    simulated_camera,
+    roi_camera_scene,
+    assert_roi_point_accuracy,
+    deskew_uniform_expectation,
     relocate_acquisition,
     live_mode,
 ) -> None:
     """Process a complete live acquisition using only the supplied illumination."""
-    observed = simulated_camera((4, 8, 5), conversion=0.24).raw
-    raw = observed[None, None, None, ::-1].copy()
+    scene = roi_camera_scene()
+    raw = scene.pixels[..., ::-1, :, :].copy()
     dataset = opm_v2_live_acquisition_factory(
-        raw, name="live", illumination=np.full((1, 8, 5), 2.0, np.float32)
+        raw,
+        name="live",
+        illumination=np.full((1, 32, 32), 2.0, np.float32),
+        camera_conversion=1.0,
     )
     root = relocate_acquisition(tmp_path, copy=save_float32)
     assert dataset.path.exists() == save_float32
     illumination_path = root / dataset.illumination_path.name
-    expected_float = orthogonal_deskew(
-        np.maximum(observed.astype(np.float32) - 100, 0) * 0.24 / 2,
-        theta=30.0,
-        distance=0.4,
-        pixel_size=0.115,
-        downsample_factor=1,
-    )
     args = [
         str(root),
         "--no-max-projection",
@@ -256,7 +253,9 @@ def test_live_process_matches_direct_deskew_without_estimating(
         # Offline live-wait finds the supplied field in the current directory.
         field = root / "live_flatfield.ome.tif"
         processing = importlib.import_module("opm_processing.process")
-        processing.write_flatfield(field, np.full((1, 1, 8, 5), 2.0, np.float32), 0.115)
+        processing.write_flatfield(
+            field, np.full((1, 1, 32, 32), 2.0, np.float32), 0.115
+        )
         args.extend(("--live-wait", "--flatfield-correction"))
     if save_float32:
         args.append("--save-float32")
@@ -265,15 +264,20 @@ def test_live_process_matches_direct_deskew_without_estimating(
 
     output = open_position_collection(root / "live_deskewed.ome.zarr")
     actual = output.arrays[0][0, 0].read().result()
-    expected = (
-        expected_float
-        if save_float32
-        else np.clip(expected_float, 0, np.iinfo(np.uint16).max).astype(np.uint16)
-    )
     assert np.dtype(actual.dtype) == expected_dtype
-    # Bound float32 calibration and the four interpolation products against
-    # analytical intensity; uint16 values still compare exactly at this scale.
-    np.testing.assert_allclose(actual, expected, rtol=4 * np.finfo(np.float32).eps)
+    assert actual.shape == deskew_uniform_expectation(raw.shape[-3:], 1).shape
+    stage_anchor = np.asarray((-30.0, -100.0, 200.0))
+    assert_roi_point_accuracy(
+        actual[None, None],
+        scene,
+        stage_anchor + output.spatial_origins_zyx_um[0],
+        output.voxel_size_um,
+        raw_origin=(-30.0, -102.8, 200.0),
+        illumination=2.0,
+    )
+    assert output.spatial_origins_zyx_um[0] == (0.0, -2.8, 0.0)
+    state = ProcessingState.read(root / "live.processing.json")
+    assert state.completed_tiles(root / "live_deskewed.ome.zarr") == {(0, 0)}
     if save_float32:
         positive = actual[actual > 0]
         assert positive.size > 0
@@ -282,9 +286,14 @@ def test_live_process_matches_direct_deskew_without_estimating(
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("signal_field", (1.0, 2.0))
+@pytest.mark.parametrize("save_float32", (False, True))
 def test_live_occupancy_filter_preserves_sample_signal_and_writes_zero(
     tmp_path,
     live_acquisition_factory,
+    deskew_uniform_expectation,
+    signal_field,
+    save_float32,
 ) -> None:
     """Ignore a persistent hot pixel while processing a channel with real signal."""
     raw = np.full((2, 4, 8, 5), 100, dtype=np.uint16)
@@ -295,6 +304,7 @@ def test_live_occupancy_filter_preserves_sample_signal_and_writes_zero(
     illumination[0] = (
         0.1  # Amplifying detector artifacts must not rescue an empty channel.
     )
+    illumination[1] = signal_field
     dataset = live_acquisition_factory(
         raw[None, None], name="live_empty", illumination=illumination
     )
@@ -303,6 +313,7 @@ def test_live_occupancy_filter_preserves_sample_signal_and_writes_zero(
         root_path=tmp_path,
         live=illumination_path,
         deconvolve=False,
+        save_float32=save_float32,
         skip_empty_below=2.0,
         skip_empty_min_signal_fraction=0.1,
         max_projection=True,
@@ -317,14 +328,21 @@ def test_live_occupancy_filter_preserves_sample_signal_and_writes_zero(
     assert np.count_nonzero(output.arrays[0][0, 0].read().result()) == 0
     assert np.count_nonzero(max_output.arrays[0][0, 0].read().result()) == 0
     assert np.count_nonzero(output.arrays[0][0, 1].read().result()) > 0
-    expected = orthogonal_deskew(
-        np.full((4, 8, 5), 100 * 0.24, dtype=np.float32),
-        theta=30.0,
-        distance=0.4,
-        pixel_size=0.115,
-        downsample_factor=1,
-    ).astype(np.uint16)
-    np.testing.assert_array_equal(output.arrays[0][0, 1].read().result(), expected)
+    expected = deskew_uniform_expectation(
+        (4, 8, 5),
+        100 * 0.24 / signal_field,
+        dtype=np.float32 if save_float32 else np.uint16,
+    )
+    actual = output.arrays[0][0, 1].read().result()
+    assert actual.dtype == expected.dtype
+    # Four interpolation products, camera gain and illumination division bound
+    # float32 accumulation; integer output retains its exact clipped ADC codes.
+    np.testing.assert_allclose(
+        actual,
+        expected,
+        rtol=6 * np.finfo(np.float32).eps if save_float32 else 0,
+        atol=0,
+    )
     state = ProcessingState.read(processing_state_path(tmp_path, "live_empty"))
     assert state.zero_channels(tmp_path / "live_empty_deskewed.ome.zarr") == {(0, 0, 0)}
     assert len(max_output.multiscale_factors_yx) > 1
@@ -332,9 +350,11 @@ def test_live_occupancy_filter_preserves_sample_signal_and_writes_zero(
         max_output.multiscale_factors_yx, max_output.multiscale_arrays, strict=False
     ):
         assert np.count_nonzero(level_arrays[0][0, 0].read().result()) == 0
-        np.testing.assert_array_equal(
+        np.testing.assert_allclose(
             level_arrays[0][0, 1].read().result(),
             expected.max(axis=0, keepdims=True)[..., ::factor, ::factor],
+            rtol=6 * np.finfo(np.float32).eps if save_float32 else 0,
+            atol=0,
         )
     assert "opm_v2" not in output.attributes
     coordinates = output.attributes["opm_processing_coordinates"]
@@ -349,6 +369,7 @@ def test_offline_resume_skips_durably_completed_tile_and_default_overwrites(
     monkeypatch,
     acquisition_factory,
     action,
+    deskew_uniform_expectation,
 ) -> None:
     """Resume preserves completed pixels; explicit overwrite recomputes them."""
     process_module = importlib.import_module("opm_processing.process")
@@ -394,13 +415,7 @@ def test_offline_resume_skips_durably_completed_tile_and_default_overwrites(
     completed_tile = interrupted.arrays[0][0, 0].read().result()
     np.testing.assert_array_equal(
         completed_tile,
-        orthogonal_deskew(
-            np.full((4, 8, 5), 10, dtype=np.float32),
-            theta=30.0,
-            distance=0.4,
-            pixel_size=0.115,
-            downsample_factor=1,
-        ).astype(np.uint16),
+        deskew_uniform_expectation((4, 8, 5), 10),
     )
     collection.arrays[0][0].write(np.full((1, 4, 8, 5), 501, dtype=np.uint16)).result()
 
@@ -429,23 +444,11 @@ def test_offline_resume_skips_durably_completed_tile_and_default_overwrites(
         resumed.arrays[0][0, 0].read().result(),
         completed_tile
         if action == "resume"
-        else orthogonal_deskew(
-            np.full((4, 8, 5), 401, dtype=np.float32),
-            theta=30.0,
-            distance=0.4,
-            pixel_size=0.115,
-            downsample_factor=1,
-        ).astype(np.uint16),
+        else deskew_uniform_expectation((4, 8, 5), 401),
     )
     np.testing.assert_array_equal(
         resumed.arrays[1][0, 0].read().result(),
-        orthogonal_deskew(
-            np.full((4, 8, 5), 20, dtype=np.float32),
-            theta=30.0,
-            distance=0.4,
-            pixel_size=0.115,
-            downsample_factor=1,
-        ).astype(np.uint16),
+        deskew_uniform_expectation((4, 8, 5), 20),
     )
 
     process_module.process_skewed(
@@ -459,19 +462,13 @@ def test_offline_resume_skips_durably_completed_tile_and_default_overwrites(
     overwritten = open_position_collection(output_path)
     np.testing.assert_array_equal(
         overwritten.arrays[0][0, 0].read().result(),
-        orthogonal_deskew(
-            np.full((4, 8, 5), 401, dtype=np.float32),
-            theta=30.0,
-            distance=0.4,
-            pixel_size=0.115,
-            downsample_factor=1,
-        ).astype(np.uint16),
+        deskew_uniform_expectation((4, 8, 5), 401),
     )
 
 
 @pytest.mark.unit
 def test_live_processing_resumes_completed_output_tiles(
-    tmp_path, monkeypatch, live_acquisition_factory
+    tmp_path, monkeypatch, live_acquisition_factory, deskew_uniform_expectation
 ) -> None:
     """Preserve completed tiles and safely redo a partially written next tile."""
     pixels = np.empty((1, 2, 2, 4, 8, 5), np.uint16)
@@ -530,13 +527,7 @@ def test_live_processing_resumes_completed_output_tiles(
         0,
     )
     assert np.all(resumed_output.arrays[1].read().result() != 999)
-    expected_tile = orthogonal_deskew(
-        np.full((4, 8, 5), 11 * 0.24, dtype=np.float32),
-        theta=30.0,
-        distance=0.4,
-        pixel_size=0.115,
-        downsample_factor=1,
-    ).astype(np.uint16)
+    expected_tile = deskew_uniform_expectation((4, 8, 5), 11 * 0.24)
     for channel in range(2):
         np.testing.assert_array_equal(
             resumed_output.arrays[1][0, channel].read().result(), expected_tile

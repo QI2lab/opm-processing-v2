@@ -63,9 +63,17 @@ def photon_splitter(cupy_gpu, request):
 
 
 @pytest.fixture
-def detector_response_sample(stage_gain, strided, camera_gain_profile):
+def detector_response_sample(
+    stage_gain, strided, camera_gain_profile, linear_camera_field
+):
     """Apply detector sensitivity and ADC conversion to prescribed detected counts."""
-    photons = np.random.default_rng(47).integers(20, 1021, (31, 65, 73))
+    coordinates = tuple(
+        np.rint(np.linspace(0, len(axis) - 1, size)).astype(int)
+        for axis, size in zip(linear_camera_field.axes, (31, 65, 73), strict=True)
+    )
+    # The shared physical concentration ramp ranges from 50 to 150. A fixed
+    # exposure gives a prescribed 20..1020 detected-photon calibration object.
+    photons = 20 + 10 * (linear_camera_field.field[np.ix_(*coordinates)] - 50)
     y = np.linspace(-1, 1, 65, dtype=np.float32)[:, None]
     x = np.linspace(-1, 1, 73, dtype=np.float32)[None, :]
     illumination = np.asarray(0.5 + 0.5 * np.exp(-x * x - y * y), dtype=np.float32)
