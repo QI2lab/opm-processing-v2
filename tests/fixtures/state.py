@@ -16,6 +16,7 @@ from opm_processing.dataio.processing_state import (
     ProcessingState,
     processing_state_image_attributes,
 )
+from opm_processing.imageprocessing.tilefusion import _processed_store_identity
 
 
 @pytest.fixture
@@ -146,7 +147,9 @@ def record_registration(tmp_path):
         roi_series: tuple[dict[str, object], ...] = (),
     ) -> tuple[Path, ProcessingState]:
         """Persist measured placement and completed series for fusion and ROI selection."""
-        stem = processed_path.name.split("_", 1)[0]
+        identity = _processed_store_identity(processed_path)
+        assert identity is not None
+        stem, _suffix = identity
         source = tmp_path / f"{stem}.ome.zarr"
         source.mkdir(exist_ok=True)
         state = ProcessingState.create(tmp_path / f"{stem}.processing.json", source)
