@@ -8,11 +8,11 @@ pytestmark = pytest.mark.unit
 
 @pytest.mark.parametrize("fractional", [False, True])
 @pytest.mark.parametrize("array_backend", ["gpu", "host"])
-def test_matlab_split_matches_independent_distribution_moments(
+def test_count_split_matches_prescribed_distribution_moments(
     cupy_gpu, array_backend, fractional
 ):
     # Integer photons and calibrated fractional weights across the count range.
-    """Match the reference split mean, variance and fractional-count behavior."""
+    """Match prescribed split mean, variance and fractional-count distributions."""
     from opm_processing.imageprocessing.rlgc import _split_observed_counts
 
     xp = cupy_gpu if array_backend == "gpu" else np
