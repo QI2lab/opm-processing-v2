@@ -5,6 +5,8 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -301,3 +303,104 @@ def test_changed_read_dependency_does_not_touch_any_metadata(legacy_repair_case)
         apply_stage_coordinate_repair(plan)
     assert _snapshot(root) == before
     assert not (root / ".coordinate-repair-backups").exists()
+
+
+@pytest.fixture
+def split_repair_case(legacy_repair_case):
+    """Separate raw/current fusion from processed tiles and their journal."""
+    root = legacy_repair_case
+    primary, additional = root / "volume_f", root / "volume_g"
+    primary.mkdir()
+    additional.mkdir()
+    stem = "repair_case"
+    journal = json.loads((root / f"{stem}.processing.json").read_text())
+    destinations = {
+        f"{stem}.ome.zarr": primary,
+        f"{stem}_fused.ome.zarr": primary,
+        f"{stem}_max_z_fused.ome.zarr": primary,
+        f"{stem}_deskewed.ome.zarr": additional,
+        f"{stem}_max_z_deskewed.ome.zarr": additional,
+    }
+    for name, destination in destinations.items():
+        source, target = root / name, destination / name
+        assert source.resolve().is_relative_to(root.resolve())
+        assert target.resolve().is_relative_to(root.resolve())
+        source.rename(target)
+    # Full fusion pads native Z to two planes for its factor-two pyramid.
+    # The coarse image therefore has one plane, as the actual producer writes.
+    coarse_path = primary / f"{stem}_fused.ome.zarr" / "1" / "zarr.json"
+    coarse = json.loads(coarse_path.read_text())
+    coarse["shape"][2] = 1
+    _write_json(coarse_path, coarse)
+    owner = copy.deepcopy(journal["registration"][f"{stem}_deskewed.ome.zarr"])
+    owner["fused_path"] = str(primary / f"{stem}_fused.ome.zarr")
+    owner["max_projection_path"] = str(primary / f"{stem}_max_z_fused.ome.zarr")
+    owner_key = str(additional / f"{stem}_deskewed.ome.zarr")
+    journal["source"]["path"] = str(primary / f"{stem}.ome.zarr")
+    journal["registration"] = {owner_key: owner}
+    journal_path = additional / f"{stem}.processing.json"
+    _write_json(journal_path, journal)
+    (root / f"{stem}.processing.json").unlink()
+
+    # This older same-named G output has no journal owner and different geometry.
+    orphan = additional / f"{stem}_fused.ome.zarr"
+    current = primary / f"{stem}_fused.ome.zarr"
+    group = json.loads((current / "zarr.json").read_text())
+    for dataset in group["attributes"]["ome"]["multiscales"][0]["datasets"]:
+        dataset["coordinateTransformations"][1]["translation"][3] += 500
+        level = dataset["path"]
+        array = json.loads((current / level / "zarr.json").read_text())
+        array["shape"][-2] += 7
+        _write_json(orphan / level / "zarr.json", array)
+        chunk = orphan / level / "c" / "0"
+        chunk.parent.mkdir(parents=True, exist_ok=True)
+        chunk.write_bytes(b"unowned historical image pixels")
+    _write_json(orphan / "zarr.json", group)
+    return SimpleNamespace(
+        root=root,
+        primary=primary,
+        additional=additional,
+        orphan=orphan,
+        journal_path=journal_path,
+        owner_key=owner_key,
+        journal=journal,
+    )
+
+
+def _split_record_path(plan, record):
+    """Resolve a reviewed multi-root fixture record without assuming one root."""
+    return Path(plan["roots"][record["root_id"]]) / record["path"]
+
+
+def test_split_repair_changes_only_owned_available_artifacts(split_repair_case):
+    """Plan only owned split outputs while leaving all source and orphan pixels unchanged."""
+    case = split_repair_case
+    before = _snapshot(case.root)
+    plan = plan_stage_coordinate_repair(
+        case.primary, additional_roots=(case.additional,)
+    )
+    assert plan["schema"] == "opm-stage-coordinate-repair-v2"
+    assert plan["roots"] == {
+        "root_0": str(case.primary),
+        "root_1": str(case.additional),
+    }
+    assert plan["source"] == {"root_id": "root_0", "path": "repair_case.ome.zarr"}
+    assert plan["delta_zyx_um"] == [0.5, -10, 0]
+    approved = {
+        str(_split_record_path(plan, record).relative_to(case.root))
+        for record in plan["files"]
+    }
+    assert len(approved) == len(plan["files"])
+    assert all(
+        not _split_record_path(plan, record).is_relative_to(
+            case.primary / "repair_case.ome.zarr"
+        )
+        for record in plan["files"]
+    )
+    assert all(
+        not _split_record_path(plan, record).is_relative_to(case.orphan)
+        for record in plan["files"]
+    )
+    assert all("decon" not in record["path"] for record in plan["files"])
+    assert "repair_case_fused.ome.zarr" in json.dumps(plan["skipped_artifacts"])
+    assert _snapshot(case.root) == before

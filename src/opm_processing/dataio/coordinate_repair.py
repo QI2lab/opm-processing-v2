@@ -14,7 +14,7 @@ import os
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from ome_types import from_xml, to_xml
@@ -31,6 +31,9 @@ from opm_processing.imageprocessing.coordinates import (
     deskewed_stage_scan_offsets,
 )
 from opm_processing.imageprocessing.opmtools import deskew_shape_estimator
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 REPAIR_SCHEMA = "opm-stage-coordinate-repair-v1"
 _COLLECTION_SUFFIXES = (
@@ -164,13 +167,17 @@ def _physical_plan(root: Path, source: Path, positions: np.ndarray) -> dict[str,
     }
 
 
-def plan_stage_coordinate_repair(root: str | Path) -> dict[str, Any]:
+def plan_stage_coordinate_repair(
+    root: str | Path, *, additional_roots: Sequence[str | Path] = ()
+) -> dict[str, Any]:
     """Build a reviewable metadata-only repair plan without writing any file.
 
     Parameters
     ----------
     root : str or pathlib.Path
         Acquisition directory containing the raw and four processed collections.
+    additional_roots : sequence of path, optional
+        Explicit additional directories for a split raw/processing/fusion layout.
 
     Returns
     -------
@@ -178,6 +185,12 @@ def plan_stage_coordinate_repair(root: str | Path) -> dict[str, Any]:
         Validated whitelist, exact pre/postimage hashes, postimages, and plan hash.
         An already repaired acquisition returns an empty change list.
     """
+    if additional_roots:
+        from opm_processing.dataio.coordinate_repair_layout import (
+            plan_split_stage_coordinate_repair,
+        )
+
+        return plan_split_stage_coordinate_repair(root, additional_roots)
     directory = Path(root).expanduser().resolve()
     source = resolve_acquisition_path(directory)
     source_dependencies = [
