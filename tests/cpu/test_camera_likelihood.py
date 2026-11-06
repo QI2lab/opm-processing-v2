@@ -155,10 +155,13 @@ def test_camera_sampling_bounds_detect_photon_and_spatial_errors(
         camera_sampling_accuracy,
         camera_sampling_envelope,
     )
+    from tests.simulation.metrics import camera_noise_accuracy
 
     case = camera_sampling_case
     expected, camera = case.expectation, case.camera
-    envelope = camera_sampling_envelope(expected, case.raw, camera, radii=case.radii)
+    envelope = camera_sampling_envelope(
+        expected, case.raw, camera, radii=case.radii, footprint=case.footprint
+    )
     # Identity sampling is an allowed positive interpolation: its central
     # coefficient is one. Its noise is the actual physical camera draw.
     prediction = np.maximum(
@@ -185,6 +188,13 @@ def test_camera_sampling_bounds_detect_photon_and_spatial_errors(
         prediction, expected, envelope, np.ones(expected.shape, bool)
     )
     assert measured.accepted == (artifact == "correct"), measured
+    # The inverse-solver target uses this same independently observed optical
+    # phantom. Its likelihood and calibrated-noise scores must distinguish the
+    # same absolute gain and spatial errors without fitting a reconstruction.
+    inverse_accuracy = camera_noise_accuracy(
+        prediction, expected, camera, np.ones(expected.shape, bool)
+    )
+    assert inverse_accuracy.accepted == (artifact == "correct"), inverse_accuracy
     if artifact == "stripes":
         assert measured.flux_lower <= measured.flux <= measured.flux_upper
         assert not measured.inside_envelope

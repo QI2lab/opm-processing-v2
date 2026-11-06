@@ -557,7 +557,10 @@ def uniform_response_case(scan_planes, detector_shape):
 def camera_sampling_case(uniform_detector_scene):
     """Share a fixed high-dose physical phantom and its actual detector residual."""
     from tests.simulation.camera import digitize
-    from tests.simulation.camera_likelihood import sampling_stencil_radii
+    from tests.simulation.camera_likelihood import (
+        sampling_stencil_footprint,
+        sampling_stencil_radii,
+    )
 
     scene = uniform_detector_scene()
     raw = digitize(scene.means, scene.microscope.camera, seed=937)
@@ -567,6 +570,9 @@ def camera_sampling_case(uniform_detector_scene):
         camera=scene.microscope.camera,
         nominal=scene.nominal,
         radii=sampling_stencil_radii(
+            scene.microscope, (scene.microscope.pixel_size_um,) * 3
+        ),
+        footprint=sampling_stencil_footprint(
             scene.microscope, (scene.microscope.pixel_size_um,) * 3
         ),
     )

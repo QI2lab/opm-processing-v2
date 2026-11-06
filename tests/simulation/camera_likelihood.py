@@ -105,12 +105,68 @@ def sampling_stencil_radii(
     )
 
 
+def sampling_stencil_footprint(
+    microscope: Microscope,
+    output_spacing_zyx: Sequence[float],
+    *,
+    z_bin_factor: int = 1,
+    origin_y_error_um: float = 0,
+) -> np.ndarray:
+    """Exclude physically unreachable corners of the native-camera stencil.
+
+    A perpendicular projection onto an adjacent scan plane changes laboratory
+    Y by at most ``step*sin(theta)**2``. Detector-row interpolation adds at
+    most ``pixel*cos(theta)`` and inverse camera sampling one output Y pitch.
+    Native Z averaging leaves Y fixed. This necessary geometric condition
+    retains every positive contributor without reproducing interpolation
+    indices or weights.
+
+    Parameters
+    ----------
+    microscope : Microscope
+        Recorded camera pitch, scan spacing and OPM angle.
+    output_spacing_zyx : sequence of float
+        Saved-grid spacing, including any extra fractional-fusion stencil.
+    z_bin_factor : int
+        Native planes per output Z bin.
+    origin_y_error_um : float
+        Independently declared Y-origin serialization error bound.
+
+    Returns
+    -------
+    numpy.ndarray
+        Immutable centered SYX footprint for installed min/max filters.
+    """
+    radii = sampling_stencil_radii(
+        microscope, output_spacing_zyx, z_bin_factor=z_bin_factor
+    )
+    if not np.isfinite(origin_y_error_um) or origin_y_error_um < 0:
+        raise ValueError("Require a finite nonnegative coordinate-error bound")
+    pixel, step = microscope.pixel_size_um, microscope.scan_step_um
+    angle = np.deg2rad(microscope.angle_deg)
+    offsets = np.meshgrid(
+        *(np.arange(-radius, radius + 1) for radius in radii), indexing="ij"
+    )
+    distance_y = offsets[0] * step + offsets[1] * pixel * np.cos(angle)
+    reach_y = (
+        float(output_spacing_zyx[1])
+        + step * np.sin(angle) ** 2
+        + pixel * abs(np.cos(angle))
+        + origin_y_error_um
+    )
+    arithmetic = 32 * np.finfo(float).eps * max(reach_y, step, pixel)
+    support = np.abs(distance_y) <= reach_y + arithmetic
+    support.setflags(write=False)
+    return support
+
+
 def camera_sampling_envelope(
     expectation: ArrayLike,
     raw: ArrayLike,
     camera: Camera,
     *,
     radii: Sequence[int],
+    footprint: ArrayLike | None = None,
     response: ArrayLike = 1,
     views: int = 1,
     z_bin_factor: int = 1,
@@ -135,6 +191,8 @@ def camera_sampling_envelope(
         Explicit detector gain and offset.
     radii : sequence of int
         Native-camera stencil radii supplied by physical geometry.
+    footprint : array-like or None
+        Optional correlated physical support within the rectangular radii.
     response : array-like
         Positive response divided out before image interpolation.
     views : int
@@ -171,13 +229,19 @@ def camera_sampling_envelope(
     signal = means / sensitivity
     residual = (observed - means) / sensitivity
     window = tuple(2 * radius.astype(int) + 1)
+    support = None if footprint is None else np.asarray(footprint, bool)
+    if support is not None and (
+        support.shape != window or not support[tuple(radius.astype(int))]
+    ):
+        raise ValueError("Require a centered physical footprint within the stencil")
+    filters = {"size": window} if support is None else {"footprint": support}
     lower = (
-        minimum_filter(signal, size=window, mode="nearest")
-        + minimum_filter(residual, size=window, mode="nearest")
+        minimum_filter(signal, mode="nearest", **filters)
+        + minimum_filter(residual, mode="nearest", **filters)
     ) * sensitivity
     upper = (
-        maximum_filter(signal, size=window, mode="nearest")
-        + maximum_filter(residual, size=window, mode="nearest")
+        maximum_filter(signal, mode="nearest", **filters)
+        + maximum_filter(residual, mode="nearest", **filters)
     ) * sensitivity
     # Per view: calibration, four-sample orthogonal interpolation, eight-sample
     # inverse camera interpolation and normalized fusion take fewer than 64
