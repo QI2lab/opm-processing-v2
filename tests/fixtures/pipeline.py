@@ -17,6 +17,174 @@ from tests.simulation.forward_model import Acquisition, camera_psf, forward_mode
 from tests.simulation.scenes import prepare_scene
 
 
+@pytest.fixture
+def pipeline_geometry(deskew_geometric_support):
+    """Define the independent physical aperture and padded orthogonal canvas."""
+
+    def create(shape, microscope, *, scan_factor=1):
+        """Cover the oblique scan planes without evaluating an image interpolator."""
+        scans, rows, columns = shape
+        fine_shape = ((scans - 1) * scan_factor + 1, rows, columns)
+        step = microscope.scan_step_um / scan_factor
+        pixel = microscope.pixel_size_um
+        angle = np.deg2rad(microscope.angle_deg)
+        output_shape = (
+            int(np.ceil(rows * np.sin(angle))),
+            (int(np.ceil(fine_shape[0] * step / pixel + rows * np.cos(angle))) + 3)
+            // 4
+            * 4,
+            (columns + 3) // 4 * 4,
+        )
+        support = deskew_geometric_support(
+            fine_shape,
+            output_shape,
+            {"theta": microscope.angle_deg, "distance": step, "pixel_size": pixel},
+        )
+        aperture = (support[..., None] > 0) & (np.arange(output_shape[2]) < columns)
+        return SimpleNamespace(shape=output_shape, support=aperture)
+
+    return create
+
+
+@pytest.fixture
+def pipeline_camera_accuracy(pipeline_geometry):
+    """Score persisted CPU images against the original optical camera means."""
+    from scipy.special import kl_div
+    from yaozarrs import open_group
+
+    from opm_processing.dataio.acquisition import inspect_acquisition
+    from tests.simulation.forward_model import sensor_integral
+    from tests.simulation.metrics import airy_rayleigh
+
+    def check(
+        result,
+        means,
+        microscope,
+        mode,
+        *,
+        source_y_half_um,
+        offsets_x=None,
+        regions=None,
+    ):
+        """Reject omitted/doubled photon Jacobians and Rayleigh-scale displacement."""
+        shape = means.shape[-3:]
+        scans, rows, columns = shape
+        pixel, step = microscope.pixel_size_um, microscope.scan_step_um
+        angle = np.deg2rad(microscope.angle_deg)
+        span = (scans - 1) * step
+        local_origin = np.array((0, -span if mode == "stage" else 0, 0))
+        center = np.array(
+            (
+                (rows - 1) * pixel * np.sin(angle) / 2,
+                (span + (rows - 1) * pixel * np.cos(angle)) / 2,
+                (columns - 1) * pixel / 2,
+            )
+        )
+        geometry = pipeline_geometry(shape, microscope)
+        native_axes = tuple(
+            (np.arange(size) - (size - 1) / 2) * spacing
+            for size, spacing in zip(shape, (step, pixel, pixel), strict=True)
+        )
+        sampler = replace(microscope, pixel_samples=1)
+        support_axes = tuple(
+            np.arange(size) * pixel - coordinate
+            for size, coordinate in zip(geometry.shape, center, strict=True)
+        )
+        coverage = sensor_integral(
+            geometry.support.astype(float),
+            support_axes,
+            shape,
+            sampler,
+            sensor_axes=native_axes,
+            area_integral=False,
+        )
+        mask = coverage >= 1 - 32 * np.finfo(float).eps
+        # A fixed region containing the original object avoids empty scan tails;
+        # it is defined in physical coordinates before inspecting any output.
+        camera_y = native_axes[0][:, None] + native_axes[1][None] * np.cos(angle)
+        mask &= (np.abs(camera_y) <= source_y_half_um)[..., None]
+        rayleigh, _ = airy_rayleigh(
+            microscope.wavelength_um, microscope.numerical_aperture
+        )
+        displacement = int(np.ceil(rayleigh / pixel))
+        mask[..., :displacement] = False
+        mask[..., -displacement:] = False
+        gain = 2 * pixel / step
+        positions = means.shape[1]
+        offsets_x = np.zeros(positions) if offsets_x is None else np.asarray(offsets_x)
+        source_metadata = inspect_acquisition(
+            result.fusion.processing_state.source_path()
+        )
+        stage_z, stage_scan, stage_x = source_metadata.stage_positions_zxy[0]
+        anchor = np.array((-stage_z, -stage_scan, stage_x))
+        fused = open_group(result.output)["0"].to_tensorstore().read().result()
+
+        def score(image, origin, frame_origin, expected, response, selections):
+            """Resample only; never apply a second optical PSF or fit intensity."""
+            axes = tuple(
+                coordinate + np.arange(size) * pixel - target
+                for coordinate, size, target in zip(
+                    origin, image.shape, frame_origin + center, strict=True
+                )
+            )
+            prediction = (
+                sensor_integral(
+                    image / gain,
+                    axes,
+                    shape,
+                    sampler,
+                    sensor_axes=native_axes,
+                    area_integral=False,
+                )
+                * response
+            )
+            alternatives = [prediction * gain, prediction / gain]
+            alternatives.extend(
+                np.roll(prediction, shift, axis=-1)
+                for shift in (-displacement, displacement)
+            )
+            for selection in selections:
+                selected = mask.copy()
+                selected[..., : selection.start] = False
+                selected[..., selection.stop :] = False
+                assert selected.any() and expected[selected].sum() > 0
+                rates = expected[selected]
+                correct = kl_div(
+                    rates, np.maximum(prediction[selected], np.finfo(float).tiny)
+                ).sum()
+                for alternative in alternatives:
+                    incorrect = kl_div(
+                        rates, np.maximum(alternative[selected], np.finfo(float).tiny)
+                    ).sum()
+                    assert correct < incorrect, (correct, incorrect, selection)
+
+        for time, position, channel in np.ndindex(means.shape[:3]):
+            expected = means[time, position, channel]
+            response = 1 if result.field is None else result.field[0, channel]
+            selections = [slice(0, columns)] if regions is None else regions[position]
+            image = result.collection.arrays[position][time, channel].read().result()
+            assert image.shape == geometry.shape
+            score(
+                image,
+                np.asarray(result.collection.spatial_origins_zyx_um[position]),
+                local_origin,
+                expected,
+                response,
+                selections,
+            )
+            frame_origin = anchor + local_origin + np.array((0, 0, offsets_x[position]))
+            score(
+                fused[time, channel],
+                np.asarray(result.fusion.offset_um),
+                frame_origin,
+                expected,
+                response,
+                selections,
+            )
+
+    return check
+
+
 @pytest.fixture(autouse=True)
 def integration_pipeline_records(request):
     """Require real producer inputs and durable processing results for integrations.
@@ -357,6 +525,8 @@ def pipeline_case(
     opm_v2_acquisition_factory,
     tmp_path,
     pipeline_runner,
+    pipeline_geometry,
+    pipeline_camera_accuracy,
     small_cpu_kernels,
 ):
     """Process independent repeat exposures with a known stage-placement error.
@@ -378,8 +548,6 @@ def pipeline_case(
     orthogonal interpolation, registration and fusion execute normally, with
     native TensorStore storage in pytest temporary directories.
     """
-    from opm_processing.imageprocessing.opmtools import orthogonal_deskew
-
     mode, illumination, step, crop = request.param
     microscope, expectation, psf = pipeline_optical_data(step, illumination)
     raw = np.empty((2, 2, 2, *expectation.shape), dtype=np.uint16)
@@ -412,25 +580,30 @@ def pipeline_case(
         crop_scan=crop,
     )
     factor = scan_upsample_from_metadata(dataset.metadata) if deconvolve else 1
-    reconstruction_shape = (
-        (expectation.shape[0] - 1) * factor + 1,
-        *expectation.shape[1:],
+    geometry = pipeline_geometry(expectation.shape, microscope, scan_factor=factor)
+    means = np.broadcast_to(
+        expectation[None, None, None]
+        * (1 + np.arange(2)[:, None, None] / 4 + np.arange(2)[None, None] / 2)[
+            ..., None, None, None
+        ],
+        raw.shape,
     )
-    support = (
-        orthogonal_deskew(
-            np.full(reconstruction_shape, 1, dtype=np.float32),
-            distance=step / factor,
-            pixel_size=pixel,
-            theta=microscope.angle_deg,
-            downsample_factor=1,
+    if not deconvolve:
+        pipeline_camera_accuracy(
+            result,
+            means,
+            microscope,
+            mode,
+            source_y_half_um=simulation_parameters["specimens"]["points"][
+                "half_extent_zyx_um"
+            ][1]
+            - microscope.psf_half_extent_zyx_um[1],
         )
-        > 0
-    )
     return SimpleNamespace(
         **vars(result),
         dataset=dataset,
         microscope=microscope,
-        support=support,
+        support=geometry.support,
         expectation=expectation,
         psf=psf,
     )

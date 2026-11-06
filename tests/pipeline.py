@@ -257,6 +257,8 @@ def test_extended_mosaic_acquisition_to_fusion(
     mosaic_acquisition,
     deconvolve,
     pipeline_runner,
+    pipeline_geometry,
+    pipeline_camera_accuracy,
     monkeypatch,
     tmp_path,
 ):
@@ -427,16 +429,9 @@ def test_extended_mosaic_acquisition_to_fusion(
         if not deconvolve:
             np.testing.assert_array_equal(actual, expected)
 
-    support = (
-        orthogonal_deskew(
-            np.full(shape, 1, dtype=np.float32),
-            distance=scan_step,
-            pixel_size=case.microscope.pixel_size_um,
-            theta=case.microscope.angle_deg,
-            downsample_factor=1,
-        )
-        > 0
-    )
+    support = pipeline_geometry(
+        case.dataset.raw_data.shape[-3:], case.microscope, scan_factor=factor
+    ).support
     assert len(tiled.deskew_tiles) > 1
     assert all(
         np.all(np.asarray(tile_shape) <= tile_limits)
@@ -449,6 +444,30 @@ def test_extended_mosaic_acquisition_to_fusion(
     fused = []
     for result in (full, tiled):
         actual = assert_fused_ngff(result)
+        if not deconvolve:
+            means = np.stack(
+                [
+                    case.expectation[
+                        ..., position * offset : position * offset + shape[-1]
+                    ]
+                    for position in range(2)
+                ]
+            )[None, :, None]
+            pipeline_camera_accuracy(
+                result,
+                means,
+                case.microscope,
+                case.dataset.metadata.mode,
+                source_y_half_um=parameters["line_length_um"] / 2,
+                offsets_x=np.arange(2) * offset * case.microscope.pixel_size_um,
+                regions={
+                    0: [slice(0, offset), slice(offset, shape[-1])],
+                    1: [
+                        slice(0, shape[-1] - offset),
+                        slice(shape[-1] - offset, shape[-1]),
+                    ],
+                },
+            )
         fused.append(actual)
         fusion = result.fusion
         origins = np.asarray(fusion._tile_positions)
