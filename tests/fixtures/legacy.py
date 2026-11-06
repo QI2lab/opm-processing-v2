@@ -8,6 +8,7 @@ import itertools
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import unquote
 
 import numpy as np
 import pytest
@@ -16,7 +17,11 @@ import tensorstore as ts
 import zarr
 
 from opm_processing.dataio.acquisition import inspect_acquisition
-from opm_processing.dataio.legacy_reference import _headers
+from opm_processing.dataio.legacy_reference import (
+    _build_reference_store,
+    _headers,
+    _write_reference_headers,
+)
 
 
 @pytest.fixture(
@@ -234,19 +239,25 @@ def refkv_mapping_factory(tmp_path, legacy_raw_factory):
             },
         }
         references = _headers(metadata, descriptor, raw.path)
-        sources, source_files = [], []
-        # Enumerate actual native keys. No test encoder, chunk-padding routine,
-        # or filesystem adapter stands in for TensorStore or refkv.
-        keys = sorted(raw.array.kvstore.list().result())
-        for encoded_key in keys:
-            source_key = encoded_key.decode()
-            parts = source_key.split("/")
-            if len(parts) != 6 or not all(part.isdecimal() for part in parts):
-                continue
-            t, p, c, z, y, x = parts
-            key = f"{p}/0/c/{t}/{c}/{z}/{y}/{x}"
-            raw_file = raw.path / source_key
-            if key == corrupt_key:
+        store, _count, _bytes = _build_reference_store(
+            raw.path, root, descriptor, references, workers=2
+        )
+        source_files = sorted(
+            path
+            for path in raw.path.rglob("*")
+            if path.is_file() and path.name not in (".zarray", ".zattrs")
+        )
+        if missing_key is not None or corrupt_key is not None:
+            # Alter an actual archive only for explicit reader error cases.
+            # Successful layouts always come from the production format writer.
+            damaged_references = dict(store.mapping)
+            sources = list(store.sources)
+            if missing_key is not None:
+                del damaged_references[missing_key]
+            if corrupt_key is not None:
+                entry = damaged_references[corrupt_key]
+                source = sources[entry.source]
+                raw_file = (root / unquote(source.url)).resolve()
                 damaged = ts.open(
                     {
                         "driver": "zarr",
@@ -265,20 +276,20 @@ def refkv_mapping_factory(tmp_path, legacy_raw_factory):
                 ).result()
                 damaged.write(np.ones(3, np.uint16)).result()
                 raw_file.write_bytes((tmp_path / "short.zarr/0").read_bytes())
-            source_files.append(raw_file)
-            if key != missing_key:
-                sources.append(
-                    refkv.Source(url=raw_file.as_uri(), size=raw_file.stat().st_size)
+                size = raw_file.stat().st_size
+                sources[entry.source] = refkv.Source(url=source.url, size=size)
+                damaged_references[corrupt_key] = refkv.Range(
+                    source=entry.source, offset=0, length=size
                 )
-                references[key] = refkv.Range(
-                    source=len(sources) - 1, offset=0, length=raw_file.stat().st_size
-                )
-        refkv.ReferenceStore(references, sources).save(root / "references.vzip")
-        for key, value in references.items():
-            if isinstance(value, bytes):
-                target = root / key
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(value)
+            store = refkv.ReferenceStore(
+                damaged_references,
+                sources,
+                url=(root / "references.vzip").as_uri(),
+                compressed=references,
+                page_size=65536,
+            )
+        store.save(root / "references.vzip", mirror_refs=False)
+        _write_reference_headers(root, references)
         return inspect_acquisition(root), raw.data, source_files
 
     return create

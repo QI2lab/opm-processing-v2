@@ -27,6 +27,8 @@ from opm_processing.dataio.position_collection import _build_ome_xml
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
+    from refkv import ReferenceStore
+
 app = typer.Typer(pretty_exceptions_enable=False)
 
 
@@ -212,6 +214,89 @@ def _chunk_indices(descriptor: dict[str, Any]) -> Iterator[tuple[int, ...]]:
     )
 
 
+def _build_reference_store(
+    raw: Path,
+    destination: Path,
+    descriptor: dict[str, Any],
+    headers: dict[str, bytes],
+    *,
+    workers: int,
+) -> tuple[ReferenceStore, int, int]:
+    """Build native chunk references using the mapper's single layout definition.
+
+    Metadata inference is separate: callers supply validated hierarchy headers,
+    so the same format writer can describe independently acquired timepoints.
+    Source pixels and their codecs remain untouched.
+    """
+    import refkv
+
+    archive = destination / "references.vzip"
+    values: dict[str, Any] = dict(headers)
+    sources = []
+    expected = math.prod(
+        math.ceil(n / c)
+        for n, c in zip(descriptor["shape"], descriptor["chunks"], strict=True)
+    )
+    separator = descriptor.get("dimension_separator", ".")
+
+    def describe(indices: tuple[int, ...]) -> tuple[str, Any, int]:
+        source_key = separator.join(map(str, indices))
+        chunk_path = raw / source_key
+        stat = (
+            chunk_path.stat()
+        )  # Missing raw chunks are errors, never invented zero frames.
+        if stat.st_size < 16 or not chunk_path.is_file():
+            raise ValueError(f"Invalid raw Blosc chunk: {chunk_path}")
+        t, p, c, z, y, x = indices
+        key = f"{p}/0/c/{t}/{c}/{z}/{y}/{x}"
+        try:
+            reference_url = quote(
+                os.path.relpath(chunk_path, destination).replace(os.sep, "/"), safe="/"
+            )
+        except ValueError:
+            # Separate Windows drives cannot be expressed as relative paths.
+            reference_url = chunk_path.as_uri()
+        return key, refkv.Source(url=reference_url, size=stat.st_size), stat.st_size
+
+    indices = iter(_chunk_indices(descriptor))
+    count = 0
+    compressed_bytes = 0
+    print(f"Referencing {expected:,} original compressed chunks...", flush=True)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        while batch := list(itertools.islice(indices, 2048)):
+            for key, entry, size in pool.map(describe, batch):
+                source_index = len(sources)
+                sources.append(entry)
+                values[key] = refkv.Range(source=source_index, offset=0, length=size)
+                count += 1
+                compressed_bytes += size
+            if count % 32768 == 0 or count == expected:
+                print(f"Referenced {count:,}/{expected:,} chunks", flush=True)
+    store = refkv.ReferenceStore(
+        values, sources, url=archive.as_uri(), compressed=headers, page_size=65536
+    )
+    return store, count, compressed_bytes
+
+
+def _write_reference_headers(destination: Path, headers: dict[str, bytes]) -> None:
+    """Write the metadata facade that rejects readers without reference support."""
+    for key, data in headers.items():
+        # The on-disk hierarchy is a metadata facade. Unsupported readers must
+        # fail rather than return fill-zero images for the absent pixel files.
+        if key.endswith("/0/zarr.json"):
+            node = json.loads(data)
+            node["storage_transformers"] = [
+                {
+                    "name": "opm-processing-refkv",
+                    "configuration": {"archive": "references.vzip"},
+                }
+            ]
+            data = _json_bytes(node)
+        target = destination / key
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+
+
 def map_legacy_acquisition(
     source: str | Path, output: str | Path | None = None, *, workers: int = 8
 ) -> Path:
@@ -253,67 +338,12 @@ def map_legacy_acquisition(
     staging = output.with_name(f".{output.name}.mapping-{uuid.uuid4().hex}")
     staging.mkdir()
     archive = staging / "references.vzip"
-    values: dict[str, Any] = dict(headers)
-    sources = []
-    expected = math.prod(
-        math.ceil(n / c)
-        for n, c in zip(descriptor["shape"], descriptor["chunks"], strict=True)
+    store, count, compressed_bytes = _build_reference_store(
+        raw, staging, descriptor, headers, workers=workers
     )
-    separator = descriptor.get("dimension_separator", ".")
-
-    def describe(indices: tuple[int, ...]) -> tuple[str, Any, int]:
-        source_key = separator.join(map(str, indices))
-        chunk_path = raw / source_key
-        stat = (
-            chunk_path.stat()
-        )  # Missing raw chunks are errors, never invented zero frames.
-        if stat.st_size < 16 or not chunk_path.is_file():
-            raise ValueError(f"Invalid raw Blosc chunk: {chunk_path}")
-        t, p, c, z, y, x = indices
-        key = f"{p}/0/c/{t}/{c}/{z}/{y}/{x}"
-        try:
-            reference_url = quote(
-                os.path.relpath(chunk_path, staging).replace(os.sep, "/"), safe="/"
-            )
-        except ValueError:
-            # Separate Windows drives cannot be expressed as relative paths.
-            reference_url = chunk_path.as_uri()
-        return key, refkv.Source(url=reference_url, size=stat.st_size), stat.st_size
-
-    indices = iter(_chunk_indices(descriptor))
-    count = 0
-    compressed_bytes = 0
-    print(f"Referencing {expected:,} original compressed chunks...", flush=True)
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        while batch := list(itertools.islice(indices, 2048)):
-            for key, entry, size in pool.map(describe, batch):
-                source_index = len(sources)
-                sources.append(entry)
-                values[key] = refkv.Range(source=source_index, offset=0, length=size)
-                count += 1
-                compressed_bytes += size
-            if count % 32768 == 0 or count == expected:
-                print(f"Referenced {count:,}/{expected:,} chunks", flush=True)
     print("Writing the reference archive and OME metadata...", flush=True)
-    store = refkv.ReferenceStore(
-        values, sources, url=archive.as_uri(), compressed=headers, page_size=65536
-    )
     summary = store.save(archive, mirror_refs=False)
-    for key, data in headers.items():
-        # The on-disk hierarchy is a metadata facade. Unsupported readers must
-        # fail rather than return fill-zero images for the absent pixel files.
-        if key.endswith("/0/zarr.json"):
-            node = json.loads(data)
-            node["storage_transformers"] = [
-                {
-                    "name": "opm-processing-refkv",
-                    "configuration": {"archive": "references.vzip"},
-                }
-            ]
-            data = _json_bytes(node)
-        target = staging / key
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(data)
+    _write_reference_headers(staging, headers)
     inspected = inspect_acquisition(staging)
     inspected.validate_processing_calibration()
     if list(inspected.shape) != descriptor["shape"]:
