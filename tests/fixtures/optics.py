@@ -1,7 +1,7 @@
 """Physical specimens and shared production optics for reconstruction."""
 
 import json
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,19 +27,7 @@ from tests.simulation.scenes import OpticalScene, freeze_metadata
 
 
 @dataclass(frozen=True)
-class FrozenOpticalData:
-    """Protect cached numerical fields and nested metadata from consumer mutation."""
-
-    def __post_init__(self):
-        """Freeze every stored field, including arrays inside tuples and mappings."""
-        for item in fields(self):
-            object.__setattr__(
-                self, item.name, freeze_metadata(getattr(self, item.name))
-            )
-
-
-@dataclass(frozen=True)
-class CameraObservation(FrozenOpticalData):
+class CameraObservation:
     """One immutable optical scene and its independent detector observation."""
 
     ground_truth: OpticalScene
@@ -49,15 +37,7 @@ class CameraObservation(FrozenOpticalData):
 
 
 @dataclass(frozen=True)
-class TranslationObservations(FrozenOpticalData):
-    """Independent camera realizations with a prescribed physical displacement."""
-
-    images: tuple[np.ndarray, ...]
-    expected: np.ndarray
-
-
-@dataclass(frozen=True)
-class OpticalSetup(FrozenOpticalData):
+class OpticalSetup:
     """Immutable calibrated PSF samples, with a fresh installed interpolator."""
 
     microscope: Microscope
@@ -74,20 +54,18 @@ class OpticalSetup(FrozenOpticalData):
 
 
 @dataclass(frozen=True)
-class RayleighObservations(FrozenOpticalData):
+class RayleighObservations:
     """Known point-pair separation and immutable sampled diffraction response."""
 
     axis: str
     separation: float
-    microscope: Microscope
     acquisition_dip: float
     offset: np.ndarray
     expectation: np.ndarray
-    psf: np.ndarray
 
 
 @dataclass(frozen=True)
-class AnalyticalCameraField(FrozenOpticalData):
+class AnalyticalCameraField:
     """Known analytical concentration on an immutable physical Cartesian grid."""
 
     axes: tuple[np.ndarray, ...]
@@ -97,7 +75,7 @@ class AnalyticalCameraField(FrozenOpticalData):
 
 
 @dataclass(frozen=True)
-class PointAcquisition(FrozenOpticalData):
+class PointAcquisition:
     """Immutable independently refined emitter observations and optical kernels."""
 
     microscope: Microscope
@@ -142,11 +120,11 @@ def independent_photon_scene_factory(microscope_parameters, simulation_parameter
     from tests.simulation.scenes import prepare_scene
 
     @lru_cache(maxsize=2)
-    def build(kind="points", profile="uniform", spacing=0.05):
-        """Reuse cached physical scenes at the requested illumination and grid spacing."""
+    def build(kind="points", profile="uniform"):
+        """Reuse physical scenes on the shared calibrated fine grid."""
         return prepare_scene(
             kind,
-            replace(microscope_parameters, fine_spacing_um=spacing),
+            microscope_parameters,
             parameters=simulation_parameters["specimens"][kind],
             illumination_profile=profile,
         )
@@ -174,23 +152,19 @@ def simulated_camera(
         shape,
         *,
         step=0.4,
-        offset=100.0,
         conversion=0.25,
         geometry="oblique",
         exposure=1.0,
         seed=42,
-        kind="points",
-        profile="uniform",
         budget=None,
     ):
         """Simulate optical formation before camera sampling and digitization."""
-        scene = independent_photon_scene_factory(kind)
+        scene = independent_photon_scene_factory()
         microscope = replace(
             microscope_parameters,
             scan_step_um=step,
             camera=replace(
                 microscope_parameters.camera,
-                offset_adu=offset,
                 electrons_per_adu=conversion,
             ),
         )
@@ -201,7 +175,6 @@ def simulated_camera(
                 shape,
                 geometry=geometry,
                 exposure=exposure,
-                illumination_profile=profile,
                 camera_photon_budget=(
                     tuple(simulation_parameters["photon_budgets"][0])
                     if budget is None
@@ -215,8 +188,8 @@ def simulated_camera(
         return CameraObservation(
             ground_truth=scene,
             microscope=microscope,
-            expectation=expectation,
-            raw=raw,
+            expectation=freeze_metadata(expectation),
+            raw=freeze_metadata(raw),
         )
 
     return render
@@ -276,10 +249,7 @@ def physical_translation_pair(independent_photon_scene_factory):
             images.append(
                 digitize(mean, microscope.camera, seed=42 + index).astype(np.float32)
             )
-        return TranslationObservations(
-            images=tuple(images),
-            expected=-np.array(applied_shift),
-        )
+        return (*freeze_metadata(images), freeze_metadata(-np.array(applied_shift)))
 
     return render
 
@@ -296,8 +266,8 @@ def optical_setup(microscope_parameters):
     psf, _ = camera_psf(microscope)
     return OpticalSetup(
         microscope=microscope,
-        psf=psf.astype(np.float32),
-        axes=axes,
+        psf=freeze_metadata(psf.astype(np.float32)),
+        axes=freeze_metadata(axes),
         irradiance=field,
     )
 
@@ -362,13 +332,11 @@ def rayleigh_pair(request, optical_setup):
     return RayleighObservations(
         axis=axis,
         separation=separation,
-        microscope=microscope,
         acquisition_dip=two_point_profile(
             expectation, (np.array(expectation.shape) - 1) / 2, offset, microscope
         )["valley_depth"],
-        offset=offset,
-        expectation=expectation,
-        psf=optical_setup.psf,
+        offset=freeze_metadata(offset),
+        expectation=freeze_metadata(expectation),
     )
 
 
@@ -794,8 +762,8 @@ def linear_camera_field():
     axes = tuple(np.linspace(-5, 5, 101) for _ in range(3))
     z, y, x = np.meshgrid(*axes, indexing="ij", sparse=True)
     return AnalyticalCameraField(
-        axes=axes,
-        field=100 + 2 * x + 3 * y + 5 * z,
+        axes=freeze_metadata(axes),
+        field=freeze_metadata(100 + 2 * x + 3 * y + 5 * z),
         shape=(7, 12, 9),
         center=(0.03, -0.12, 0.21),
     )
@@ -807,8 +775,8 @@ def quadratic_camera_field():
     axes = tuple(np.arange(-40, 41) * 0.0025 for _ in range(3))
     z, y, x = np.meshgrid(*axes, indexing="ij", sparse=True)
     return AnalyticalCameraField(
-        axes=axes,
-        field=10 + 2 * x**2 + y**2 + z**2,
+        axes=freeze_metadata(axes),
+        field=freeze_metadata(10 + 2 * x**2 + y**2 + z**2),
         shape=(1, 1, 1),
         center=(0, 0, 0),
     )
@@ -959,8 +927,10 @@ def production_point_acquisition(
     radius = 0.61 * microscope.wavelength_um / microscope.numerical_aperture
     return PointAcquisition(
         microscope=microscope,
-        expectations=expectations,
-        kernels=kernels,
-        kernel=kernel / kernel.sum(),
-        apertures=(np.ones(shape, bool), distance <= radius, distance >= 2 * radius),
+        expectations=freeze_metadata(expectations),
+        kernels=freeze_metadata(kernels),
+        kernel=freeze_metadata(kernel / kernel.sum()),
+        apertures=freeze_metadata(
+            (np.ones(shape, bool), distance <= radius, distance >= 2 * radius)
+        ),
     )

@@ -137,6 +137,7 @@ def test_native_gc_directional_rayleigh_pair(
     cupy_gpu,
     reconstruct,
     rayleigh_pair,
+    optical_setup,
     camera_exposure,
     factor,
     camera_mode,
@@ -145,6 +146,7 @@ def test_native_gc_directional_rayleigh_pair(
 ):
     """Resolve noisy pairs placed at the directional optical first-minimum spacing."""
     case = rayleigh_pair
+    psf, microscope = optical_setup.psf, optical_setup.microscope
     expectation = case.expectation
     if camera_mode:
         expectation = camera_exposure(expectation, 3000)
@@ -161,7 +163,7 @@ def test_native_gc_directional_rayleigh_pair(
         calibrated = observed
     recovered = reconstruct(
         calibrated,
-        case.psf,
+        psf,
         factor,
         read_noise=camera.read_noise_e if camera_mode else 0,
     )
@@ -171,7 +173,7 @@ def test_native_gc_directional_rayleigh_pair(
         positions = np.arange(acquired.shape[0]) * factor
         baseline = interp1d(positions, acquired, axis=0)(np.arange(positions[-1] + 1))
     center = (np.array(observed.shape) - 1) / 2
-    measured = two_point_profile(recovered, center, case.offset, case.microscope)
+    measured = two_point_profile(recovered, center, case.offset, microscope)
     metrics = {
         "axis": case.axis,
         "scan_factor": factor,
@@ -179,8 +181,8 @@ def test_native_gc_directional_rayleigh_pair(
         "sampled_rayleigh_dip": case.acquisition_dip,
         "measured_dip": measured["valley_depth"],
         "measured_positions_um": measured["peak_positions_um"],
-        "predictive_deviance": predictive_deviance(recovered, expectation, case.psf),
-        "baseline_deviance": predictive_deviance(baseline, expectation, case.psf),
+        "predictive_deviance": predictive_deviance(recovered, expectation, psf),
+        "baseline_deviance": predictive_deviance(baseline, expectation, psf),
     }
     print(metrics)
     assert np.isfinite(recovered).all() and recovered.min() >= 0

@@ -209,7 +209,7 @@ def test_qi2lab_acquisition_to_fused_ngff_v05(
             case,
             case.camera_means,
             case.microscope,
-            case.optical_data.optical_object.ground_truth,
+            case.optical_data.ground_truth,
         )
 
 
@@ -549,6 +549,6 @@ def test_extended_mosaic_acquisition_to_fusion(
                 result,
                 means,
                 case.microscope,
-                case.optical_data.optical_object.ground_truth,
+                case.optical_data.ground_truth,
                 offsets_x=offsets_x,
             )

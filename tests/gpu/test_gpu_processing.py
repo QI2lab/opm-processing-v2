@@ -167,15 +167,14 @@ def test_unbounded_registration_recovers_displaced_physical_observations(
 ):
     """Register independently exposed, aperiodic points without a displacement prior."""
     tilefusion = importlib.import_module("opm_processing.imageprocessing.tilefusion")
-    pair = physical_translation_pair(applied_shift)
-    fixed, moving = pair.images
+    fixed, moving, expected = physical_translation_pair(applied_shift)
     unregistered = tilefusion._ssim(
         cupy_gpu.asarray(fixed), cupy_gpu.asarray(moving), 5
     )
     measured, score = tilefusion.TileFusion.register_and_score(
         fixed, moving, win_size=5
     )
-    np.testing.assert_allclose(measured, pair.expected, atol=0.15)
+    np.testing.assert_allclose(measured, expected, atol=0.15)
     assert score > unregistered
 
 

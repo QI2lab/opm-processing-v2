@@ -28,22 +28,6 @@ from tests.simulation.scenes import OpticalScene, prepare_scene
 
 
 @dataclass(frozen=True)
-class PipelineOpticalObject:
-    """One physical emission dose, shared unchanged by every acquisition grid."""
-
-    microscope: Microscope
-    axes: tuple[np.ndarray, ...]
-    density: np.ndarray
-    source_density: np.ndarray
-    ground_truth: OpticalScene
-
-    def __post_init__(self):
-        """Protect cached optical truth from individual processing scenarios."""
-        for array in (*self.axes, self.density, self.source_density):
-            array.setflags(write=False)
-
-
-@dataclass(frozen=True)
 class PipelineOpticalData:
     """Immutable camera expectations and inverse kernel for one sensor grid."""
 
@@ -51,12 +35,8 @@ class PipelineOpticalData:
     expectation: np.ndarray
     source_expectation: np.ndarray
     psf: np.ndarray
-    optical_object: PipelineOpticalObject
-
-    def __post_init__(self):
-        """Keep repeated camera draws independent of cached optical data."""
-        for array in (self.expectation, self.source_expectation, self.psf):
-            array.setflags(write=False)
+    ground_truth: OpticalScene
+    source_density: np.ndarray
 
 
 @pytest.fixture
@@ -816,13 +796,17 @@ def pipeline_optical_data(
             replace(acquisition, camera_photon_budget=(3000, 0)),
             microscope,
         )
-        return PipelineOpticalObject(microscope, scene.axes, dose, source, scene)
+        dose.setflags(write=False)
+        source.setflags(write=False)
+        return scene, dose, source
 
     @lru_cache(maxsize=6)
     def create(step, illumination=False, *, mosaic=False, scan_extent_factor=1):
         """Sample one unchanged physical emission field at the requested scan pitch."""
-        optical_object = dosed_object(illumination, mosaic, scan_extent_factor)
-        microscope = replace(optical_object.microscope, scan_step_um=step)
+        scene, dose, source_density = dosed_object(
+            illumination, mosaic, scan_extent_factor
+        )
+        microscope = replace(scene.microscope, scan_step_um=step)
         settings = simulation_parameters["pipeline_mosaic" if mosaic else "pipeline"]
         height, width = settings["camera_shape_yx"]
         shape = (
@@ -830,15 +814,18 @@ def pipeline_optical_data(
             height,
             width + settings.get("tile_offset_x_pixels", 0),
         )
-        acquisition = Acquisition(optical_object.axes, shape, output="expectation")
-        expected = forward_model(optical_object.density, acquisition, microscope)
-        source = forward_model(optical_object.source_density, acquisition, microscope)
+        acquisition = Acquisition(scene.axes, shape, output="expectation")
+        expected = forward_model(dose, acquisition, microscope)
+        source = forward_model(source_density, acquisition, microscope)
         factor = scan_upsample_from_metadata(
             replace(acquisition_metadata, scan_axis_step_um=step)
         )
         psf, _ = camera_psf(replace(microscope, scan_step_um=step / factor))
+        psf = psf.astype(np.float32)
+        for array in (expected, source, psf):
+            array.setflags(write=False)
         return PipelineOpticalData(
-            microscope, expected, source, psf.astype(np.float32), optical_object
+            microscope, expected, source, psf, scene, source_density
         )
 
     return create
@@ -866,9 +853,9 @@ def pipeline_source_image(pipeline_geometry):
             for size, origin in zip(geometry.shape, center, strict=True)
         )
         return forward_model(
-            data.optical_object.source_density,
+            data.source_density,
             Acquisition(
-                data.optical_object.axes,
+                data.ground_truth.axes,
                 geometry.shape,
                 sensor_axes=axes,
                 geometry="cartesian",

@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import tensorstore as ts
 
+from opm_processing.imageprocessing.opmpsf import centered_sensor_axes
 from opm_processing.imageprocessing.tilefusion import (
     TileFusion,
     _infer_registration_limits,
@@ -236,10 +237,7 @@ def registration_scene(microscope_parameters):
                 "features": {"centers_xyz_um": centers[:, ::-1].tolist()},
             },
         )
-        sensor_axes = tuple(
-            (np.arange(size) - (size - 1) / 2) * distance
-            for size, distance in zip(shape, spacing, strict=True)
-        )
+        sensor_axes = centered_sensor_axes(shape, spacing)
         dose = forward_model(
             scene.density,
             Acquisition(
@@ -613,6 +611,5 @@ def weighted_fusion_case(strided, shared, partial):
         negative_weight=0.5 if strided else 0.25,
         probes=probes,
         untouched=untouched,
-        selection=selection,
         source_origin=source_origin,
     )

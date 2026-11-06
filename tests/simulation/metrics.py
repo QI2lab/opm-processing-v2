@@ -24,7 +24,6 @@ class CameraNoiseAccuracy:
     deviance_limit: float
     pearson: float
     pearson_limit: float
-    samples: int
 
     @property
     def accepted(self):
@@ -38,15 +37,14 @@ class CameraNoiseAccuracy:
         )
 
 
-def camera_noise_accuracy(
-    prediction, expectation, camera, mask, *, tail_probability=1e-6
-):
+def camera_noise_accuracy(prediction, expectation, camera, mask):
     """Judge camera-prediction error against a predeclared measurement-noise target.
 
     This is a metrology target motivated by one independent high-count camera
     observation, not a coverage theorem for nonlinear reconstructed pixels.
     The reference chi-square has one degree of freedom per original camera
     sample. Its variance includes Poisson, read and ADC quantization terms.
+    The fixed upper-tail probability is 1e-6.
     No gain, covariance or degrees of freedom are fitted to the reconstruction.
 
     Parameters
@@ -59,8 +57,6 @@ def camera_noise_accuracy(
         Independently declared detector read noise and electron/ADU calibration.
     mask : array-like
         Fixed physical aperture, selected without using reconstructed values.
-    tail_probability : float
-        Predeclared upper tail of the high-count camera reference distribution.
 
     Returns
     -------
@@ -75,7 +71,6 @@ def camera_noise_accuracy(
         not selected.any()
         or not np.isfinite(expected[selected]).all()
         or np.min(expected[selected]) < 1000
-        or not 0 < tail_probability < 1
         or not np.isfinite((camera.read_noise_e, camera.electrons_per_adu)).all()
         or camera.read_noise_e < 0
         or camera.electrons_per_adu <= 0
@@ -83,15 +78,14 @@ def camera_noise_accuracy(
         raise ValueError("Require a nonempty fixed high-count camera aperture")
     truth, actual = expected[selected], predicted[selected]
     if not np.isfinite(actual).all() or np.any(actual < 0):
-        return CameraNoiseAccuracy(np.inf, 0, np.inf, 0, int(truth.size))
+        return CameraNoiseAccuracy(np.inf, 0, np.inf, 0)
     variance = truth + camera.read_noise_e**2 + camera.electrons_per_adu**2 / 12
-    limit = float(chi2.isf(tail_probability, truth.size))
+    limit = float(chi2.isf(1e-6, truth.size))
     return CameraNoiseAccuracy(
         float(2 * kl_div(truth, actual).sum(dtype=np.float64)),
         limit * float(np.max(variance / truth)),
         float(np.sum((actual - truth) ** 2 / variance, dtype=np.float64)),
         limit,
-        int(truth.size),
     )
 
 
