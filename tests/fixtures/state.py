@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
+from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
@@ -84,8 +86,53 @@ def processing_state(tmp_path):
     return ProcessingState.create(tmp_path / "sample.processing.json", source)
 
 
-if TYPE_CHECKING:
-    from pathlib import Path
+@pytest.fixture
+def external_registration_state(request, tmp_path, processing_state, monkeypatch):
+    """Prescribe another output directory and its filesystem-relative-path policy."""
+    processed = tmp_path / "sample_deskewed.ome.zarr"
+    destination = tmp_path.parent / f"{tmp_path.name}-fused"
+    fused = destination / "sample_fused.ome.zarr"
+    maximum = destination / "sample_max_z_fused.ome.zarr"
+    cross_drive_calls = []
+    if request.param:
+        relative = os.path.relpath
+
+        def different_drive(path, start):
+            if path in (fused, maximum):
+                cross_drive_calls.append(path)
+                raise ValueError("path is on another Windows drive")
+            return relative(path, start)
+
+        monkeypatch.setattr(os.path, "relpath", different_drive)
+    return SimpleNamespace(
+        state=processing_state,
+        processed=processed,
+        fused=fused,
+        maximum=maximum,
+        cross_drive=bool(request.param),
+        cross_drive_calls=cross_drive_calls,
+    )
+
+
+@pytest.fixture
+def filesystem_replace_error(monkeypatch):
+    """Inject a failure for one actual filesystem replacement and restore it afterward."""
+
+    @contextmanager
+    def interrupt(destination):
+        """Fail the named destination while letting other real replacements execute."""
+        replace = type(destination).replace
+
+        def fail(path, target, *args, **kwargs):
+            if Path(target).resolve() == destination.resolve():
+                raise OSError("interrupted state replacement")
+            return replace(path, target, *args, **kwargs)
+
+        with monkeypatch.context() as filesystem:
+            filesystem.setattr(type(destination), "replace", fail)
+            yield
+
+    return interrupt
 
 
 @pytest.fixture

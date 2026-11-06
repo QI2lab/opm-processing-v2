@@ -619,6 +619,7 @@ def acquisition_psf_cache():
         CUDA processing still generates and consumes its own production PSFs.
     """
     import json
+    from copy import deepcopy
 
     from opm_processing.dataio.deconvolution import (
         emission_wavelengths_from_metadata,
@@ -654,8 +655,9 @@ def acquisition_psf_cache():
             )
             for kernel in kernels:
                 kernel.setflags(write=False)
-            cache[key] = (kernels, parameters)
-        return cache[key]
+            cache[key] = (tuple(kernels), deepcopy(parameters))
+        kernels, parameters = cache[key]
+        return list(kernels), deepcopy(parameters)
 
     return generate
 

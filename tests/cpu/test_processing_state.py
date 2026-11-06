@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-import os
-from unittest.mock import Mock
+from pathlib import Path
 
 import pytest
 
@@ -113,25 +112,14 @@ def test_processing_state_resume_requires_exact_run_configuration(
     assert path.read_bytes() == saved
 
 
-@pytest.mark.parametrize("cross_drive", [False, True])
+@pytest.mark.parametrize("external_registration_state", [False, True], indirect=True)
 def test_registration_tracks_external_artifacts_in_the_original_journal(
-    tmp_path, processing_state, monkeypatch, cross_drive
+    external_registration_state,
 ):
     """Record another output location without weakening processed-run ownership."""
-    state = processing_state
-    processed = tmp_path / "sample_deskewed.ome.zarr"
-    destination = tmp_path.parent / f"{tmp_path.name}-fused"
-    fused = destination / "sample_fused.ome.zarr"
-    maximum = destination / "sample_max_z_fused.ome.zarr"
-    if cross_drive:
-        relative = os.path.relpath
-
-        def different_drive(path, start):
-            if path in (fused, maximum):
-                raise ValueError("path is on another Windows drive")
-            return relative(path, start)
-
-        monkeypatch.setattr(os.path, "relpath", different_drive)
+    case = external_registration_state
+    state, processed = case.state, case.processed
+    fused, maximum = case.fused, case.maximum
     state.initialize_run(processed, configuration={}, overwrite=True)
     state.save_registration(
         processed,
@@ -146,6 +134,11 @@ def test_registration_tracks_external_artifacts_in_the_original_journal(
     assert reopened.registered_output_for_max_projection(maximum) == processed
     record = reopened.registration(processed)
     assert record["pairwise_metrics"] == {"0,1": [0, 1, 2, 0.9]}
+    assert Path(record["fused_path"]).is_absolute() == case.cross_drive
+    assert Path(record["max_projection_path"]).is_absolute() == case.cross_drive
+    assert set(case.cross_drive_calls) == (
+        {fused, maximum} if case.cross_drive else set()
+    )
     assert (state.path.parent / record["fused_path"]).resolve() == fused
     with pytest.raises(ValueError, match="must be inside"):
         reopened.initialize_run(fused, configuration={}, overwrite=True)
@@ -189,7 +182,7 @@ def test_overwriting_one_run_preserves_siblings_and_invalidates_only_its_registr
 
 
 def test_failed_channel_checkpoint_keeps_previous_durable_state(
-    tmp_path, processing_state, monkeypatch
+    tmp_path, processing_state, filesystem_replace_error
 ):
     """Failure to replace the JSON must leave the preceding checkpoint readable."""
     output = tmp_path / "sample_deskewed.ome.zarr"
@@ -199,12 +192,10 @@ def test_failed_channel_checkpoint_keeps_previous_durable_state(
     state.complete_channel(output, 0, 3, 0, is_zero=True)
     before = state.path.read_bytes()
 
-    monkeypatch.setattr(
-        type(state.path),
-        "replace",
-        Mock(side_effect=OSError("interrupted state replacement")),
-    )
-    with pytest.raises(OSError, match="interrupted state replacement"):
+    with (
+        filesystem_replace_error(state.path),
+        pytest.raises(OSError, match="interrupted state replacement"),
+    ):
         state.complete_channel(output, 0, 3, 1)
 
     assert state.path.read_bytes() == before
