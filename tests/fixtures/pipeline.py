@@ -462,6 +462,143 @@ def pipeline_runner(monkeypatch, processing_options, invoke_cli):
     return run
 
 
+@pytest.fixture
+def pipeline_illumination_calibration(
+    opm_v2_acquisition_factory,
+    uniform_optical_calibration,
+    invoke_cli,
+):
+    """Fit an identifiable real calibration acquisition before processing tissue."""
+    from opm_processing.dataio.acquisition import acquisition_stem
+    from opm_processing.process import read_current_flatfield, write_flatfield
+    from tests.simulation.camera_likelihood import (
+        SamplingEnvelope,
+        camera_sampling_accuracy,
+        camera_sampling_envelope,
+    )
+
+    def calibrate(dataset, microscope, shape, mode):
+        """Use known uniform emission, real camera draws and the production BaSiC worker."""
+        shape = tuple(shape)
+        stem = acquisition_stem(dataset.path)
+        working_width = shape[2] // 2
+        assert working_width > 1
+        # align_corners=True places the half-size samples at this native pitch.
+        # The antialiased bilinear reduction and bilinear expansion each span
+        # one such pitch; round outward before fitting any field.
+        native_reach = int(np.ceil(2 * (shape[2] - 1) / (working_width - 1)))
+        radii = (shape[0] - 1, shape[1] - 1, native_reach)
+        # The calibration's physical dose is declared before any camera draw.
+        # All channels share the same 637-nm optics in these pipeline cases.
+        means = uniform_optical_calibration(
+            microscope,
+            shape,
+            "edge-taper",
+            (5000 / microscope.quantum_efficiency, 0),
+        )
+        channels = dataset.metadata.shape[2]
+        levels = (0.75, 1.25)
+        raw = np.empty((1, len(levels), channels, *shape), np.uint16)
+        for position, channel in np.ndindex(raw.shape[1:3]):
+            raw[0, position, channel] = digitize(
+                means * levels[position] * (1 + channel / 4),
+                microscope.camera,
+                seed=903 + 10 * position + channel,
+            )
+        assert raw.max() < np.iinfo(raw.dtype).max
+        canonical = raw.copy()
+        if mode == "stage":
+            raw = raw[:, :, :, ::-1].copy()
+        calibration = opm_v2_acquisition_factory(
+            raw,
+            name=f"illumination-calibration/{stem}_calibration",
+            mode=mode,
+            camera_offset=microscope.camera.offset_adu,
+            camera_conversion=microscope.camera.electrons_per_adu,
+            pixel_size_um=microscope.pixel_size_um,
+            scan_axis_step_um=microscope.scan_step_um,
+            angle_deg=microscope.angle_deg,
+            stage_positions_zxy=((0, 0, 0),) * len(levels),
+        )
+        output = calibration.path.parent / "processed"
+        invoke_cli(
+            "process",
+            calibration.path,
+            output=output,
+            deconvolve=False,
+            flatfield_correction=True,
+            save_float32=True,
+            z_downsample_level=1,
+            max_projection=False,
+            create_fused_max_projection=False,
+            write_fused_max_projection_tiff=False,
+        )
+        field = read_current_flatfield(
+            output / f"{acquisition_stem(calibration.path)}_flatfield.ome.tif",
+            (1, channels, *shape[-2:]),
+        )
+        assert field is not None
+        # BaSiC's working image has half the native detector dimensions.
+        # Permit the declared reduction/expansion sampling aperture, with the
+        # original camera residuals as the absolute noise allowance. This
+        # criterion is specified before fitting and cannot cancel a wrong
+        # field against the subsequent tissue correction. It is an accuracy
+        # requirement for the nonlinear estimator, not a claim that BaSiC's
+        # optimization is itself a local convex interpolation.
+        for channel in range(channels):
+            truth = means * (1 + channel / 4)
+            view_bounds = [
+                camera_sampling_envelope(
+                    truth * level,
+                    canonical[0, position, channel],
+                    microscope.camera,
+                    radii=radii,
+                    response=level,
+                    views=len(levels),
+                )
+                for position, level in enumerate(levels)
+            ]
+            envelope = SamplingEnvelope(
+                np.minimum.reduce(
+                    [
+                        bound.lower / level
+                        for bound, level in zip(view_bounds, levels, strict=True)
+                    ]
+                ),
+                np.maximum.reduce(
+                    [
+                        bound.upper / level
+                        for bound, level in zip(view_bounds, levels, strict=True)
+                    ]
+                ),
+                np.maximum.reduce(
+                    [
+                        bound.roundoff / level
+                        for bound, level in zip(view_bounds, levels, strict=True)
+                    ]
+                ),
+            )
+            prediction = np.broadcast_to(field[0, channel] * truth.mean(), truth.shape)
+            mask = np.ones(truth.shape, bool)
+            result = camera_sampling_accuracy(prediction, truth, envelope, mask)
+            assert result.accepted, result
+            # The prescribed illumination is measurable: uncorrected unit
+            # sensitivity must fail the same absolute aperture, not merely
+            # score a little worse than the fitted result.
+            uncorrected = camera_sampling_accuracy(
+                np.full_like(truth, truth.mean()), truth, envelope, mask
+            )
+            assert not uncorrected.accepted, uncorrected
+        write_flatfield(
+            dataset.path.parent / f"{stem}_flatfield.ome.tif",
+            field,
+            microscope.pixel_size_um,
+        )
+        return field
+
+    return calibrate
+
+
 @pytest.fixture(scope="session")
 def pipeline_optical_data(
     microscope_parameters, simulation_parameters, acquisition_metadata
