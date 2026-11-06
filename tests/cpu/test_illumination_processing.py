@@ -11,6 +11,7 @@ from typer.testing import CliRunner
 
 from opm_processing.dataio.live import read_lifecycle_event
 from opm_processing.dataio.position_collection import open_position_collection
+from opm_processing.imageprocessing.camera import camera_correct, illumination_correct
 from opm_processing.imageprocessing.flatfield import estimate_illuminations
 from opm_processing.process import app
 
@@ -60,10 +61,12 @@ def test_processing_uses_existing_flatfield_with_separate_output(
         .read()
         .result()
     )
-    calibrated = (
-        acquisition.raw_data[:, 0].astype(np.float32) - acquisition.camera_offset
-    ) * acquisition.camera_conversion
-    expected = (calibrated / selected_field[0])[:, :, np.newaxis]
+    calibrated = camera_correct(
+        acquisition.raw_data[:, 0],
+        acquisition.camera_offset,
+        acquisition.camera_conversion,
+    )
+    expected = illumination_correct(calibrated, selected_field[0])[:, :, np.newaxis]
     np.testing.assert_allclose(saved, expected, rtol=1e-6)
     # The original object and optical model predict the calibrated photons;
     # neither raw counts nor a second processing pass supplies this truth.
