@@ -89,6 +89,8 @@ url = "https://pypi.nvidia.com"
 
 [tool.uv]
 default-groups = ["processing", "gpu"]
+# Require a usable CUDA wheel for supported Windows workstations.
+required-environments = ["sys_platform == 'win32' and platform_machine == 'AMD64'"]
 
 [dependency-groups]
 processing = ["opm-processing-v2[processing]"]
