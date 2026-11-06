@@ -790,3 +790,22 @@ def production_point_acquisition(
         kernels=kernels,
         kernel=kernel / kernel.sum(),
     )
+
+
+@pytest.fixture
+def camera_sampling_case(uniform_detector_scene):
+    """Share a fixed high-dose physical phantom and its actual detector residual."""
+    from tests.simulation.camera import digitize
+    from tests.simulation.camera_likelihood import sampling_stencil_radii
+
+    scene = uniform_detector_scene()
+    raw = digitize(scene.means, scene.microscope.camera, seed=937)
+    return SimpleNamespace(
+        expectation=scene.means,
+        raw=raw,
+        camera=scene.microscope.camera,
+        nominal=scene.nominal,
+        radii=sampling_stencil_radii(
+            scene.microscope, (scene.microscope.pixel_size_um,) * 3
+        ),
+    )

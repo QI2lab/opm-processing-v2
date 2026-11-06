@@ -141,3 +141,50 @@ def test_directional_rayleigh_measurement_matches_airy_first_minimum():
     assert dip == pytest.approx(0.26497, abs=5e-5)
     with pytest.raises(ValueError, match="first minimum"):
         first_minimum(radius, np.exp(-(radius**2)))
+
+
+@pytest.mark.parametrize(
+    "artifact", ["correct", "gain", "dim", "stripes", "zero", "zero-unbounded"]
+)
+def test_camera_sampling_bounds_detect_photon_and_spatial_errors(
+    camera_sampling_case, artifact
+):
+    """Known detector noise cannot conceal a twenty-percent or mean-preserving stripe error."""
+    from tests.simulation.camera_likelihood import (
+        SamplingEnvelope,
+        camera_sampling_accuracy,
+        camera_sampling_envelope,
+    )
+
+    case = camera_sampling_case
+    expected, camera = case.expectation, case.camera
+    envelope = camera_sampling_envelope(expected, case.raw, camera, radii=case.radii)
+    # Identity sampling is an allowed positive interpolation: its central
+    # coefficient is one. Its noise is the actual physical camera draw.
+    prediction = np.maximum(
+        (case.raw.astype(np.float64) - camera.offset_adu) * camera.electrons_per_adu,
+        0,
+    )
+    original_flux = prediction.sum(dtype=np.float64)
+    if artifact == "gain":
+        prediction *= 1.2
+    elif artifact == "dim":
+        prediction *= 0.8
+    elif artifact == "stripes":
+        prediction += np.where(np.arange(prediction.shape[-1]) % 2, 1, -1) * (
+            0.2 * case.nominal
+        )
+        assert prediction.sum(dtype=np.float64) == original_flux
+    elif artifact in ("zero", "zero-unbounded"):
+        prediction.fill(0)
+        if artifact == "zero-unbounded":
+            envelope = SamplingEnvelope(
+                np.zeros_like(expected), expected * 2, np.zeros_like(expected)
+            )
+    measured = camera_sampling_accuracy(
+        prediction, expected, envelope, np.ones(expected.shape, bool)
+    )
+    assert measured.accepted == (artifact == "correct"), measured
+    if artifact == "stripes":
+        assert measured.flux_lower <= measured.flux <= measured.flux_upper
+        assert not measured.inside_envelope
