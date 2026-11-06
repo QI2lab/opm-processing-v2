@@ -401,6 +401,27 @@ class AcquisitionMetadata:
         result["channel_count"] = len(self.channels)
         result["stage_axis_flips_xyz"] = self.stage_axis_flips_xyz
         result["scan_axis_reversed"] = self.scan_axis_reversed
+        for name in (
+            "stage_positions_zxy",
+            "scan_start_positions_xyz",
+            "scan_end_positions_xyz",
+        ):
+            result[name] = tuple(
+                tuple(round(float(value), 3) for value in position)
+                for position in result[name]
+            )
+        for name in (
+            "pixel_size_um",
+            "scan_axis_step_um",
+            "scan_span_um",
+            "scan_axis_overlap_um",
+        ):
+            if result[name] is not None:
+                result[name] = round(float(result[name]), 3)
+        result["registration_overlap_zyx_um"] = tuple(
+            None if value is None else round(float(value), 3)
+            for value in result["registration_overlap_zyx_um"]
+        )
         return result
 
 

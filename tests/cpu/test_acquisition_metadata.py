@@ -76,12 +76,12 @@ def test_scan_metadata_retains_all_physical_scan_planes(
 
 @pytest.mark.unit
 @pytest.mark.parametrize("downsample", ["stride", "block_mean"])
-def test_position_collection_multiscales_round_spatial_metadata(
+def test_position_collection_multiscales_preserve_spatial_metadata(
     tmp_path: Path,
     downsample,
 ) -> None:
-    """Round NGFF spacing/origins and preserve block-center coordinates."""
-    path = tmp_path / "rounded_projection.ome.zarr"
+    """Round micrometer metadata to three decimals and preserve block centers."""
+    path = tmp_path / "precise_projection.ome.zarr"
     collection = create_position_collection(
         path,
         (1, 1, 1, 1, 17, 21),
@@ -101,27 +101,17 @@ def test_position_collection_multiscales_round_spatial_metadata(
     metadata = reopened["0"].ome_metadata()
     assert isinstance(metadata, v05.Image)
     datasets = metadata.multiscales[0].datasets
-    expected_scales = (
-        [1.0, 1.0, 0.346, 0.115, 0.117],
-        [1.0, 1.0, 0.346, 0.23, 0.234],
-        [1.0, 1.0, 0.346, 0.46, 0.468],
-    )
-    expected_translations = (
-        [0.0, 0.0, 4.568, 5.679, 6.789],
-        [0.0, 0.0, 4.568, 5.679, 6.789],
-        [0.0, 0.0, 4.568, 5.679, 6.789],
-    )
-    for dataset, scale, translation in zip(
-        datasets, expected_scales, expected_translations, strict=False
-    ):
-        assert dataset.scale_transform.scale == scale
+    for dataset, factor in zip(datasets, (1, 2, 4), strict=True):
+        np.testing.assert_allclose(
+            dataset.scale_transform.scale,
+            (1, 1, 0.346, round(0.115 * factor, 3), round(0.117 * factor, 3)),
+            rtol=0,
+            atol=1e-12,
+        )
         assert dataset.translation_transform is not None
-        expected_origin = np.asarray(translation)
+        expected_origin = np.asarray((0, 0, 4.568, 5.679, 6.789))
         if downsample == "block_mean":
-            factor = scale[-1] / expected_scales[0][-1]
-            expected_origin[-2:] += (
-                0.5 * (factor - 1) * np.array(expected_scales[0][-2:])
-            )
+            expected_origin[-2:] += 0.5 * (factor - 1) * np.asarray((0.115, 0.117))
         np.testing.assert_allclose(
             dataset.translation_transform.translation,
             expected_origin,
@@ -209,7 +199,9 @@ def test_recorded_overlap_uses_raw_geometry_and_stage_distance(
     )
     assert metadata.to_dict()["scan_axis_overlap_um"] == scan_um
     assert metadata.to_dict()["registration_overlap_zyx_um"] == (
-        metadata.registration_overlap_zyx_um
+        0.069,
+        round(scan_overlap, 3),
+        0.144,
     )
 
 
