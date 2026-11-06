@@ -131,6 +131,7 @@ documentation = "https://qi2lab.github.io/opm-processing-v2/"
 [project.scripts]
 process = "opm_processing.process:main"
 inspect-opm = "opm_processing.dataio.acquisition:main"
+map-legacy-opm = "opm_processing.dataio.legacy_reference:main"
 export-projections = "opm_processing.export_projections:main"
 encode-projections = "opm_processing.encode_projections:main"
 export-ome-tiff = "opm_processing.export_ome_tiff:main"
