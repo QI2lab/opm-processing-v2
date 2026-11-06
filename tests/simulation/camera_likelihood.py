@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
-from scipy.ndimage import maximum_filter, minimum_filter
+from scipy.ndimage import maximum_filter, minimum_filter, shift
 from scipy.special import gammaln, kl_div, log_ndtr, logsumexp, ndtri, xlogy
 from scipy.stats import poisson
 
@@ -171,6 +171,7 @@ def camera_sampling_envelope(
     response: ArrayLike = 1,
     views: int = 1,
     z_bin_factor: int = 1,
+    view_offsets_x: Sequence[float] | None = None,
 ) -> SamplingEnvelope:
     """Bound positive resampling using original optical truth and detector residuals.
 
@@ -200,6 +201,9 @@ def camera_sampling_envelope(
         Maximum number of independently acquired views mixed by fusion.
     z_bin_factor : int
         Native planes per output bin, used to bound arithmetic roundoff.
+    view_offsets_x : sequence of float or None
+        Known integer native-X displacements of stacked views relative to the
+        target camera frame. Combine their bounds in corrected-photon units.
 
     Returns
     -------
@@ -209,6 +213,41 @@ def camera_sampling_envelope(
     means, codes = np.broadcast_arrays(
         np.asarray(expectation, np.float64), np.asarray(raw, np.float64)
     )
+    if view_offsets_x is not None:
+        offsets = np.asarray(view_offsets_x, float)
+        if (
+            means.ndim != 4
+            or offsets.shape != (means.shape[0],)
+            or not np.isfinite(offsets).all()
+            or not np.allclose(offsets, np.rint(offsets), rtol=0, atol=1e-8)
+        ):
+            raise ValueError("Require stacked camera views and known integer X offsets")
+        sensitivity = np.broadcast_to(np.asarray(response, float), means.shape[1:])
+        low, high = np.full(means.shape[1:], np.nan), np.full(means.shape[1:], np.nan)
+        for mean, raw, offset in zip(means, codes, offsets, strict=True):
+            bounds = camera_sampling_envelope(
+                mean,
+                raw,
+                camera,
+                radii=radii,
+                footprint=footprint,
+                response=sensitivity,
+                views=max(views, len(offsets)),
+                z_bin_factor=z_bin_factor,
+            )
+            aligned = [
+                shift(
+                    values / sensitivity,
+                    (0, 0, int(np.rint(offset))),
+                    order=0,
+                    mode="constant",
+                    cval=np.nan,
+                    prefilter=False,
+                )
+                for values in (bounds.lower, bounds.upper)
+            ]
+            low, high = np.fmin(low, aligned[0]), np.fmax(high, aligned[1])
+        return SamplingEnvelope(low * sensitivity, high * sensitivity)
     sensitivity = np.broadcast_to(np.asarray(response, np.float64), means.shape)
     radius = np.asarray(radii)
     if (

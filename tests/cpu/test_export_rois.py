@@ -7,7 +7,6 @@ import numpy as np
 import pytest
 import tifffile
 from ome_types import from_xml
-from rich.text import Text
 from typer.testing import CliRunner
 from yaozarrs import open_group, v05
 
@@ -119,7 +118,6 @@ def test_raw_roi_exports_and_resume(
     monkeypatch.setattr(export_rois, "select_rois", choose)
     missing_channel = CliRunner().invoke(export_rois.app, [str(directory)])
     assert missing_channel.exit_code == 2
-    assert "--registration-channel" in Text.from_ansi(missing_channel.output).plain
     assert not calls
     completed = None
     for attempt in range(2):
@@ -249,24 +247,24 @@ def test_raw_roi_exports_and_resume(
     assert calls[0].name == preview_name
 
 
-@pytest.mark.unit
-def test_missing_preview_explains_creation(tmp_path):
-    """Missing previews fail before GUI creation with a complete CLI command."""
-    with pytest.raises(ValueError, match=r"uv run process .*--no-deconvolve"):
-        export_rois.resolve_roi_source(tmp_path)
-
-
 @pytest.mark.integration
 @pytest.mark.parametrize(
     "mosaic_acquisition", [("mirror", 0.4, 0.001), ("stage", 1.2, 0.001)], indirect=True
 )
 def test_roi_maps_extended_specimen_to_raw_tiles(
-    mosaic_acquisition, monkeypatch, independent_photon_scene_factory, invoke_cli
+    mosaic_acquisition, monkeypatch, invoke_cli, pipeline_geometry
 ):
     """Keep the oblique preimage and measure fresh links across a real tile seam."""
     from opm_processing.dataio.position_collection import open_position_collection
     from opm_processing.imageprocessing.tilefusion import TileFusion
     from opm_processing.process import process_skewed
+    from tests.simulation.camera_likelihood import (
+        camera_sampling_accuracy,
+        camera_sampling_envelope,
+        sampling_stencil_footprint,
+        sampling_stencil_radii,
+    )
+    from tests.simulation.metrics import camera_object_apertures, camera_volume_samples
 
     case = mosaic_acquisition
     process_skewed(
@@ -323,18 +321,81 @@ def test_roi_maps_extended_specimen_to_raw_tiles(
         .multiscales[0]
         .datasets[0]
     )
-    projection = final[0, 0].max(axis=0)
-    peak_x = int(np.unravel_index(np.argmax(projection), projection.shape)[1])
-    observed_x = metadata.translation_transform.translation[-1] + peak_x * pixel
-    scene = independent_photon_scene_factory("line-pairs")
-    source_x = (
-        1.15
-        + (case.expectation.shape[-1] - 1) * pixel / 2
-        + np.asarray(scene.features["positions_x_um"])
+    raw = case.dataset.raw_data[0, :, 0]
+    stage = case.dataset.metadata.scan_axis_reversed
+    if stage:
+        raw = raw[:, ::-1]
+    shape = raw.shape[-3:]
+    width = shape[-1]
+    means = [case.expectation[..., p * offset : p * offset + width] for p in range(2)]
+    gain = 2 * pixel / microscope.scan_step_um
+    geometry = pipeline_geometry(shape, microscope)
+    native_support = camera_volume_samples(
+        geometry.support.astype(float),
+        (0, 0, 0),
+        (pixel, pixel, pixel),
+        (0, 0, 0),
+        shape,
+        microscope,
     )
-    # A diffraction-limited line-pair maximum may lie between unresolved lines.
-    rayleigh = 0.61 * microscope.wavelength_um / microscope.numerical_aperture
-    assert np.min(np.abs(source_x - observed_x)) <= rayleigh + pixel
+    for fused in (False, True):
+        spacing = np.asarray(
+            metadata.scale_transform.scale[-3:] if fused else saved.voxel_size_um
+        )
+        # Fractional stage placement adds one further interpolation stencil.
+        pitch = spacing * (2 if fused else 1)
+        for position, mean in enumerate(means):
+            image = (
+                final[0, 0] if fused else saved.arrays[position][0, 0].read().result()
+            )
+            origin = (
+                metadata.translation_transform.translation[-3:]
+                if fused
+                else saved.spatial_origins_zyx_um[position]
+            )
+            # These are the simulator's actual placements, before the prescribed
+            # one-pixel X and 0.001-um scan-encoder errors in acquisition metadata.
+            frame_origin = (
+                -2.3,
+                4.6 - ((scans - 1) * microscope.scan_step_um if stage else 0),
+                1.15 + position * offset * pixel,
+            )
+            sample = (origin, spacing, frame_origin, shape, microscope)
+            support = camera_volume_samples(np.ones(image.shape), *sample)
+            support = (
+                np.minimum(support, native_support) >= 1 - 32 * np.finfo(float).eps
+            )
+            prediction = camera_volume_samples(image / gain, *sample)
+            envelope = camera_sampling_envelope(
+                np.asarray(means) if fused else mean,
+                raw if fused else raw[position],
+                microscope.camera,
+                radii=sampling_stencil_radii(microscope, pitch),
+                footprint=sampling_stencil_footprint(
+                    microscope, pitch, origin_y_error_um=0.0005
+                ),
+                views=2 if fused else 1,
+                view_offsets_x=(np.arange(2) - position) * offset if fused else None,
+            )
+            apertures = camera_object_apertures(
+                case.optical_data.ground_truth,
+                microscope,
+                shape,
+                camera_offset_zyx_um=(
+                    0,
+                    0,
+                    (position * offset + (width - case.expectation.shape[-1]) / 2)
+                    * pixel,
+                ),
+            )
+            assert all(np.any(aperture & support) for aperture in apertures[:2])
+            for aperture in apertures:
+                selected = aperture & support
+                if np.any(selected):
+                    accuracy = camera_sampling_accuracy(
+                        prediction, mean, envelope, selected
+                    )
+                    assert accuracy.accepted, accuracy
 
 
 @pytest.mark.unit

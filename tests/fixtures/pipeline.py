@@ -65,7 +65,6 @@ def pipeline_geometry():
 @pytest.fixture
 def pipeline_camera_accuracy(pipeline_geometry):
     """Bound persisted camera predictions by original optical means and detector residuals."""
-    from scipy.ndimage import shift as shift_bound
     from yaozarrs import open_group
 
     from opm_processing.dataio.acquisition import (
@@ -74,7 +73,6 @@ def pipeline_camera_accuracy(pipeline_geometry):
     )
     from opm_processing.dataio.ngff import SPATIAL_DECIMALS
     from tests.simulation.camera_likelihood import (
-        SamplingEnvelope,
         camera_sampling_accuracy,
         camera_sampling_envelope,
         sampling_stencil_footprint,
@@ -178,18 +176,6 @@ def pipeline_camera_accuracy(pipeline_geometry):
                 response = np.broadcast_to(
                     1 if result.field is None else result.field[0, channel], shape
                 )
-                source_bounds = [
-                    camera_sampling_envelope(
-                        means[time, position, channel],
-                        original[time, position, channel],
-                        microscope.camera,
-                        radii=fused_radii,
-                        footprint=fused_footprint,
-                        response=response,
-                        views=positions,
-                    )
-                    for position in range(positions)
-                ]
                 for position in range(positions):
                     expected = means[time, position, channel]
                     selections = (
@@ -218,31 +204,16 @@ def pipeline_camera_accuracy(pipeline_geometry):
                         own_bounds,
                         selections,
                     )
-                    # Fusion is a positive mixture of ALL independently exposed
-                    # views. Align interval bounds in corrected-photon units,
-                    # then convert back with the target detector response.
-                    low = np.full(shape, np.nan)
-                    high = np.full(shape, np.nan)
-                    for source_position, bounds in enumerate(source_bounds):
-                        delta = (
-                            offsets_x[position] - offsets_x[source_position]
-                        ) / pixel
-                        assert np.isclose(delta, np.rint(delta), rtol=0, atol=1e-8)
-                        shift = (0, 0, -int(np.rint(delta)))
-                        aligned = [
-                            shift_bound(
-                                array / response,
-                                shift,
-                                order=0,
-                                mode="constant",
-                                cval=np.nan,
-                                prefilter=False,
-                            )
-                            for array in (bounds.lower, bounds.upper)
-                        ]
-                        low = np.fmin(low, aligned[0])
-                        high = np.fmax(high, aligned[1])
-                    fused_bounds = SamplingEnvelope(low * response, high * response)
+                    fused_bounds = camera_sampling_envelope(
+                        means[time, :, channel],
+                        original[time, :, channel],
+                        microscope.camera,
+                        radii=fused_radii,
+                        footprint=fused_footprint,
+                        response=response,
+                        views=positions,
+                        view_offsets_x=(offsets_x - offsets_x[position]) / pixel,
+                    )
                     frame_origin = (
                         anchor + local_origin + np.array((0, 0, offsets_x[position]))
                     )
