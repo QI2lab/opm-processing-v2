@@ -187,15 +187,15 @@ def test_cumulative_updates_follow_each_positions_exact_previous_layer(
     _regions, reference, records = export_ao_relative.relative_regions(
         manifest, saved, reader
     )
-    running = {0: np.zeros(2), 1: np.zeros(2)}
     for record in records:
         depth, index = record["depth_index"], record["region_index"]
         start = baseline if depth == 0 else final[depth - 1, index]
         delta = final[depth, index] - start
-        running[index] += delta
         np.testing.assert_array_equal(record["layer_delta_coefficients"], delta)
         np.testing.assert_allclose(
-            record["cumulative_coefficients"], running[index], atol=1e-12
+            record["cumulative_coefficients"],
+            final[depth, index] - baseline,
+            atol=1e-12,
         )
         np.testing.assert_array_equal(
             record["plotted_coefficients"], final[depth, index] - baseline

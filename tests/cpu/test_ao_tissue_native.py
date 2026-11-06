@@ -1,15 +1,13 @@
 """Native tissue exports preserve source pixels and physical pupil geometry."""
 
-import base64
-from io import BytesIO
 from pathlib import Path
-from xml.etree import ElementTree
 
 import matplotlib
 import numpy as np
 import pytest
 from matplotlib.colors import Normalize
 from PIL import Image
+from scripts.ao_saved_viewing_background import read_saved_viewing_background
 from scripts.ao_tissue_overlay import write_tissue_overlay
 
 pytestmark = pytest.mark.unit
@@ -41,19 +39,11 @@ def test_native_canvas_retains_full_anisotropic_background_and_grid(
     with Image.open(page["png"]) as image:
         assert image.size == (2100, 60)
         pixels = np.asarray(image.convert("RGB"))
-    embedded_shapes = []
-    for element in ElementTree.parse(page["svg"]).iter():
-        if not element.tag.endswith("image"):
-            continue
-        href = element.get(
-            "{http://www.w3.org/1999/xlink}href", element.get("href", "")
-        )
-        if href.startswith("data:image/png;base64,"):
-            with Image.open(
-                BytesIO(base64.b64decode(href.partition(",")[2]))
-            ) as embedded:
-                embedded_shapes.append(embedded.size)
-    assert (2100, 60) in embedded_shapes
+    background, provenance = read_saved_viewing_background(
+        Path(page["svg"]), (60, 2100)
+    )
+    np.testing.assert_array_equal(background, np.zeros((60, 2100, 3), np.uint8))
+    assert provenance["pixel_shape_yx"] == [60, 2100]
 
     axis = next(axis for axis in figures[0].axes if axis.images)
     np.testing.assert_allclose(

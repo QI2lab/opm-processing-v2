@@ -65,6 +65,18 @@ class TissueGeometry:
     )
 
 
+def _pixel_edge_extent(
+    shape_yx: Sequence[int],
+    origin_yx_um: Sequence[float],
+    scale_yx_um: Sequence[float],
+) -> tuple[float, float, float, float]:
+    """Convert calibrated first-pixel centers to physical YX edge bounds."""
+    origin, scale = np.asarray(origin_yx_um), np.asarray(scale_yx_um)
+    lower = origin - 0.5 * scale
+    upper = origin + (np.asarray(shape_yx) - 0.5) * scale
+    return float(lower[0]), float(upper[0]), float(lower[1]), float(upper[1])
+
+
 def _compose_transform(
     dataset: dict[str, Any], multiscale: dict[str, Any]
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -281,9 +293,10 @@ def read_tissue_geometry(
         if load_image
         else np.empty((0, 0), dtype=np.float32)
     )
-    y0, x0 = origin[-2:] - 0.5 * scale[-2:]
-    y1, x1 = origin[-2:] + (np.asarray(shape[-2:]) - 0.5) * scale[-2:]
-    extent = tuple(round(float(value), 3) for value in (y0, y1, x0, x1))
+    extent = tuple(
+        round(value, 3)
+        for value in _pixel_edge_extent(shape[-2:], origin[-2:], scale[-2:])
+    )
 
     state_path = image_processing_state_path(preview, preview.name.removesuffix(suffix))
     state = ProcessingState.read(state_path)

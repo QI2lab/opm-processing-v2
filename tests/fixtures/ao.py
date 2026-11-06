@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 from matplotlib.figure import Figure
 from scripts import ao_layer_projections
-from scripts.ao_tissue_geometry import TissueGeometry
+from scripts.ao_tissue_geometry import TissueGeometry, _pixel_edge_extent
 from yaozarrs import open_group
 
 from opm_processing.dataio.processing_state import ProcessingState
@@ -44,12 +44,7 @@ def ao_geometry_factory():
             "scale_yx_um": (dy, dx),
             "preview_origin_yx_um": (oy, ox),
             "preview_scale_yx_um": (dy, dx),
-            "extent_yx_um": (
-                oy - dy / 2,
-                oy + (shape[0] - 0.5) * dy,
-                ox - dx / 2,
-                ox + (shape[1] - 0.5) * dx,
-            ),
+            "extent_yx_um": _pixel_edge_extent(shape, (oy, ox), (dy, dx)),
             "centers_by_depth_index": {},
             "depth_offsets": {},
             "provenance": {},
@@ -431,21 +426,20 @@ def ao_cache_export_factory(tmp_path, ao_result_factory, ao_geometry_factory):
                 "canvas_origin_yx_um": [0.5, 0.5],
                 "canvas_scale_yx_um": [1, 1],
             }
-            arrays, _, cache = ao_layer_projections._open_projection_cache(
+            arrays, completed, cache = ao_layer_projections._open_projection_cache(
                 directory, context, shape, np.dtype(np.uint16), depths, 1
             )
             for depth in depths:
                 arrays[depth][:] = images[channel][depth]
-                arrays[depth].flush()
-                hashes[channel, depth] = hashlib.sha256(
-                    np.asarray(images[channel][depth], dtype=np.uint16).tobytes()
-                ).hexdigest()
-            cache["manifest"].update(
-                phase="complete",
-                completed_xy_blocks=[True],
-                mip_sha256_by_depth={str(d): hashes[channel, d] for d in depths},
+            completed[:] = True
+            ao_layer_projections._checkpoint_projection_cache(
+                arrays, completed, cache, 0
             )
-            ao_layer_projections._write_cache_manifest(cache["path"], cache["manifest"])
+            completed_hashes = ao_layer_projections._finalize_projection_cache(
+                arrays, cache
+            )
+            for depth in depths:
+                hashes[channel, depth] = completed_hashes[str(depth)]
             cache_paths[channel] = cache["path"]
             fingerprints[channel] = cache["manifest"]["fingerprint"]
         records, regions = [], []

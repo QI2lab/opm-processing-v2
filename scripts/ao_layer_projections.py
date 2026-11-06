@@ -509,6 +509,34 @@ def _image_sha(image: np.ndarray) -> str:
     return digest.hexdigest()
 
 
+def _checkpoint_projection_cache(
+    images: dict[int, np.ndarray],
+    completed_blocks: np.ndarray,
+    cache: dict[str, Any],
+    volume_read_bytes: int,
+) -> None:
+    """Publish completed projection blocks only after their pixels are durable."""
+    _flush_cache_arrays(images, cache["image_paths"])
+    cache["manifest"]["completed_xy_blocks"] = completed_blocks.tolist()
+    cache["manifest"]["volume_read_bytes"] = volume_read_bytes
+    _write_cache_manifest(cache["path"], cache["manifest"])
+
+
+def _finalize_projection_cache(
+    images: dict[int, np.ndarray], cache: dict[str, Any] | None
+) -> dict[str, str]:
+    """Hash completed native projections and publish their cache completion."""
+    hashes = {str(depth): _image_sha(image) for depth, image in images.items()}
+    if cache is not None:
+        expected_hashes = cache["manifest"].get("mip_sha256_by_depth")
+        if cache["manifest"]["phase"] == "complete" and expected_hashes != hashes:
+            raise ValueError("Projection cache image checksum mismatch")
+        cache["manifest"]["mip_sha256_by_depth"] = hashes
+        cache["manifest"]["phase"] = "complete"
+        _write_cache_manifest(cache["path"], cache["manifest"])
+    return hashes
+
+
 def _read_layer_projections_unlocked(
     geometry: Any,
     *,
@@ -635,10 +663,7 @@ def _read_layer_projections_unlocked(
     def checkpoint() -> None:
         """Publish only completed block writes after their native cache is durable."""
         if cache is not None:
-            _flush_cache_arrays(images, cache["image_paths"])
-            cache["manifest"]["completed_xy_blocks"] = completed_blocks.tolist()
-            cache["manifest"]["volume_read_bytes"] = bytes_read
-            _write_cache_manifest(cache["path"], cache["manifest"])
+            _checkpoint_projection_cache(images, completed_blocks, cache, bytes_read)
 
     print(
         f"Local layer projections: {completed}/{total} XY blocks ({resumed} resumed)",
@@ -679,23 +704,16 @@ def _read_layer_projections_unlocked(
         raise ValueError(
             "Projection source metadata changed during calculation; cache cannot be reused"
         )
-    hashes = {}
+    hashes = _finalize_projection_cache(images, cache)
     for depth, record in provenance.items():
         record["xy_block_shape"] = list(XY_BLOCK_SHAPE)
         record["read_workers"] = READ_WORKERS
         record["shared_volume_read_bytes"] = bytes_read
-        record["mip_sha256"] = hashes[str(depth)] = _image_sha(images[depth])
+        record["mip_sha256"] = hashes[str(depth)]
         record["resumed_xy_blocks"] = resumed
         if cache is not None:
             record["projection_cache"] = str(cache["path"])
             record["projection_cache_fingerprint"] = cache["manifest"]["fingerprint"]
-    if cache is not None:
-        expected_hashes = cache["manifest"].get("mip_sha256_by_depth")
-        if cache["manifest"]["phase"] == "complete" and expected_hashes != hashes:
-            raise ValueError("Projection cache image checksum mismatch")
-        cache["manifest"]["mip_sha256_by_depth"] = hashes
-        cache["manifest"]["phase"] = "complete"
-        _write_cache_manifest(cache["path"], cache["manifest"])
     return images, provenance
 
 

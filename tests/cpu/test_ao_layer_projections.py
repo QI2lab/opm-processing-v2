@@ -5,7 +5,6 @@ from dataclasses import replace
 
 import numpy as np
 import pytest
-import zarr
 from scripts import ao_layer_projections
 from scripts.ao_layer_projections import read_layer_projections
 from yaozarrs import open_group
@@ -65,9 +64,7 @@ def test_layer_projection_rejects_incompatible_xy_calibration(layer_case):
 def test_layer_projection_validates_camera_physics_against_processed_slab(layer_case):
     """A wrong source Z shape cannot redefine the acquisition layer thickness."""
     case = layer_case
-    zarr.open_array(str(case.collection.path / "0/0"), mode="r+").resize(
-        (1, 1, 3, 3, 3)
-    )
+    case.collection.arrays[0].resize(exclusive_max=(1, 1, 3, 3, 3)).result()
     with pytest.raises(ValueError, match="acquisition ROI height"):
         read_layer_projections(case.geometry, timepoint=0, channel=0, depths=[0])
 

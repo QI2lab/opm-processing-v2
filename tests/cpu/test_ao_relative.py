@@ -171,16 +171,21 @@ def test_full_command_preserves_nonzero_initial_spherical_correction(
 def test_full_command_is_starting_state_plus_signed_layer_changes_once(ao_modal_chain):
     """Including the starting state changes the plot, not the accumulated deltas."""
     manifest, saved, baseline = ao_modal_chain()
+    commands = {
+        (record["depth_index"], record["region_index"]): np.asarray(
+            record["final_coefficients"]
+        )
+        for record in manifest["regions"]
+    }
     reader = ao_wavekit_phase
     _, _, relative = relative_regions(manifest, saved, reader)
     _, _, full = relative_regions(manifest, saved, reader, include_starting=True)
-    manual = {index: baseline.copy() for index in range(2)}
     for record, relative_record in zip(full, relative, strict=True):
-        index = record["region_index"]
-        manual[index] += (
-            np.asarray(record["final_coefficients"]) - record["starting_coefficients"]
+        command = commands[record["depth_index"], record["region_index"]]
+        np.testing.assert_allclose(record["plotted_coefficients"], command)
+        np.testing.assert_allclose(
+            record["cumulative_coefficients"], command - baseline
         )
-        np.testing.assert_allclose(record["plotted_coefficients"], manual[index])
         np.testing.assert_array_equal(
             record["plotted_coefficients"], record["final_coefficients"]
         )
@@ -194,7 +199,7 @@ def test_full_command_is_starting_state_plus_signed_layer_changes_once(ao_modal_
         )
         assert record["relative_rms_opd_nm"] == relative_record["relative_rms_opd_nm"]
         assert record["plotted_rms_opd_nm"] == pytest.approx(
-            1000 * np.linalg.norm(manual[index])
+            1000 * np.linalg.norm(command)
         )
 
 
