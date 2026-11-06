@@ -124,54 +124,6 @@ def fused_store_factory(tmp_path):
     return create
 
 
-def ptv_manifest(image_paths=("0",)):
-    """Return explicit synthetic processing provenance, without implied calibration."""
-    return {
-        "schema_version": 1,
-        "dataset_id": "synthetic-processed",
-        "producer_version": "0.3.0",
-        "product_kind": "deconvolved_deskewed",
-        "processing_history": [{"operation": "synthetic_processed_fixture"}],
-        "registration": {"applied": False, "coordinate_frame": "stored_processed"},
-        "calibration": {"gain_offset_applied": False, "uncertainty_validated": False},
-        "images": [
-            {
-                "path": name,
-                "source_indices": [0, 1, 3],
-                "volume_status_by_channel": [["valid", "invalid", "incomplete"]],
-            }
-            for name in image_paths
-        ],
-    }
-
-
-@pytest.fixture
-def ptv_collection(tmp_path):
-    """Allocate a tiny actual processed writer output; no numerical processing runs."""
-    path = tmp_path / "processed.ome.zarr"
-    create_position_collection(
-        path,
-        (3, 1, 1, 7, 12, 14),
-        (0.23, 0.115, 0.15),
-        spatial_offset_um=(-2.1, 3.2, -4.3),
-        time_interval_s=0.085,
-        multiscale_factors_yx=(2,),
-        channels=["beads"],
-        attributes={
-            "opm_processing": {
-                "timing": {
-                    "schema_version": 1,
-                    "n_acquired_planes": 17,
-                    "dt_plane_s": 0.005,
-                    "dt_volume_s": 0.085,
-                    "source": "synthetic_trigger",
-                }
-            }
-        },
-    )
-    return path
-
-
 @pytest.fixture
 def processed_directory_factory(tmp_path):
     """Create derived-store identities for source/output path resolution tests."""

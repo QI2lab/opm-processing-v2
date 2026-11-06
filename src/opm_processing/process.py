@@ -56,7 +56,6 @@ from opm_processing.dataio.processing_state import (
     ProcessingState,
     processing_state_path,
 )
-from opm_processing.dataio.ptv import mark_ptv_tile, publish_processing_state_ptv
 from opm_processing.dataio.roi import (
     PhysicalRoi,
     world_roi_to_skewed_bounds,
@@ -2048,9 +2047,6 @@ def process_skewed(
         resume=state_resume,
         output_preexisting=output_preexisting,
     )
-    ptv_export_enabled = acquisition.volume_interval_s is not None
-    if ptv_export_enabled:
-        publish_processing_state_ptv(output_path, processing_state)
     if max_projection:
         if state_resume and max_z_output_preexisting:
             try:
@@ -2436,13 +2432,6 @@ def process_skewed(
                 pos_idx,
                 zero_channels=tile_zero_channels,
             )
-            if ptv_export_enabled:
-                mark_ptv_tile(
-                    output_path,
-                    int(t_idx),
-                    int(pos_idx),
-                    zero_channels=tile_zero_channels,
-                )
             if max_projection:
                 processing_state.complete_tile(max_z_output_path, t_idx, pos_idx)
 

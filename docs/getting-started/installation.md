@@ -10,7 +10,7 @@ groups select processing and, on Windows/Linux, GPU support as before.
 
 For IO only, use `uv sync --no-default-groups` in this checkout or add the base
 `opm-processing-v2` dependency to a consumer project. Import the public reader
-with `from opm_processing.dataio import read_processed_snapshot`.
+with `from opm_processing.dataio import inspect_acquisition`.
 
 Python 3.12 and [`uv`](https://docs.astral.sh/uv/) are required.
 
