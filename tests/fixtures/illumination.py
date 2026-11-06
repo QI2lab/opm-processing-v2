@@ -68,7 +68,6 @@ def uniform_camera_scene(uniform_detector_scene):
         assert pixels.max() < np.iinfo(np.uint16).max
         return SimpleNamespace(
             pixels=pixels,
-            means=means,
             source_means=source_means,
             fields=response,
             microscope=microscope,
@@ -139,7 +138,6 @@ def assert_uniform_photon_accuracy():
                 envelope = SamplingEnvelope(
                     np.maximum(low - roundoff - quantum, 0),
                     high + roundoff + quantum,
-                    np.full(coverage.shape, roundoff + quantum),
                 )
                 actual = data[time, channel]
                 result = camera_sampling_accuracy(
@@ -155,7 +153,7 @@ def assert_uniform_photon_accuracy():
 def projection_illumination_case(opm_v2_projection_zarr, simulated_camera):
     """Retain original optical camera means for the actual projection producer."""
     dataset = opm_v2_projection_zarr
-    means = np.empty_like(dataset.raw_data[:, 0], dtype=np.float64)
+    means = np.empty_like(dataset.raw_data[:, 0, :, 0], dtype=np.float64)
     for time, channel in np.ndindex(means.shape[:2]):
         observation = simulated_camera(
             (1, *means.shape[-2:]),
@@ -213,26 +211,19 @@ def illumination_calibration_ensemble(roi_camera_scene, uniform_optical_calibrat
     """Provide identifiable optical calibration before the unchanged point sample."""
     from tests.simulation.camera import digitize
 
-    def create():
-        """Illuminate a uniform physical object covering the sensor and PSF support."""
-        scene = roi_camera_scene(shape=(24, 33, 33))
-        microscope = scene.microscope
-        # Constant emission over the full optical support makes illumination
-        # identifiable independently of sparse sample structure at timepoint1.
-        calibration_mean = uniform_optical_calibration(
-            microscope, scene.pixels.shape[-3:]
-        )
-        calibration_raw = digitize(calibration_mean, microscope.camera, seed=71)
-        assert calibration_raw.max() < np.iinfo(np.uint16).max
-        return SimpleNamespace(
-            scene=scene,
-            raw=np.concatenate((calibration_raw[None, None, None], scene.pixels)),
-            calibration_mean=calibration_mean,
-            calibration_photons=2000 * microscope.quantum_efficiency,
-            sample_timepoint=1,
-        )
-
-    return create
+    scene = roi_camera_scene(shape=(24, 33, 33))
+    microscope = scene.microscope
+    # Constant emission over the full optical support makes illumination
+    # identifiable independently of sparse sample structure at timepoint1.
+    calibration_mean = uniform_optical_calibration(microscope, scene.pixels.shape[-3:])
+    calibration_raw = digitize(calibration_mean, microscope.camera, seed=71)
+    assert calibration_raw.max() < np.iinfo(np.uint16).max
+    return SimpleNamespace(
+        scene=scene,
+        raw=np.concatenate((calibration_raw[None, None, None], scene.pixels)),
+        calibration_photons=2000 * microscope.quantum_efficiency,
+        sample_timepoint=1,
+    )
 
 
 @pytest.fixture
@@ -322,9 +313,6 @@ def illumination_observations(
                     ),
                     np.maximum.reduce(
                         [(bound.upper / levels).max(axis=0) for bound in bounds]
-                    ),
-                    np.maximum.reduce(
-                        [(bound.roundoff / levels).max(axis=0) for bound in bounds]
                     ),
                 )
             )

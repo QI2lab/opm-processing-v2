@@ -359,7 +359,6 @@ def shifted_slab_pair(registration_observation_pair):
         count = np.zeros(union_shape, np.uint8)
         low = np.full(union_shape, np.nan)
         high = np.full(union_shape, np.nan)
-        rounding = np.full(union_shape, np.nan)
         for start, raw, expected in zip(
             observation.starts, observation.volumes, observation.means, strict=True
         ):
@@ -378,7 +377,6 @@ def shifted_slab_pair(registration_observation_pair):
             )
             low[selection] = np.fmin(low[selection], bounds.lower)
             high[selection] = np.fmax(high[selection], bounds.upper)
-            rounding[selection] = np.fmax(rounding[selection], bounds.roundoff)
         # With unity feathering, two coincident measurements have the closed
         # arithmetic-mean expectation; it is independent of the block renderer.
         expected_pixels = np.divide(
@@ -403,8 +401,7 @@ def shifted_slab_pair(registration_observation_pair):
             starts=observation.starts,
             observation=observation,
             expected_pixels=expected_pixels,
-            expected_envelope=SamplingEnvelope(low, high, rounding),
-            covered=count > 0,
+            expected_envelope=SamplingEnvelope(low, high),
             accuracy_mask=interior & (count > 0),
         )
 
@@ -416,7 +413,7 @@ def projection_fusion(fusion_operator):
     """Share projection geometry and native TensorStore arrays for chunk tests."""
     from opm_processing.imageprocessing.maxtilefusion import MaxTileFusion
 
-    def create(tiles, positions, shape, *, chunk_size=3, **settings):
+    def create(tiles, positions, shape, *, chunk_size=3):
         """Build a bounded projection fuser from explicit TCZYX camera data."""
         channels, height, width = tiles[0].shape[1], *tiles[0].shape[-2:]
         return fusion_operator(
@@ -438,7 +435,6 @@ def projection_fusion(fusion_operator):
             fused_ts=ts.array(
                 np.zeros((tiles[0].shape[0], channels, 1, *shape), tiles[0].dtype)
             ),
-            **settings,
         )
 
     return create

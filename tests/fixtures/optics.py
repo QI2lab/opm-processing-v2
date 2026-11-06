@@ -523,9 +523,8 @@ def uniform_detector_scene(microscope_parameters):
             microscope,
         )
         np.testing.assert_allclose(means, 12000, rtol=2e-5)
+        means.setflags(write=False)
         return SimpleNamespace(
-            density=dose,
-            axes=axes,
             microscope=microscope,
             means=means,
             shape=shape,

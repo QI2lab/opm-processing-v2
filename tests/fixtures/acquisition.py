@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Literal
@@ -18,35 +18,6 @@ from opm_processing.dataio.position_collection import (
     open_position_collection,
     update_group_attributes,
 )
-
-
-@dataclass(frozen=True)
-class OpmV2ProjectionFixture:
-    """A projection object stored in the upstream OPMMirrorHandler layout.
-
-    Attributes
-    ----------
-    path : pathlib.Path
-        Persisted raw acquisition.
-    raw_data : numpy.ndarray
-        Known camera values in TPCYX order.
-    camera_offset, camera_conversion : float
-        Detector offset in ADU and conversion to photon counts.
-    pixel_size_um : float
-        Detector pixel pitch in micrometers.
-    channel_names : tuple of str
-        Spectral labels in storage order.
-    stage_positions_zxy : numpy.ndarray
-        Recorded stage positions in micrometers.
-    """
-
-    path: Path
-    raw_data: np.ndarray
-    camera_offset: float
-    camera_conversion: float
-    pixel_size_um: float
-    channel_names: tuple[str, ...]
-    stage_positions_zxy: np.ndarray
 
 
 def opm_v2_frame_metadata(
@@ -179,9 +150,7 @@ def write_synthetic_acquisition_zarr(
 
 
 @pytest.fixture
-def opm_v2_projection_zarr(
-    simulated_camera, opm_v2_acquisition_factory
-) -> OpmV2ProjectionFixture:
+def opm_v2_projection_zarr(simulated_camera, opm_v2_acquisition_factory):
     """Simulate spectral/time observations and persist them with OpmDataHandler."""
     shape = (2, 1, 2, 16, 18)
     raw_data = np.empty(shape, dtype=np.uint16)
@@ -192,21 +161,12 @@ def opm_v2_projection_zarr(
                 geometry="cartesian",
                 exposure=1 + time / 4 + channel / 2,
             ).raw[0]
-    dataset = opm_v2_acquisition_factory(
+    return opm_v2_acquisition_factory(
         raw_data[:, :, :, None],
         name="opm_v2_projection",
         mode="projection",
         suffix=".zarr",
         stage_positions_zxy=((4.0, 20.0, 30.0),),
-    )
-    return OpmV2ProjectionFixture(
-        path=dataset.path,
-        raw_data=raw_data,
-        camera_offset=dataset.metadata.camera_offset,
-        camera_conversion=dataset.metadata.camera_conversion,
-        pixel_size_um=dataset.metadata.pixel_size_um,
-        channel_names=dataset.metadata.channel_names,
-        stage_positions_zxy=np.asarray(dataset.metadata.stage_positions_zxy),
     )
 
 

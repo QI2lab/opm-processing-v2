@@ -37,12 +37,14 @@ def test_processing_uses_existing_flatfield_with_separate_output(
     source_field = np.full(field_shape, 2.0, dtype=np.float32)
     selected_field = source_field
     write_flatfield(
-        acquisition.path.parent / filename, source_field, acquisition.pixel_size_um
+        acquisition.path.parent / filename,
+        source_field,
+        acquisition.metadata.pixel_size_um,
     )
     if output_flatfield:
         selected_field = np.full(field_shape, 1.25, dtype=np.float32)
         write_flatfield(
-            output_dir / filename, selected_field, acquisition.pixel_size_um
+            output_dir / filename, selected_field, acquisition.metadata.pixel_size_um
         )
 
     process(
@@ -62,9 +64,9 @@ def test_processing_uses_existing_flatfield_with_separate_output(
         .result()
     )
     calibrated = camera_correct(
-        acquisition.raw_data[:, 0],
-        acquisition.camera_offset,
-        acquisition.camera_conversion,
+        acquisition.raw_data[:, 0, :, 0],
+        acquisition.metadata.camera_offset,
+        acquisition.metadata.camera_conversion,
     )
     expected = illumination_correct(calibrated, selected_field[0])[:, :, np.newaxis]
     np.testing.assert_allclose(saved, expected, rtol=1e-6)

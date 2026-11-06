@@ -67,15 +67,10 @@ def write_manifest(
     data_path: Path, *, timepoints: int = 2, document: dict | None = None
 ) -> LiveManifest:
     """Persist a live acquisition plan and reopen it through the real reader."""
-    sidecars = SimpleNamespace(
-        manifest=data_path.with_name(
-            data_path.name.removesuffix(".ome.zarr") + ".manifest.json"
-        ),
-        log=data_path.with_name(
-            data_path.name.removesuffix(".ome.zarr") + ".log.jsonl"
-        ),
+    manifest_path = data_path.with_name(
+        data_path.name.removesuffix(".ome.zarr") + ".manifest.json"
     )
-    sidecars.manifest.write_text(
+    manifest_path.write_text(
         json.dumps(
             document
             if document is not None
@@ -83,7 +78,7 @@ def write_manifest(
         ),
         encoding="utf-8",
     )
-    return LiveManifest.read(sidecars.manifest)
+    return LiveManifest.read(manifest_path)
 
 
 @pytest.fixture
@@ -103,7 +98,6 @@ def opm_v2_live_acquisition_factory(tmp_path, opm_v2_acquisition_factory):
         name="sample",
         illumination=None,
         camera_conversion=0.24,
-        stage_positions=None,
     ):
         """Deliver actual frames through the upstream publisher and TensorStore writer."""
         path = tmp_path / f"{name}.ome.zarr"
@@ -111,13 +105,9 @@ def opm_v2_live_acquisition_factory(tmp_path, opm_v2_acquisition_factory):
         document["data_path"] = str(path)
         document["camera_e_to_adu"] = camera_conversion
         document["index_sizes"] = dict(zip("tpcz", raw_data.shape[:4], strict=True))
-        document["stage_positions_zxy"] = (
-            [list(position) for position in stage_positions]
-            if stage_positions is not None
-            else [
-                [30.0, 100.0, 200.0 + 2 * index] for index in range(raw_data.shape[1])
-            ]
-        )
+        document["stage_positions_zxy"] = [
+            [30.0, 100.0, 200.0 + 2 * index] for index in range(raw_data.shape[1])
+        ]
         document["channels"] = [
             {
                 "name": f"637nm-{index}",
@@ -147,13 +137,8 @@ def opm_v2_live_acquisition_factory(tmp_path, opm_v2_acquisition_factory):
             else illumination
         )
         imwrite(field_path, field, metadata={"axes": "CYX"})
-        return SimpleNamespace(
-            path=dataset.path,
-            metadata=dataset.metadata,
-            raw_data=dataset.raw_data,
-            raw_arrays=dataset.raw_arrays,
-            illumination_path=field_path,
-        )
+        dataset.illumination_path = field_path
+        return dataset
 
     return create
 
@@ -163,18 +148,14 @@ def live_acquisition_factory(tmp_path):
     """Return a writer for complete or partially acquired live camera objects."""
 
     def create(
-        raw_data=None,
         *,
         name="sample",
         shape=(2, 1, 2, 3, 4, 5),
         stage_positions=None,
         chunks=None,
         completed=True,
-        illumination=None,
     ):
         """Persist a stage scan, lifecycle plan and measured illumination field."""
-        if raw_data is not None:
-            shape = raw_data.shape
         data_path = tmp_path / f"{name}.ome.zarr"
         document = manifest_document(data_path, timepoints=shape[0])
         document["index_sizes"] = dict(zip("tpcz", shape[:4], strict=True))
@@ -199,9 +180,6 @@ def live_acquisition_factory(tmp_path):
             },
             chunks=chunks if chunks is not None else (1, 1, 1, *shape[-2:]),
         )
-        if raw_data is not None:
-            for position, array in enumerate(collection.arrays):
-                array.write(raw_data[:, position]).result()
         manifest = write_manifest(data_path, document=document)
         log_path = tmp_path / f"{name}.log.jsonl"
         if completed:
@@ -213,11 +191,7 @@ def live_acquisition_factory(tmp_path):
                 encoding="utf-8",
             )
         illumination_path = tmp_path / f"{name}_illumination.ome.tif"
-        field = (
-            np.ones((shape[2], *shape[-2:]), np.float32)
-            if illumination is None
-            else illumination
-        )
+        field = np.ones((shape[2], *shape[-2:]), np.float32)
         imwrite(illumination_path, field, metadata={"axes": "CYX"})
         return SimpleNamespace(
             path=data_path,
@@ -359,7 +333,7 @@ def live_wait_case(
 
     kind = request.param
     if kind == "estimate":
-        ensemble = illumination_calibration_ensemble()
+        ensemble = illumination_calibration_ensemble
         scene, pixels = ensemble.scene, ensemble.raw
         sample_timepoint = ensemble.sample_timepoint
     else:
@@ -368,13 +342,8 @@ def live_wait_case(
     raw = pixels[..., ::-1, :, :].copy()
     produced = opm_v2_live_acquisition_factory(raw, camera_conversion=1.0)
     acquisition, manifest, log = processing.open_live_acquisition(tmp_path)
-    dataset = SimpleNamespace(
-        path=produced.path,
-        manifest=manifest,
-        log=log,
-        illumination_path=produced.illumination_path,
-    )
-    dataset.illumination_path.unlink()
+    produced.manifest, produced.log = manifest, log
+    produced.illumination_path.unlink()
     destination = tmp_path / "processed"
     field_path = tmp_path / "sample_flatfield.ome.tif"
     if kind == "cached":
@@ -420,7 +389,7 @@ def live_wait_case(
     monkeypatch.setattr(processing.time, "sleep", finish)
     return SimpleNamespace(
         kind=kind,
-        dataset=dataset,
+        dataset=produced,
         raw=raw,
         scene=scene,
         sample_timepoint=sample_timepoint,

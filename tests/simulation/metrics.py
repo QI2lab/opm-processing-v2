@@ -13,6 +13,7 @@ from opm_processing.imageprocessing.opmpsf import (
     camera_grid_center,
     centered_sensor_axes,
     get_skewed_coords,
+    integrate_camera_pixels,
 )
 
 
@@ -246,10 +247,6 @@ def camera_volume_samples(
     numpy.ndarray
         Intensities at the original camera centers in SYX order.
     """
-    from dataclasses import replace
-
-    from tests.simulation.forward_model import sensor_integral
-
     shape = tuple(native_shape)
     pixel, step = microscope.pixel_size_um, microscope.scan_step_um
     center = camera_grid_center(shape, pixel, step, microscope.angle_deg)
@@ -261,12 +258,13 @@ def camera_volume_samples(
         )
     )
     native_axes = centered_sensor_axes(shape, (step, pixel, pixel))
-    return sensor_integral(
+    return integrate_camera_pixels(
         volume,
         axes,
-        shape,
-        replace(microscope, pixel_samples=1),
-        sensor_axes=native_axes,
+        native_axes,
+        pixel_size_um=pixel,
+        theta_deg=microscope.angle_deg,
+        samples=1,
         area_integral=False,
     )
 

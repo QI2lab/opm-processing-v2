@@ -32,11 +32,10 @@ class SamplingEnvelope:
 
     lower: np.ndarray
     upper: np.ndarray
-    roundoff: np.ndarray
 
     def __post_init__(self) -> None:
         """Keep shared numerical bounds immutable across individual checks."""
-        for array in (self.lower, self.upper, self.roundoff):
+        for array in (self.lower, self.upper):
             array.setflags(write=False)
 
 
@@ -205,7 +204,7 @@ def camera_sampling_envelope(
     Returns
     -------
     SamplingEnvelope
-        Immutable lower/upper camera-rate bounds and float32 arithmetic margin.
+        Immutable camera-rate bounds including the float32 arithmetic margin.
     """
     means, codes = np.broadcast_arrays(
         np.asarray(expectation, np.float64), np.asarray(raw, np.float64)
@@ -260,7 +259,6 @@ def camera_sampling_envelope(
     return SamplingEnvelope(
         np.maximum(lower - roundoff, 0),
         np.maximum(upper + roundoff, 0),
-        roundoff,
     )
 
 

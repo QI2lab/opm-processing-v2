@@ -3,7 +3,6 @@
 import importlib
 from dataclasses import dataclass, replace
 from functools import lru_cache, partial, wraps
-from inspect import signature
 from itertools import product
 from types import SimpleNamespace
 
@@ -230,7 +229,6 @@ def pipeline_camera_accuracy(pipeline_geometry):
                     # then convert back with the target detector response.
                     low = np.full(shape, np.nan)
                     high = np.full(shape, np.nan)
-                    rounding = np.full(shape, np.nan)
                     for source_position, bounds in enumerate(source_bounds):
                         delta = (
                             offsets_x[position] - offsets_x[source_position]
@@ -246,14 +244,11 @@ def pipeline_camera_accuracy(pipeline_geometry):
                                 cval=np.nan,
                                 prefilter=False,
                             )
-                            for array in (bounds.lower, bounds.upper, bounds.roundoff)
+                            for array in (bounds.lower, bounds.upper)
                         ]
                         low = np.fmin(low, aligned[0])
                         high = np.fmax(high, aligned[1])
-                        rounding = np.fmax(rounding, aligned[2])
-                    fused_bounds = SamplingEnvelope(
-                        low * response, high * response, rounding * response
-                    )
+                    fused_bounds = SamplingEnvelope(low * response, high * response)
                     frame_origin = (
                         anchor + local_origin + np.array((0, 0, offsets_x[position]))
                     )
@@ -358,22 +353,12 @@ def integration_pipeline_records(request):
 
         def observe_processor(processor):
             """Record successful real processing without changing its arguments or output."""
-            parameters = signature(processor)
 
             @wraps(processor)
-            def execute(*args, **kwargs):
+            def execute(root_path, acquisition, *args, **kwargs):
                 """Run the complete production operation before recording its source."""
-                arguments = parameters.bind(*args, **kwargs).arguments
-                acquisition = arguments.get("acquisition")
-                source = (
-                    acquisition.path
-                    if acquisition is not None
-                    else arguments["root_path"]
-                )
-                result = processor(*args, **kwargs)
-                from pathlib import Path
-
-                processed_sources.add(Path(source).resolve())
+                result = processor(root_path, acquisition, *args, **kwargs)
+                processed_sources.add(acquisition.path.resolve())
                 return result
 
             return execute
@@ -713,12 +698,6 @@ def pipeline_illumination_calibration(
                 np.maximum.reduce(
                     [
                         bound.upper / level
-                        for bound, level in zip(view_bounds, levels, strict=True)
-                    ]
-                ),
-                np.maximum.reduce(
-                    [
-                        bound.roundoff / level
                         for bound, level in zip(view_bounds, levels, strict=True)
                     ]
                 ),

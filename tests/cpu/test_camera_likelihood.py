@@ -185,9 +185,7 @@ def test_camera_sampling_bounds_detect_photon_and_spatial_errors(
     elif artifact in ("zero", "zero-unbounded"):
         prediction.fill(0)
         if artifact == "zero-unbounded":
-            envelope = SamplingEnvelope(
-                np.zeros_like(expected), expected * 2, np.zeros_like(expected)
-            )
+            envelope = SamplingEnvelope(np.zeros_like(expected), expected * 2)
     measured = camera_sampling_accuracy(
         prediction, expected, envelope, np.ones(expected.shape, bool)
     )

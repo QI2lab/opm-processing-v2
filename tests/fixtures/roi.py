@@ -159,7 +159,6 @@ def roi_run(tmp_path: Path, opm_v2_acquisition_factory, roi_camera_scene):
         roi_path=roi_path,
         output_dir=tmp_path / "sample_roi",
         truth=scene,
-        raw_origin_zyx_um=(0.0, 0.0, 0.0),
     )
 
 
@@ -460,7 +459,7 @@ def assert_roi_point_accuracy(assert_roi_point_locations):
                     np.maximum(upper, 1) * 8 * np.finfo(np.float32).eps + quantum
                 )
                 envelope = SamplingEnvelope(
-                    np.maximum(lower - numerical, 0), upper + numerical, numerical
+                    np.maximum(lower - numerical, 0), upper + numerical
                 )
                 for aperture in apertures:
                     mask = certain & (coverage > 0) & aperture[None]

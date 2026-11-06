@@ -79,16 +79,18 @@ def test_projection_output_preserves_calibration_geometry_and_provenance(
     output_path = output_dir / f"{fixture.path.stem}_projection.ome.zarr"
     collection = open_position_collection(output_path)
     assert collection.shape == (2, 1, 2, 1, 16, 18)
-    assert collection.channel_names == fixture.channel_names
+    assert collection.channel_names == fixture.metadata.channel_names
     assert collection.voxel_size_um == (1.0, 0.115, 0.115)
     np.testing.assert_allclose(
-        collection.stage_positions_zxy, fixture.stage_positions_zxy
+        collection.stage_positions_zxy, fixture.metadata.stage_positions_zxy
     )
     state = ProcessingState.read(processing_state_path(output_dir, fixture.path.stem))
     assert state.document["source"]["path"] == str(fixture.path.resolve())
     expected = format_processed_output(
         camera_correct(
-            fixture.raw_data[:, 0], fixture.camera_offset, fixture.camera_conversion
+            fixture.raw_data[:, 0, :, 0],
+            fixture.metadata.camera_offset,
+            fixture.metadata.camera_conversion,
         ),
         save_float32,
     )
@@ -112,7 +114,9 @@ def test_projection_cli_resume_preserves_completed_pixels(
     output_path = fixture.path.parent / f"{fixture.path.stem}_projection.ome.zarr"
     expected = format_processed_output(
         camera_correct(
-            fixture.raw_data[:, 0], fixture.camera_offset, fixture.camera_conversion
+            fixture.raw_data[:, 0, :, 0],
+            fixture.metadata.camera_offset,
+            fixture.metadata.camera_conversion,
         ),
         False,
     )[:, :, None]
@@ -131,9 +135,9 @@ def test_projection_cli_resume_preserves_completed_pixels(
     if not resume:
         expected = format_processed_output(
             camera_correct(
-                np.full_like(fixture.raw_data[:, 0], 900),
-                fixture.camera_offset,
-                fixture.camera_conversion,
+                np.full_like(fixture.raw_data[:, 0, :, 0], 900),
+                fixture.metadata.camera_offset,
+                fixture.metadata.camera_conversion,
             ),
             False,
         )[:, :, None]
