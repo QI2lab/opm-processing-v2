@@ -384,6 +384,266 @@ def ao_geometry_case(
 
 
 @pytest.fixture
+def ao_cache_export_factory(tmp_path, ao_result_factory, ao_geometry_factory):
+    """Persist known scalar caches, real AO stores, and actual publication figures."""
+    import hashlib
+    import json
+    from types import SimpleNamespace
+
+    from scripts import ao_publication_style, finish_ao_native
+    from scripts.ao_tissue_bigtiff import write_tissue_bigtiffs
+    from scripts.ao_tissue_overlay import write_tissue_overlay
+    from scripts.ao_wavekit_phase import BASIS_VERSION, phase_from_modal_coeff
+    from scripts.export_ao_overview import Region
+
+    def create(
+        images,
+        colors,
+        limits,
+        starts,
+        finals,
+        *,
+        name="export",
+        native=False,
+        center=None,
+        pupil_diameter_um=8,
+        scale_bar_um=5,
+        grid=None,
+    ):
+        output = tmp_path / name
+        output.mkdir()
+        channels = tuple(images)
+        depths = tuple(sorted(next(iter(images.values()))))
+        shape = tuple(next(iter(next(iter(images.values())).values())).shape)
+        center = center or (shape[0] / 2, shape[1] / 2)
+        cache_paths, fingerprints, hashes = {}, {}, {}
+        for channel in channels:
+            directory = output / (
+                "projection_cache"
+                if channel == 1
+                else f"projection_cache_channel_{channel}"
+            )
+            context = {
+                "channel": channel,
+                "timepoint": 0,
+                "depths": list(depths),
+                "shape_yx": list(shape),
+                "canvas_origin_yx_um": [0.5, 0.5],
+                "canvas_scale_yx_um": [1, 1],
+            }
+            arrays, _, cache = ao_layer_projections._open_projection_cache(
+                directory, context, shape, np.dtype(np.uint16), depths, 1
+            )
+            for depth in depths:
+                arrays[depth][:] = images[channel][depth]
+                arrays[depth].flush()
+                hashes[channel, depth] = hashlib.sha256(
+                    np.asarray(images[channel][depth], dtype=np.uint16).tobytes()
+                ).hexdigest()
+            cache["manifest"].update(
+                phase="complete",
+                completed_xy_blocks=[True],
+                mip_sha256_by_depth={str(d): hashes[channel, d] for d in depths},
+            )
+            ao_layer_projections._write_cache_manifest(cache["path"], cache["manifest"])
+            cache_paths[channel] = cache["path"]
+            fingerprints[channel] = cache["manifest"]["fingerprint"]
+        records, regions = [], []
+        reader_path = None
+        for depth in depths:
+            case = ao_result_factory(
+                path=tmp_path / f"{name}_ao" / f"depth_{depth}",
+                starting=starts[depth],
+                final=finals[depth],
+            )
+            reader_path = case.reader_path
+            records.append(
+                {
+                    "depth_index": depth,
+                    "region_index": 0,
+                    "source": str(case.result.zarr_path),
+                    "starting_coefficients": case.starting.tolist(),
+                    "final_coefficients": case.final.tolist(),
+                }
+            )
+            regions.append(
+                Region(
+                    depth,
+                    0,
+                    case.result,
+                    phase_from_modal_coeff(
+                        case.final,
+                        samples=512,
+                        norm=True,
+                        wavelength=0.488,
+                        out="radians",
+                    ),
+                )
+            )
+        pages = []
+        for depth in depths:
+            pages.append(
+                {
+                    "depth_index": depth,
+                    "sample_depth_um": 11.76 * depth,
+                    "scale_bar": {"length_um": scale_bar_um},
+                    "planned_grid": grid
+                    or {"horizontal_y_um": [], "vertical_x_um": []},
+                    "regions": [{"region_index": 0, "center_yx_um": list(center)}],
+                    "projection_roi": {
+                        "depth_index": depth,
+                        "aggregate_z_start_stop": [depth, depth + 2],
+                        "projection_cache_by_channel": {
+                            str(c): str(cache_paths[c]) for c in channels
+                        },
+                        "projection_cache_fingerprint_by_channel": {
+                            str(c): fingerprints[c] for c in channels
+                        },
+                        "mip_sha256_by_channel": {
+                            str(c): hashes[c, depth] for c in channels
+                        },
+                    },
+                }
+            )
+        manifest = {
+            "timepoint": 0,
+            "coefficient_state": "final",
+            "wavelength_nm": 488,
+            "reader": str(reader_path),
+            "reader_sha256": hashlib.sha256(reader_path.read_bytes()).hexdigest(),
+            "pupil_reconstruction": {"basis_version": BASIS_VERSION},
+            "native_tissue_overlays": {"status": "rendering"},
+            "regions": records,
+            "grids": [{"reference": str(Path(ao_publication_style.__file__))}],
+            "tissue_overlay": {
+                "extent_yx_um": [0, shape[0], 0, shape[1]],
+                "pupil_display_diameter_um": pupil_diameter_um,
+                "pages": pages,
+                "geometry": {
+                    "tissue_composite": {
+                        "channels": list(channels),
+                        "colors_rgb8": {str(c): list(colors[c]) for c in channels},
+                        "display_limits_by_channel_depth": {
+                            str(c): {str(d): list(limits[c][d]) for d in depths}
+                            for c in channels
+                        },
+                    }
+                },
+            },
+        }
+        cached_geometry = finish_ao_native.load_cached_geometry(output, manifest)
+        from scripts.ao_tissue_preview import make_layer_previews
+
+        view_images, _factor = make_layer_previews(
+            cached_geometry.images_by_depth,
+            cached_geometry.display_limits_by_depth,
+            max_edge=max(shape),
+        )
+        geometry = ao_geometry_factory(
+            view_images[depths[0]],
+            origin_yx_um=(0.5, 0.5),
+            extent_yx_um=tuple(manifest["tissue_overlay"]["extent_yx_um"]),
+            planned_centers_by_depth_index=cached_geometry.planned_centers_by_depth_index,
+            planned_grid_by_depth_index=cached_geometry.planned_grid_by_depth_index,
+            images_by_depth=cached_geometry.images_by_depth,
+            display_limits_by_depth=cached_geometry.display_limits_by_depth,
+            layer_projection_rois_by_depth=cached_geometry.layer_projection_rois_by_depth,
+            depth_offsets={depth: 11.76 * depth for depth in depths},
+            provenance=cached_geometry.provenance,
+        )
+        from dataclasses import replace
+
+        preview_geometry = replace(geometry, images_by_depth=view_images)
+        previews = write_tissue_overlay(
+            regions,
+            preview_geometry,
+            output / "previews",
+            timepoint=0,
+            pupil_diameter_um=pupil_diameter_um,
+            scale_bar_um=scale_bar_um,
+            planned_grid=True,
+            output_shape_yx=shape,
+        )
+        manifest["tissue_overlay"] = previews
+        native_result = None
+        if native:
+            native_result = write_tissue_bigtiffs(
+                regions,
+                geometry,
+                output / "native",
+                timepoint=0,
+                pupil_diameter_um=pupil_diameter_um,
+                scale_bar_um=scale_bar_um,
+            )
+            manifest["native_tissue_overlays"] = native_result
+        (output / "ao_publication.json").write_text(json.dumps(manifest, indent=2))
+        return SimpleNamespace(
+            output=output,
+            manifest=manifest,
+            cache_paths=cache_paths,
+            hashes=hashes,
+            colors=colors,
+            regions=regions,
+            geometry=geometry,
+            previews=previews,
+            native=native_result,
+        )
+
+    return create
+
+
+@pytest.fixture
+def completed_viewing_export(ao_cache_export_factory):
+    """Make prescribed spectral bands using real cache and image-format writers."""
+    depths, channels = (0, 1, 2), (0, 1, 3)
+    colors = {0: (255, 0, 255), 1: (0, 255, 255), 3: (255, 165, 0)}
+    images, limits = {}, {}
+    for channel_index, channel in enumerate(channels):
+        images[channel], limits[channel] = {}, {}
+        for depth in depths:
+            image = np.zeros((40, 60), dtype=np.uint16)
+            column = ((channel_index + depth) % 3) * 20
+            amplitude = (channel_index + 1) * (depth + 1) * 100
+            image[:, column : column + 20] = amplitude
+            images[channel][depth] = image
+            limits[channel][depth] = (0, amplitude)
+    coefficients = {depth: np.zeros(32) for depth in depths}
+    return ao_cache_export_factory(images, colors, limits, coefficients, coefficients)
+
+
+@pytest.fixture
+def saved_phase_inputs(ao_result_factory):
+    """Persist nonzero asymmetric modal states using the actual AO producer."""
+    import hashlib
+    from types import SimpleNamespace
+
+    starting = np.zeros(32)
+    starting[5:7] = (0.04, -0.02)
+    final = starting.copy()
+    final[5:7] += (0.09, -0.08)
+    case = ao_result_factory(starting=starting, final=final, index=2)
+    manifest = {
+        "reader": str(case.reader_path),
+        "reader_sha256": hashlib.sha256(case.reader_path.read_bytes()).hexdigest(),
+        "timepoint": 0,
+        "wavelength_nm": 488,
+        "coefficient_state": "final",
+        "regions": [
+            {
+                "source": str(case.result.zarr_path),
+                "depth_index": 1,
+                "region_index": 2,
+                "starting_coefficients": starting.tolist(),
+                "final_coefficients": final.tolist(),
+            }
+        ],
+    }
+    return SimpleNamespace(
+        manifest=manifest, starting=starting, final=final, result=case.result
+    )
+
+
+@pytest.fixture
 def ao_modal_sequence_factory():
     """Construct prescribed warm starts with the actual shared pupil operator."""
     from types import SimpleNamespace
@@ -452,6 +712,55 @@ def ao_modal_chain(ao_modal_sequence_factory):
         return case.manifest, case.saved, reference
 
     return create
+
+
+@pytest.fixture
+def ao_relative_export_case(ao_cache_export_factory):
+    """Create actual cached RGB exports and inherited, nonflat modal states."""
+    from types import SimpleNamespace
+
+    baseline = np.array([0.2, -0.1, 0, 0, 0, 0, 0, 0.12])
+    finals = (
+        np.array([0.5, 0.4, 0, 0, 0, 0, 0, 0.18]),
+        np.array([0.9, 0.7, 0, 0, 0, 0, 0, 0.25]),
+    )
+    rows, columns = np.indices((64, 96))
+    backgrounds = {
+        depth: np.stack(
+            (
+                (3 * columns + rows + depth * 31) % 256,
+                (columns + 5 * rows + depth * 47) % 256,
+                (7 * columns + 2 * rows + depth * 19) % 256,
+            ),
+            axis=-1,
+        ).astype(np.uint8)
+        for depth in range(2)
+    }
+    channels = (0, 1, 3)
+    images = {
+        channel: {
+            depth: rgb[:, :, index].astype(np.uint16)
+            for depth, rgb in backgrounds.items()
+        }
+        for index, channel in enumerate(channels)
+    }
+    colors = {0: (255, 0, 0), 1: (0, 255, 0), 3: (0, 0, 255)}
+    limits = {channel: dict.fromkeys(backgrounds, (0, 255)) for channel in channels}
+    case = ao_cache_export_factory(
+        images,
+        colors,
+        limits,
+        {0: baseline, 1: finals[0]},
+        dict(enumerate(finals)),
+        name="original",
+        native=True,
+        center=(28, 40),
+        pupil_diameter_um=16,
+        grid={"horizontal_y_um": [20, 44], "vertical_x_um": [32, 64]},
+    )
+    return SimpleNamespace(
+        case=case, baseline=baseline, finals=finals, backgrounds=backgrounds
+    )
 
 
 @pytest.fixture
