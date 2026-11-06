@@ -1,7 +1,7 @@
 """Check physical tissue scale and unchanged SJS pupil orientation."""
 
+from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -35,43 +35,16 @@ def test_scale_bar_uses_horizontal_physical_spacing_after_resizing(thumbnail_fac
 
 
 def test_tissue_overlay_preserves_pupil_orientation_centers_and_full_extent(
-    tmp_path, monkeypatch
+    tmp_path, ao_overlay_case, ao_figure_observer
 ):
-    """Asymmetric pupils keep SJS orientation over an inverted tissue Y axis."""
-    pupil = np.ma.array(
-        [[-np.pi / 4, np.pi / 2], [3 * np.pi / 4, 0]],
-        mask=[[False, False], [False, True]],
+    """Asymmetric pupils retain orientation over an inverted physical tissue Y axis."""
+    geometry, regions, pupil = (
+        ao_overlay_case.geometry,
+        ao_overlay_case.regions,
+        ao_overlay_case.pupil,
     )
-    regions = [
-        SimpleNamespace(depth=depth, index=index, pupil=pupil.copy())
-        for depth in range(4)
-        for index in range(2)
-    ]
-    centers = {
-        0: {0: (-35, 83)},
-        1: {0: (-20, 95)},
-        2: {0: (-10, 100)},
-        3: {0: (0, 110)},
-    }
-    for positions in centers.values():
-        y, x = positions[0]
-        positions[1] = (y + 3, x - 3)
-    geometry = SimpleNamespace(
-        image=np.arange(25 * 50).reshape(25, 50),
-        extent_yx_um=(-40, 10, 80, 120),
-        centers_by_depth_index=centers,
-        depth_offsets={depth: depth * 11.76 for depth in range(4)},
-        provenance={"sampling": "fourfold thumbnail of anisotropic source"},
-    )
-    figures = []
-    original_savefig = Figure.savefig
-
-    def capture_figure(figure, *args, **kwargs):
-        if figure not in figures:
-            figures.append(figure)
-        return original_savefig(figure, *args, **kwargs)
-
-    monkeypatch.setattr(Figure, "savefig", capture_figure)
+    centers = geometry.centers_by_depth_index
+    figures = ao_figure_observer
     record = write_tissue_overlay(
         regions, geometry, tmp_path, timepoint=0, pupil_diameter_um=20, scale_bar_um=10
     )
@@ -134,37 +107,17 @@ def test_tissue_overlay_preserves_pupil_orientation_centers_and_full_extent(
         assert page["scale_bar"]["length_um"] == 10
 
 
-def test_planned_grid_evenly_divides_the_full_acquisition_area(tmp_path, monkeypatch):
-    """All nine corrections occupy cell centers across the full tissue canvas."""
-    planned = {
-        index: (y, x)
-        for index, (y, x) in enumerate(
-            (y, x) for x in (100, 300, 500) for y in (250, 150, 50)
-        )
-    }
-    boundaries = {"horizontal_y_um": [100, 200], "vertical_x_um": [200, 400]}
-    geometry = SimpleNamespace(
-        image=np.arange(30 * 60).reshape(30, 60),
-        extent_yx_um=(0, 300, 0, 600),
-        centers_by_depth_index={0: {0: (210, 500), 8: (250, 550)}},
-        planned_centers_by_depth_index={0: planned},
-        planned_grid_by_depth_index={0: boundaries},
-        depth_offsets={0: 0},
-        provenance={},
+def test_planned_grid_evenly_divides_the_full_acquisition_area(
+    tmp_path, ao_planned_overlay_case, ao_figure_observer
+):
+    """Nine correction symbols occupy independent known physical grid centers."""
+    geometry, regions = (
+        ao_planned_overlay_case.geometry,
+        ao_planned_overlay_case.regions,
     )
-    regions = [
-        SimpleNamespace(depth=0, index=index, pupil=np.ma.array([[0, 1], [2, 3]]))
-        for index in range(9)
-    ]
-    figures = []
-    original_savefig = Figure.savefig
-
-    def capture_figure(figure, *args, **kwargs):
-        if figure not in figures:
-            figures.append(figure)
-        return original_savefig(figure, *args, **kwargs)
-
-    monkeypatch.setattr(Figure, "savefig", capture_figure)
+    planned = geometry.planned_centers_by_depth_index[0]
+    boundaries = geometry.planned_grid_by_depth_index[0]
+    figures = ao_figure_observer
     record = write_tissue_overlay(
         regions,
         geometry,
@@ -210,36 +163,13 @@ def test_planned_grid_evenly_divides_the_full_acquisition_area(tmp_path, monkeyp
 
 
 def test_each_depth_uses_its_local_projection_and_reports_its_roi(
-    tmp_path, monkeypatch
+    tmp_path, ao_local_overlay_case, ao_figure_observer
 ):
-    """Different layer structures must survive per-layer display normalization."""
-    first = np.full((16, 24), 2.0)
-    first[:, 3:6] = 12
-    second = np.full((16, 24), 100.0)
-    second[10:13] = 400
-    rois = {0: {"z_bounds_um": [-20, -10]}, 1: {"z_bounds_um": [-40, -30]}}
-    geometry = SimpleNamespace(
-        image=np.empty((0, 0)),  # A shared projection must never be consulted.
-        images_by_depth={0: first, 1: second},
-        extent_yx_um=(0, 16, 0, 24),
-        centers_by_depth_index={0: {0: (8, 12)}, 1: {0: (8, 12)}},
-        depth_offsets={0: 0, 1: 11.76},
-        layer_projection_rois_by_depth=rois,
-        provenance={},
-    )
-    regions = [
-        SimpleNamespace(depth=depth, index=0, pupil=np.ma.zeros((4, 4)))
-        for depth in range(2)
-    ]
-    figures = []
-    original_savefig = Figure.savefig
-
-    def capture_figure(figure, *args, **kwargs):
-        if figure not in figures:
-            figures.append(figure)
-        return original_savefig(figure, *args, **kwargs)
-
-    monkeypatch.setattr(Figure, "savefig", capture_figure)
+    """Distinct known layer structures survive their own display normalization."""
+    geometry, regions = ao_local_overlay_case.geometry, ao_local_overlay_case.regions
+    first, second = (geometry.images_by_depth[depth] for depth in (0, 1))
+    rois = geometry.layer_projection_rois_by_depth
+    figures = ao_figure_observer
     record = write_tissue_overlay(
         regions, geometry, tmp_path, timepoint=0, pupil_diameter_um=2, scale_bar_um=5
     )
@@ -253,7 +183,7 @@ def test_each_depth_uses_its_local_projection_and_reports_its_roi(
         assert record["pages"][depth]["projection_roi"] == rois[depth]
         assert record["pages"][depth]["tissue_display_limits"] == limits
 
-    geometry.images_by_depth = {0: first}
+    geometry = replace(geometry, images_by_depth={0: first})
     with pytest.raises(ValueError, match="Missing local Z projection for layer 1"):
         write_tissue_overlay(
             regions[1:],

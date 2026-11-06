@@ -8,6 +8,7 @@ pytest_plugins = (
     "tests.fixtures.hardware",
     "tests.fixtures.ao",
     "tests.fixtures.ao_storage",
+    "tests.fixtures.ao_rendering",
     "tests.fixtures.coordinates",
     "tests.fixtures.legacy",
     "tests.fixtures.acquisition",
