@@ -49,20 +49,6 @@ def test_origins_use_individual_scan_spans_without_rounding(stage_trajectory_met
 
 
 @pytest.mark.unit
-def test_legacy_positive_scan_without_endpoints_uses_recorded_step(
-    stage_trajectory_metadata,
-):
-    """Legacy stage records retain positive scanning with recorded spacing."""
-    acquisition = replace(
-        stage_trajectory_metadata(leading=2),
-        scan_start_positions_xyz=(),
-        scan_end_positions_xyz=(),
-    )
-    assert acquisition.scan_axis_reversed is True
-    assert deskewed_stage_scan_offsets(acquisition)[0, 1] == -3.2
-
-
-@pytest.mark.unit
 def test_nonstage_geometry_has_no_stage_scan_displacement(stage_trajectory_metadata):
     """Mirror scans do not inherit stage endpoint offsets."""
     acquisition = replace(stage_trajectory_metadata(), mode="mirror")

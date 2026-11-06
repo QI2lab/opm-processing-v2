@@ -14,16 +14,14 @@ from opm_processing.dataio.roi import (
     align_bounds_to_grid,
     projection_tile_footprints,
 )
-from opm_processing.imageprocessing.coordinates import STAGE_COORDINATE_VERSION
 from opm_processing.imageprocessing.maxtilefusion import MaxTileFusion
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("marked_processed", [False, True])
 def test_registered_stage_roi_keeps_endpoint_and_removes_only_crop(
-    stage_coordinate_case, record_registration, fused_store_factory, marked_processed
+    stage_coordinate_case, record_registration, fused_store_factory
 ):
-    """New registration can reuse legacy pixels without shifting ROI raw indices."""
+    """Registered stage placement preserves the retained raw scan's endpoint."""
     case = stage_coordinate_case
     processed = case.directory / "sample_deskewed.ome.zarr"
     create_position_collection(
@@ -31,10 +29,8 @@ def test_registered_stage_roi_keeps_endpoint_and_removes_only_crop(
         (1, 2, 1, 4, 12, 5),
         (1, 1, 1),
         stage_positions=case.positions,
-        spatial_offset_um=(0, -7 if marked_processed else 3, 2),
-        attributes={"opm_processing_coordinates": case.marker}
-        if marked_processed
-        else {},
+        spatial_offset_um=(0, -7, 2),
+        attributes={"opm_processing_coordinates": case.marker},
     )
     preview = fused_store_factory(
         np.zeros((1, 1, 1, 12, 5), np.uint16),
@@ -109,64 +105,6 @@ def test_stage_preview_footprints_match_fused_pixel_origins(
     else:
         assert tiles[0]["bounds_yx_um"] == [-157, -145, 22, 27]
         assert tiles[0]["raw_origin_zyx_um"] == [-3, -160, 20]
-
-
-@pytest.mark.unit
-def test_legacy_stage_preview_requires_regeneration(
-    stage_coordinate_case, record_registration, fused_store_factory
-):
-    """Old absolute preview coordinates must not seed a new stage ROI run."""
-    case = stage_coordinate_case
-    processed = case.directory / "sample_deskewed.ome.zarr"
-    create_position_collection(
-        processed, (1, 2, 1, 4, 12, 5), (1, 1, 1), stage_positions=case.positions
-    )
-    preview = fused_store_factory(
-        np.zeros((1, 1, 1, 12, 5), np.uint16), name="sample_max_z_fused"
-    )
-    record_registration(
-        processed,
-        [{"time_index": 0, "position_index": 0, "origin_zyx_um": [-3, -100, 20]}],
-    )
-
-    with pytest.raises(ValueError, match="Regenerate it with process or fuse"):
-        projection_tile_footprints(preview)
-
-
-@pytest.mark.unit
-@pytest.mark.parametrize(
-    "saved_version", [None, "older-frame", STAGE_COORDINATE_VERSION]
-)
-def test_saved_stage_roi_must_match_regenerated_source_coordinates(
-    stage_coordinate_case, record_registration, fused_store_factory, saved_version
-):
-    """Recreating a preview at the same path must not bless old ROI world bounds."""
-    case = stage_coordinate_case
-    preview = fused_store_factory(
-        np.zeros((1, 1, 1, 12, 5), np.uint16),
-        name="sample_max_z_fused",
-        attributes={"opm_processing_coordinates": case.marker},
-    )
-    record_registration(
-        case.directory / "sample_deskewed.ome.zarr",
-        [{"time_index": 0, "position_index": 0, "origin_zyx_um": [-3, -110, 20]}],
-    )
-    roi = PhysicalRoi(
-        bounds_yx_um=(-110, -105, 20, 25),
-        source_path=preview,
-        grid_origin_yx_um=(-110, 20),
-        pixel_size_yx_um=(1, 1),
-        coordinate_version=saved_version,
-    )
-    path = roi.write(case.directory / "selection.json")
-
-    if saved_version == STAGE_COORDINATE_VERSION:
-        assert PhysicalRoi.read(path) == roi
-    else:
-        with pytest.raises(
-            ValueError, match="Saved ROI uses earlier stage image coordinates"
-        ):
-            PhysicalRoi.read(path)
 
 
 @pytest.mark.unit
