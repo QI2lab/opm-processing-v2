@@ -231,8 +231,10 @@ def deskew_processing_case(deskew_field, factor, mode, acquisition_factory):
     ramp = np.pad(case.data[0, 0], (0, response.shape[-1] - case.data.shape[-1]))
     expected = response * ramp
     pixel = case.geometry["pixel_size"]
+    # The fixed Z grid uses nominal bin centers, including unsupported tail planes.
+    z_origin = round(float(np.mean(np.arange(factor))) * pixel, 3)
     roi = None
-    origin = (0, 0, 0)
+    origin = (z_origin, 0, 0)
     if mode == "roi":
         y_end, x_end = response.shape[1] * pixel, case.data.shape[-1] * pixel
         roi = PhysicalRoi(
@@ -251,7 +253,7 @@ def deskew_processing_case(deskew_field, factor, mode, acquisition_factory):
             ),
         )
         expected = expected[:, 2:, 2 : case.data.shape[-1]]
-        origin = (0, round(2 * pixel, 3), round(2 * pixel, 3))
+        origin = (z_origin, round(2 * pixel, 3), round(2 * pixel, 3))
     if mode == "cropped":
         angle = np.deg2rad(case.geometry["theta"])
         crop_y = int(np.ceil(case.data.shape[1] * np.cos(angle)))
@@ -260,7 +262,7 @@ def deskew_processing_case(deskew_field, factor, mode, acquisition_factory):
         )
         core = expected[:, crop_y : raw_y - crop_y]
         expected = np.pad(core, ((0, 0), (0, (-core.shape[1]) % 4), (0, 0)))
-        origin = (0, round(crop_y * pixel, 3), 0)
+        origin = (z_origin, round(crop_y * pixel, 3), 0)
     return SimpleNamespace(
         dataset=dataset,
         acquisition=inspect_acquisition(dataset.path),
