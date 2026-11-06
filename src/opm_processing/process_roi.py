@@ -81,7 +81,10 @@ def roi_with_registration_context(
     has_pairs = False
     for time in times:
         group = [tile for tile in footprints if tile["time_index"] == time]
-        if len(group) < 2:
+        if len(group) < 2 or all(
+            np.array_equal(tile["origin_zyx_um"], group[0]["origin_zyx_um"])
+            for tile in group
+        ):
             continue
         origins, shapes = [], []
         for tile in group:
