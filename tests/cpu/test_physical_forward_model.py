@@ -1,11 +1,11 @@
 """Camera statistics and independent optical source-to-sensor image formation."""
 
 from dataclasses import replace
+from itertools import pairwise
 
 import numpy as np
 import pytest
 
-from tests.simulation.camera import digitize
 from tests.simulation.forward_model import (
     Acquisition,
     camera_psf,
@@ -46,43 +46,42 @@ def test_line_pairs_have_declared_spacing_and_equal_emitted_photons(
 @pytest.mark.parametrize(
     "mean,noise,full_model", [(0, 0.7, False), (2, 1.6, False), (30, 1.6, True)]
 )
-def test_camera_adc_moments(
-    independent_photon_scene_factory, mean, noise, full_model, camera_calibration
-):
+def test_camera_adc_moments(camera_adc_case, mean, noise, full_model):
     """Detection/read variances add before gain; unsigned ADC retains its offset."""
-    camera = replace(camera_calibration, read_noise_e=noise)
-    if full_model:
-        scene = independent_photon_scene_factory()
-        # A closed exposure has only the specified photon background.
-        raw = forward_model(
-            scene.density,
-            Acquisition(
-                scene.axes,
-                (1, 400, 1000),
-                exposure=0,
-                background_electrons=mean,
-                seed=637,
-            ),
-            replace(scene.microscope, camera=camera),
-        )
-    else:
-        raw = digitize(
-            np.full(400_000, float(mean)), camera, seed=637 if mean == 0 else 31
-        )
-    variance = (mean + noise**2) / camera.electrons_per_adu**2 + 1 / 12
-    tolerance = (
-        (0.02 if mean == 0 else 0.05)
-        if not full_model
-        else 5 * np.sqrt(variance / raw.size)
+    from scipy.stats import binom, norm
+
+    raw, moments = camera_adc_case.raw, camera_adc_case.moments
+    count = raw.size
+    variance_upper = moments.variance + moments.variance_error
+    variance_lower = max(0, moments.variance - moments.variance_error)
+    mean_tolerance = moments.mean_error + 5 * np.sqrt(variance_upper / count)
+    # Exact variance of the unbiased sample variance for independent observations.
+    variance_tolerance = moments.variance_error + 5 * np.sqrt(
+        (moments.fourth_moment_upper - (count - 3) / (count - 1) * variance_lower**2)
+        / count
     )
     assert raw.dtype == np.uint16
-    assert raw.mean() == pytest.approx(
-        camera.offset_adu + mean / camera.electrons_per_adu, abs=tolerance
-    )
-    assert raw.var() == pytest.approx(variance, rel=0.02)
+    assert raw.mean() == pytest.approx(moments.mean, abs=mean_tolerance)
+    assert raw.var(ddof=1) == pytest.approx(moments.variance, abs=variance_tolerance)
     if mean == 0:
-        assert 0.42 < np.mean(raw < 100) < 0.46
-        assert np.mean(raw == 0) == 0
+        below = moments.probabilities[
+            moments.codes < camera_adc_case.camera.offset_adu
+        ].sum()
+        binomial_tolerance = (
+            moments.omitted_probability
+            + moments.summation_roundoff * below
+            + 5 * np.sqrt(below * (1 - below) / count)
+        )
+        assert np.mean(raw < camera_adc_case.camera.offset_adu) == pytest.approx(
+            below, abs=binomial_tolerance
+        )
+        zero_probability_upper = (
+            moments.probabilities[0] * (1 + moments.summation_roundoff)
+            + moments.omitted_probability
+        )
+        assert np.count_nonzero(raw == 0) <= binom.ppf(
+            norm.cdf(5), count, zero_probability_upper
+        )
 
 
 @pytest.mark.parametrize("profile", ("uniform", "edge-taper"))
@@ -111,21 +110,33 @@ def test_512_by_1900_excitation_varies_only_along_camera_x(
 
 
 @pytest.mark.parametrize("geometry", ("oblique", "cartesian"))
+@pytest.mark.parametrize("pixel_samples", (1, 3, 5, 9))
 def test_tilted_sensor_integrates_area_instead_of_point_sampling(
-    geometry, microscope_parameters
+    geometry, pixel_samples, quadratic_camera_field, microscope_parameters
 ):
-    """A quadratic irradiance has an independently known finite-pixel response."""
-    p = replace(microscope_parameters, pixel_samples=3)
-    axis = np.arange(-20, 21) * 0.005
-    z, y, x = np.meshgrid(axis, axis, axis, indexing="ij", sparse=True)
-    field = (10 + 2 * x**2 + y**2 + z**2).astype(np.float32)
+    """Known quadratic irradiance gives exact midpoint error proportional to n^-2."""
+    p = replace(microscope_parameters, pixel_samples=pixel_samples)
+    case = quadratic_camera_field
     actual = sensor_integral(
-        field, (axis, axis, axis), (1, 1, 1), p, geometry=geometry
+        case.field, case.axes, case.shape, p, geometry=geometry
     ).item()
-    # Camera row offsets rotate in YZ, preserving y²+z². Midpoint quadrature
-    # variance per pixel dimension is pitch²*(1 - 1/n²)/12.
-    expected_average = 10 + 3 * p.pixel_size_um**2 * (1 - 1 / 3**2) / 12
-    assert actual == pytest.approx(expected_average * p.pixel_size_um**2, abs=2e-7)
+    # Rotation preserves y²+z². The exact pixel integral of 10+2x²+y²+z² is
+    # 10*p²+p^4/4; n midpoint samples undercount it by exactly p^4/(4*n²).
+    pitch = p.pixel_size_um
+    integral = 10 * pitch**2 + pitch**4 / 4
+    midpoint_error = pitch**4 / (4 * pixel_samples**2)
+    # Linear interpolation of a*x² over spacing h errs by at most a*h²/4.
+    # The three coefficients sum to four. Convex trilinear weights retain this
+    # bound; 32 float64 operations per quadrature point cover accumulation.
+    spacing = case.axes[0][1] - case.axes[0][0]
+    interpolation_error = pitch**2 * spacing**2
+    operations = 32 * pixel_samples**2
+    gamma = operations * np.finfo(np.float64).eps
+    gamma /= 1 - gamma
+    roundoff = gamma * case.field.max() * pitch**2
+    assert integral - actual == pytest.approx(
+        midpoint_error, abs=interpolation_error + roundoff
+    )
 
 
 @pytest.mark.parametrize("profile", ("uniform", "edge-taper"))
@@ -277,17 +288,6 @@ def test_subsampling_selects_the_same_physical_exposures(
     np.testing.assert_allclose(coarse, dense[::factor], rtol=1e-6, atol=1e-10)
 
 
-def test_pixel_quadrature_convergence(independent_photon_scene_factory):
-    """Refine tilted sensor integration while holding the physical scene fixed."""
-    fine = independent_photon_scene_factory(spacing=0.025)
-    metadata = Acquisition(fine.axes, acquisition_shape(fine), output="expectation")
-    images = [
-        forward_model(fine.density, metadata, replace(fine.microscope, pixel_samples=n))
-        for n in (3, 5)
-    ]
-    assert np.linalg.norm(images[0] - images[1]) / np.linalg.norm(images[1]) < 0.005
-
-
 @pytest.mark.parametrize("angle", [30, 38])
 @pytest.mark.parametrize("step", [0.2, 0.4, 0.8])
 def test_oblique_pixel_coordinates_match_linear_field(
@@ -350,7 +350,17 @@ def test_optical_grid_convergence(fine_optical_images, step, microscope_paramete
             for a in samples[:-1]
         ]
         assert errors[1] < errors[0]
-        assert errors[1] < 0.02
+        changes = [np.linalg.norm(a - b) for a, b in pairwise(samples)]
+        # Finite, inclusive PSF boundaries can add first-order terms to the
+        # interior second-order grid error. Verify at least first-order
+        # contraction at every available adjacent refinement, rather than
+        # assuming the asymptotic h² regime. Conditional on that regime
+        # continuing, the medium-to-limit geometric tail is <=2*last change.
+        assert changes[1] <= changes[0] / 2
+        estimated_limit_error = 2 * changes[-1] / np.linalg.norm(reference)
+        # Retain the established 2% accuracy target, applying it to the stronger
+        # conditional continuum estimate instead of only the last difference.
+        assert estimated_limit_error < 0.02
     if step == 0.8:
         dense = sensor_integral(
             image, axes, (33, 33, 17), replace(p, scan_step_um=0.2), area_integral=False

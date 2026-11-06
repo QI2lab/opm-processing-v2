@@ -1,7 +1,5 @@
 """Generated optical kernels must retain their declared physical coordinates."""
 
-from dataclasses import replace
-
 import numpy as np
 import pytest
 
@@ -40,48 +38,6 @@ def test_oblique_psf_refinement_against_independent_acquisition(
     assert refinement[0] < np.sqrt(refinement[1]), refinement
     assert metrics[3][0] < np.sqrt(metrics[3][1]), metrics
     assert metrics[3][0] < metrics[2][0] < metrics[1][0], metrics
-
-
-@pytest.mark.parametrize("oversampling", [1, 2, 3])
-@pytest.mark.parametrize("step", [0.4, 1.2])
-def test_oblique_psf_matches_physical_pixel_integration(
-    microscope_parameters,
-    production_psf_parameters,
-    production_psf_grid,
-    oversampling,
-    step,
-):
-    """Integrate the same optical field using the shared physical camera model.
-
-    The reference maps finite pixels through X=c+u, Y=s+(r+v)cos(theta),
-    Z=(r+v)sin(theta). This checks all axial positions and both camera dimensions
-    without replacing the optical model or constructing another forward model.
-    """
-    from tests.simulation.forward_model import sensor_integral
-
-    microscope = replace(
-        microscope_parameters, scan_step_um=step, pixel_samples=oversampling
-    )
-    parameters = dict(production_psf_parameters, grid_oversampling=oversampling)
-    kernel = generate_skewed_psf(
-        microscope.wavelength_um,
-        microscope.pixel_size_um,
-        step,
-        microscope.angle_deg,
-        parameters=parameters,
-    )
-    field, (dxy, dz, nxy, nz) = production_psf_grid[0]
-    axes = tuple(
-        (np.arange(n) - (n - 1) / 2) * spacing
-        for n, spacing in ((nz, dz), (nxy, dxy), (nxy, dxy))
-    )
-    expected = sensor_integral(field, axes, kernel.shape, microscope)
-    np.testing.assert_allclose(
-        kernel,
-        expected,
-        rtol=2e-11,
-        atol=1e-15,
-    )
 
 
 @pytest.mark.parametrize("geometry", ["cartesian", "projection"])

@@ -1,7 +1,7 @@
 """Physical specimens and shared production optics for reconstruction."""
 
 import json
-from dataclasses import replace
+from dataclasses import dataclass, fields, replace
 from functools import lru_cache
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,15 +18,102 @@ from tests.simulation.forward_model import (
     forward_model,
 )
 from tests.simulation.objects import centered_axis, deposit_point
+from tests.simulation.scenes import OpticalScene, freeze_metadata
+
+
+@dataclass(frozen=True)
+class FrozenOpticalData:
+    """Protect cached numerical fields and nested metadata from consumer mutation."""
+
+    def __post_init__(self):
+        """Freeze every stored field, including arrays inside tuples and mappings."""
+        for item in fields(self):
+            object.__setattr__(
+                self, item.name, freeze_metadata(getattr(self, item.name))
+            )
+
+
+@dataclass(frozen=True)
+class CameraObservation(FrozenOpticalData):
+    """One immutable optical scene and its independent detector observation."""
+
+    ground_truth: OpticalScene
+    microscope: Microscope
+    expectation: np.ndarray
+    raw: np.ndarray
+
+
+@dataclass(frozen=True)
+class TranslationObservations(FrozenOpticalData):
+    """Independent camera realizations with a prescribed physical displacement."""
+
+    images: tuple[np.ndarray, ...]
+    means: tuple[np.ndarray, ...]
+    expected: np.ndarray
+    ground_truth: OpticalScene
+    microscope: Microscope
+
+
+@dataclass(frozen=True)
+class OpticalSetup(FrozenOpticalData):
+    """Immutable calibrated PSF samples, with a fresh installed interpolator."""
+
+    microscope: Microscope
+    psf: np.ndarray
+    density_scale: float
+    axes: tuple[np.ndarray, ...]
+    irradiance: np.ndarray
+
+    @property
+    def field(self):
+        """Build the real interpolator without sharing its mutable configuration."""
+        return RegularGridInterpolator(
+            self.axes, self.irradiance, bounds_error=False, fill_value=0
+        )
+
+
+@dataclass(frozen=True)
+class RayleighObservations(FrozenOpticalData):
+    """Known point-pair separation and immutable sampled diffraction response."""
+
+    axis: str
+    separation: float
+    microscope: Microscope
+    acquisition_dip: float
+    offset: np.ndarray
+    expectation: np.ndarray
+    psf: np.ndarray
+
+
+@dataclass(frozen=True)
+class AnalyticalCameraField(FrozenOpticalData):
+    """Known analytical concentration on an immutable physical Cartesian grid."""
+
+    axes: tuple[np.ndarray, ...]
+    field: np.ndarray
+    shape: tuple[int, int, int]
+    center: tuple[float, float, float]
+
+
+@dataclass(frozen=True)
+class PointAcquisition(FrozenOpticalData):
+    """Immutable independently refined emitter observations and optical kernels."""
+
+    microscope: Microscope
+    expectations: tuple[np.ndarray, ...]
+    kernels: dict[int, np.ndarray]
+    kernel: np.ndarray
 
 
 @pytest.fixture(scope="session")
 def simulation_parameters():
     """Load the shared physical acquisition and specimen configuration."""
-    return json.loads(
-        (
-            Path(__file__).resolve().parent / "configs/deconvolution_figures.json"
-        ).read_text()
+    return freeze_metadata(
+        json.loads(
+            (
+                Path(__file__).resolve().parent / "configs/deconvolution_figures.json"
+            ).read_text()
+        )
     )
 
 
@@ -92,6 +179,7 @@ def simulated_camera(
         seed=42,
         kind="points",
         profile="uniform",
+        budget=None,
     ):
         """Simulate optical formation before camera sampling and digitization."""
         scene = independent_photon_scene_factory(kind)
@@ -112,13 +200,17 @@ def simulated_camera(
                 geometry=geometry,
                 exposure=exposure,
                 illumination_profile=profile,
-                camera_photon_budget=tuple(simulation_parameters["photon_budgets"][0]),
+                camera_photon_budget=(
+                    tuple(simulation_parameters["photon_budgets"][0])
+                    if budget is None
+                    else budget
+                ),
                 output="expectation",
             ),
             microscope,
         )
         raw = digitize(expectation, microscope.camera, seed=seed)
-        return SimpleNamespace(
+        return CameraObservation(
             ground_truth=scene,
             microscope=microscope,
             expectation=expectation,
@@ -186,7 +278,7 @@ def physical_translation_pair(independent_photon_scene_factory):
             images.append(
                 digitize(mean, microscope.camera, seed=42 + index).astype(np.float32)
             )
-        return SimpleNamespace(
+        return TranslationObservations(
             images=tuple(images),
             means=tuple(means),
             expected=-np.array(applied_shift),
@@ -207,11 +299,12 @@ def optical_setup(microscope_parameters):
     )
     axes, field = emission_psf(microscope, microscope.fine_spacing_um)
     psf, scale = camera_psf(microscope)
-    return SimpleNamespace(
+    return OpticalSetup(
         microscope=microscope,
         psf=psf.astype(np.float32),
         density_scale=scale,
-        field=RegularGridInterpolator(axes, field, bounds_error=False, fill_value=0),
+        axes=axes,
+        irradiance=field,
     )
 
 
@@ -272,7 +365,7 @@ def rayleigh_pair(request, optical_setup):
     expectation = forward_model(
         density, Acquisition(axes, tuple(shape), output="expectation"), microscope
     )
-    return SimpleNamespace(
+    return RayleighObservations(
         axis=axis,
         separation=separation,
         microscope=microscope,
@@ -294,6 +387,35 @@ def ideal_photon_camera(camera_calibration):
 
 
 @pytest.fixture
+def camera_adc_case(
+    independent_photon_scene_factory, mean, noise, full_model, camera_calibration
+):
+    """Draw one million calibrated camera pixels and independent exact ADC moments."""
+    from tests.simulation.camera import digitize
+    from tests.simulation.camera_statistics import adc_moments
+
+    camera = replace(camera_calibration, read_noise_e=noise)
+    if full_model:
+        scene = independent_photon_scene_factory()
+        raw = forward_model(
+            scene.density,
+            Acquisition(
+                scene.axes,
+                (1, 1000, 1000),
+                exposure=0,
+                background_electrons=mean,
+                seed=637,
+            ),
+            replace(scene.microscope, camera=camera),
+        )
+    else:
+        raw = digitize(
+            np.full(1_000_000, float(mean)), camera, seed=637 if mean == 0 else 31
+        )
+    return SimpleNamespace(raw=raw, camera=camera, moments=adc_moments(mean, camera))
+
+
+@pytest.fixture
 def measured_psf_calibration(tmp_path, optical_setup, psf_format):
     """Persist a real production optical kernel through its supported file writer."""
     import tifffile
@@ -312,7 +434,7 @@ def measured_psf_calibration(tmp_path, optical_setup, psf_format):
     return SimpleNamespace(path=path, kernel=kernel, write=write)
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture
 def planar_point_model(optical_setup):
     """Return two known emitters and the normalized central YX PSF used to blur them."""
     central = optical_setup.psf[optical_setup.psf.shape[0] // 2].copy()
@@ -326,7 +448,7 @@ def planar_point_model(optical_setup):
     return truth, central, psf
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture
 def point_response_model(optical_setup):
     """Share known point counts and a finite, sampled physical response kernel.
 
@@ -429,6 +551,25 @@ def uniform_response_case(scan_planes, detector_shape):
     psf /= psf.sum()
     measured = ndimage.convolve(truth, psf, mode="reflect") * response
     return SimpleNamespace(response=response, truth=truth, psf=psf, measured=measured)
+
+
+@pytest.fixture
+def camera_sampling_case(uniform_detector_scene):
+    """Share a fixed high-dose physical phantom and its actual detector residual."""
+    from tests.simulation.camera import digitize
+    from tests.simulation.camera_likelihood import sampling_stencil_radii
+
+    scene = uniform_detector_scene()
+    raw = digitize(scene.means, scene.microscope.camera, seed=937)
+    return SimpleNamespace(
+        expectation=scene.means,
+        raw=raw,
+        camera=scene.microscope.camera,
+        nominal=scene.nominal,
+        radii=sampling_stencil_radii(
+            scene.microscope, (scene.microscope.pixel_size_um,) * 3
+        ),
+    )
 
 
 @pytest.fixture
@@ -618,7 +759,7 @@ def fine_optical_images(microscope_parameters):
             microscope,
         )
         result.append((axes, psf, image))
-    return result
+    return freeze_metadata(result)
 
 
 @pytest.fixture(scope="session")
@@ -626,11 +767,24 @@ def linear_camera_field():
     """Known concentration ramp, with an even row count and shifted XYZ origin."""
     axes = tuple(np.linspace(-5, 5, 101) for _ in range(3))
     z, y, x = np.meshgrid(*axes, indexing="ij", sparse=True)
-    return SimpleNamespace(
+    return AnalyticalCameraField(
         axes=axes,
         field=100 + 2 * x + 3 * y + 5 * z,
         shape=(7, 12, 9),
         center=(0.03, -0.12, 0.21),
+    )
+
+
+@pytest.fixture(scope="session")
+def quadratic_camera_field():
+    """Share a quadratic irradiance with a known trilinear interpolation bound."""
+    axes = tuple(np.arange(-40, 41) * 0.0025 for _ in range(3))
+    z, y, x = np.meshgrid(*axes, indexing="ij", sparse=True)
+    return AnalyticalCameraField(
+        axes=axes,
+        field=10 + 2 * x**2 + y**2 + z**2,
+        shape=(1, 1, 1),
+        center=(0, 0, 0),
     )
 
 
@@ -688,7 +842,7 @@ def point_profile_case(request, microscope_parameters):
     )
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture
 def production_psf_parameters(microscope_parameters):
     """Provide explicit optical support and taper calibration for generated kernels."""
     microscope = microscope_parameters
@@ -708,25 +862,7 @@ def production_psf_parameters(microscope_parameters):
     }
 
 
-@pytest.fixture
-def production_psf_grid(monkeypatch):
-    """Observe production optical fields and their declared sample coordinates."""
-    from opm_processing.imageprocessing import opmpsf
-
-    grids = []
-    evaluate = opmpsf.create_psf_silicone_100x
-
-    def capture(*args, **kwargs):
-        """Retain the actual optical field and its declared Cartesian spacing."""
-        field = evaluate(*args, **kwargs)
-        grids.append((field, args[:4]))
-        return field
-
-    monkeypatch.setattr(opmpsf, "create_psf_silicone_100x", capture)
-    return grids
-
-
-@pytest.fixture(scope="module", params=[(0.4, (5, 17, 17)), (1.2, (3, 17, 17))])
+@pytest.fixture(params=[(0.4, (5, 17, 17)), (1.2, (3, 17, 17))])
 def production_point_acquisition(
     request, microscope_parameters, production_psf_parameters
 ):
@@ -784,28 +920,9 @@ def production_point_acquisition(
         for n, size in zip(kernel.shape, shape, strict=True)
     )
     kernel = kernel[region]
-    return SimpleNamespace(
+    return PointAcquisition(
         microscope=microscope,
         expectations=expectations,
         kernels=kernels,
         kernel=kernel / kernel.sum(),
-    )
-
-
-@pytest.fixture
-def camera_sampling_case(uniform_detector_scene):
-    """Share a fixed high-dose physical phantom and its actual detector residual."""
-    from tests.simulation.camera import digitize
-    from tests.simulation.camera_likelihood import sampling_stencil_radii
-
-    scene = uniform_detector_scene()
-    raw = digitize(scene.means, scene.microscope.camera, seed=937)
-    return SimpleNamespace(
-        expectation=scene.means,
-        raw=raw,
-        camera=scene.microscope.camera,
-        nominal=scene.nominal,
-        radii=sampling_stencil_radii(
-            scene.microscope, (scene.microscope.pixel_size_um,) * 3
-        ),
     )

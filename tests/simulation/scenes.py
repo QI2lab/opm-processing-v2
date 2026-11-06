@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import MappingProxyType
 
 import numpy as np
 
@@ -18,7 +19,20 @@ from tests.simulation.objects import (
 )
 
 
-@dataclass
+def freeze_metadata(value):
+    """Protect cached physical metadata without sharing mutable lists or mappings."""
+    if isinstance(value, dict):
+        return MappingProxyType(
+            {key: freeze_metadata(item) for key, item in value.items()}
+        )
+    if isinstance(value, (tuple, list)):
+        return tuple(freeze_metadata(item) for item in value)
+    if isinstance(value, np.ndarray):
+        value.setflags(write=False)
+    return value
+
+
+@dataclass(frozen=True)
 class OpticalScene:
     """Known fine object and optical calibration for reconstruction comparisons."""
 
@@ -31,6 +45,13 @@ class OpticalScene:
     illumination_profile: str
     illumination_half_width_um: float
     features: dict
+
+    def __post_init__(self) -> None:
+        """Protect cached optical truth while allowing independent acquisition draws."""
+        for array in (*self.axes, self.density, *self.psf_axes, self.psf_irradiance):
+            array.setflags(write=False)
+
+        object.__setattr__(self, "features", freeze_metadata(self.features))
 
 
 def prepare_scene(
