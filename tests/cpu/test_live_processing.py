@@ -285,151 +285,85 @@ def test_live_processing_preserves_original_optical_emitters(
     assert "opm_v2" not in output.attributes
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 @pytest.mark.parametrize("signal_field", (1.0, 2.0))
 @pytest.mark.parametrize("save_float32", (False, True))
 def test_live_occupancy_filter_preserves_sample_signal_and_writes_zero(
-    tmp_path,
-    live_acquisition_factory,
-    deskew_uniform_expectation,
-    signal_field,
-    save_float32,
-) -> None:
-    """Ignore a persistent hot pixel while processing a channel with real signal."""
-    raw = np.full((2, 4, 8, 5), 100, dtype=np.uint16)
-    raw[0, :, 0, 0] = 200  # One persistent detector hot pixel.
-    raw[0, 0, 0, 1:5] = 104  # Sub-threshold signal before illumination correction.
-    raw[1] = 200  # A uniformly occupied fluorescent volume.
-    illumination = np.ones((2, 8, 5), dtype=np.float32)
-    illumination[0] = (
-        0.1  # Amplifying detector artifacts must not rescue an empty channel.
-    )
-    illumination[1] = signal_field
-    dataset = live_acquisition_factory(
-        raw[None, None], name="live_empty", illumination=illumination
-    )
-    illumination_path = dataset.illumination_path
+    tmp_path, live_occupancy_case, save_float32, assert_uniform_photon_accuracy
+):
+    """Preserve a known optical sample while rejecting physical detector artifacts."""
+    case = live_occupancy_case
     process(
         root_path=tmp_path,
-        live=illumination_path,
+        live=case.dataset.illumination_path,
         deconvolve=False,
         save_float32=save_float32,
-        skip_empty_below=2.0,
+        skip_empty_below=case.threshold,
         skip_empty_min_signal_fraction=0.1,
         max_projection=True,
         create_fused_max_projection=False,
         z_downsample_level=1,
     )
-
-    output = open_position_collection(tmp_path / "live_empty_deskewed.ome.zarr")
-    max_output = open_position_collection(
-        tmp_path / "live_empty_max_z_deskewed.ome.zarr"
+    path = tmp_path / "live_empty_deskewed.ome.zarr"
+    output = open_position_collection(path)
+    maximum = open_position_collection(tmp_path / "live_empty_max_z_deskewed.ome.zarr")
+    data = output.arrays[0].read().result()
+    assert data.dtype == (np.float32 if save_float32 else np.uint16)
+    np.testing.assert_array_equal(data[:, 0], 0)
+    assert_uniform_photon_accuracy(data, case.scene, channels=(1,))
+    np.testing.assert_array_equal(
+        maximum.arrays[0].read().result(), data.max(axis=2, keepdims=True)
     )
-    assert np.count_nonzero(output.arrays[0][0, 0].read().result()) == 0
-    assert np.count_nonzero(max_output.arrays[0][0, 0].read().result()) == 0
-    assert np.count_nonzero(output.arrays[0][0, 1].read().result()) > 0
-    expected = deskew_uniform_expectation(
-        (4, 8, 5),
-        100 * 0.24 / signal_field,
-        dtype=np.float32 if save_float32 else np.uint16,
-    )
-    actual = output.arrays[0][0, 1].read().result()
-    assert actual.dtype == expected.dtype
-    # Four interpolation products, camera gain and illumination division bound
-    # float32 accumulation; integer output retains its exact clipped ADC codes.
-    np.testing.assert_allclose(
-        actual,
-        expected,
-        rtol=6 * np.finfo(np.float32).eps if save_float32 else 0,
-        atol=0,
-    )
-    state = ProcessingState.read(processing_state_path(tmp_path, "live_empty"))
-    assert state.zero_channels(tmp_path / "live_empty_deskewed.ome.zarr") == {(0, 0, 0)}
-    assert len(max_output.multiscale_factors_yx) > 1
-    for factor, level_arrays in zip(
-        max_output.multiscale_factors_yx, max_output.multiscale_arrays, strict=False
+    assert len(maximum.multiscale_factors_yx) > 1
+    for factor, arrays in zip(
+        maximum.multiscale_factors_yx, maximum.multiscale_arrays, strict=True
     ):
-        assert np.count_nonzero(level_arrays[0][0, 0].read().result()) == 0
-        np.testing.assert_allclose(
-            level_arrays[0][0, 1].read().result(),
-            expected.max(axis=0, keepdims=True)[..., ::factor, ::factor],
-            rtol=6 * np.finfo(np.float32).eps if save_float32 else 0,
-            atol=0,
+        np.testing.assert_array_equal(
+            arrays[0].read().result(),
+            data.max(axis=2, keepdims=True)[..., ::factor, ::factor],
         )
+    state = ProcessingState.read(processing_state_path(tmp_path, "live_empty"))
+    assert state.zero_channels(path) == {(0, 0, 0)}
+    assert state.completed_tiles(path) == {(0, 0)}
     assert "opm_v2" not in output.attributes
     coordinates = output.attributes["opm_processing_coordinates"]
     assert coordinates["version"] == STAGE_COORDINATE_VERSION
     assert coordinates["stage_positions_zxy_um"] == [[30.0, 100.0, 200.0]]
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 @pytest.mark.parametrize("action", ["resume", "overwrite"])
 def test_offline_resume_skips_durably_completed_tile_and_default_overwrites(
     tmp_path,
-    monkeypatch,
-    acquisition_factory,
+    resume_acquisition,
+    interrupt_completed_tile,
     action,
-    deskew_uniform_expectation,
-) -> None:
-    """Resume preserves completed pixels; explicit overwrite recomputes them."""
+    assert_uniform_photon_accuracy,
+    relocate_acquisition,
+    cli_runner,
+):
+    """Recover partial real acquisitions across relocation without changing completed photons."""
     process_module = importlib.import_module("opm_processing.process")
-    pixels = np.empty((1, 2, 1, 4, 8, 5), np.uint16)
-    pixels[:, 0] = 110
-    pixels[:, 1] = 120
-    dataset = acquisition_factory(
-        pixels,
-        name="offline_resume",
-        mode="stage",
-        camera_conversion=1.0,
-        stage_positions_zxy=((30.0, 100.0, 200.0), (30.0, 100.0, 202.0)),
-    )
-    data_path, collection, metadata = dataset.path, dataset.collection, dataset.metadata
-    real_complete_tile = process_module.ProcessingState.complete_tile
-    completion_count = 0
-
-    def interrupt_after_first(self, *args, **kwargs):
-        """Interrupt after a durable write to exercise restart behavior."""
-        nonlocal completion_count
-        real_complete_tile(self, *args, **kwargs)
-        completion_count += 1
-        if completion_count == 1:
-            raise KeyboardInterrupt
-
-    monkeypatch.setattr(
-        process_module.ProcessingState,
-        "complete_tile",
-        interrupt_after_first,
-    )
-    with pytest.raises(KeyboardInterrupt):
-        process_module.process_skewed(
-            data_path,
-            acquisition=metadata,
-            output_dir=tmp_path,
-            max_projection=False,
-            create_fused_max_projection=False,
-            z_downsample_level=1,
-        )
-
-    output_path = tmp_path / "offline_resume_deskewed.ome.zarr"
-    interrupted = open_position_collection(output_path)
-    completed_tile = interrupted.arrays[0][0, 0].read().result()
-    np.testing.assert_array_equal(
-        completed_tile,
-        deskew_uniform_expectation((4, 8, 5), 10),
-    )
-    collection.arrays[0][0].write(np.full((1, 4, 8, 5), 501, dtype=np.uint16)).result()
-
-    monkeypatch.setattr(
-        process_module.ProcessingState,
-        "complete_tile",
-        real_complete_tile,
-    )
-    result = CliRunner().invoke(
+    case = resume_acquisition()
+    dataset = case.dataset
+    options = {
+        "max_projection": False,
+        "create_fused_max_projection": False,
+        "z_downsample_level": 1,
+    }
+    with interrupt_completed_tile(case.output), pytest.raises(KeyboardInterrupt):
+        process_module.process_skewed(dataset.path, dataset.metadata, **options)
+    first = open_position_collection(case.output).arrays[0].read().result()
+    assert_uniform_photon_accuracy(first, case.scene, position=0)
+    dataset.raw_arrays[0].write(case.changed.pixels[:, 0, :, ::-1].copy()).result()
+    root = relocate_acquisition(tmp_path, copy=action == "resume")
+    source = root / dataset.path.name
+    result = cli_runner.invoke(
         app,
         [
-            str(data_path),
+            str(source),
             "--output",
-            str(tmp_path),
+            str(root),
             "--no-max-projection",
             "--no-create-fused-max-projection",
             "--z-downsample-level",
@@ -439,110 +373,68 @@ def test_offline_resume_skips_durably_completed_tile_and_default_overwrites(
     )
     assert result.exit_code == 0, result.exception
     assert "Resume / Overwrite / Cancel" in result.output
-    resumed = open_position_collection(output_path)
-    np.testing.assert_array_equal(
-        resumed.arrays[0][0, 0].read().result(),
-        completed_tile
-        if action == "resume"
-        else deskew_uniform_expectation((4, 8, 5), 401),
+    output = open_position_collection(root / case.output.name)
+    actual = output.arrays[0].read().result()
+    assert_uniform_photon_accuracy(
+        actual, case.scene if action == "resume" else case.changed, position=0
     )
-    np.testing.assert_array_equal(
-        resumed.arrays[1][0, 0].read().result(),
-        deskew_uniform_expectation((4, 8, 5), 20),
+    if action == "resume":
+        np.testing.assert_array_equal(actual, first)
+    else:
+        assert not np.array_equal(actual, first)
+    assert_uniform_photon_accuracy(
+        output.arrays[1].read().result(), case.scene, position=1
     )
-
     process_module.process_skewed(
-        data_path,
-        acquisition=metadata,
-        output_dir=tmp_path,
-        max_projection=False,
-        create_fused_max_projection=False,
-        z_downsample_level=1,
+        source, inspect_acquisition(source), output_dir=root, **options
     )
-    overwritten = open_position_collection(output_path)
-    np.testing.assert_array_equal(
-        overwritten.arrays[0][0, 0].read().result(),
-        deskew_uniform_expectation((4, 8, 5), 401),
+    overwritten = open_position_collection(root / case.output.name)
+    assert_uniform_photon_accuracy(
+        overwritten.arrays[0].read().result(), case.changed, position=0
+    )
+    assert_uniform_photon_accuracy(
+        overwritten.arrays[1].read().result(), case.scene, position=1
     )
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_live_processing_resumes_completed_output_tiles(
-    tmp_path, monkeypatch, live_acquisition_factory, deskew_uniform_expectation
-) -> None:
-    """Preserve completed tiles and safely redo a partially written next tile."""
-    pixels = np.empty((1, 2, 2, 4, 8, 5), np.uint16)
-    pixels[:, 0] = 100
-    pixels[:, 1] = 111
-    dataset = live_acquisition_factory(pixels, name="live_resume")
-    illumination_path = dataset.illumination_path
-    output_path = tmp_path / "live_resume_deskewed.ome.zarr"
-    max_output_path = tmp_path / "live_resume_max_z_deskewed.ome.zarr"
-
-    real_complete = ProcessingState.complete_tile
-
-    def interrupt_after_first(self, *args, **kwargs):
-        """Interrupt after a durable write to exercise restart behavior."""
-        real_complete(self, *args, **kwargs)
-        # A live tile is durable only after both the volume and projection
-        # checkpoints are committed. Interrupt after the second output.
-        if args[0] == max_output_path:
-            raise KeyboardInterrupt
-
-    monkeypatch.setattr(ProcessingState, "complete_tile", interrupt_after_first)
-    with pytest.raises(KeyboardInterrupt):
-        process(
-            root_path=tmp_path,
-            live=illumination_path,
-            max_projection=True,
-            create_fused_max_projection=False,
-            z_downsample_level=1,
-        )
-
-    first_output = open_position_collection(output_path)
-    first_max_output = open_position_collection(max_output_path)
-    # The first tile is exactly the camera offset, hence zero calibrated photons.
-    np.testing.assert_array_equal(first_output.arrays[0].read().result(), 0)
-    np.testing.assert_array_equal(first_max_output.arrays[0].read().result(), 0)
-    first_output.arrays[1][0, 0, 0, 0, 0].write(np.uint16(999)).result()
-
-    dataset.collection.arrays[0].write(np.uint16(901)).result()
-    monkeypatch.setattr(ProcessingState, "complete_tile", real_complete)
-    process(
-        root_path=tmp_path,
-        live=illumination_path,
-        max_projection=True,
-        create_fused_max_projection=False,
-        z_downsample_level=1,
-    )
-
-    resumed_output = open_position_collection(output_path)
-    resumed_max_output = open_position_collection(max_output_path)
+    tmp_path,
+    resume_acquisition,
+    interrupt_completed_tile,
+    assert_uniform_photon_accuracy,
+    relocate_acquisition,
+):
+    """Preserve durable dark tiles and recompute an interrupted physical sample."""
+    case = resume_acquisition(live=True)
+    dataset = case.dataset
+    log_path = tmp_path / "live_resume.log.jsonl"
+    lifecycle = log_path.read_bytes()
+    options = {
+        "max_projection": True,
+        "create_fused_max_projection": False,
+        "z_downsample_level": 1,
+    }
+    with interrupt_completed_tile(case.maximum), pytest.raises(KeyboardInterrupt):
+        process(root_path=tmp_path, live=dataset.illumination_path, **options)
+    output = open_position_collection(case.output)
+    maximum = open_position_collection(case.maximum)
+    np.testing.assert_array_equal(output.arrays[0].read().result(), 0)
+    np.testing.assert_array_equal(maximum.arrays[0].read().result(), 0)
+    output.arrays[1][0, 0, 0, 0, 0].write(np.uint16(999)).result()
+    dataset.raw_arrays[0].write(case.changed.pixels[:, 0, :, ::-1].copy()).result()
+    root = relocate_acquisition(tmp_path, copy=True)
+    process(root_path=root, live=root / dataset.illumination_path.name, **options)
+    resumed = open_position_collection(root / case.output.name)
+    projection = open_position_collection(root / case.maximum.name)
+    np.testing.assert_array_equal(resumed.arrays[0].read().result(), 0)
+    np.testing.assert_array_equal(projection.arrays[0].read().result(), 0)
+    actual = resumed.arrays[1].read().result()
+    assert_uniform_photon_accuracy(actual, case.scene, position=1)
     np.testing.assert_array_equal(
-        resumed_output.arrays[0].read().result(),
-        0,
+        projection.arrays[1].read().result(), actual.max(axis=2, keepdims=True)
     )
-    np.testing.assert_array_equal(
-        resumed_max_output.arrays[0].read().result(),
-        0,
-    )
-    assert np.all(resumed_output.arrays[1].read().result() != 999)
-    expected_tile = deskew_uniform_expectation((4, 8, 5), 11 * 0.24)
-    for channel in range(2):
-        np.testing.assert_array_equal(
-            resumed_output.arrays[1][0, channel].read().result(), expected_tile
-        )
-        np.testing.assert_array_equal(
-            resumed_max_output.arrays[1][0, channel].read().result(),
-            expected_tile.max(axis=0, keepdims=True),
-        )
-    acquisition_records = [
-        json.loads(line)
-        for line in dataset.log.read_text(encoding="utf-8").splitlines()
-    ]
-    assert acquisition_records == [
-        {"event": "completed", "acquisition_id": "synthetic-acquisition"}
-    ]
-    state = ProcessingState.read(processing_state_path(tmp_path, "live_resume"))
-    assert state.completed_tiles(output_path) == {(0, 0), (0, 1)}
-    assert state.completed_tiles(max_output_path) == {(0, 0), (0, 1)}
+    assert (root / log_path.name).read_bytes() == lifecycle
+    state = ProcessingState.read(processing_state_path(root, "live_resume"))
+    assert state.completed_tiles(root / case.output.name) == {(0, 0), (0, 1)}
+    assert state.completed_tiles(root / case.maximum.name) == {(0, 0), (0, 1)}
