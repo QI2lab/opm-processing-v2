@@ -387,7 +387,6 @@ def test_expanded_cache_uses_initial_settings_and_restores_final_limits(
     fusion.pairwise_metrics = {(0, 1): (15, -284, 0, 0.9)}
     assert fusion._registration_cache_settings() == initial
     fusion.save_pairwise_metrics()
-    saved = processing_state.path.read_bytes()
     final_pairs = fusion._pair_registration_limits.copy()
     fusion.max_registration_shift_zyx = fusion._initial_registration_shift_zyx
     fusion._pair_registration_limits = fusion._initial_pair_registration_limits.copy()
@@ -396,7 +395,18 @@ def test_expanded_cache_uses_initial_settings_and_restores_final_limits(
     assert fusion.max_registration_shift_zyx == (17, 299, 33)
     assert fusion._pair_registration_limits == final_pairs
     assert fusion._registration_retry_count == 1
-    assert processing_state.path.read_bytes() == saved
+    assert fusion.pairwise_metrics == {(0, 1): (15, -284, 0, 0.9)}
+    reopened = ProcessingState.read(processing_state.path)
+    record = reopened.registration(fusion.data, configuration=initial)
+    assert record["pairwise_metrics"] == {"0,1": [15, -284, 0, 0.9]}
+    assert record["effective_registration_limits"] == {
+        "maximum_zyx": [17, 299, 33],
+        "pairs": {
+            f"{left},{right}": list(limits)
+            for (left, right), limits in final_pairs.items()
+        },
+        "retries": 1,
+    }
     fusion.registration_retries = 0
     with pytest.raises(ValueError, match="settings do not match"):
         fusion.load_pairwise_metrics()

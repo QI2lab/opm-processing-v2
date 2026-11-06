@@ -1,5 +1,7 @@
 """Minimal numerical fusion operators with explicitly supplied geometry and data."""
 
+from dataclasses import replace
+from functools import lru_cache
 from types import SimpleNamespace
 
 import numpy as np
@@ -183,10 +185,59 @@ def retry_fusion(fusion_operator):
     )
 
 
+@pytest.fixture(scope="session")
+def registration_scene(microscope_parameters):
+    """Render a known fluorescent point specimen with the shared optical model.
+
+    A spatially distributed specimen supplies features throughout thin overlaps.
+    Cropping a single detector observation preserves an independently known
+    translation without replacing correlation, SSIM or camera implementations.
+    """
+    from tests.simulation.forward_model import Acquisition, forward_model
+    from tests.simulation.scenes import prepare_scene
+
+    @lru_cache(maxsize=8)
+    def render(shape, *, seed=51):
+        """Return unsigned camera samples and the object that produced them."""
+        microscope = replace(
+            microscope_parameters, fine_spacing_um=0.1, scan_step_um=0.23
+        )
+        spacing = np.array((microscope.scan_step_um, *[microscope.pixel_size_um] * 2))
+        half_extent = np.maximum((np.asarray(shape) - 1) * spacing / 2, spacing)
+        # Coordinates are object positions, not random image intensities. The
+        # same vectorial PSF and pixel integration used by all optics tests
+        # form these photons before the calibrated camera digitizes them.
+        count = max(32, int(np.prod(2 * half_extent) * 4))
+        centers = np.random.default_rng(seed).uniform(
+            -half_extent, half_extent, (count, 3)
+        )
+        scene = prepare_scene(
+            "points",
+            microscope,
+            parameters={
+                "half_extent_zyx_um": half_extent + 0.3,
+                "features": {"centers_xyz_um": centers[:, ::-1].tolist()},
+            },
+        )
+        raw = forward_model(
+            scene.density,
+            Acquisition(
+                scene.axes,
+                shape,
+                geometry="cartesian",
+                camera_photon_budget=(1000, 30),
+                seed=seed,
+            ),
+            microscope,
+        )
+        return SimpleNamespace(raw=raw, ground_truth=scene, microscope=microscope)
+
+    return render
+
+
 @pytest.fixture
-def shifted_slab_pair():
-    """Build known translated slabs from one prescribed blurred random field."""
-    from scipy.ndimage import gaussian_filter
+def shifted_slab_pair(registration_scene):
+    """Crop known translated slabs from one physical camera observation."""
 
     def create(
         shape, nominal_step, correction, *, seed=51, spacing=(0.23, 0.115, 0.115)
@@ -194,14 +245,10 @@ def shifted_slab_pair():
         """Return paired pixels, nominal placement and independent exact shifts."""
         shift = np.asarray(correction, dtype=int)
         delta = shift + np.array((nominal_step, 0, 0))
-        truth = np.rint(
-            gaussian_filter(
-                np.random.default_rng(seed).uniform(
-                    0, 1000, np.asarray(shape) + abs(delta)
-                ),
-                (1, 2, 2),
-            )
-        ).astype(np.uint16)
+        observation = registration_scene(
+            tuple(np.asarray(shape) + abs(delta)), seed=seed
+        )
+        truth = observation.raw
         starts = (np.maximum(0, -delta), np.maximum(0, delta))
         volumes = tuple(
             truth[
@@ -219,6 +266,7 @@ def shifted_slab_pair():
             expected=shift,
             truth=truth,
             starts=starts,
+            observation=observation,
         )
 
     return create
@@ -258,11 +306,13 @@ def projection_fusion(fusion_operator):
 
 
 @pytest.fixture
-def fusion_mosaic():
+def fusion_mosaic(registration_scene):
     """Prescribe one laboratory field seen by cropped, attenuated, partial tiles."""
     shape = (28, 46, 69)
-    z, y, x = np.indices(shape)
-    field = 100.375 + 3 * z + 2 * y + x
+    # Retain the fractional calibrated intensity of this float-output case.
+    # Integer-cast boundary arithmetic is checked separately using
+    # explicitly prescribed scalar weights and photon counts.
+    field = registration_scene(shape).raw.astype(np.float32) + np.float32(0.375)
     field[:, 2, 4] = 0  # Real darkness inside valid support.
     tiles, origins, shapes, supports, profiles, gains, present = (
         [],

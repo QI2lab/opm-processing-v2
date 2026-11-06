@@ -129,6 +129,75 @@ def simulated_camera(
 
 
 @pytest.fixture(scope="session")
+def physical_translation_pair(independent_photon_scene_factory):
+    """Observe an aperiodic object from displaced physical sensor coordinates.
+
+    Both acquisitions share one known emission dose and calibrated microscope.
+    Independent detector realizations avoid matching a reused camera-noise field.
+    """
+    from tests.simulation.camera import digitize
+
+    @lru_cache(maxsize=4)
+    def render(applied_shift):
+        """Return two camera images with the prescribed subpixel physical shift."""
+        scene = independent_photon_scene_factory("points")
+        microscope = replace(scene.microscope, scan_step_um=0.23)
+        shape = (31, 65, 65)
+        spacing = np.array(
+            (
+                microscope.scan_step_um,
+                microscope.pixel_size_um,
+                microscope.pixel_size_um,
+            )
+        )
+        axes = tuple(
+            (np.arange(n) - (n - 1) / 2) * step
+            for n, step in zip(shape, spacing, strict=True)
+        )
+        dose = forward_model(
+            scene.density,
+            Acquisition(
+                scene.axes,
+                shape,
+                geometry="cartesian",
+                camera_photon_budget=(10000, 30),
+                output="object",
+            ),
+            microscope,
+        )
+        images, means = [], []
+        for index, displacement in enumerate((np.zeros(3), np.array(applied_shift))):
+            sensor_axes = tuple(
+                axis - shift * step
+                for axis, shift, step in zip(axes, displacement, spacing, strict=True)
+            )
+            mean = forward_model(
+                dose,
+                Acquisition(
+                    scene.axes,
+                    shape,
+                    sensor_axes=sensor_axes,
+                    geometry="cartesian",
+                    output="expectation",
+                ),
+                microscope,
+            )
+            means.append(mean)
+            images.append(
+                digitize(mean, microscope.camera, seed=42 + index).astype(np.float32)
+            )
+        return SimpleNamespace(
+            images=tuple(images),
+            means=tuple(means),
+            expected=-np.array(applied_shift),
+            ground_truth=scene,
+            microscope=microscope,
+        )
+
+    return render
+
+
+@pytest.fixture(scope="session")
 def optical_setup(microscope_parameters):
     """Share one calibrated PSF between profiles, operators and optical specimens."""
     microscope = replace(
@@ -217,16 +286,54 @@ def rayleigh_pair(request, optical_setup):
 
 
 @pytest.fixture(scope="session")
-def planar_point_model():
+def ideal_photon_camera(camera_calibration):
+    """Use the shared camera digitizer for ideal, unsigned photon observations."""
+    return replace(
+        camera_calibration, read_noise_e=0, electrons_per_adu=1, offset_adu=0
+    )
+
+
+@pytest.fixture(scope="session")
+def planar_point_model(optical_setup):
     """Return two known emitters and the normalized central YX PSF used to blur them."""
-    y, x = np.mgrid[-3:4, -3:4]
-    central = np.exp(-(y**2 + x**2) / 8).astype(np.float32)
+    central = optical_setup.psf[optical_setup.psf.shape[0] // 2].copy()
     central /= central.sum()
     psf = np.stack((np.ones_like(central), central * 7, np.ones_like(central) * 100))
-    truth = np.zeros((41, 43), np.float32)
-    truth[12, 13] = 2000
-    truth[28, 30] = 3000
+    density = np.zeros((3, 41, 43), np.float32)
+    axes = tuple(np.arange(n, dtype=float) for n in density.shape)
+    deposit_point(density, axes, (13, 12, 1), 2000)
+    deposit_point(density, axes, (30, 28, 1), 3000)
+    truth = density[1]
     return truth, central, psf
+
+
+@pytest.fixture(scope="session")
+def point_response_model(optical_setup):
+    """Share known point counts and a finite, sampled physical response kernel.
+
+    This discrete detector-operator unit conditions the production optical PSF
+    on its declared five-by-seven-by-seven support before normalizing mass.
+    Full optical acquisition accuracy is exercised by the forward-model cases.
+    """
+    from scipy import ndimage
+
+    radii = (2, 3, 3)
+    center = np.array(optical_setup.psf.shape) // 2
+    selection = tuple(
+        slice(c - r, c + r + 1) for c, r in zip(center, radii, strict=True)
+    )
+    psf = optical_setup.psf[selection].copy()
+    psf /= psf.sum()
+    truth = np.zeros((9, 35, 37), np.float32)
+    axes = tuple(np.arange(n, dtype=float) for n in truth.shape)
+    points = ((3, 10, 10), (6, 25, 27))
+    for point, count in zip(points, (20000, 30000), strict=True):
+        deposit_point(truth, axes, point[::-1], count)
+    response = np.broadcast_to(np.linspace(0.25, 2, 37, dtype=np.float32), (35, 37))
+    expectation = response * (ndimage.convolve(truth, psf, mode="reflect") + 0.25)
+    return SimpleNamespace(
+        truth=truth, psf=psf, response=response, expectation=expectation, points=points
+    )
 
 
 @pytest.fixture

@@ -1,6 +1,6 @@
 """Depth gains are shared across XY fields and fitted separately per channel."""
 
-from types import SimpleNamespace
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -27,10 +27,11 @@ def test_depth_gain_fit_is_robust_and_anchors_unobserved_depths():
 
 def test_normalization_matches_depths_and_preserves_xy_brightness(
     fusion_operator,
+    registration_scene,
+    acquisition_metadata,
 ):
     """Invert known Beer attenuation while preserving threefold XY contrast."""
-    rng = np.random.default_rng(31)
-    specimen = rng.uniform(100, 1000, (24, 64, 64)).astype(np.float32)
+    specimen = registration_scene((24, 64, 64), seed=31).raw.astype(np.float32)
     arrays = []
     attenuation_per_um = np.log((2.0, 4.0)) / 8.0
     for depth, xy_gain in ((0, 1), (0, 3), (1, 1), (1, 3)):
@@ -45,8 +46,9 @@ def test_normalization_matches_depths_and_preserves_xy_brightness(
         arrays.append(channels)
     fusion = fusion_operator(
         TileFusion,
-        acquisition=SimpleNamespace(
-            stage_positions_zxy=[(0, 0, 0), (0, 0, 100), (8, 0, 0), (8, 0, 100)]
+        acquisition=replace(
+            acquisition_metadata,
+            stage_positions_zxy=[(0, 0, 0), (0, 0, 100), (8, 0, 0), (8, 0, 100)],
         ),
         _tile_positions=[(0, 0, 0), (0, 0, 100), (8, 0, 0), (8, 0, 100)],
         _tile_source_position_indices=list(range(4)),

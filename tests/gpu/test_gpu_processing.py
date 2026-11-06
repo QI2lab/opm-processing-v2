@@ -16,6 +16,7 @@ import numpy as np
 import pytest
 from scipy import ndimage
 
+from tests.simulation.camera import digitize
 from tests.simulation.metrics import (
     predictive_deviance,
 )
@@ -54,12 +55,11 @@ def test_orthogonal_camera_pairs_recover_known_stage_errors(
     np.testing.assert_array_equal(np.rint(np.asarray(shift) * sampling), pair.expected)
 
 
-def test_fft_convolution_matches_direct_reference(cupy_gpu):
+def test_fft_convolution_matches_direct_reference(cupy_gpu, registration_scene):
     """Exercise cuFFT and validate all voxels against direct convolution."""
     cp = cupy_gpu
     rlgc = importlib.import_module("opm_processing.imageprocessing.rlgc")
-    rng = np.random.default_rng(8)
-    image = rng.normal(size=(6, 8, 10)).astype(np.float32)
+    image = registration_scene((6, 8, 10), seed=8).raw.astype(np.float32)
     psf = np.zeros((3, 3, 3), dtype=np.float32)
     psf[1, 1, 1] = 5
     psf[0, 1, 1] = 2
@@ -116,7 +116,9 @@ def test_kld_matches_independent_probability_definition(
 
 
 @pytest.mark.parametrize("applied_shift", ((1.0, -2.0, 3.0), (0.6, -2.3, 3.4)))
-def test_gpu_registration_recovers_known_3d_translation(cupy_gpu, applied_shift):
+def test_gpu_registration_recovers_known_3d_translation(
+    cupy_gpu, registration_scene, applied_shift
+):
     """Recover integer and fractional translations using cuCIM and CUDA SSIM."""
     cp = cupy_gpu
     try:
@@ -128,11 +130,7 @@ def test_gpu_registration_recovers_known_3d_translation(cupy_gpu, applied_shift)
     if not tilefusion.USING_GPU or tilefusion.xp is not cp:
         pytest.fail("TileFusion silently selected its CPU registration backend")
 
-    rng = np.random.default_rng(22)
-    fixed = ndimage.gaussian_filter(
-        rng.normal(size=(11, 39, 43)).astype(np.float32),
-        sigma=(0.8, 1.2, 1.2),
-    )
+    fixed = registration_scene((11, 39, 43), seed=22).raw.astype(np.float32)
     applied_shift = np.array(applied_shift, dtype=np.float32)
     if np.any(applied_shift != np.rint(applied_shift)):
         # The Fourier shift defines an exact periodic fractional translation;
@@ -154,11 +152,29 @@ def test_gpu_registration_recovers_known_3d_translation(cupy_gpu, applied_shift)
     )
 
     recovered, score = tilefusion.TileFusion.register_and_score(
-        fixed, moving, win_size=5
+        fixed, moving, win_size=5, max_shift=(2, 4, 5)
     )
 
     np.testing.assert_allclose(recovered, -applied_shift, atol=0.15)
     assert score > unregistered_score
+
+
+@pytest.mark.parametrize("applied_shift", ((1.0, -2.0, 3.0), (0.6, -2.3, 3.4)))
+def test_unbounded_registration_recovers_displaced_physical_observations(
+    cupy_gpu, physical_translation_pair, applied_shift
+):
+    """Register independently exposed, aperiodic points without a displacement prior."""
+    tilefusion = importlib.import_module("opm_processing.imageprocessing.tilefusion")
+    pair = physical_translation_pair(applied_shift)
+    fixed, moving = pair.images
+    unregistered = tilefusion._ssim(
+        cupy_gpu.asarray(fixed), cupy_gpu.asarray(moving), 5
+    )
+    measured, score = tilefusion.TileFusion.register_and_score(
+        fixed, moving, win_size=5
+    )
+    np.testing.assert_allclose(measured, pair.expected, atol=0.15)
+    assert score > unregistered
 
 
 @pytest.mark.parametrize("crop_scan", [None, 1, 2, 0, -1, 1.5, True])
@@ -211,16 +227,16 @@ def test_rlgc_empty_image_remains_empty(
 
 @pytest.mark.parametrize("singleton_z", [False, True])
 def test_rlgc_2d_recovers_points_using_central_psf(
-    cupy_gpu, planar_point_model, singleton_z
+    cupy_gpu, planar_point_model, ideal_photon_camera, singleton_z
 ):
     """Run the real wrapper and solver against independently blurred YX truth."""
     rlgc = importlib.import_module("opm_processing.imageprocessing.rlgc")
     truth, central, skewed_psf = planar_point_model
-    observed = (
-        np.random.default_rng(31)
-        .poisson(ndimage.convolve(truth, central, mode="reflect") + 0.25)
-        .astype(np.float32)
-    )
+    observed = digitize(
+        ndimage.convolve(truth, central, mode="reflect") + 0.25,
+        ideal_photon_camera,
+        seed=31,
+    ).astype(np.float32)
     if singleton_z:
         observed = observed[None]
         truth = truth[None]

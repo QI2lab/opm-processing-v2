@@ -4,7 +4,6 @@ from dataclasses import replace
 
 import numpy as np
 import pytest
-from scipy.ndimage import gaussian_filter
 
 from opm_processing.dataio.acquisition import inspect_acquisition
 from opm_processing.imageprocessing.opmtools import deskew_shape_estimator
@@ -89,11 +88,14 @@ def test_orthogonal_camera_pairs_recover_known_stage_errors(
     ],
 )
 def test_empty_or_uninformative_overlap_is_rejected_before_histogram_matching(
-    shape, blank_side, level
+    registration_scene, shape, blank_side, level
 ):
     """Reject empty or featureless overlaps before histogram matching."""
-    rng = np.random.default_rng(292)
-    fixed = rng.uniform(100, 1000, shape).astype(np.float32)
+    fixed = registration_scene((1, *shape) if len(shape) == 2 else shape).raw.astype(
+        np.float32
+    )
+    if len(shape) == 2:
+        fixed = fixed[0]
     moving = fixed.copy()
     if blank_side in ("fixed", "both"):
         fixed.fill(level)
@@ -107,11 +109,12 @@ def test_empty_or_uninformative_overlap_is_rejected_before_histogram_matching(
 
 @pytest.mark.parametrize("ramp_in_fixed", [False, True])
 def test_zero_energy_directional_edges_keep_valid_intensity_registration(
+    registration_scene,
     ramp_in_fixed,
 ):
     """Retain valid intensity registration when directional edges have zero energy."""
-    rng = np.random.default_rng(293)
-    fixed = np.broadcast_to(rng.uniform(100, 1000, (25, 31)), (7, 25, 31)).copy()
+    plane = registration_scene((1, 25, 31)).raw[0]
+    fixed = np.broadcast_to(plane, (7, 25, 31)).astype(np.float32).copy()
     moving = np.roll(fixed, 3, axis=2).astype(np.float32)
     if ramp_in_fixed:
         fixed += 2 * np.arange(7)[:, None, None]
@@ -129,7 +132,6 @@ def test_zero_energy_directional_edges_keep_valid_intensity_registration(
 
 
 def test_stage_grid_allows_depth_footprint_drift_and_preserves_overlap():
-    # Independent dimensions and spacing from the failed four-depth stage scan.
     """Check geometric drift bounds against independent stage-grid dimensions."""
     positions = np.asarray(
         [(-z, -y, x) for z in (0, 11.76) for y in (0, 642.28) for x in (0, 183.89)]
@@ -222,11 +224,10 @@ def test_recorded_overlap_changes_allowance_without_changing_pair_geometry():
 
 def test_recorded_depth_overlap_recovers_lateral_pair_beyond_old_z_budget(
     registration_pair,
+    registration_scene,
 ):
     """Recover independent slab sampling with a nine-pixel axial stage error."""
-    truth = gaussian_filter(
-        np.random.default_rng(186).uniform(100, 1000, (80, 96, 160)), (3, 2, 2)
-    ).astype(np.float32)
+    truth = registration_scene((80, 96, 160), seed=186).raw.astype(np.float32)
     volumes = [truth[:64, :, :96], truth[9:73, :, 64:160]]
     positions = [(0, 0, 0), (0, 0, 60)]
     limits = _infer_registration_limits(
@@ -283,8 +284,6 @@ def test_no_registration_limits_for_missing_or_disjoint_tiles():
 def test_inferred_depth_limits_recover_or_reject_measured_drift(
     registration_pair, shifted_slab_pair, drift
 ):
-    # A fixed random specimen sampled by two slabs with an independently
-    # imposed Y displacement, including one outside the geometric allowance.
     """Recover a known slab displacement and reject drift beyond geometric bounds."""
     pair = shifted_slab_pair((64, 512, 64), 51, (0, -drift, 0))
     fusion = registration_pair(pair.volumes, pair.positions)
@@ -348,27 +347,39 @@ def test_aligned_registration_views_preserve_fractional_translation(offsets):
 
 
 @pytest.mark.parametrize("uniform", (True, False))
-def test_context_rejects_background_without_matching_specimen(uniform):
+def test_context_rejects_background_without_matching_specimen(
+    uniform, camera_calibration
+):
     """Similar background levels must not manufacture a depth match."""
-    rng = np.random.default_rng(913)
+    from tests.simulation.camera import digitize
+
     fields = [np.full((25, 48, 40), 1000, np.float32) for _ in range(2)]
     if not uniform:
-        for field in fields:
-            field += gaussian_filter(rng.normal(0, 5, field.shape), 1)
+        camera = replace(camera_calibration, electrons_per_adu=100, offset_adu=0)
+        fields = [
+            digitize(field * 100, camera, seed=seed).astype(np.float32)
+            for seed, field in enumerate(fields)
+        ]
     masks = tuple(np.ones_like(field) for field in fields)
     _, score = _refine_depth_candidate(*fields, masks, 12, (0, 0), 9, 7)
     assert not np.isfinite(score)
 
 
 @pytest.mark.parametrize("noise", [0.0, 0.3])
-def test_high_ssim_shared_xy_background_cannot_establish_a_z_registration(noise):
+def test_high_ssim_shared_xy_background_cannot_establish_a_z_registration(
+    noise, registration_scene, camera_calibration
+):
     """Shared shading can have almost perfect SSIM without shared axial features."""
-    rng = np.random.default_rng(297)
-    background = gaussian_filter(rng.uniform(100, 1000, (48, 40)), 2)
+    from tests.simulation.camera import digitize
+
+    background = registration_scene((1, 48, 40)).raw[0]
     fixed = np.broadcast_to(background, (48, 48, 40)).copy()
     moving = fixed.copy()
-    fixed += rng.normal(0, noise, fixed.shape)
-    moving += rng.normal(0, noise, moving.shape)
+    if noise:
+        dose = float(background.mean() / noise**2)
+        camera = replace(camera_calibration, electrons_per_adu=dose, offset_adu=0)
+        fixed = digitize(fixed * dose, camera, seed=297)
+        moving = digitize(moving * dose, camera, seed=298)
     fixed, moving = fixed.astype(np.float32), moving.astype(np.float32)
     assert _ssim(fixed, moving, 7) > 0.99
     masks = (np.ones_like(fixed), np.ones_like(moving))
@@ -387,10 +398,11 @@ def test_identical_line_crops_preserve_zero_displacement():
     assert score == pytest.approx(1, abs=1e-6)
 
 
-def test_similarity_scores_common_geometric_support_and_rejects_unrelated_signal():
+def test_similarity_scores_common_geometric_support_and_rejects_unrelated_signal(
+    registration_scene,
+):
     """Exclude opposing wedge padding while retaining an independent mismatch check."""
-    rng = np.random.default_rng(38)
-    truth = rng.uniform(0, 1000, (21, 45, 37)).astype(np.float32)
+    truth = registration_scene((21, 45, 37), seed=38).raw.astype(np.float32)
     truth[:, 23:26, 17:20] = 0  # Supported dark specimen pixels remain eligible.
     z, y, _x = np.indices(truth.shape)
     fixed_support = y >= z
@@ -400,20 +412,21 @@ def test_similarity_scores_common_geometric_support_and_rejects_unrelated_signal
     moving = np.asarray(truth * moving_support)
     assert _ssim(fixed, moving, 7) < 0.7
     assert _ssim(fixed, moving, 7, valid_mask=common) == pytest.approx(1, abs=1e-6)
-    unrelated = np.asarray(rng.uniform(0, 1000, truth.shape).astype(np.float32))
+    unrelated = registration_scene(truth.shape, seed=39).raw.astype(np.float32)
     assert _ssim(fixed, unrelated, 7, valid_mask=common) < 0.7
 
 
 @pytest.mark.parametrize("unrelated", (False, True))
-def test_thin_depth_registration_scores_only_common_planes(unrelated):
+def test_thin_depth_registration_scores_only_common_planes(
+    unrelated, registration_scene
+):
     """Use matched XY samples when geometric gaps prevent a 3D SSIM window."""
-    rng = np.random.default_rng(83)
-    truth = gaussian_filter(rng.uniform(0, 1000, (5, 45, 37)), (0, 1, 1))
+    truth = registration_scene((5, 45, 37), seed=83).raw.astype(np.float32)
     support = np.zeros(truth.shape, bool)
     support[[0, 2, 4], 4:-4, 4:-4] = True
     fixed = np.asarray(truth.astype(np.float32))
     moving = np.asarray(
-        gaussian_filter(rng.uniform(0, 1000, truth.shape), (0, 1, 1)).astype(np.float32)
+        registration_scene(truth.shape, seed=84).raw.astype(np.float32)
         if unrelated
         else truth.astype(np.float32)
     )

@@ -1,5 +1,8 @@
 """Numerical and storage-boundary unit tests for tile fusion."""
 
+import math
+from itertools import combinations
+
 import numpy as np
 import pytest
 import tensorstore as ts
@@ -15,10 +18,11 @@ pytestmark = pytest.mark.unit
 
 
 @pytest.mark.parametrize("half_width", [1, 3, 5])
-def test_registration_similarity_uses_acquired_window_support(half_width):
+def test_registration_similarity_uses_acquired_window_support(
+    half_width, registration_scene
+):
     """Identical oblique samples have unit similarity only with a valid window."""
-    rng = np.random.default_rng(321)
-    image = rng.uniform(10, 100, size=(17, 19, 21)).astype(np.float32)
+    image = registration_scene((17, 19, 21), seed=321).raw.astype(np.float32)
     z, y, _ = np.indices(image.shape)
     mask = np.abs(z - y) < half_width
     score = tilefusion_module._registration_similarity(
@@ -98,9 +102,16 @@ def test_uint16_weighted_fusion_preserves_integer_boundary_rounding() -> None:
     profile = np.linspace(0.1, 1, 128, dtype=np.float32)
     accumulated = np.zeros((1, 1, 1, 1), np.float32)
     weights = np.zeros_like(accumulated)
-    expected_sum = np.float32(0)
-    expected_weight = np.float32(0)
-    for photon_count, x_weight in ((272, profile[73]), (2690, profile[9])):
+    photon_counts = (272, 2690)
+    x_weights = (profile[73], profile[9])
+    feathers = [np.float32(np.float32(0.1) * profile[24]) * x for x in x_weights]
+    expected_sum = np.float32(
+        math.fsum(
+            float(a) * float(w) for a, w in zip(photon_counts, feathers, strict=True)
+        )
+    )
+    expected_weight = np.float32(math.fsum(map(float, feathers)))
+    for photon_count, x_weight in zip(photon_counts, x_weights, strict=True):
         source = np.full(accumulated.shape, photon_count, np.uint16)
         tilefusion_module._accumulate_tile_block(
             accumulated,
@@ -115,11 +126,6 @@ def test_uint16_weighted_fusion_preserves_integer_boundary_rounding() -> None:
             0,
             0,
         )
-        feather = np.float32(np.float32(0.1) * profile[24]) * x_weight
-        expected_sum = np.float32(
-            np.float64(expected_sum) + np.float64(photon_count) * np.float64(feather)
-        )
-        expected_weight = np.float32(expected_weight + feather)
         np.testing.assert_array_equal(source, photon_count)
     np.testing.assert_array_equal(accumulated, expected_sum)
     np.testing.assert_array_equal(weights, expected_weight)
@@ -236,12 +242,8 @@ def test_registration_pairs_include_every_physical_overlap() -> None:
         pixel_size_zyx=(1.0, 1.0, 1.0),
     )
 
-    expected = {
-        (i, j)
-        for i in range(len(positions))
-        for j in range(i + 1, len(positions))
-        if np.all(np.abs(np.asarray(positions[j]) - np.asarray(positions[i])) < 10.0)
-    }
+    # All eight length-ten boxes share the central [8,10]^3 cube.
+    expected = set(combinations(range(8), 2))
     assert set(pairs) == expected
 
 

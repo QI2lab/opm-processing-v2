@@ -105,6 +105,7 @@ def test_native_gc_directional_rayleigh_pair(
     factor,
     camera_mode,
     camera_calibration,
+    ideal_photon_camera,
 ):
     """Resolve noisy pairs placed at the directional optical first-minimum spacing."""
     case = rayleigh_pair
@@ -120,7 +121,9 @@ def test_native_gc_directional_rayleigh_pair(
             0,
         )
     else:
-        observed = np.random.default_rng(31).poisson(expectation).astype(np.float32)
+        observed = digitize(expectation, ideal_photon_camera, seed=31).astype(
+            np.float32
+        )
         calibrated = observed
     recovered = reconstruct(
         calibrated,
@@ -170,7 +173,7 @@ def test_native_gc_directional_rayleigh_pair(
 @pytest.mark.parametrize("factor", [1, 3, 4])
 @pytest.mark.parametrize("crop_scan", [None, 5])
 def test_optical_forward_adjoint_matches_scipy(
-    cupy_gpu, optical_setup, factor, crop_scan
+    cupy_gpu, optical_setup, registration_scene, factor, crop_scan
 ):
     """Check the actual optical operator against independent CPU convolution."""
     cp = cupy_gpu
@@ -181,9 +184,8 @@ def test_optical_forward_adjoint_matches_scipy(
     psf /= psf.sum()
     shape = (31, 17, 19)
     selection = (slice(None, None, factor), slice(None), slice(None))
-    rng = np.random.default_rng(34)
-    obj = rng.uniform(1, 10, shape).astype(np.float32)
-    measured = rng.uniform(1, 10, obj[selection].shape).astype(np.float32)
+    obj = registration_scene(shape, seed=34).raw.astype(np.float32)
+    measured = registration_scene(obj[selection].shape, seed=35).raw.astype(np.float32)
     pads = solver._linear_fft_pad_width(shape, psf.shape)
     padded_shape = tuple(n + sum(p) for n, p in zip(shape, pads, strict=False))
     core = solver._observed_region_slices(padded_shape, pads)
