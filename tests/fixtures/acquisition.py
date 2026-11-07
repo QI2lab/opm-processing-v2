@@ -151,9 +151,7 @@ def write_synthetic_acquisition_zarr(
 @pytest.fixture
 def opm_v2_projection_zarr(request, simulated_camera, opm_v2_acquisition_factory):
     """Simulate spectral/time observations and persist them with OpmDataHandler."""
-    from tests.simulation.camera import digitize
-
-    mode, response = getattr(request, "param", ("projection", 1.0))
+    mode, illumination_factor = getattr(request, "param", ("projection", 1.0))
     shape = (2, 1, 2, 16, 18)
     raw_data = np.empty(shape, dtype=np.uint16)
     expectation = np.empty(shape, dtype=np.float64)
@@ -163,19 +161,21 @@ def opm_v2_projection_zarr(request, simulated_camera, opm_v2_acquisition_factory
             observation = simulated_camera(
                 (1, *shape[-2:]),
                 geometry="cartesian",
-                exposure=1 + time / 4 + channel / 2,
+                # Uniform excitation scales the emission dose before optics
+                # and detection; this factor does not change detector QE.
+                exposure=(1 + time / 4 + channel / 2) * illumination_factor,
                 seed=42 + 100 * time + channel,
                 # A prescribed calibration dose supports absolute camera-noise
                 # accuracy without clipping the ADC, including doubled exposure.
                 budget=(1000, 2000),
             )
-            source_expectation[time, 0, channel] = observation.expectation[0]
-            expectation[time, 0, channel] = observation.expectation[0] * response
-            raw_data[time, 0, channel] = digitize(
-                expectation[time, 0, channel],
-                observation.microscope.camera,
-                seed=42 + 100 * time + channel,
+            # The prescribed input factor fixes the reference-illumination
+            # photon dose independently of the saved flatfield or processing.
+            source_expectation[time, 0, channel] = (
+                observation.expectation[0] / illumination_factor
             )
+            expectation[time, 0, channel] = observation.expectation[0]
+            raw_data[time, 0, channel] = observation.raw[0]
     assert expectation.min() >= 1000
     assert raw_data.max() < np.iinfo(np.uint16).max
     dataset = opm_v2_acquisition_factory(

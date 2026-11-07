@@ -347,7 +347,7 @@ def live_wait_case(
     field_path = tmp_path / "sample_flatfield.ome.tif"
     if kind == "cached":
         processing.write_flatfield(
-            field_path, np.full((1, 1, *raw.shape[-2:]), 2, np.float32), 0.115
+            field_path, np.ones((1, 1, *raw.shape[-2:]), np.float32), 0.115
         )
     completed_log = log.read_bytes()
     if kind == "estimate":

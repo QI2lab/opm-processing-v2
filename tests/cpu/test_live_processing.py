@@ -234,7 +234,7 @@ def test_live_processing_preserves_original_optical_emitters(
     dataset = opm_v2_live_acquisition_factory(
         raw,
         name="live",
-        illumination=np.full((1, 32, 32), 2.0, np.float32),
+        illumination=np.ones((1, 32, 32), np.float32),
         camera_conversion=1.0,
     )
     root = relocate_acquisition(tmp_path, copy=save_float32)
@@ -253,9 +253,7 @@ def test_live_processing_preserves_original_optical_emitters(
         # Offline live-wait finds the supplied field in the current directory.
         field = root / "live_flatfield.ome.tif"
         processing = importlib.import_module("opm_processing.process")
-        processing.write_flatfield(
-            field, np.full((1, 1, 32, 32), 2.0, np.float32), 0.115
-        )
+        processing.write_flatfield(field, np.ones((1, 1, 32, 32), np.float32), 0.115)
         args.extend(("--live-wait", "--flatfield-correction"))
     if save_float32:
         args.append("--save-float32")
@@ -273,7 +271,6 @@ def test_live_processing_preserves_original_optical_emitters(
         stage_anchor + output.spatial_origins_zyx_um[0],
         output.voxel_size_um,
         raw_origin=(-30.0, -102.8, 200.0),
-        illumination=2.0,
     )
     assert output.spatial_origins_zyx_um[0] == (0.0, -2.8, 0.0)
     state = ProcessingState.read(root / "live.processing.json")

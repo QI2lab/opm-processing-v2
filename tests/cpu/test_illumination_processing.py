@@ -12,6 +12,11 @@ from opm_processing.dataio.live import read_lifecycle_event
 from opm_processing.dataio.position_collection import open_position_collection
 from opm_processing.imageprocessing.camera import camera_correct, illumination_correct
 from opm_processing.imageprocessing.flatfield import estimate_illuminations
+from tests.simulation.metrics import (
+    camera_flux_accuracy,
+    camera_noise_accuracy,
+    camera_partition_apertures,
+)
 
 
 @pytest.mark.integration
@@ -76,12 +81,16 @@ def test_processing_uses_existing_flatfield_with_separate_output(
     # neither raw counts nor a second processing pass supplies this truth.
     mean = acquisition.source_expectation[:, 0, :, 0]
     observations = saved[:, :, 0]
-    true_deviance = (2 * kl_div(observations, mean)).sum()
-    for incorrect_brightness in (0.5, 1.5):
-        assert (
-            true_deviance
-            < (2 * kl_div(observations, mean * incorrect_brightness)).sum()
-        )
+    camera = acquisition.microscope.camera
+    for time, channel in np.ndindex(mean.shape[:2]):
+        for aperture in camera_partition_apertures(mean.shape[-2:]):
+            accuracy = camera_noise_accuracy(
+                observations[time, channel], mean[time, channel], camera, aperture
+            )
+            assert accuracy.accepted, (time, channel, accuracy)
+            assert camera_flux_accuracy(
+                observations[time, channel], mean[time, channel], camera, aperture
+            ), (time, channel)
 
 
 @pytest.mark.unit
@@ -312,7 +321,7 @@ def test_live_wait_defers_processing_and_selects_flatfield(
         assert field is not None
         assert np.all(np.isfinite(field) & (field > 0))
         if case.kind == "cached":
-            np.testing.assert_array_equal(field, 2)
+            np.testing.assert_array_equal(field, 1)
     output = open_position_collection(case.destination / "sample_deskewed.ome.zarr")
     data = output.arrays[0].read().result()
     span = (case.raw.shape[-3] - 1) * case.scene.microscope.scan_step_um
