@@ -183,7 +183,6 @@ def test_native_gc_directional_rayleigh_pair(
         "predictive_deviance": predictive_deviance(recovered, expectation, psf),
         "baseline_deviance": predictive_deviance(baseline, expectation, psf),
     }
-    print(metrics)
     assert np.isfinite(recovered).all() and recovered.min() >= 0
     assert metrics["predictive_deviance"] < metrics["baseline_deviance"], metrics
     # Sparse scans need not preserve the information required by the Rayleigh
