@@ -14,6 +14,9 @@ from opm_processing.imageprocessing.tilefusion import (
     _refine_depth_candidate,
     _ssim,
 )
+from tests.registration import (
+    test_orthogonal_camera_pairs_recover_known_stage_errors as test_orthogonal_camera_pairs_recover_known_stage_errors,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -47,32 +50,6 @@ def test_recorded_overlap_uses_deskewed_voxel_spacing(
     allowance_um = limits[0, 1][0] * spacing[0]
     assert 2.944 <= allowance_um < 2.944 + spacing[0]
     assert limits[0, 1][0] == {1: 26, 2: 13, 4: 7}[z_downsample]
-
-
-@pytest.mark.parametrize("sampling", [(1, 1, 1), (1, 2, 2)])
-def test_orthogonal_camera_pairs_recover_known_stage_errors(
-    orthogonal_registration_pair,
-    sampling,
-):
-    """Recover prescribed stage errors from independently formed oblique images."""
-    from skimage.measure import block_reduce
-
-    pair = orthogonal_registration_pair
-    fixed, moving = (
-        block_reduce(image, sampling, np.mean) for image in (pair.fixed, pair.moving)
-    )
-    masks = tuple(block_reduce(mask, sampling, np.min) for mask in pair.masks)
-    shift, score = TileFusion.register_and_score(
-        fixed,
-        moving,
-        3,
-        max_shift=np.array((2, 4, 4)) / sampling,
-        registration_axis=pair.axis,
-        shift_sampling=sampling,
-        support_masks=masks,
-    )
-    assert np.isfinite(score)
-    np.testing.assert_array_equal(np.rint(np.asarray(shift) * sampling), pair.expected)
 
 
 @pytest.mark.parametrize("shape", [(17, 19), (7, 17, 19)])

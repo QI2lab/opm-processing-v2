@@ -17,6 +17,9 @@ import pytest
 from scipy import ndimage
 from scipy.stats import entropy
 
+from tests.registration import (
+    test_orthogonal_camera_pairs_recover_known_stage_errors as test_orthogonal_camera_pairs_recover_known_stage_errors,
+)
 from tests.simulation.camera import digitize
 from tests.simulation.metrics import (
     camera_flux_accuracy,
@@ -24,38 +27,7 @@ from tests.simulation.metrics import (
     predictive_deviance,
 )
 
-pytestmark = pytest.mark.unit
-
-
-@pytest.mark.parametrize("sampling", [(1, 1, 1), (1, 2, 2)])
-def test_orthogonal_camera_pairs_recover_known_stage_errors(
-    cupy_gpu, orthogonal_registration_pair, sampling
-):
-    """Recover prescribed stage errors from independently formed oblique images."""
-    from cucim.skimage.measure import block_reduce
-
-    from opm_processing.imageprocessing.tilefusion import TileFusion
-
-    pair = orthogonal_registration_pair
-    fixed, moving = (
-        block_reduce(cupy_gpu.asarray(image), sampling, cupy_gpu.mean)
-        for image in (pair.fixed, pair.moving)
-    )
-    masks = tuple(
-        block_reduce(cupy_gpu.asarray(mask), sampling, cupy_gpu.min)
-        for mask in pair.masks
-    )
-    shift, score = TileFusion.register_and_score(
-        fixed,
-        moving,
-        3,
-        max_shift=np.array((2, 4, 4)) / sampling,
-        registration_axis=pair.axis,
-        shift_sampling=sampling,
-        support_masks=masks,
-    )
-    assert np.isfinite(score)
-    np.testing.assert_array_equal(np.rint(np.asarray(shift) * sampling), pair.expected)
+pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("cupy_gpu")]
 
 
 def test_fft_convolution_matches_direct_reference(cupy_gpu, registration_scene):
