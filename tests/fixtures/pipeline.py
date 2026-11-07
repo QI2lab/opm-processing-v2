@@ -30,9 +30,9 @@ class PipelineOpticalData:
 
     microscope: Microscope
     expectation: np.ndarray
-    source_expectation: np.ndarray
+    source_expectation: np.ndarray | None
     ground_truth: OpticalScene
-    source_density: np.ndarray
+    source_density: np.ndarray | None
 
 
 @pytest.fixture
@@ -532,8 +532,8 @@ def pipeline_optical_data(microscope_parameters, simulation_parameters):
     Returns
     -------
     callable
-        Return immutable camera means, source-only means and original optical truth
-        for a scan step, illumination selection and extended-mosaic flag.
+        Return immutable camera means and original optical truth, with source-only
+        fields for extended mosaics.
     """
 
     @lru_cache(maxsize=4)
@@ -570,13 +570,15 @@ def pipeline_optical_data(microscope_parameters, simulation_parameters):
             output="object",
         )
         dose = forward_model(scene.density, acquisition, microscope)
-        source = forward_model(
-            scene.density,
-            replace(acquisition, camera_photon_budget=(3000, 0)),
-            microscope,
-        )
         dose.setflags(write=False)
-        source.setflags(write=False)
+        source = None
+        if mosaic:
+            source = forward_model(
+                scene.density,
+                replace(acquisition, camera_photon_budget=(3000, 0)),
+                microscope,
+            )
+            source.setflags(write=False)
         return scene, dose, source
 
     @lru_cache(maxsize=6)
@@ -595,9 +597,11 @@ def pipeline_optical_data(microscope_parameters, simulation_parameters):
         )
         acquisition = Acquisition(scene.axes, shape, output="expectation")
         expected = forward_model(dose, acquisition, microscope)
-        source = forward_model(source_density, acquisition, microscope)
-        for array in (expected, source):
-            array.setflags(write=False)
+        expected.setflags(write=False)
+        source = None
+        if mosaic:
+            source = forward_model(source_density, acquisition, microscope)
+            source.setflags(write=False)
         return PipelineOpticalData(microscope, expected, source, scene, source_density)
 
     return create
@@ -735,7 +739,6 @@ def pipeline_case(
         microscope=microscope,
         support=geometry.support,
         expectation=expectation,
-        source_expectation=optical_data.source_expectation,
         optical_data=optical_data,
     )
 
