@@ -117,7 +117,7 @@ def independent_photon_scene_factory(microscope_parameters, simulation_parameter
 def simulated_camera(
     microscope_parameters, simulation_parameters, independent_photon_scene_factory
 ):
-    """Cache camera observations of the shared physical ground-truth objects.
+    """Cache optical means and draw independent camera observations per call.
 
     Returns
     -------
@@ -129,17 +129,16 @@ def simulated_camera(
     from tests.simulation.camera import digitize
 
     @lru_cache(maxsize=24)
-    def render(
+    def optical_data(
         shape,
         *,
         step=0.4,
         conversion=0.25,
         geometry="oblique",
         exposure=1.0,
-        seed=42,
         budget=None,
     ):
-        """Simulate optical formation before camera sampling and digitization."""
+        """Reuse immutable optical formation independently of detector noise."""
         scene = independent_photon_scene_factory()
         microscope = replace(
             microscope_parameters,
@@ -165,11 +164,32 @@ def simulated_camera(
             ),
             microscope,
         )
+        return scene, microscope, freeze_metadata(expectation)
+
+    def render(
+        shape,
+        *,
+        step=0.4,
+        conversion=0.25,
+        geometry="oblique",
+        exposure=1.0,
+        seed=42,
+        budget=None,
+    ):
+        """Digitize the shared optical means with the requested detector seed."""
+        scene, microscope, expectation = optical_data(
+            shape,
+            step=step,
+            conversion=conversion,
+            geometry=geometry,
+            exposure=exposure,
+            budget=budget,
+        )
         raw = digitize(expectation, microscope.camera, seed=seed)
         return CameraObservation(
             ground_truth=scene,
             microscope=microscope,
-            expectation=freeze_metadata(expectation),
+            expectation=expectation,
             raw=freeze_metadata(raw),
         )
 
@@ -186,8 +206,8 @@ def physical_translation_pair(independent_photon_scene_factory):
     from tests.simulation.camera import digitize
 
     @lru_cache(maxsize=4)
-    def render(applied_shift):
-        """Return two camera images with the prescribed subpixel physical shift."""
+    def optical_data(applied_shift):
+        """Reuse two immutable optical means at the prescribed physical shift."""
         scene = independent_photon_scene_factory("points")
         microscope = replace(scene.microscope, scan_step_um=0.23)
         shape = (31, 65, 65)
@@ -210,8 +230,8 @@ def physical_translation_pair(independent_photon_scene_factory):
             ),
             microscope,
         )
-        images = []
-        for index, displacement in enumerate((np.zeros(3), np.array(applied_shift))):
+        means = []
+        for displacement in (np.zeros(3), np.array(applied_shift)):
             sensor_axes = tuple(
                 axis - shift * step
                 for axis, shift, step in zip(axes, displacement, spacing, strict=True)
@@ -227,10 +247,21 @@ def physical_translation_pair(independent_photon_scene_factory):
                 ),
                 microscope,
             )
-            images.append(
-                digitize(mean, microscope.camera, seed=42 + index).astype(np.float32)
-            )
-        return (*freeze_metadata(images), freeze_metadata(-np.array(applied_shift)))
+            means.append(mean)
+        return (
+            microscope.camera,
+            freeze_metadata(means),
+            freeze_metadata(-np.array(applied_shift)),
+        )
+
+    def render(applied_shift):
+        """Draw independent detector samples for the prescribed translated pair."""
+        camera, means, expected = optical_data(applied_shift)
+        images = [
+            digitize(mean, camera, seed=42 + index).astype(np.float32)
+            for index, mean in enumerate(means)
+        ]
+        return (*freeze_metadata(images), expected)
 
     return render
 

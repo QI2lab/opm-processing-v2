@@ -292,8 +292,8 @@ def registration_scene(registration_specimen):
     from tests.simulation.scenes import freeze_metadata
 
     @lru_cache(maxsize=8)
-    def render(shape, *, seed=51):
-        """Return unsigned camera samples and the object that produced them."""
+    def optical_data(shape, *, seed=51):
+        """Reuse immutable landmark optics for the specified specimen seed."""
         scene = registration_specimen(shape, seed=seed)
         microscope = scene.microscope
         dose = forward_model(
@@ -312,11 +312,16 @@ def registration_scene(registration_specimen):
             Acquisition(scene.axes, shape, geometry="cartesian", output="expectation"),
             microscope,
         )
+        return scene, microscope, freeze_metadata(means)
+
+    def render(shape, *, seed=51):
+        """Draw unsigned camera samples without retaining detector realizations."""
+        scene, microscope, means = optical_data(shape, seed=seed)
         raw = digitize(means, microscope.camera, seed=seed)
         return CameraObservation(
             ground_truth=scene,
             microscope=microscope,
-            expectation=freeze_metadata(means),
+            expectation=means,
             raw=freeze_metadata(raw),
         )
 
