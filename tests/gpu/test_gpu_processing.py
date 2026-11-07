@@ -15,51 +15,26 @@ import importlib
 import numpy as np
 import pytest
 from scipy import ndimage
+from scipy.stats import entropy
 
+from tests.registration import (
+    test_orthogonal_camera_pairs_recover_known_stage_errors as test_orthogonal_camera_pairs_recover_known_stage_errors,
+)
+from tests.simulation.camera import digitize
 from tests.simulation.metrics import (
+    camera_flux_accuracy,
+    camera_prediction,
     predictive_deviance,
 )
 
-pytestmark = pytest.mark.unit
+pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("cupy_gpu")]
 
 
-@pytest.mark.parametrize("sampling", [(1, 1, 1), (1, 2, 2)])
-def test_orthogonal_camera_pairs_recover_known_stage_errors(
-    cupy_gpu, orthogonal_registration_pair, sampling
-):
-    """Recover prescribed stage errors from independently formed oblique images."""
-    from cucim.skimage.measure import block_reduce
-
-    from opm_processing.imageprocessing.tilefusion import TileFusion
-
-    pair = orthogonal_registration_pair
-    fixed, moving = (
-        block_reduce(cupy_gpu.asarray(image), sampling, cupy_gpu.mean)
-        for image in (pair.fixed, pair.moving)
-    )
-    masks = tuple(
-        block_reduce(cupy_gpu.asarray(mask), sampling, cupy_gpu.min)
-        for mask in pair.masks
-    )
-    shift, score = TileFusion.register_and_score(
-        fixed,
-        moving,
-        3,
-        max_shift=np.array((2, 4, 4)) / sampling,
-        registration_axis=pair.axis,
-        shift_sampling=sampling,
-        support_masks=masks,
-    )
-    assert np.isfinite(score)
-    np.testing.assert_array_equal(np.rint(np.asarray(shift) * sampling), pair.expected)
-
-
-def test_fft_convolution_matches_direct_reference(cupy_gpu):
+def test_fft_convolution_matches_direct_reference(cupy_gpu, registration_scene):
     """Exercise cuFFT and validate all voxels against direct convolution."""
     cp = cupy_gpu
     rlgc = importlib.import_module("opm_processing.imageprocessing.rlgc")
-    rng = np.random.default_rng(8)
-    image = rng.normal(size=(6, 8, 10)).astype(np.float32)
+    image = registration_scene((6, 8, 10), seed=8).raw.astype(np.float32)
     psf = np.zeros((3, 3, 3), dtype=np.float32)
     psf[1, 1, 1] = 5
     psf[0, 1, 1] = 2
@@ -104,11 +79,10 @@ def test_kld_matches_independent_probability_definition(
     q = cp.asarray(q_values, dtype=cp.float32)
     scratch = cp.empty_like(p)
 
-    probability_p = np.asarray(p_values, dtype=np.float64) + 1e-4
-    probability_q = np.asarray(q_values, dtype=np.float64) + 1e-4
-    probability_p /= probability_p.sum()
-    probability_q /= probability_q.sum()
-    expected = np.sum(probability_p * np.log(probability_p / probability_q))
+    expected = entropy(
+        np.asarray(p_values, dtype=np.float64) + 1e-4,
+        np.asarray(q_values, dtype=np.float64) + 1e-4,
+    )
     actual = rlgc._kl_div_into(p, q, scratch)
     np.testing.assert_allclose(actual, expected, rtol=2e-6, atol=2e-6)
     np.testing.assert_array_equal(to_numpy(p), p_values)
@@ -116,8 +90,10 @@ def test_kld_matches_independent_probability_definition(
 
 
 @pytest.mark.parametrize("applied_shift", ((1.0, -2.0, 3.0), (0.6, -2.3, 3.4)))
-def test_gpu_registration_recovers_known_3d_translation(cupy_gpu, applied_shift):
-    """Recover integer and fractional translations using cuCIM and CUDA SSIM."""
+def test_exact_signal_registration_recovers_known_3d_translation(
+    cupy_gpu, registration_scene, applied_shift
+):
+    """Register noiseless optical means under declared exact signal transforms."""
     cp = cupy_gpu
     try:
         import cucim  # noqa: F401
@@ -128,11 +104,7 @@ def test_gpu_registration_recovers_known_3d_translation(cupy_gpu, applied_shift)
     if not tilefusion.USING_GPU or tilefusion.xp is not cp:
         pytest.fail("TileFusion silently selected its CPU registration backend")
 
-    rng = np.random.default_rng(22)
-    fixed = ndimage.gaussian_filter(
-        rng.normal(size=(11, 39, 43)).astype(np.float32),
-        sigma=(0.8, 1.2, 1.2),
-    )
+    fixed = registration_scene((11, 39, 43), seed=22).expectation.astype(np.float32)
     applied_shift = np.array(applied_shift, dtype=np.float32)
     if np.any(applied_shift != np.rint(applied_shift)):
         # The Fourier shift defines an exact periodic fractional translation;
@@ -154,21 +126,33 @@ def test_gpu_registration_recovers_known_3d_translation(cupy_gpu, applied_shift)
     )
 
     recovered, score = tilefusion.TileFusion.register_and_score(
-        fixed, moving, win_size=5
+        fixed, moving, win_size=5, max_shift=(2, 4, 5)
     )
 
     np.testing.assert_allclose(recovered, -applied_shift, atol=0.15)
     assert score > unregistered_score
 
 
-@pytest.mark.parametrize("crop_scan", [None, 1, 2, 0, -1, 1.5, True])
-@pytest.mark.parametrize(
-    "verbosity", [None, 0, 1], ids=["default", "no-diagnostics", "diagnostics"]
-)
-def test_rlgc_empty_image_remains_empty(
-    cupy_gpu, crop_scan, verbosity, capsys, monkeypatch
+@pytest.mark.parametrize("applied_shift", ((1.0, -2.0, 3.0), (0.6, -2.3, 3.4)))
+def test_unbounded_registration_recovers_displaced_physical_observations(
+    cupy_gpu, physical_translation_pair, applied_shift
 ):
-    """Preserve empty data and release solver state with opt-in diagnostics."""
+    """Register independently exposed, aperiodic points without a displacement prior."""
+    tilefusion = importlib.import_module("opm_processing.imageprocessing.tilefusion")
+    fixed, moving, expected = physical_translation_pair(applied_shift)
+    unregistered = tilefusion._ssim(
+        cupy_gpu.asarray(fixed), cupy_gpu.asarray(moving), 5
+    )
+    measured, score = tilefusion.TileFusion.register_and_score(
+        fixed, moving, win_size=5
+    )
+    np.testing.assert_allclose(measured, expected, atol=0.15)
+    assert score > unregistered
+
+
+@pytest.mark.parametrize("crop_scan", [None, 1, 2, 0, -1, 1.5, True])
+def test_rlgc_empty_image_remains_empty(cupy_gpu, crop_scan, monkeypatch):
+    """Preserve empty data and release solver state."""
     rlgc = importlib.import_module("opm_processing.imageprocessing.rlgc")
     clear = rlgc.clear_rlgc_caches
     cleanups = []
@@ -187,23 +171,9 @@ def test_rlgc_empty_image_remains_empty(
         with pytest.raises(ValueError, match="crop_scan must be a positive integer"):
             rlgc.rlgc(observed, psf, crop_scan=crop_scan)
         return
-    options = {} if verbosity is None else {"verbose": verbosity}
-    restored = rlgc.rlgc(observed, psf, crop_scan=crop_scan, **options)
+    restored = rlgc.rlgc(observed, psf, crop_scan=crop_scan)
     np.testing.assert_array_equal(restored, observed)
     assert len(cleanups) == 1
-    captured = capsys.readouterr()
-    assert not captured.out
-    assert ("decon:" in captured.err) == (crop_scan in (1, 2))
-    if verbosity:
-        assert "RLGC acquired_shape=" in captured.err
-        assert "iteration=" in captured.err
-        assert "stop=" in captured.err
-    else:
-        assert "RLGC acquired_shape=" not in captured.err
-        assert "iteration=" not in captured.err
-        assert "stop=" not in captured.err
-        if crop_scan is None:
-            assert not captured.err
     assert not rlgc._fft_cache_3d
     pool = cupy_gpu.get_default_memory_pool()
     assert pool.total_bytes() == pool.used_bytes()
@@ -211,16 +181,17 @@ def test_rlgc_empty_image_remains_empty(
 
 @pytest.mark.parametrize("singleton_z", [False, True])
 def test_rlgc_2d_recovers_points_using_central_psf(
-    cupy_gpu, planar_point_model, singleton_z
+    cupy_gpu, planar_point_model, ideal_photon_camera, singleton_z
 ):
     """Run the real wrapper and solver against independently blurred YX truth."""
     rlgc = importlib.import_module("opm_processing.imageprocessing.rlgc")
-    truth, central, skewed_psf = planar_point_model
-    observed = (
-        np.random.default_rng(31)
-        .poisson(ndimage.convolve(truth, central, mode="reflect") + 0.25)
-        .astype(np.float32)
-    )
+    case = planar_point_model
+    truth, central, skewed_psf = case.truth, case.central, case.psf
+    observed = digitize(
+        case.expectation,
+        ideal_photon_camera,
+        seed=31,
+    ).astype(np.float32)
     if singleton_z:
         observed = observed[None]
         truth = truth[None]
@@ -228,7 +199,7 @@ def test_rlgc_2d_recovers_points_using_central_psf(
     assert restored.shape == truth.shape
     assert restored.dtype == np.float32
     psf = central[None] if singleton_z else central
-    expectation = ndimage.convolve(truth, psf, mode="reflect") + 0.25
+    expectation = case.expectation[None] if singleton_z else case.expectation
     assert predictive_deviance(
         restored, expectation, psf, boundary="reflect"
     ) < predictive_deviance(observed, expectation, psf, boundary="reflect")
@@ -236,6 +207,18 @@ def test_rlgc_2d_recovers_points_using_central_psf(
         np.unravel_index(np.argmax(restored), restored.shape),
         np.unravel_index(np.argmax(truth), truth.shape),
     )
+    prediction = camera_prediction(restored, psf, boundary="reflect")
+    for aperture in case.apertures:
+        assert camera_flux_accuracy(
+            prediction, expectation, ideal_photon_camera, aperture
+        )
+    plane = restored[0] if singleton_z else restored
+    for point, field in zip(case.points, case.point_fields, strict=True):
+        candidates = np.where(field, plane, -np.inf)
+        peak = np.unravel_index(np.argmax(candidates), plane.shape)
+        # Localize both original emitters to one output sample, without a
+        # peak-dependent search window or fitted amplitude.
+        np.testing.assert_allclose(peak, point, rtol=0, atol=1)
 
 
 @pytest.mark.parametrize("scale", (0.01, 1, 1000))
@@ -243,20 +226,20 @@ def test_rlgc_2d_recovers_points_using_central_psf(
 def test_split_kl_scores_match_direct_probability_definition(
     cupy_gpu, scale, array_backend
 ):
-    """Lock MATLAB's prediction-to-split direction, normalization and pseudocount."""
+    """Check prescribed prediction-to-split relative entropy and pseudocount."""
     solver = importlib.import_module("opm_processing.imageprocessing.rlgc")
     xp = cupy_gpu if array_backend == "gpu" else np
     rng = np.random.default_rng(51)
     prediction = (rng.uniform(0, 30, (3, 5, 7)) * scale).astype(np.float32)
     prediction[0] = 0
     halves = [rng.poisson(3, prediction.shape).astype(np.float32) for _ in range(2)]
-    probability = prediction.astype(np.float64) + 1e-4
-    probability /= probability.sum()
-    expected = []
-    for half in halves:
-        target = half.astype(np.float64) + 1e-4
-        target /= target.sum()
-        expected.append(np.sum(probability * np.log(probability / target)))
+    expected = [
+        entropy(
+            (prediction.astype(np.float64) + 1e-4).ravel(),
+            (half.astype(np.float64) + 1e-4).ravel(),
+        )
+        for half in halves
+    ]
     actual = solver.split_kl_scores(
         *(xp.asarray(value) for value in (prediction, *halves)),
         xp.empty_like(xp.asarray(prediction)),

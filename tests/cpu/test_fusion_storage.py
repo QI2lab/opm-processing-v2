@@ -3,17 +3,19 @@
 import numpy as np
 import pytest
 from skimage.measure import block_reduce as block_reduce_cpu
-from typer.testing import CliRunner
 from yaozarrs import open_group, v05
 
 from opm_processing.dataio.position_collection import (
     open_image_array,
     open_position_collection,
 )
-from opm_processing.dataio.processing_state import ProcessingState
-from opm_processing.fuse import app as fuse_app
-from opm_processing.imageprocessing.maxtilefusion import MaxTileFusion
-from opm_processing.imageprocessing.tilefusion import TileFusion
+from opm_processing.dataio.processing_state import (
+    ProcessingState,
+)
+from opm_processing.imageprocessing.maxtilefusion import (
+    MaxTileFusion,
+    regenerate_fused_max_projection,
+)
 
 
 @pytest.mark.unit
@@ -48,7 +50,7 @@ def test_max_projection_fusion_writes_centered_multiscales_and_offsets(
     tmp_path,
     position_store_factory,
 ) -> None:
-    """Persist every fused max level with rounded physical coordinates."""
+    """Persist every fused max level with three-decimal micrometer metadata."""
     source = np.arange(64, dtype=np.uint16).reshape(1, 1, 1, 8, 8)
     output_path = tmp_path / "max_z_fused.ome.zarr"
     collection = position_store_factory(
@@ -128,7 +130,7 @@ def test_max_projection_fusion_writes_centered_multiscales_and_offsets(
     ),
 )
 def test_multiscale_storage_round_trip_matches_reference(
-    fusion_operator,
+    tile_fusion,
     tmp_path,
     downsample_method,
     is_2d,
@@ -136,28 +138,28 @@ def test_multiscale_storage_round_trip_matches_reference(
     dtype,
 ):
     """Reopen exact pyramid data and verify its common physical-space center."""
-    fusion = fusion_operator(
-        TileFusion,
-        padded_shape=padded_shape,
-        offset_um=(4.51234, -3.01234, 12.25123),
-        _pixel_size=(0.81234, 0.51234, 0.25123),
-        time_dim=1,
-        channels=1,
+    fusion = tile_fusion(
+        [np.zeros((2, *padded_shape), dtype)] * 2,
+        [(0, 0, 0)] * 2,
+        time_indices=(0, 1),
         multiscale_factors=(2, 4),
-        _is_2d=is_2d,
-        chunk_y=4,
-        chunk_x=4,
+        resolution_multiples=((1, 1, 1), (2, 2, 2), (4, 4, 4)),
+        chunk_shape_yx=(4, 4),
         multiscale_downsample=downsample_method,
-        _max_workers=2,
+        max_workers=2,
         fusion_ram_fraction=0.4,
         max_in_flight_writes=2,
-        _input_chunk_zyx=(2, 4, 4),
-        output_dtype=np.dtype(dtype),
     )
+    # These prescribed serializer inputs include deliberately anisotropic,
+    # sub-millipixel precision independent of the native acquisition fixture.
+    fusion.padded_shape = padded_shape
+    fusion.offset_um = (4.51234, -3.01234, 12.25123)
+    fusion._pixel_size = (0.81234, 0.51234, 0.25123)
+    assert fusion._is_2d == is_2d
 
-    path = tmp_path / "multiscale.ome.zarr"
+    path = tmp_path / "sample_fused.ome.zarr"
     scale0, fusion.write_block_shape = fusion._prepare_fused_image(path)
-    source_shape = (1, 1, *padded_shape)
+    source_shape = (2, 2, *padded_shape)
     source = np.arange(np.prod(source_shape), dtype=dtype).reshape(source_shape)
     if dtype == np.float32:
         source = source / 4 + np.float32(0.25)
@@ -171,52 +173,56 @@ def test_multiscale_storage_round_trip_matches_reference(
     assert [dataset.path for dataset in datasets] == ["0", "1", "2"]
 
     expected = source
-    rounded_offset = np.asarray([round(float(value), 3) for value in fusion.offset_um])
-    rounded_pixel_size = np.asarray(
+    recorded_offset = np.asarray([round(float(value), 3) for value in fusion.offset_um])
+    recorded_pixel_size = np.asarray(
         [round(float(value), 3) for value in fusion._pixel_size]
     )
     base_center = (
-        rounded_offset
-        + (np.asarray(padded_shape, dtype=np.float64) - 1.0) * rounded_pixel_size / 2.0
+        recorded_offset
+        + (np.asarray(padded_shape, dtype=np.float64) - 1.0) * recorded_pixel_size / 2.0
     )
     for absolute_factor, dataset in zip((1, 2, 4), datasets, strict=False):
         z_factor = 1 if is_2d else absolute_factor
         expected_scale = np.asarray(
-            [
-                round(float(value), 3)
-                for value in (
-                    1.0,
-                    1.0,
-                    rounded_pixel_size[0] * z_factor,
-                    rounded_pixel_size[1] * absolute_factor,
-                    rounded_pixel_size[2] * absolute_factor,
-                )
-            ]
+            (
+                1.0,
+                1.0,
+                recorded_pixel_size[0] * z_factor,
+                recorded_pixel_size[1] * absolute_factor,
+                recorded_pixel_size[2] * absolute_factor,
+            )
+        )
+        expected_scale = np.asarray(
+            [round(float(value), 3) for value in expected_scale]
         )
         center_shift = 0.5 if downsample_method == "block_mean" else 0.0
         expected_translation = np.asarray(
-            [
-                round(float(value), 3)
-                for value in (
-                    0.0,
-                    0.0,
-                    rounded_offset[0]
-                    + center_shift * (z_factor - 1) * rounded_pixel_size[0],
-                    rounded_offset[1]
-                    + center_shift * (absolute_factor - 1) * rounded_pixel_size[1],
-                    rounded_offset[2]
-                    + center_shift * (absolute_factor - 1) * rounded_pixel_size[2],
-                )
-            ]
+            (
+                0.0,
+                0.0,
+                recorded_offset[0]
+                + center_shift * (z_factor - 1) * recorded_pixel_size[0],
+                recorded_offset[1]
+                + center_shift * (absolute_factor - 1) * recorded_pixel_size[1],
+                recorded_offset[2]
+                + center_shift * (absolute_factor - 1) * recorded_pixel_size[2],
+            )
+        )
+        expected_translation = np.asarray(
+            [round(float(value), 3) for value in expected_translation]
         )
         np.testing.assert_allclose(
             dataset.scale_transform.scale,
             expected_scale,
+            rtol=0,
+            atol=1e-12,
         )
         assert dataset.translation_transform is not None
         np.testing.assert_allclose(
             dataset.translation_transform.translation,
             expected_translation,
+            rtol=0,
+            atol=1e-12,
         )
         reopened_array = reopened[dataset.path].to_tensorstore()
         assert np.dtype(reopened_array.dtype.numpy_dtype) == dtype
@@ -239,10 +245,12 @@ def test_multiscale_storage_round_trip_matches_reference(
             output_coordinate = np.asarray(
                 dataset.translation_transform.translation[-3:]
             ) + output_index * np.asarray(dataset.scale_transform.scale[-3:])
-            source_coordinate = rounded_offset + source_index * rounded_pixel_size
+            source_coordinate = recorded_offset + source_index * recorded_pixel_size
             np.testing.assert_allclose(
                 output_coordinate,
                 source_coordinate,
+                rtol=0,
+                atol=1e-12,
             )
 
         spatial_shape = np.asarray(reopened_array.shape[-3:], dtype=np.float64)
@@ -251,7 +259,7 @@ def test_multiscale_storage_round_trip_matches_reference(
             + (spatial_shape - 1.0) * expected_scale[-3:] / 2.0
         )
         if downsample_method == "block_mean":
-            np.testing.assert_allclose(physical_center, base_center, atol=0.002)
+            np.testing.assert_allclose(physical_center, base_center, rtol=0, atol=0.002)
 
         if dataset.path == "0":
             np.testing.assert_array_equal(
@@ -274,68 +282,49 @@ def test_multiscale_storage_round_trip_matches_reference(
             expected,
         )
 
-    assert not any(key.startswith("opm_") for key in reopened.attrs)
-
-
-@pytest.mark.unit
-def test_regenerate_max_z_flag_preserves_multiscale_pyramid_round_trip(
-    registered_projection_case,
-) -> None:
-    """All pyramid levels include photons from every full-resolution Z plane."""
-    case = registered_projection_case
-    result = CliRunner().invoke(
-        fuse_app,
-        [str(case.raw_path), "--regenerate-max-z", "--max-workers", "2"],
+    assert (
+        reopened.attrs["opm_processing_coordinates"]["version"]
+        == "stage-endpoint-origin-v1"
     )
-    assert result.exit_code == 0, result.output
-
-    reopened = open_group(case.output_path)
-    metadata = reopened.ome_metadata()
-    assert isinstance(metadata, v05.Image)
-    datasets = metadata.multiscales[0].datasets
-    assert [dataset.path for dataset in datasets] == ["0", "1"]
-    projection = case.truth.max(axis=2, keepdims=True)
-    for level, dataset in enumerate(datasets):
-        actual = reopened[dataset.path].to_tensorstore().read().result()
-        factor = 2**level
+    processed, state = fusion.data, fusion.processing_state
+    state.save_registration(processed, configuration={}, pairwise_metrics={})
+    state.complete_registration(processed, fused_path=path, tiles=())
+    projected = regenerate_fused_max_projection(
+        path, tmp_path / "sample_max_z_fused.ome.zarr", max_workers=2
+    )
+    projection = source.max(axis=2, keepdims=True)
+    result = open_group(projected)
+    projected_levels = result.ome_metadata().multiscales[0].datasets
+    assert [level.path for level in projected_levels] == ["0", "1", "2"]
+    for factor, original, level in zip(
+        (1, 2, 4), datasets, projected_levels, strict=True
+    ):
         expected = projection[..., ::factor, ::factor]
-        if case.downsample == "block_mean":
+        if downsample_method == "block_mean":
             expected = np.rint(
                 block_reduce_cpu(
-                    projection,
-                    block_size=(1, 1, 1, factor, factor),
-                    func=np.mean,
+                    projection, block_size=(1, 1, 1, factor, factor), func=np.mean
                 )
-            ).astype(case.truth.dtype)
-        np.testing.assert_array_equal(actual, expected)
-        expected_scale = [
-            case.scales[level][0],
-            case.scales[level][1],
-            *(round(value, 3) for value in case.scales[level][2:]),
-        ]
-        np.testing.assert_allclose(dataset.scale_transform.scale, expected_scale)
-        assert dataset.translation_transform is not None
-        expected_translation = [
-            case.translations[level][0],
-            case.translations[level][1],
-            *(round(value, 3) for value in case.translations[level][2:]),
-        ]
-        expected_translation[2] = (
-            case.translations[0][2]
-            + 0.5 * (case.truth.shape[2] - 1) * case.scales[0][2]
+            ).astype(dtype)
+        np.testing.assert_array_equal(
+            result[level.path].to_tensorstore().read().result(), expected
         )
-        expected_translation[2:] = [
-            round(value, 3) for value in expected_translation[2:]
-        ]
         np.testing.assert_allclose(
-            dataset.translation_transform.translation,
-            expected_translation,
+            level.scale_transform.scale,
+            original.scale_transform.scale,
+            rtol=0,
+            atol=1e-12,
         )
-    assert not any(key.startswith("opm_") for key in reopened.attrs)
-    state = ProcessingState.read(case.state_path)
+        origin = original.translation_transform.translation.copy()
+        origin[2] = round(
+            recorded_offset[0] + 0.5 * (padded_shape[0] - 1) * recorded_pixel_size[0], 3
+        )
+        np.testing.assert_allclose(
+            level.translation_transform.translation, origin, rtol=0, atol=1e-12
+        )
     assert (
-        state.registered_output_for_max_projection(case.output_path)
-        == case.processed_path
+        ProcessingState.read(state.path).registered_output_for_max_projection(projected)
+        == processed
     )
 
 
@@ -355,7 +344,6 @@ def test_expanded_cache_uses_initial_settings_and_restores_final_limits(
     fusion.pairwise_metrics = {(0, 1): (15, -284, 0, 0.9)}
     assert fusion._registration_cache_settings() == initial
     fusion.save_pairwise_metrics()
-    saved = processing_state.path.read_bytes()
     final_pairs = fusion._pair_registration_limits.copy()
     fusion.max_registration_shift_zyx = fusion._initial_registration_shift_zyx
     fusion._pair_registration_limits = fusion._initial_pair_registration_limits.copy()
@@ -364,7 +352,18 @@ def test_expanded_cache_uses_initial_settings_and_restores_final_limits(
     assert fusion.max_registration_shift_zyx == (17, 299, 33)
     assert fusion._pair_registration_limits == final_pairs
     assert fusion._registration_retry_count == 1
-    assert processing_state.path.read_bytes() == saved
+    assert fusion.pairwise_metrics == {(0, 1): (15, -284, 0, 0.9)}
+    reopened = ProcessingState.read(processing_state.path)
+    record = reopened.registration(fusion.data, configuration=initial)
+    assert record["pairwise_metrics"] == {"0,1": [15, -284, 0, 0.9]}
+    assert record["effective_registration_limits"] == {
+        "maximum_zyx": [17, 299, 33],
+        "pairs": {
+            f"{left},{right}": list(limits)
+            for (left, right), limits in final_pairs.items()
+        },
+        "retries": 1,
+    }
     fusion.registration_retries = 0
     with pytest.raises(ValueError, match="settings do not match"):
         fusion.load_pairwise_metrics()

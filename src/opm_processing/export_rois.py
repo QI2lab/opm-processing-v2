@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 from opm_processing.dataio.acquisition import acquisition_stem, inspect_acquisition
 from opm_processing.dataio.processing_state import (
     ProcessingState,
-    processing_state_path,
+    image_processing_state_path,
 )
 from opm_processing.dataio.roi import (
     ROI_PREVIEW_SUFFIXES,
@@ -332,7 +332,7 @@ def export_rois(
         suffix for suffix in ROI_PREVIEW_SUFFIXES if source.name.endswith(suffix)
     )
     stem = source.name.removesuffix(suffix)
-    state = ProcessingState.read(processing_state_path(source.parent, stem))
+    state = ProcessingState.read(image_processing_state_path(source, stem))
     acquisition = inspect_acquisition(state.source_path())
     acquisition.validate_processing_calibration()
     if acquisition.is_2d:

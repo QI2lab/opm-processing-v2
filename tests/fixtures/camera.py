@@ -6,66 +6,30 @@ import numpy as np
 import pytest
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture
 def camera_gain_profile():
     """Provide a prescribed nonuniform detector response for calibration tests."""
     return np.linspace(0.7, 1.3, 1900, dtype=np.float32)
 
 
-@pytest.fixture(scope="session")
-def camera_exposure():
-    """Set exposure by peak expected detected photons per camera pixel.
-
-    Each detected photon generates one photoelectron. The supplied expectation
-    already includes QE, optical throughput and sensor integration. Scaling it
-    changes the source exposure before the Poisson camera draw, not noisy data.
-    """
-
-    def at_peak(expectation, peak_detected_photons):
-        """Set the declared mean detector exposure before the Poisson draw."""
-        expectation = np.asarray(expectation, dtype=np.float64)
-        maximum = float(expectation.max())
-        if (
-            not np.isfinite(expectation).all()
-            or np.any(expectation < 0)
-            or maximum <= 0
-            or not np.isfinite(peak_detected_photons)
-            or peak_detected_photons <= 0
-        ):
-            raise ValueError("Require positive exposure and finite nonnegative rates")
-        return expectation * (peak_detected_photons / maximum)
-
-    return at_peak
-
-
-@pytest.fixture(scope="session")
+@pytest.fixture
 def camera_codes():
     """All recorded uint16 values for physical gain, offset and saturation checks."""
     return np.arange(65536, dtype=np.uint16).reshape(16, 16, 256)
 
 
-@pytest.fixture(params=["gpu", "host"])
-def photon_splitter(cupy_gpu, request):
-    """Run the production split with installed CuPy or NumPy generators."""
-    from opm_processing.imageprocessing import rlgc
-
-    xp = cupy_gpu if request.param == "gpu" else np
-    to_numpy = cupy_gpu.asnumpy if request.param == "gpu" else np.asarray
-
-    def split(observed, seed=19):
-        """Split prescribed observations with a reproducible GPU random generator."""
-        counts = xp.asarray(observed, dtype=xp.float32)
-        rng = xp.random.default_rng(seed)
-        first = rlgc._split_observed_counts(counts, rng)
-        return to_numpy(first)
-
-    return SimpleNamespace(split=split, xp=xp, to_numpy=to_numpy)
-
-
 @pytest.fixture
-def detector_response_sample(stage_gain, strided, camera_gain_profile):
+def detector_response_sample(
+    stage_gain, strided, camera_gain_profile, linear_camera_field
+):
     """Apply detector sensitivity and ADC conversion to prescribed detected counts."""
-    photons = np.random.default_rng(47).integers(20, 1021, (31, 65, 73))
+    coordinates = tuple(
+        np.rint(np.linspace(0, len(axis) - 1, size)).astype(int)
+        for axis, size in zip(linear_camera_field.axes, (31, 65, 73), strict=True)
+    )
+    # The shared physical concentration ramp ranges from 50 to 150. A fixed
+    # exposure gives a prescribed 20..1020 detected-photon calibration object.
+    photons = 20 + 10 * (linear_camera_field.field[np.ix_(*coordinates)] - 50)
     y = np.linspace(-1, 1, 65, dtype=np.float32)[:, None]
     x = np.linspace(-1, 1, 73, dtype=np.float32)[None, :]
     illumination = np.asarray(0.5 + 0.5 * np.exp(-x * x - y * y), dtype=np.float32)
@@ -91,7 +55,7 @@ def detector_response_sample(stage_gain, strided, camera_gain_profile):
     )
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def camera_likelihood_sample(camera_calibration, rate):
     """Share independent camera data and its true-rate score across hypotheses."""
     from tests.simulation.camera import digitize

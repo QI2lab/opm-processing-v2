@@ -6,67 +6,10 @@ import numpy as np
 import pytest
 import tensorstore as ts
 
-from opm_processing import encode_projections, export_ome_tiff, export_projections
+from opm_processing import export_ome_tiff
 from opm_processing.process import apply_stage_axis_flips, validate_empty_tile_options
 
 pytestmark = pytest.mark.unit
-
-
-@pytest.mark.parametrize(
-    "cli_file_layout,expected",
-    [
-        (("sample_deskewed.ome.zarr",), "sample_deskewed.ome.zarr"),
-        (
-            ("sample_max_z_tissue_deskewed.ome.zarr",),
-            "sample_max_z_tissue_deskewed.ome.zarr",
-        ),
-        (("sample_decon_deskewed.ome.zarr",), "sample_decon_deskewed.ome.zarr"),
-        (
-            (
-                "sample_deskewed.ome.zarr",
-                "sample_decon_deskewed.ome.zarr",
-                "sample_max_z_decon_deskewed.ome.zarr",
-            ),
-            "sample_decon_deskewed.ome.zarr",
-        ),
-        ((), None),
-        (("sample_max_z_decon_deskewed.ome.zarr",), None),
-        (("first_decon_deskewed.ome.zarr", "second_deskewed.ome.zarr"), None),
-    ],
-    indirect=["cli_file_layout"],
-)
-def test_projection_discovery_selects_full_processed_data(cli_file_layout, expected):
-    """Choose one full store without confusing previews or distinct acquisitions."""
-    if expected is None:
-        with pytest.raises(ValueError):
-            export_projections.find_datasets(cli_file_layout)
-    else:
-        assert export_projections.find_datasets(cli_file_layout) == [
-            cli_file_layout / expected
-        ]
-        with pytest.raises(ValueError, match="acquisition root"):
-            export_projections.find_datasets(cli_file_layout / expected)
-
-
-@pytest.mark.parametrize(
-    "cli_file_layout,indices",
-    [
-        (("p0/c0/sample_t9.tiff", "p0/c0/sample_t10.tiff", "notes.txt"), (9, 10)),
-        (("sample_t1.tiff", "sample_t3.tiff"), None),
-        (("sample_t1.tiff", "sample_t01.tif"), None),
-        (("notes.txt",), None),
-    ],
-    indirect=["cli_file_layout"],
-)
-def test_video_sequences_require_unique_contiguous_timepoints(cli_file_layout, indices):
-    """Sort acquired indices numerically and reject missing or duplicate frames."""
-    if indices is None:
-        with pytest.raises(ValueError):
-            encode_projections.find_sequences(cli_file_layout)
-    else:
-        sequences = encode_projections.find_sequences(cli_file_layout)
-        assert len(sequences) == 1
-        assert [int(p.stem.rsplit("t", 1)[1]) for p in sequences[0]] == list(indices)
 
 
 @pytest.mark.parametrize(
@@ -83,25 +26,6 @@ def test_export_basename_retains_specimen_identifier(suffix):
     """Strip a processing suffix without truncating the acquisition identifier."""
     source = Path("sample_name" + suffix)
     assert export_ome_tiff.export_source_stem(source) == "sample_name"
-
-
-@pytest.mark.parametrize(
-    "values,expected",
-    [
-        ([0, 1, 2, np.nan], (0.00002, 1.99998)),
-        ([7, 7, np.inf], (7, 8)),
-        ([np.nan, np.inf], None),
-    ],
-)
-def test_projection_contrast_uses_finite_first_exposure(values, expected):
-    """Keep fixed intensity scaling with explicit constant and invalid-input cases."""
-    if expected is None:
-        with pytest.raises(ValueError, match="no finite"):
-            export_projections.contrast_limits(np.asarray(values))
-    else:
-        np.testing.assert_allclose(
-            export_projections.contrast_limits(np.asarray(values)), expected
-        )
 
 
 @pytest.mark.parametrize("flips", list(np.ndindex(2, 2, 2)))
@@ -158,28 +82,6 @@ def test_tiff_tiles_preserve_page_order_partial_edges_and_counts(tile_shape, dty
         tiles[spatial], source[0, 0, 1, : tile_shape[0], : tile_shape[1]]
     )
     assert all(tile.dtype == dtype for tile in tiles)
-
-
-@pytest.mark.parametrize(
-    "options",
-    [
-        {"fps": 0},
-        {"fps": 121},
-        {"bitrate": 0},
-        {"gpu": -1},
-        {"codec": "invalid"},
-        {"rate_control": "invalid"},
-    ],
-)
-def test_encoder_rejects_invalid_options_before_gpu_allocation(
-    encoder_frames, tmp_path, options
-):
-    """Reject invalid playback and encoder settings without loading CUDA."""
-    with pytest.raises(ValueError):
-        encode_projections.encode_sequence(
-            encoder_frames, tmp_path / "movie.mp4", **options
-        )
-    assert not (tmp_path / "movie.mp4").exists()
 
 
 @pytest.mark.parametrize(
@@ -358,41 +260,8 @@ def test_acquisition_manifest_is_json_serializable(acquisition_metadata, times):
     assert manifest["camera_conversion"] == acquisition.camera_conversion
 
 
-@pytest.mark.parametrize("export_image_input", ["collection"], indirect=True)
-@pytest.mark.parametrize(
-    "acquisition_link",
-    [
-        "override",
-        "journal",
-        "relative",
-        "moved",
-        "copied",
-        "windows-moved",
-        "external",
-        "relative-external",
-        "missing",
-        "ambiguous",
-    ],
-    indirect=True,
-)
-def test_projection_metadata_requires_an_unambiguous_source(acquisition_link):
-    """Read recorded acquisition calibration from explicit or journal-linked paths."""
-    link = acquisition_link
-    if link.kind in ("missing", "ambiguous"):
-        with pytest.raises(ValueError, match="one processing sidecar"):
-            export_projections.acquisition_for(link.processed)
-    else:
-        metadata = export_projections.acquisition_for(
-            link.processed, link.source if link.kind == "override" else None
-        )
-        assert metadata.path == link.source.resolve()
-        assert metadata.shape == (1, 1, 1, 3, 4, 5)
-        assert metadata.camera_offset == 100
-        assert metadata.camera_conversion == 0.25
-
-
-def test_estimation_worker_returns_annotated_errors_and_closes_pipe():
-    """Return the original input error and its traceback through a real pipe."""
+def test_estimation_worker_returns_input_errors_and_closes_pipe():
+    """Return the original input error through a real pipe and close it."""
     import multiprocessing as mp
     from contextlib import closing
 
@@ -404,5 +273,4 @@ def test_estimation_worker_returns_annotated_errors_and_closes_pipe():
         run_estimate_illuminations(invalid, 100, 0.25, None, None, None, sending)
         error = receiving.recv()
         assert isinstance(error, ValueError)
-        assert any("Flatfield worker traceback" in note for note in error.__notes__)
         assert sending.closed

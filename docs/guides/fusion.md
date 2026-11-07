@@ -13,17 +13,43 @@ prints the selected store. Supply the processed store itself to select it
 explicitly. Fusion writes a registered multiscale volume and its maximum-Z
 projection beside the processed data.
 
+To render the fused volume and maximum-Z OME-Zarrs to another folder or drive:
+
+```powershell
+uv run fuse "G:\data\acquisition" --registration-channel 0 --output-dir "H:\fused\acquisition"
+```
+
+The destination is created if needed. The processing journal, cached pairwise
+registration, final tile positions, and depth-gain report stay beside the
+deskewed input. Choosing another destination reuses compatible registration.
+The external image stores contain a link to that journal so projection
+regeneration, ROI selection, and TIFF export can still find their provenance.
+Keep the linked input/journal accessible. To regenerate just the maximum-Z
+image, use the same input and `--output-dir` with `--regenerate-max-z`.
+
 ## Register neighboring tiles
 
 Choose a channel with shared tissue signal in tile overlaps. Stage positions,
-tile shapes, spacing, and scan geometry determine initial placement and
-automatic search limits. Registration downsampling adapts to each overlap.
+tile shapes, spacing, and scan geometry determine initial placement.
+Automatic search limits read the acquisition's recorded `Positions` overlap
+settings. Stage scans use `scan_axis_overlap_um` when available; the
+fractional `scan_axis_overlap`, `tile_axis_overlap`, and `z_axis_overlap`
+settings are converted using raw camera and scan geometry. The full recorded
+overlap supplies the initial allowance, bounded by actual common support.
+Missing settings use measured stage-geometry overlaps, without assuming an
+overlap percentage. Registration downsampling adapts to each overlap.
 The similarity threshold defaults to 0.7.
 
 Empty overlaps and one-sided constant backgrounds are rejected before histogram
 matching, which could otherwise turn a blank patch into a bright constant image.
 An optional directional edge image with zero energy is skipped; a valid
 intensity-based registration is retained.
+Periodic equivalents of each measured phase peak are checked against physical
+shift limits and scored on common image support before an excessive shift is
+rejected. This includes thin depth overlaps: resolving the same peak's period
+does not require selecting a different correlation peak. The period is the
+actual sampled patch shape, including block-reduction padding. A small
+equivalent shift still has to pass similarity and axial-feature checks.
 If real-space disambiguation is degenerate, its unresolved periodic shift is
 discarded. Registration can use an independently resolved intensity or edge
 candidate; the pair is rejected when neither provides a valid measurement.
@@ -34,11 +60,15 @@ After measuring the lateral displacement, it searches the contextual samples
 for Z alignment using correlation of axial intensity differences on common
 geometric support, then checks the original-intensity match with SSIM.
 Shared XY background can produce high SSIM at many Z shifts; it does not
-establish an axial registration. Initial automatic depth limits allow twenty percent
-of the tile depth and require at least three actually matched planes, rather
+establish an axial registration. Initial automatic depth limits use the recorded
+depth overlap and require at least three actually matched planes, rather
 than being capped by the nominal overlap width.
 Explicit correction limits still apply; measured peaks beyond them are
-rejected, with tile indices and corrections reported in the warning. A weak
+rejected. Shift-limit warnings count only candidates meeting the SSIM threshold;
+low-similarity out-of-range candidates are reported separately and do not
+suggest expanding the search. The warning's largest ZYX values are maxima
+on each axis across the listed candidates and can come from different pairs.
+A weak
 lateral match in the nominal overlap is checked again using the wider context.
 Changes to this method invalidate saved pairwise registration so
 the next fusion run recomputes it.

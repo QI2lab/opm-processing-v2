@@ -15,7 +15,7 @@ from opm_processing.dataio.live import (
     LiveManifest,
 )
 from opm_processing.dataio.position_collection import create_position_collection
-from opm_processing.imageprocessing.opmtools import orthogonal_deskew
+from opm_processing.imageprocessing.camera import camera_correct, illumination_correct
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -67,15 +67,10 @@ def write_manifest(
     data_path: Path, *, timepoints: int = 2, document: dict | None = None
 ) -> LiveManifest:
     """Persist a live acquisition plan and reopen it through the real reader."""
-    sidecars = SimpleNamespace(
-        manifest=data_path.with_name(
-            data_path.name.removesuffix(".ome.zarr") + ".manifest.json"
-        ),
-        log=data_path.with_name(
-            data_path.name.removesuffix(".ome.zarr") + ".log.jsonl"
-        ),
+    manifest_path = data_path.with_name(
+        data_path.name.removesuffix(".ome.zarr") + ".manifest.json"
     )
-    sidecars.manifest.write_text(
+    manifest_path.write_text(
         json.dumps(
             document
             if document is not None
@@ -83,7 +78,7 @@ def write_manifest(
         ),
         encoding="utf-8",
     )
-    return LiveManifest.read(sidecars.manifest)
+    return LiveManifest.read(manifest_path)
 
 
 @pytest.fixture
@@ -97,20 +92,30 @@ def opm_v2_live_acquisition_factory(tmp_path, opm_v2_acquisition_factory):
     """
     from opm_processing.dataio.acquisition import ChannelMetadata
 
-    def create(raw_data, *, name="sample", illumination=None):
+    def create(
+        raw_data,
+        *,
+        name="sample",
+        illumination=None,
+        camera_conversion=0.24,
+    ):
         """Deliver actual frames through the upstream publisher and TensorStore writer."""
         path = tmp_path / f"{name}.ome.zarr"
         document = manifest_document(path, timepoints=raw_data.shape[0])
         document["data_path"] = str(path)
+        document["camera_e_to_adu"] = camera_conversion
         document["index_sizes"] = dict(zip("tpcz", raw_data.shape[:4], strict=True))
+        document["stage_positions_zxy"] = [
+            [30.0, 100.0, 200.0 + 2 * index] for index in range(raw_data.shape[1])
+        ]
         document["channels"] = [
             {
-                "name": "637nm",
+                "name": f"637nm-{index}",
                 "wavelength_nm": 637.0,
                 "exposure_ms": 10.0,
                 "laser_power": 12.0,
             }
-            for _ in range(raw_data.shape[2])
+            for index in range(raw_data.shape[2])
         ]
         dataset = opm_v2_acquisition_factory(
             raw_data,
@@ -118,7 +123,7 @@ def opm_v2_live_acquisition_factory(tmp_path, opm_v2_acquisition_factory):
             mode="stage",
             live_manifest=document,
             channels=tuple(
-                ChannelMetadata(index, "637nm", 637.0, 10.0, 12.0)
+                ChannelMetadata(index, f"637nm-{index}", 637.0, 10.0, 12.0)
                 for index in range(raw_data.shape[2])
             ),
             stage_positions_zxy=tuple(map(tuple, document["stage_positions_zxy"])),
@@ -132,7 +137,8 @@ def opm_v2_live_acquisition_factory(tmp_path, opm_v2_acquisition_factory):
             else illumination
         )
         imwrite(field_path, field, metadata={"axes": "CYX"})
-        return SimpleNamespace(path=dataset.path, illumination_path=field_path)
+        dataset.illumination_path = field_path
+        return dataset
 
     return create
 
@@ -142,18 +148,14 @@ def live_acquisition_factory(tmp_path):
     """Return a writer for complete or partially acquired live camera objects."""
 
     def create(
-        raw_data=None,
         *,
         name="sample",
         shape=(2, 1, 2, 3, 4, 5),
         stage_positions=None,
         chunks=None,
         completed=True,
-        illumination=None,
     ):
         """Persist a stage scan, lifecycle plan and measured illumination field."""
-        if raw_data is not None:
-            shape = raw_data.shape
         data_path = tmp_path / f"{name}.ome.zarr"
         document = manifest_document(data_path, timepoints=shape[0])
         document["index_sizes"] = dict(zip("tpcz", shape[:4], strict=True))
@@ -178,9 +180,6 @@ def live_acquisition_factory(tmp_path):
             },
             chunks=chunks if chunks is not None else (1, 1, 1, *shape[-2:]),
         )
-        if raw_data is not None:
-            for position, array in enumerate(collection.arrays):
-                array.write(raw_data[:, position]).result()
         manifest = write_manifest(data_path, document=document)
         log_path = tmp_path / f"{name}.log.jsonl"
         if completed:
@@ -192,11 +191,7 @@ def live_acquisition_factory(tmp_path):
                 encoding="utf-8",
             )
         illumination_path = tmp_path / f"{name}_illumination.ome.tif"
-        field = (
-            np.ones((shape[2], *shape[-2:]), np.float32)
-            if illumination is None
-            else illumination
-        )
+        field = np.ones((shape[2], *shape[-2:]), np.float32)
         imwrite(illumination_path, field, metadata={"axes": "CYX"})
         return SimpleNamespace(
             path=data_path,
@@ -209,73 +204,198 @@ def live_acquisition_factory(tmp_path):
     return create
 
 
+@pytest.fixture
+def live_occupancy_case(
+    signal_field,
+    uniform_camera_scene,
+    opm_v2_live_acquisition_factory,
+    microscope_parameters,
+):
+    """Publish a dark detector-defect channel and independently observed sample."""
+    threshold = 6 * microscope_parameters.camera.read_noise_e
+    fields = np.broadcast_to(
+        np.asarray((0.1, signal_field), np.float32)[:, None, None], (2, 24, 256)
+    ).copy()
+    scene = uniform_camera_scene(
+        channels=2,
+        fields=fields,
+        exposures=np.asarray((0.0, 0.25))[None, None],
+        detector_artifacts=True,
+    )
+    camera = scene.microscope.camera
+    detector = camera_correct(
+        scene.pixels[0, 0, 0], camera.offset_adu, camera.electrons_per_adu
+    ).astype(np.float64)
+    assert np.count_nonzero(detector >= threshold) / detector.size < 0.1
+    wrong_order = illumination_correct(detector, fields[0])
+    assert np.count_nonzero(wrong_order >= threshold) / detector.size >= 0.1
+    dataset = opm_v2_live_acquisition_factory(
+        scene.pixels[..., ::-1, :, :].copy(),
+        name="live_empty",
+        illumination=fields,
+        camera_conversion=scene.microscope.camera.electrons_per_adu,
+    )
+    return SimpleNamespace(
+        dataset=dataset,
+        scene=scene,
+        threshold=threshold,
+    )
+
+
+@pytest.fixture
+def resume_acquisition(
+    tmp_path,
+    uniform_camera_scene,
+    opm_v2_acquisition_factory,
+    opm_v2_live_acquisition_factory,
+):
+    """Share real publisher inputs and a second declared optical source state."""
+
+    def create(*, live=False):
+        """Acquire independent photons before testing durable partial output recovery."""
+        exposures = (
+            np.asarray(((0.0, 0.0), (0.2, 0.25)))[None]
+            if live
+            else np.asarray((0.15, 0.17))[None, :, None]
+        )
+        parameters = {
+            "positions": 2,
+            "channels": exposures.shape[-1],
+            "exposures": exposures,
+            "read_noise_e": 0 if live else 1.6,
+        }
+        scene = uniform_camera_scene(**parameters)
+        changed_exposures = exposures.copy()
+        changed_exposures[:, 0] = 0.4
+        changed = uniform_camera_scene(**dict(parameters, exposures=changed_exposures))
+        raw = scene.pixels[..., ::-1, :, :].copy()
+        name = "live_resume" if live else "offline_resume"
+        if live:
+            dataset = opm_v2_live_acquisition_factory(
+                raw,
+                name=name,
+                camera_conversion=scene.microscope.camera.electrons_per_adu,
+            )
+        else:
+            dataset = opm_v2_acquisition_factory(
+                raw,
+                name=name,
+                mode="stage",
+                camera_conversion=scene.microscope.camera.electrons_per_adu,
+                stage_positions_zxy=((30.0, 100.0, 200.0), (30.0, 100.0, 202.0)),
+            )
+        return SimpleNamespace(
+            dataset=dataset,
+            scene=scene,
+            changed=changed,
+            output=tmp_path / f"{name}_deskewed.ome.zarr",
+            maximum=tmp_path / f"{name}_max_z_deskewed.ome.zarr",
+        )
+
+    return create
+
+
+@pytest.fixture
+def interrupt_completed_tile(monkeypatch):
+    """Inject an explicit interruption only after the real requested checkpoint."""
+    from contextlib import contextmanager
+
+    from opm_processing.dataio.processing_state import ProcessingState
+
+    @contextmanager
+    def interrupt(output):
+        """Interrupt the first fully written tile of the selected real output."""
+        complete = ProcessingState.complete_tile
+
+        def checkpoint(state, path, time, position, **kwargs):
+            complete(state, path, time, position, **kwargs)
+            if path == output and position == 0:
+                raise KeyboardInterrupt
+
+        with monkeypatch.context() as patch:
+            patch.setattr(ProcessingState, "complete_tile", checkpoint)
+            yield
+
+    return interrupt
+
+
 @pytest.fixture(params=["estimate", "pending-chunks", "cached"])
 def live_wait_case(
-    request, tmp_path, live_acquisition_factory, monkeypatch, simulated_camera
+    request,
+    tmp_path,
+    opm_v2_live_acquisition_factory,
+    monkeypatch,
+    roi_camera_scene,
 ):
-    """Share camera input and controlled completion for offline live-wait decisions."""
+    """Delay real published chunks and lifecycle state for simulated optical input."""
     from opm_processing import process as processing
 
     kind = request.param
-    shape = (
-        1,
-        1,
-        1,
-        12 if kind == "estimate" else 4,
-        8,
-        16 if kind == "estimate" else 5,
-    )
-    raw = (
-        simulated_camera(shape[-3:], conversion=0.24).raw[None, None, None, ::-1].copy()
-    )
-    dataset = live_acquisition_factory(
-        raw if kind == "cached" else None, shape=shape, completed=kind != "estimate"
-    )
-    dataset.illumination_path.unlink()
+    if kind == "estimate":
+        ensemble = request.getfixturevalue("illumination_calibration_ensemble")
+        scene, pixels = ensemble.scene, ensemble.raw
+        sample_timepoint = ensemble.sample_timepoint
+    else:
+        scene = roi_camera_scene(shape=(24, 33, 33))
+        pixels, sample_timepoint = scene.pixels, 0
+    raw = pixels[..., ::-1, :, :].copy()
+    produced = opm_v2_live_acquisition_factory(raw, camera_conversion=1.0)
+    acquisition, manifest, log = processing.open_live_acquisition(tmp_path)
+    produced.manifest, produced.log = manifest, log
+    produced.illumination_path.unlink()
     destination = tmp_path / "processed"
     field_path = tmp_path / "sample_flatfield.ome.tif"
     if kind == "cached":
         processing.write_flatfield(
-            field_path, np.full((1, 1, *shape[-2:]), 2, np.float32), 0.115
+            field_path, np.ones((1, 1, *raw.shape[-2:]), np.float32), 0.115
         )
+    completed_log = log.read_bytes()
+    if kind == "estimate":
+        log.write_text(
+            json.dumps(
+                {
+                    "event": "started",
+                    "acquisition_id": manifest.acquisition_id,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    pending = None
+    if kind != "cached":
+        array_root = produced.path / acquisition.array_paths[0]
+        chunk = next(
+            path
+            for path in array_root.rglob("*")
+            if path.is_file() and path.name != "zarr.json"
+        )
+        pending = tmp_path / "pending_camera_chunk"
+        chunk.replace(pending)
     sleeps = []
 
     def finish(seconds):
-        """Write the acquisition completion event during the wait callback."""
+        """Publish actual writer bytes and the controller's real completion event."""
         assert not destination.exists()
         assert not (destination / field_path.name).exists()
         sleeps.append(seconds)
-        if len(sleeps) == 1:
-            dataset.collection.arrays[0].write(raw[:, 0]).result()
-            assert kind != "cached"
+        if len(sleeps) == 1 and pending is not None:
+            pending.replace(chunk)
         elif len(sleeps) == 2 and kind == "estimate":
-            dataset.log.write_text(
-                json.dumps(
-                    {
-                        "event": "completed",
-                        "acquisition_id": dataset.manifest.acquisition_id,
-                    }
-                )
-                + "\n",
-                encoding="utf-8",
-            )
+            log.write_bytes(completed_log)
         else:
             pytest.fail("Processing kept waiting after acquisition completion")
 
     monkeypatch.setattr(processing.time, "sleep", finish)
-    calibrated = np.maximum(raw[0, 0, 0, ::-1].astype(np.float32) - 100, 0) * 0.24
     return SimpleNamespace(
         kind=kind,
-        dataset=dataset,
+        dataset=produced,
         raw=raw,
+        scene=scene,
+        sample_timepoint=sample_timepoint,
+        calibration_photons=ensemble.calibration_photons
+        if kind == "estimate"
+        else None,
         destination=destination,
         sleeps=sleeps,
-        expected=orthogonal_deskew(
-            calibrated / (2 if kind == "cached" else 1),
-            theta=30.0,
-            distance=0.4,
-            pixel_size=0.115,
-            downsample_factor=1,
-        ),
         field_path=field_path if kind == "cached" else destination / field_path.name,
     )

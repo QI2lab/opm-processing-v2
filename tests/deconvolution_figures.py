@@ -94,7 +94,6 @@ def generate_case(
     observed = camera_correct(
         raw[::factor], P.camera.offset_adu, P.camera.electrons_per_adu
     )
-    shape = ((observed.shape[0] - 1) * factor + 1, *observed.shape[1:])
     chosen = CONFIG["rendering"]["best_view"][kind]
     best = dict.fromkeys(VIEWS, (-np.inf, None, None))
     selected = None
@@ -125,7 +124,7 @@ def generate_case(
         gradient_consensus=False,
         max_iterations=RL_ITERATIONS,
         max_delta=0,
-        initial_estimate=np.ones(shape, np.float32),
+        read_noise=READ_NOISE,
         callback=record,
         release_memory=False,
     )
@@ -213,7 +212,6 @@ def simulate() -> None:
                         kind,
                         P,
                         parameters=CONFIG["specimens"][kind],
-                        illumination_profile=profile,
                     )
                 shape = acquisition_shape(scene)
                 _, axes = laboratory(np.zeros(shape, np.float32))

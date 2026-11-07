@@ -43,7 +43,6 @@ import psutil
 import tensorstore as ts
 from numba import njit
 from tqdm import tqdm
-from yaozarrs import v05
 from yaozarrs.write.v05 import prepare_image
 
 from opm_processing.cuda import preload_cuda_libraries
@@ -54,19 +53,24 @@ from opm_processing.dataio.acquisition import (
 )
 from opm_processing.dataio.ngff import (
     round_spatial_values,
-    round_tczyx_transform,
+    tczyx_image_metadata,
 )
 from opm_processing.dataio.position_collection import open_position_collection
 from opm_processing.dataio.processing_state import (
     ProcessingState,
+    processing_state_image_attributes,
     processing_state_path,
 )
-from opm_processing.dataio.timing import time_axis
 from opm_processing.imageprocessing.coordinates import (
+    STAGE_COORDINATE_VERSION,
+    deskewed_stage_scan_offsets,
     stage_positions_to_image_coordinates,
     stage_z_level_indices,
 )
-from opm_processing.imageprocessing.opmtools import orthogonal_deskew
+from opm_processing.imageprocessing.opmtools import (
+    deskew_coverage,
+    deskew_shape_estimator,
+)
 
 DEFAULT_REGISTRATION_DOWNSAMPLE = (3, 5, 5)
 DEFAULT_REGISTRATION_SSIM_WINDOW = 15
@@ -95,6 +99,41 @@ minimum_filter: Any
 _ssim_cpu: Any | None = None
 
 xp: Any = np
+
+
+def _cpu_registration_backend() -> dict[str, Any]:
+    """Load the CPU operators used by registration's production fallback.
+
+    Returns
+    -------
+    dict of str to object
+        Backend flags, NumPy array operations and installed SciPy/skimage
+        operators. Each call returns a fresh set of module bindings.
+    """
+    from scipy import ndimage
+    from skimage.exposure import match_histograms
+    from skimage.measure import block_reduce
+    from skimage.metrics import structural_similarity
+    from skimage.registration import phase_cross_correlation
+    from skimage.registration._masked_phase_cross_correlation import (
+        cross_correlate_masked,
+    )
+
+    return {
+        "USING_GPU": False,
+        "cp": None,
+        "xp": np,
+        "ssim_cuda": None,
+        "_ssim_cpu": structural_similarity,
+        "match_histograms": match_histograms,
+        "block_reduce": block_reduce,
+        "phase_cross_correlation": phase_cross_correlation,
+        "masked_cross_correlation": cross_correlate_masked,
+        "sobel_filter": ndimage.sobel,
+        "shift_filter": ndimage.shift,
+        "minimum_filter": ndimage.minimum_filter,
+    }
+
 
 preload_cuda_libraries()
 
@@ -126,25 +165,7 @@ try:
 except Exception as error:
     # GPU stack unavailable; fall back to CPU.
     GPU_IMPORT_ERROR = error
-    from scipy.ndimage import minimum_filter as _minimum_filter  # type: ignore
-    from scipy.ndimage import shift as _shift  # type: ignore
-    from scipy.ndimage import sobel as _sobel  # type: ignore
-    from skimage.exposure import match_histograms as _mh  # type: ignore
-    from skimage.measure import block_reduce as _br  # type: ignore
-    from skimage.metrics import structural_similarity as _cpu_ssim  # type: ignore
-    from skimage.registration import phase_cross_correlation as _pcc  # type: ignore
-    from skimage.registration._masked_phase_cross_correlation import (
-        cross_correlate_masked as masked_cross_correlation,
-    )
-
-    match_histograms = _mh
-    block_reduce = _br
-    phase_cross_correlation = _pcc
-    sobel_filter = _sobel
-    shift_filter = _shift
-    minimum_filter = _minimum_filter
-    _ssim_cpu = _cpu_ssim
-    USING_GPU = False
+    globals().update(_cpu_registration_backend())
 
 
 def _default_fusion_workers() -> int:
@@ -513,6 +534,118 @@ def _registration_similarity(
         return score
     except ValueError:
         return -math.inf
+
+
+def _registration_rejection_messages(
+    time_index: int,
+    maximum_shift_zyx: Sequence[int],
+    threshold: float,
+    candidates: Sequence[
+        tuple[int, int, tuple[int, int, int], tuple[int, int, int], float]
+    ],
+) -> list[str]:
+    """Describe rejected measurements without conflating bad matches and shift limits.
+
+    Parameters
+    ----------
+    time_index : int
+        Timepoint whose measurements are being reported.
+    maximum_shift_zyx : sequence of int
+        Maximum current correction envelope across the tile pairs.
+    threshold : float
+        Required SSIM, or zero when similarity filtering is disabled.
+    candidates : sequence of tuple
+        Rejected pair indices, measured ZYX correction, pair limits and SSIM.
+
+    Returns
+    -------
+    list of str
+        Separate low-similarity diagnostics and qualifying shift-limit warnings.
+        No registration values or acceptance decisions are modified.
+    """
+    qualifying, low_similarity = [], []
+    for candidate in candidates:
+        (
+            qualifying
+            if threshold == 0 or candidate[-1] >= threshold
+            else low_similarity
+        ).append(candidate)
+    messages = []
+    if low_similarity:
+        messages.append(
+            f"Registration: rejected {len(low_similarity)} "
+            f"low-similarity out-of-range candidates at time index {time_index} "
+            f"(SSIM threshold {threshold:.3f}); these do not trigger shift-limit retries."
+        )
+        for i, j, correction, _limits, similarity in low_similarity:
+            messages.append(
+                f"  Low-similarity link ({i}, {j}): "
+                f"SSIM {similarity:.3f} < {threshold:.3f}; "
+                f"candidate ZYX correction {correction}."
+            )
+    if qualifying:
+        largest = tuple(
+            int(value)
+            for value in np.max(
+                np.abs([candidate[2] for candidate in qualifying]), axis=0
+            )
+        )
+        messages.append(
+            f"Registration warning: {len(qualifying)} "
+            f"{'pair' if len(qualifying) == 1 else 'pairs'} at "
+            f"time index {time_index} exceeded the ZYX shift limits "
+            f"(maximum envelope {tuple(maximum_shift_zyx)} pixels); "
+            f"largest per-axis absolute candidate corrections were {largest}. "
+            "Check --max-registration-shift-zyx if tiles remain misaligned."
+        )
+        for i, j, correction, limits, similarity in qualifying:
+            messages.append(
+                f"  Rejected link ({i}, {j}): ZYX correction {correction}, "
+                f"limits {limits}, SSIM {similarity:.3f}."
+            )
+    return messages
+
+
+def _registration_phase_aliases(
+    shift: Sequence[float],
+    shape: Sequence[int],
+    max_shift: Sequence[float],
+    shift_sampling: Sequence[int] | None = None,
+) -> list[tuple[float, ...]]:
+    """Enumerate physically allowed real-space equivalents of one FFT peak.
+
+    Fourier translations are periodic in the registration patch dimensions,
+    including any padding introduced by block reduction. Each axis has at
+    most two equivalents with nonempty real-space overlap. Geometry filters
+    these equivalents; image similarity must still establish a valid match.
+    This does not replace the measured peak with another correlation peak.
+    """
+    choices = []
+    sampling = (None,) * len(shape) if shift_sampling is None else shift_sampling
+    for value, length, limit, factor in zip(
+        shift, shape, max_shift, sampling, strict=True
+    ):
+        if not math.isfinite(float(value)):
+            return []
+        positive = float(value) % int(length)
+        equivalents = (positive, positive - int(length))
+        if factor is not None:
+            # Adding a large float32 period can perturb a boundary value.
+            # Apply limits on the full-resolution grid fusion actually keeps.
+            equivalents = tuple(
+                float(np.rint(value * factor)) / factor for value in equivalents
+            )
+        choices.append(
+            [
+                value
+                for value in equivalents
+                if abs(value) < length and abs(value) <= limit
+            ]
+        )
+    return sorted(
+        itertools.product(*choices),
+        key=lambda candidate: sum(value * value for value in candidate),
+    )
 
 
 def _bounded_phase_correlation_peak(
@@ -1231,16 +1364,17 @@ def _infer_registration_limits(
     angle_deg: float | None,
     *,
     is_2d: bool = False,
+    overlap_zyx_um: Sequence[float | None] | None = None,
 ) -> dict[tuple[int, int], tuple[int, int, int]]:
     """Infer search envelopes from physical overlaps and OPM scan geometry.
 
-    Stage-placement uncertainty is budgeted at ten percent of the smallest
-    face overlap on each tiled axis, with two registration sampling bins as
-    a floor. Untiled axes use ten percent of their tile extent. Depth pairs
+    Recorded acquisition overlap sets each axis's search allowance, with two
+    registration sampling bins as a floor. Missing metadata uses the measured
+    nearest-face overlap, or the tile extent on untiled axes. Depth pairs
     additionally allow the oblique-plane footprint displacement dz*cot(theta)
     along image Y. This is a search allowance, not a shear of tile origins.
-    Depth-face pairs allow up to twenty percent of their depth extent while
-    requiring at least three actually matched planes; other axes retain at
+    Depth-face pairs require at least three actually matched planes rather
+    than capping Z at half the nominal intersection. Other axes retain at
     least half their overlap.
 
     Parameters
@@ -1257,6 +1391,9 @@ def _infer_registration_limits(
         Oblique scan angle in degrees, or None when unavailable.
     is_2d : bool, default = False
         Whether tiles represent planar images.
+    overlap_zyx_um : sequence of float or None, optional
+        Recorded acquisition overlaps in physical image ZYX units. None on
+        an axis falls back to stage geometry, without a fractional budget.
 
     Returns
     -------
@@ -1301,16 +1438,23 @@ def _infer_registration_limits(
         if (left, right) in nearest_pairs and delta[axis] > 0:
             face_overlaps[axis].append(float(overlap[axis]))
     extent = np.min(shapes, axis=0)
+    recorded_overlap = (None, None, None) if overlap_zyx_um is None else overlap_zyx_um
+    if len(recorded_overlap) != 3 or any(
+        value is not None and (not math.isfinite(value) or value < 0)
+        for value in recorded_overlap
+    ):
+        raise ValueError("overlap_zyx_um must contain three nonnegative values or None")
     base = np.maximum(
         2 * sampling,
         np.ceil(
-            0.1
-            * np.asarray(
-                [
-                    min(values) if values else extent[axis]
-                    for axis, values in enumerate(face_overlaps)
-                ]
-            )
+            [
+                recorded_overlap[axis] / spacing[axis]
+                if recorded_overlap[axis] is not None
+                else min(values)
+                if values
+                else extent[axis]
+                for axis, values in enumerate(face_overlaps)
+            ]
         ),
     )
     cotangent = (
@@ -1335,9 +1479,6 @@ def _infer_registration_limits(
         if depth_pair:
             # Narrow depth intersections must not cap corrections at half their
             # width. Context reads below permit matching outside that crop.
-            budget[0] = max(
-                budget[0], math.ceil(0.2 * min(shapes[left, 0], shapes[right, 0]))
-            )
             # A correction towards the other tile increases the overlap. Do
             # not limit that correction by the small nominal intersection.
             # The contextual search checks actual common geometric support.
@@ -1432,6 +1573,8 @@ class TileFusion:
         roi_selection: PhysicalRoi | None = None,
         normalize_depth_intensity: bool = True,
         registration_retries: int = 2,
+        output_dir: str | Path | None = None,
+        registration_context_limit_zyx: tuple[int, int, int] | None = None,
     ) -> None:
         """Initialize registration and fusion for a processed acquisition.
 
@@ -1473,8 +1616,8 @@ class TileFusion:
             Absolute residual threshold in effective registration sampling bins.
         max_registration_shift_zyx : tuple[int, int, int] or None
             Maximum accepted registration correction in ZYX voxels. None
-            infers a separate limit for each pair from stage spacing, tile
-            overlap, voxel size, scan angle, and registration sampling.
+            reads recorded acquisition overlap and bounds each pair using stage
+            geometry, voxel size, scan angle, and registration sampling.
         reverse_stage_y : bool
             Whether to reverse stage-derived image-Y placement. Tile pixel
             arrays are not modified.
@@ -1493,6 +1636,13 @@ class TileFusion:
             Maximum automatic search expansions. Each expansion remeasures only
             affected pairs and refits all global offsets. Explicit shift limits
             are never expanded.
+        output_dir : str or pathlib.Path or None
+            Destination for fused OME-Zarr images. None writes beside the
+            processed tiles. Registration and depth-gain records stay there.
+        registration_context_limit_zyx : tuple[int, int, int] or None
+            Maximum search supported by a preplanned ROI read context. Clamp
+            per-pair automatic limits and retries to this ceiling without
+            changing their geometry-based allowances.
 
         Returns
         -------
@@ -1500,11 +1650,17 @@ class TileFusion:
             No value is returned.
         """
         (
-            self.output_dir,
+            processing_dir,
             self.data,
             self.acquisition_name,
             source_path,
         ) = resolve_fusion_input(root_path)
+        self.output_dir = (
+            processing_dir
+            if output_dir is None
+            else Path(output_dir).expanduser().resolve()
+        )
+        self.output_dir.mkdir(parents=True, exist_ok=True)
 
         if max_workers is None:
             max_workers = _default_fusion_workers()
@@ -1527,7 +1683,7 @@ class TileFusion:
         )
         collection = open_position_collection(self.data)
         self.processing_state = ProcessingState.read(
-            processing_state_path(self.output_dir, self.acquisition_name)
+            processing_state_path(processing_dir, self.acquisition_name)
         )
         self.processing_state.run(self.data)
         state_source_path = self.processing_state.source_path()
@@ -1600,10 +1756,21 @@ class TileFusion:
             self._reuse_registered_roi_placements = False
         else:
             collection_shape = collection.shape
+            coordinate_metadata = collection.attributes.get(
+                "opm_processing_coordinates", {}
+            )
+            coordinate_version = coordinate_metadata.get("version")
+            if coordinate_version not in (None, STAGE_COORDINATE_VERSION):
+                raise ValueError(
+                    "Unsupported processed stage-coordinate version; recreate with process"
+                )
+            placement_positions = coordinate_metadata.get(
+                "placement_stage_positions_zxy_um", collection.stage_positions_zxy
+            )
             stage_positions = [
                 position
                 for _ in range(collection_shape[0])
-                for position in collection.stage_positions_zxy
+                for position in placement_positions
             ]
             stage_origins = stage_positions_to_image_coordinates(
                 stage_positions,
@@ -1611,9 +1778,24 @@ class TileFusion:
                 reverse_z=self.reverse_stage_z,
                 opm_angle_deg=float(self.acquisition.angle_deg),
             )
-            image_origins = np.tile(
-                np.asarray(collection.spatial_origins_zyx_um), (collection_shape[0], 1)
-            )
+            local_origins = np.asarray(collection.spatial_origins_zyx_um)
+            if coordinate_version is None:
+                if (
+                    "stage" in self.acquisition.mode.lower()
+                    and not self.acquisition.scan_axis_reversed
+                ):
+                    raise ValueError(
+                        "Legacy negative stage scans used a different pixel orientation; recreate with process"
+                    )
+                # Legacy deskew pixels already have the correct orientation;
+                # their local NGFF translations omitted the reversed-scan anchor.
+                local_origins = (
+                    local_origins
+                    + deskewed_stage_scan_offsets(self.acquisition)[
+                        : len(local_origins)
+                    ]
+                )
+            image_origins = np.tile(local_origins, (collection_shape[0], 1))
             self._tile_positions = [
                 tuple(position) for position in stage_origins + image_origins
             ]
@@ -1707,6 +1889,14 @@ class TileFusion:
         self.optimization_rel_threshold = float(optimization_rel_threshold)
         self.optimization_abs_threshold = float(optimization_abs_threshold)
         self._automatic_registration_limits = max_registration_shift_zyx is None
+        if registration_context_limit_zyx is not None and (
+            len(registration_context_limit_zyx) != 3
+            or any(value < 0 for value in registration_context_limit_zyx)
+        ):
+            raise ValueError(
+                "registration_context_limit_zyx must contain three nonnegative values"
+            )
+        self._registration_context_limit_zyx = registration_context_limit_zyx
         if registration_retries < 0:
             raise ValueError("registration_retries must be nonnegative")
         self.registration_retries = int(registration_retries)
@@ -1722,7 +1912,18 @@ class TileFusion:
                     self.downsample_factors,
                     self.acquisition.angle_deg,
                     is_2d=self._is_2d,
+                    overlap_zyx_um=self.acquisition.registration_overlap_zyx_um,
                 )
+                if registration_context_limit_zyx is not None:
+                    local_limits = {
+                        pair: tuple(
+                            min(value, ceiling)
+                            for value, ceiling in zip(
+                                limits, registration_context_limit_zyx, strict=True
+                            )
+                        )
+                        for pair, limits in local_limits.items()
+                    }
                 self._pair_registration_limits.update(
                     {
                         (tile_indices[left], tile_indices[right]): limits
@@ -1740,7 +1941,7 @@ class TileFusion:
                 for axis in range(3)
             )
             print(
-                "Automatic registration limits: per-pair geometry; "
+                "Automatic registration limits: recorded overlap and per-pair geometry; "
                 f"maximum ZYX corrections {max_registration_shift_zyx} pixels."
             )
         if len(max_registration_shift_zyx) != 3 or any(
@@ -1750,7 +1951,10 @@ class TileFusion:
                 "max_registration_shift_zyx must contain three nonnegative values"
             )
         self.max_registration_shift_zyx = tuple(
-            int(value) for value in max_registration_shift_zyx
+            int(value)
+            if registration_context_limit_zyx is None
+            else min(int(value), registration_context_limit_zyx[axis])
+            for axis, value in enumerate(max_registration_shift_zyx)
         )
         self._initial_registration_shift_zyx = self.max_registration_shift_zyx
         self._initial_pair_registration_limits = self._pair_registration_limits.copy()
@@ -1878,18 +2082,24 @@ class TileFusion:
                 scan_step_um = float(reconstruction["scan_axis_step_um"])
         z_downsample = round(float(self._pixel_size[0]) / raw_pixel_size_um)
 
-        support = orthogonal_deskew(
-            np.full(
-                (scan_count, raw_camera_y, 1),
-                1024.0,
-                dtype=np.float32,
-            ),
-            theta=angle_deg,
-            distance=scan_step_um,
-            pixel_size=raw_pixel_size_um,
+        source_shape = (scan_count, raw_camera_y, 1)
+        shape, *_ = deskew_shape_estimator(
+            source_shape,
+            angle_deg,
+            scan_step_um,
+            raw_pixel_size_um,
+            crop_after_deskew=False,
             divisible_by=1 if roi_record is None else 4,
             downsample_factor=z_downsample,
-        )[..., 0]
+        )
+        support = deskew_coverage(
+            source_shape,
+            shape,
+            angle_deg,
+            scan_step_um,
+            raw_pixel_size_um,
+            downsample_factor=z_downsample,
+        )
         configuration = run.get("configuration", {})
         if roi_record is not None:
             crop_y0, crop_y1 = map(int, roi_record["deskew_crop_yx"][:2])
@@ -1897,10 +2107,6 @@ class TileFusion:
         elif configuration.get("crop_after_deskew", False):
             crop_y = int(np.ceil(raw_camera_y * np.cos(np.deg2rad(angle_deg))))
             support = support[:, crop_y:-crop_y]
-        full_response = 2048 * raw_pixel_size_um / scan_step_um
-        support *= np.float32(z_downsample / full_response)
-        np.rint(support, out=support)
-        support /= np.float32(z_downsample)
         if roi_record is not None:
             return np.ascontiguousarray(support)
         padded_support = np.zeros(
@@ -2114,13 +2320,13 @@ class TileFusion:
             Maximum SSIM window size. Thin aligned overlaps use the largest
             odd window that fits, with at least three voxels per axis.
         max_shift : sequence[float] or None
-            Maximum permitted shift in downsampled patch coordinates. The
-            upstream fully disambiguated result is used when it lies inside
-            these limits; otherwise the strongest bounded phase peak is used.
+            Maximum permitted shift in downsampled patch coordinates. Periodic
+            equivalents of a phase peak are filtered by these limits and scored
+            on common real-space support, independent of upstream unwrapping.
         allow_bounded_peak : bool, default=True
             Whether an out-of-range upstream result may be replaced by the
-            strongest in-range periodic peak. Thin-Z overlaps disable this
-            because their bounded alternatives are underdetermined.
+            strongest different in-range phase peak. Thin-Z overlaps disable
+            this replacement but still resolve equivalents of the measured peak.
         registration_axis : int or None, default=None
             Axis normal to the physical tile boundary. When provided, an
             edge-based phase-correlation candidate is scored alongside the
@@ -2239,6 +2445,24 @@ class TileFusion:
                 and bool(xp.any(xp.abs(result) >= limits * 0.5))
             ):
                 result = measured_phase_shift(fixed, moving, resolve_alias=True)
+            if result is not None and max_shift is not None:
+                # Upstream real-space disambiguation can prefer a tiny strip
+                # at the opposite image edge. Reconsider the same FFT peak's
+                # equivalents using physical bounds and acquisition support.
+                # This also applies to thin depth overlaps: unwrapping a peak
+                # does not introduce a different, potentially ambiguous peak.
+                aliases = _registration_phase_aliases(
+                    result, fixed.shape, max_shift, shift_sampling
+                )
+                if aliases:
+                    result = xp.asarray(aliases[0], dtype=xp.float32)
+                    if len(aliases) > 1:
+                        best_score = score_shift(result)
+                        for alias in aliases[1:]:
+                            candidate = xp.asarray(alias, dtype=xp.float32)
+                            candidate_score = score_shift(candidate)
+                            if candidate_score > best_score:
+                                result, best_score = candidate, candidate_score
             return result
 
         def retained_shift(candidate: Any) -> Any:
@@ -2531,7 +2755,6 @@ class TileFusion:
                     tuple[int, int, int, float],
                 ] = {}
                 candidate_scores: dict[tuple[int, int], float] = {}
-                rejected_shifts: list[tuple[int, int, int]] = []
                 rejected_links = []
                 pair_specs = []
                 input_itemsize = int(
@@ -2859,6 +3082,13 @@ class TileFusion:
                                 g1,
                                 g2,
                                 win_size=sw,
+                                # Contextual Z includes the nominal slab
+                                # displacement. Lateral limits remain correction
+                                # limits and must also guide periodic unwrapping.
+                                max_shift=(
+                                    g1.shape[0] - 1,
+                                    *max_shift_ds[1:],
+                                ),
                                 allow_bounded_peak=False,
                                 registration_axis=0,
                                 support_masks=tuple(support_masks),
@@ -2910,7 +3140,6 @@ class TileFusion:
                         or abs(dy_s) > max_shift[1]
                         or abs(dx_s) > max_shift[2]
                     ):
-                        rejected_shifts.append((dz_s, dy_s, dx_s))
                         self._rejected_registration_links[i, j] = (
                             (dz_s, dy_s, dx_s),
                             max_shift,
@@ -2941,22 +3170,10 @@ class TileFusion:
                     pending_read_bytes -= int(pair_bytes)
                     fill_read_ahead()
                 progress.close()
-                if rejected_shifts:
-                    largest = tuple(
-                        int(value) for value in np.max(np.abs(rejected_shifts), axis=0)
-                    )
-                    print(
-                        f"Registration warning: {len(rejected_shifts)} pairs at "
-                        f"time index {t} exceeded the ZYX shift limits "
-                        f"(maximum envelope {self.max_registration_shift_zyx} pixels); largest "
-                        f"measured absolute corrections were {largest}. "
-                        "Check --max-registration-shift-zyx if tiles remain misaligned."
-                    )
-                    for i, j, correction, limits, similarity in rejected_links:
-                        print(
-                            f"  Rejected link ({i}, {j}): ZYX correction {correction}, "
-                            f"limits {limits}, SSIM {similarity:.3f}."
-                        )
+                for message in _registration_rejection_messages(
+                    t, self.max_registration_shift_zyx, th, rejected_links
+                ):
+                    print(message)
                 if self._debug:
                     print(
                         "Registration source cache: TensorStore native LRU, "
@@ -3597,6 +3814,12 @@ class TileFusion:
                     peak = abs(correction[axis])
                     margin = max(2, sampling[axis], math.ceil(0.05 * peak))
                     updated[axis] = max(updated[axis], int(peak + margin))
+            context_limit = getattr(self, "_registration_context_limit_zyx", None)
+            if context_limit is not None:
+                updated = [
+                    min(value, ceiling)
+                    for value, ceiling in zip(updated, context_limit, strict=True)
+                ]
             if tuple(updated) != self._pair_registration_limits.get(pair, limits):
                 self._pair_registration_limits[pair] = tuple(updated)
                 expanded.add(pair)
@@ -3745,7 +3968,9 @@ class TileFusion:
         dict
             Output-affecting registration settings fingerprinted in the processing journal.
         """
+        context_limit = getattr(self, "_registration_context_limit_zyx", None)
         return {
+            "coordinates": STAGE_COORDINATE_VERSION,
             "channel_index": self.channel_to_use,
             "stage_y_reversed": self.reverse_stage_y,
             "stage_z_reversed_to_lab": self.reverse_stage_z,
@@ -3755,7 +3980,9 @@ class TileFusion:
             "acceptance": "reject-constant-threshold-only-no-forced-bridges-v3",
             "overlap_roi": "depth-context-lateral-fallback-axial-contrast-refinement-v4",
             "downsample": ("upstream-block-reduce-with-adaptive-zyx-ssim-support-v2"),
-            "phase_registration": ("phase-edge-and-masked-normalized-correlation-v10"),
+            "phase_registration": (
+                "phase-supported-periodic-aliases-and-masked-normalized-correlation-v11"
+            ),
             "score": ("retained-full-resolution-grid-ssim-supported-window-v8"),
             "downsample_factors_zyx": list(self.downsample_factors),
             "ssim_window": self.ssim_window,
@@ -3767,9 +3994,14 @@ class TileFusion:
                 )
             ),
             "registration_retries": getattr(self, "registration_retries", 2),
+            **(
+                {"registration_context_limit_zyx": list(context_limit)}
+                if context_limit is not None
+                else {}
+            ),
             "retry_policy": "selective-pairs-and-global-measured-peak-5pct-2px-bin-v3",
             "shift_limits_policy": (
-                "stage-overlap-contextual-depth-actual-support-per-pair-v3"
+                "recorded-overlap-contextual-depth-actual-support-per-pair-v4"
                 if getattr(self, "_automatic_registration_limits", False)
                 else "explicit"
             ),
@@ -3921,48 +4153,21 @@ class TileFusion:
         factors = (1, *self.multiscale_factors)
         dz, dy, dx = round_spatial_values(self._pixel_size)
         offset_z, offset_y, offset_x = round_spatial_values(self.offset_um)
-        t_axis, t_scale = time_axis(getattr(self, "time_interval_s", None))
-        axes = [
-            t_axis,
-            {"name": "c", "type": "channel"},
-            {"name": "z", "type": "space", "unit": "micrometer"},
-            {"name": "y", "type": "space", "unit": "micrometer"},
-            {"name": "x", "type": "space", "unit": "micrometer"},
-        ]
-        datasets = []
+        spatial_scales = []
+        spatial_origins = []
         specs = []
         z0, y0, x0 = (int(value) for value in self.padded_shape)
-        for level, factor in enumerate(factors):
+        for factor in factors:
             z_factor = 1 if self._is_2d else int(factor)
             center_shift = 0.5 if self.multiscale_downsample == "block_mean" else 0.0
-            translation = round_tczyx_transform(
+            spatial_origins.append(
                 (
-                    0,
-                    0,
                     offset_z + center_shift * (z_factor - 1) * dz,
                     offset_y + center_shift * (factor - 1) * dy,
                     offset_x + center_shift * (factor - 1) * dx,
                 )
             )
-            datasets.append(
-                {
-                    "path": str(level),
-                    "coordinateTransformations": [
-                        {
-                            "scale": round_tczyx_transform(
-                                (
-                                    t_scale,
-                                    1,
-                                    dz * z_factor,
-                                    dy * factor,
-                                    dx * factor,
-                                )
-                            )
-                        },
-                        {"translation": translation},
-                    ],
-                }
-            )
+            spatial_scales.append((dz * z_factor, dy * factor, dx * factor))
             specs.append(
                 (
                     (
@@ -3976,8 +4181,11 @@ class TileFusion:
                 )
             )
 
-        image = v05.Image(
-            multiscales=[v05.Multiscale(name="fused", axes=axes, datasets=datasets)]
+        image = tczyx_image_metadata(
+            spatial_scales,
+            spatial_origins,
+            time_interval_s=getattr(self, "time_interval_s", None),
+            name="fused",
         )
         # Keep storage chunks shallow enough for interactive plane viewing.
         # Rendering uses a separate, much deeper RAM block chosen below.
@@ -3994,7 +4202,16 @@ class TileFusion:
             output_path,
             image,
             specs,
-            extra_attributes={},
+            extra_attributes={
+                **(
+                    processing_state_image_attributes(
+                        self.processing_state.path, Path(output_path)
+                    )
+                    if hasattr(self, "processing_state")
+                    else {}
+                ),
+                "opm_processing_coordinates": {"version": STAGE_COORDINATE_VERSION},
+            },
             chunks=codec_chunks,
             writer="tensorstore",
             overwrite=True,
@@ -4710,7 +4927,7 @@ class TileFusion:
         -------
         None
             Writes the fused NGFF store to:
-            `{processing_output}/{stem}_fused.ome.zarr`
+            `{output_dir}/{stem}_fused.ome.zarr`
 
         Raises
         ------
@@ -4755,7 +4972,8 @@ class TileFusion:
         self._fuse_by_blocks()
         self._write_multiscales()
         report_path = (
-            self.output_dir / f"{self.acquisition_name}_depth_intensity_gains.json"
+            self.processing_state.path.parent
+            / f"{self.acquisition_name}_depth_intensity_gains.json"
         )
         report_path.write_text(
             json.dumps(self._depth_intensity_report or {"enabled": False}, indent=2)
@@ -4774,4 +4992,12 @@ class TileFusion:
                     }
                     for tile_index, tile_position in enumerate(self._tile_positions)
                 ),
+            )
+        else:
+            # A cropped rendering reuses the full registered placement, but
+            # its artifact may now live in another output directory.
+            self.processing_state.complete_registration(
+                self.data,
+                fused_path=omezarr,
+                tiles=self.processing_state.registration(self.data)["tiles"],
             )

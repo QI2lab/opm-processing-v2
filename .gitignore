@@ -48,6 +48,9 @@ coverage.xml
 *.cover
 .hypothesis/
 .pytest_cache/
+/.pytest_*/
+*.vzip
+*.ome.zarr/
 
 # Translations
 *.mo

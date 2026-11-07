@@ -34,6 +34,8 @@ classifiers = [
 # add your package dependencies here
 dependencies = [
     "numpy",
+    "refkv==0.2.0",
+    "ijson>=3.6,<4",
     "ome-types[lxml]",
     "tensorstore",
     "zarr>=3",
@@ -48,6 +50,7 @@ processing = [
     "basicpy @ git+https://github.com/QI2lab/BaSiCPy.git@main",
     "cmap",
     "imagecodecs",
+    "matplotlib",
     "napari[pyqt]",
     "napari-ome-zarr>=0.9.0",
     "napari-plugin-engine",
@@ -89,6 +92,8 @@ url = "https://pypi.nvidia.com"
 
 [tool.uv]
 default-groups = ["processing", "gpu"]
+# Require a usable CUDA wheel for supported Windows workstations.
+required-environments = ["sys_platform == 'win32' and platform_machine == 'AMD64'"]
 
 [dependency-groups]
 processing = ["opm-processing-v2[processing]"]
@@ -127,6 +132,7 @@ documentation = "https://qi2lab.github.io/opm-processing-v2/"
 [project.scripts]
 process = "opm_processing.process:main"
 inspect-opm = "opm_processing.dataio.acquisition:main"
+map-legacy-opm = "opm_processing.dataio.legacy_reference:main"
 export-projections = "opm_processing.export_projections:main"
 encode-projections = "opm_processing.encode_projections:main"
 export-ome-tiff = "opm_processing.export_ome_tiff:main"

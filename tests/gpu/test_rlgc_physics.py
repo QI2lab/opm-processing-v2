@@ -4,14 +4,18 @@ Numerical assertions use production operators, SciPy and the shared simulator.
 """
 
 import importlib
+from functools import partial
 
 import numpy as np
 import pytest
 from scipy.interpolate import interp1d
 from scipy.signal import fftconvolve
 
+from opm_processing.imageprocessing.camera import camera_correct
 from tests.simulation.camera import digitize
 from tests.simulation.metrics import (
+    camera_flux_accuracy,
+    camera_prediction,
     camera_score_difference,
     predictive_deviance,
     two_point_profile,
@@ -20,9 +24,34 @@ from tests.simulation.metrics import (
 pytestmark = pytest.mark.unit
 
 
+@pytest.mark.parametrize("array_backend", ["gpu", "host"])
+@pytest.mark.parametrize("variance, observed_count", [(0, 90), (4, 94)])
+def test_full_data_rl_update_preserves_uniform_photon_rates(
+    cupy_gpu, optical_setup, array_backend, variance, observed_count
+):
+    """Apply the shared optical adjoint to analytically known uniform rates."""
+    solver = importlib.import_module("opm_processing.imageprocessing.rlgc")
+    xp = cupy_gpu if array_backend == "gpu" else np
+    # A power-of-two constant field has only a DC Fourier coefficient. This
+    # isolates scalar calibration arithmetic from mixed-radix FFT roundoff;
+    # nonconstant optical-adjoint tests cover the general convolution operator.
+    shape = tuple(1 << (2 * size).bit_length() for size in optical_setup.psf.shape)
+    convolution = solver._Convolution(optical_setup.psf, shape)
+
+    adjoint = partial(convolution, adjoint=True)
+    observed = xp.full(shape, observed_count, dtype=xp.float32)
+    denominator = xp.full(shape, 45 + variance, dtype=xp.float32)
+    sensitivity = adjoint(xp.ones(shape, dtype=xp.float32))
+    actual = solver._full_data_update(
+        observed, denominator, adjoint, sensitivity, np.float32(variance)
+    )
+    if array_backend == "gpu":
+        actual = cupy_gpu.asnumpy(actual)
+    np.testing.assert_allclose(actual, 2, rtol=8 * np.finfo(np.float32).eps)
+
+
 def test_generated_psf_camera_reconstruction(cupy_gpu, production_point_acquisition):
     """Apply production GC using the same PSF as the full camera simulation."""
-    from opm_processing.imageprocessing.camera import camera_correct
     from opm_processing.imageprocessing.rlgc import rlgc
 
     case = production_point_acquisition
@@ -42,10 +71,15 @@ def test_generated_psf_camera_reconstruction(cupy_gpu, production_point_acquisit
     assert predictive_deviance(recovered, expected, case.kernel) < predictive_deviance(
         calibrated, expected, case.kernel
     )
+    prediction = camera_prediction(recovered, case.kernel, boundary="constant")
+    for name, aperture in zip(
+        ("whole", "source", "background"), case.apertures, strict=True
+    ):
+        assert camera_flux_accuracy(prediction, expected, camera, aperture), name
     score = camera_score_difference(
         digitize(expected, camera, seed=43),
-        np.maximum(fftconvolve(recovered, case.kernel, mode="same"), 0),
-        np.maximum(fftconvolve(calibrated, case.kernel, mode="same"), 0),
+        prediction,
+        camera_prediction(calibrated, case.kernel),
         camera,
     )
     assert score.sum() > 0
@@ -66,10 +100,10 @@ def test_generated_psf_camera_reconstruction(cupy_gpu, production_point_acquisit
     ],
 )
 @pytest.mark.parametrize("array_backend", ["gpu", "host"])
-def test_gc_stopping_matches_matlab_reference(
+def test_gc_stopping_uses_prescribed_fraction_and_change_limits(
     cupy_gpu, accepted, change, peak, reason, array_backend
 ):
-    """Lock MATLAB's strict bounds, absolute change, zero gate and denominator floor."""
+    """Apply strict fraction/absolute-change bounds, a zero gate and denominator floor."""
     from opm_processing.imageprocessing.rlgc import (
         GC_RELATIVE_CHANGE_LIMIT,
         GC_UPDATED_FRACTION_LIMIT,
@@ -99,33 +133,37 @@ def test_gc_stopping_matches_matlab_reference(
 @pytest.mark.parametrize("camera_mode", (False, True), ids=("ideal", "camera-3000"))
 def test_native_gc_directional_rayleigh_pair(
     cupy_gpu,
-    reconstruct,
     rayleigh_pair,
-    camera_exposure,
+    optical_setup,
     factor,
     camera_mode,
     camera_calibration,
+    ideal_photon_camera,
 ):
     """Resolve noisy pairs placed at the directional optical first-minimum spacing."""
+    solver = importlib.import_module("opm_processing.imageprocessing.rlgc")
     case = rayleigh_pair
+    psf, microscope = optical_setup.psf, optical_setup.microscope
     expectation = case.expectation
     if camera_mode:
-        expectation = camera_exposure(expectation, 3000)
+        expectation = np.asarray(expectation, dtype=np.float64)
+        expectation = expectation * (3000 / float(expectation.max()))
         assert expectation.max() == pytest.approx(3000, rel=2e-15)
         camera = camera_calibration
         observed = digitize(expectation, camera, seed=31)
-        calibrated = np.maximum(
-            (observed.astype(np.float32) - camera.offset_adu)
-            * camera.electrons_per_adu,
-            0,
+        calibrated = camera_correct(
+            observed, camera.offset_adu, camera.electrons_per_adu
         )
     else:
-        observed = np.random.default_rng(31).poisson(expectation).astype(np.float32)
+        observed = digitize(expectation, ideal_photon_camera, seed=31).astype(
+            np.float32
+        )
         calibrated = observed
-    recovered = reconstruct(
-        calibrated,
-        case.psf,
-        factor,
+    recovered = solver.rlgc(
+        calibrated if factor is None else calibrated[::factor],
+        psf,
+        scan_upsample_factor=1 if factor is None else factor,
+        boundary="reflect" if factor is None else "zero",
         read_noise=camera.read_noise_e if camera_mode else 0,
     )
     baseline = calibrated
@@ -134,7 +172,7 @@ def test_native_gc_directional_rayleigh_pair(
         positions = np.arange(acquired.shape[0]) * factor
         baseline = interp1d(positions, acquired, axis=0)(np.arange(positions[-1] + 1))
     center = (np.array(observed.shape) - 1) / 2
-    measured = two_point_profile(recovered, center, case.offset, case.microscope)
+    measured = two_point_profile(recovered, center, case.offset, microscope)
     metrics = {
         "axis": case.axis,
         "scan_factor": factor,
@@ -142,10 +180,9 @@ def test_native_gc_directional_rayleigh_pair(
         "sampled_rayleigh_dip": case.acquisition_dip,
         "measured_dip": measured["valley_depth"],
         "measured_positions_um": measured["peak_positions_um"],
-        "predictive_deviance": predictive_deviance(recovered, expectation, case.psf),
-        "baseline_deviance": predictive_deviance(baseline, expectation, case.psf),
+        "predictive_deviance": predictive_deviance(recovered, expectation, psf),
+        "baseline_deviance": predictive_deviance(baseline, expectation, psf),
     }
-    print(metrics)
     assert np.isfinite(recovered).all() and recovered.min() >= 0
     assert metrics["predictive_deviance"] < metrics["baseline_deviance"], metrics
     # Sparse scans need not preserve the information required by the Rayleigh
@@ -170,7 +207,7 @@ def test_native_gc_directional_rayleigh_pair(
 @pytest.mark.parametrize("factor", [1, 3, 4])
 @pytest.mark.parametrize("crop_scan", [None, 5])
 def test_optical_forward_adjoint_matches_scipy(
-    cupy_gpu, optical_setup, factor, crop_scan
+    cupy_gpu, optical_setup, registration_scene, factor, crop_scan
 ):
     """Check the actual optical operator against independent CPU convolution."""
     cp = cupy_gpu
@@ -181,9 +218,8 @@ def test_optical_forward_adjoint_matches_scipy(
     psf /= psf.sum()
     shape = (31, 17, 19)
     selection = (slice(None, None, factor), slice(None), slice(None))
-    rng = np.random.default_rng(34)
-    obj = rng.uniform(1, 10, shape).astype(np.float32)
-    measured = rng.uniform(1, 10, obj[selection].shape).astype(np.float32)
+    obj = registration_scene(shape, seed=34).raw.astype(np.float32)
+    measured = registration_scene(obj[selection].shape, seed=35).raw.astype(np.float32)
     pads = solver._linear_fft_pad_width(shape, psf.shape)
     padded_shape = tuple(n + sum(p) for n, p in zip(shape, pads, strict=False))
     core = solver._observed_region_slices(padded_shape, pads)

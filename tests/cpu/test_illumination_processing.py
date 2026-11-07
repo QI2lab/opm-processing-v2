@@ -7,16 +7,25 @@ import numpy as np
 import pytest
 import tensorstore as ts
 from scipy.special import kl_div
-from typer.testing import CliRunner
 
 from opm_processing.dataio.live import read_lifecycle_event
 from opm_processing.dataio.position_collection import open_position_collection
+from opm_processing.imageprocessing.camera import camera_correct, illumination_correct
 from opm_processing.imageprocessing.flatfield import estimate_illuminations
-from opm_processing.process import app
+from tests.simulation.metrics import (
+    camera_flux_accuracy,
+    camera_noise_accuracy,
+    camera_partition_apertures,
+)
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("output_flatfield", (False, True))
+@pytest.mark.parametrize(
+    "opm_v2_projection_zarr,output_flatfield",
+    [(("projection", 2.0), False), (("projection", 1.25), True)],
+    indirect=["opm_v2_projection_zarr"],
+    ids=["source-field", "output-field"],
+)
 def test_processing_uses_existing_flatfield_with_separate_output(
     opm_v2_projection_zarr,
     tmp_path: Path,
@@ -35,12 +44,14 @@ def test_processing_uses_existing_flatfield_with_separate_output(
     source_field = np.full(field_shape, 2.0, dtype=np.float32)
     selected_field = source_field
     write_flatfield(
-        acquisition.path.parent / filename, source_field, acquisition.pixel_size_um
+        acquisition.path.parent / filename,
+        source_field,
+        acquisition.metadata.pixel_size_um,
     )
     if output_flatfield:
         selected_field = np.full(field_shape, 1.25, dtype=np.float32)
         write_flatfield(
-            output_dir / filename, selected_field, acquisition.pixel_size_um
+            output_dir / filename, selected_field, acquisition.metadata.pixel_size_um
         )
 
     process(
@@ -59,11 +70,27 @@ def test_processing_uses_existing_flatfield_with_separate_output(
         .read()
         .result()
     )
-    calibrated = (
-        acquisition.raw_data[:, 0].astype(np.float32) - acquisition.camera_offset
-    ) * acquisition.camera_conversion
-    expected = (calibrated / selected_field[0])[:, :, np.newaxis]
+    calibrated = camera_correct(
+        acquisition.raw_data[:, 0, :, 0],
+        acquisition.metadata.camera_offset,
+        acquisition.metadata.camera_conversion,
+    )
+    expected = illumination_correct(calibrated, selected_field[0])[:, :, np.newaxis]
     np.testing.assert_allclose(saved, expected, rtol=1e-6)
+    # The original object and optical model predict the calibrated photons;
+    # neither raw counts nor a second processing pass supplies this truth.
+    mean = acquisition.source_expectation[:, 0, :, 0]
+    observations = saved[:, :, 0]
+    camera = acquisition.microscope.camera
+    for time, channel in np.ndindex(mean.shape[:2]):
+        for aperture in camera_partition_apertures(mean.shape[-2:]):
+            accuracy = camera_noise_accuracy(
+                observations[time, channel], mean[time, channel], camera, aperture
+            )
+            assert accuracy.accepted, (time, channel, accuracy)
+            assert camera_flux_accuracy(
+                observations[time, channel], mean[time, channel], camera, aperture
+            ), (time, channel)
 
 
 @pytest.mark.unit
@@ -119,13 +146,15 @@ def test_old_per_depth_flatfield_is_not_reused(tmp_path):
     assert read_current_flatfield(path, (1, 1, 8, 12)) is None
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 @pytest.mark.parametrize("scan_planes", [1, 4])
 def test_processing_applies_the_same_field_at_every_depth(
-    tmp_path, constant_illumination_acquisition, scan_planes
+    tmp_path,
+    constant_illumination_acquisition,
+    scan_planes,
+    assert_uniform_photon_accuracy,
 ):
     """Calibrate every channel and depth against analytically known photons."""
-    from opm_processing.imageprocessing.opmtools import orthogonal_deskew
     from opm_processing.process import process, write_flatfield
 
     case = constant_illumination_acquisition
@@ -146,32 +175,14 @@ def test_processing_applies_the_same_field_at_every_depth(
         create_fused_max_projection=False,
         write_fused_max_projection_tiff=False,
     )
-    suffix = "2d" if scan_planes == 1 else "deskewed"
+    suffix = "projection" if scan_planes == 1 else "deskewed"
     corrected = open_position_collection(
         tmp_path / "corrected" / f"sample_{suffix}.ome.zarr"
     )
     for position, array in enumerate(corrected.arrays):
-        for time, channel in np.ndindex(2, 2):
-            value = (
-                case.photons[time, position, channel] / case.fields[0, channel, 0, 0]
-            )
-            expected = (
-                np.full((1, 8, 12), value, np.float32)
-                if scan_planes == 1
-                else orthogonal_deskew(
-                    np.full((scan_planes, 8, 12), value, dtype=np.float32),
-                    distance=acquisition.metadata.scan_axis_step_um,
-                    pixel_size=acquisition.metadata.pixel_size_um,
-                    theta=acquisition.metadata.angle_deg,
-                    downsample_factor=1,
-                )
-            )
-            np.testing.assert_allclose(
-                array[time, channel].read().result(),
-                expected,
-                rtol=4 * np.finfo(np.float32).eps,
-                atol=0,
-            )
+        assert_uniform_photon_accuracy(
+            array.read().result(), case.scene, position=position
+        )
 
 
 @pytest.mark.unit
@@ -179,7 +190,9 @@ def test_processing_applies_the_same_field_at_every_depth(
     "illumination_observations", ("maximum", "masked", "tiles"), indirect=True
 )
 def test_real_estimator_predicts_known_detector_illumination(illumination_observations):
-    """Known illumination predicts calibration photons better than unit sensitivity."""
+    """Estimate identifiable fields within a predefined absolute camera accuracy target."""
+    from tests.simulation.camera_likelihood import camera_sampling_accuracy
+
     case = illumination_observations
     actual = estimate_illuminations(
         case.datastore,
@@ -190,7 +203,9 @@ def test_real_estimator_predicts_known_detector_illumination(illumination_observ
     )[0]
     assert actual.shape == case.expected.shape
     assert np.all(np.isfinite(actual) & (actual > 0))
-    for expected, estimated in zip(case.expected, actual, strict=True):
+    for expected, estimated, envelope in zip(
+        case.expected, actual, case.envelopes, strict=True
+    ):
         if np.all(expected == 1):
             np.testing.assert_array_equal(estimated, 1)
             continue
@@ -199,6 +214,15 @@ def test_real_estimator_predicts_known_detector_illumination(illumination_observ
             assert np.any(estimated[expected < 1] < 1)
         truth = case.source * expected
         prediction = case.source * estimated
+        # This is a camera-space accuracy requirement for a nonlinear estimator,
+        # rather than a claim that BaSiC itself performs convex interpolation.
+        aperture = np.ones(expected.shape, bool)
+        measured = camera_sampling_accuracy(prediction, truth, envelope, aperture)
+        assert measured.accepted, measured
+        uncorrected = camera_sampling_accuracy(
+            np.full_like(truth, case.source), truth, envelope, aperture
+        )
+        assert not uncorrected.accepted, uncorrected
         assert (2 * kl_div(truth, prediction)).sum() < (
             2 * kl_div(truth, case.source)
         ).sum()
@@ -236,8 +260,14 @@ def test_invalid_cached_fields_are_not_reused(tmp_path, level):
     assert read_current_flatfield(path, field.shape) is None
 
 
-@pytest.mark.unit
-def test_live_wait_defers_processing_and_selects_flatfield(live_wait_case, monkeypatch):
+@pytest.mark.integration
+def test_live_wait_defers_processing_and_selects_flatfield(
+    live_wait_case,
+    monkeypatch,
+    assert_roi_point_accuracy,
+    deskew_uniform_expectation,
+    invoke_cli,
+):
     """Wait for both completion and chunks, then reuse or estimate illumination."""
     processing = importlib.import_module("opm_processing.process")
 
@@ -266,21 +296,17 @@ def test_live_wait_defers_processing_and_selects_flatfield(live_wait_case, monke
     monkeypatch.setattr(
         processing, "call_estimate_illuminations", estimate_after_completion
     )
-    args = [
-        str(case.dataset.path.parent),
-        "--live-wait",
-        "--save-float32",
-        "--output",
-        str(case.destination),
-        "--no-max-projection",
-        "--no-create-fused-max-projection",
-        "--z-downsample-level",
-        "1",
-    ]
-    if case.kind != "pending-chunks":
-        args.append("--flatfield-correction")
-    result = CliRunner().invoke(app, args)
-    assert result.exit_code == 0, result.exception
+    invoke_cli(
+        "process",
+        case.dataset.path.parent,
+        live_wait=True,
+        save_float32=True,
+        output=case.destination,
+        max_projection=False,
+        create_fused_max_projection=False,
+        z_downsample_level=1,
+        flatfield_correction=case.kind != "pending-chunks",
+    )
     assert (
         case.sleeps
         == [30.0] * {"estimate": 2, "pending-chunks": 1, "cached": 0}[case.kind]
@@ -295,34 +321,40 @@ def test_live_wait_defers_processing_and_selects_flatfield(live_wait_case, monke
         assert field is not None
         assert np.all(np.isfinite(field) & (field > 0))
         if case.kind == "cached":
-            np.testing.assert_array_equal(field, 2)
-        assert (
-            "starting offline processing"
-            if case.kind == "estimate"
-            else "Using existing flatfield"
-        ) in result.output
-    actual = (
-        open_position_collection(case.destination / "sample_deskewed.ome.zarr")
-        .arrays[0][0, 0]
-        .read()
-        .result()
-    )
-    expected = case.expected
-    if case.kind == "estimate":
-        from opm_processing.imageprocessing.opmtools import orthogonal_deskew
-
-        expected = orthogonal_deskew(
-            np.maximum(case.raw[0, 0, 0, ::-1].astype(np.float32) - 100, 0)
-            * 0.24
-            / field[0, 0],
-            theta=30,
-            distance=0.4,
-            pixel_size=0.115,
-            downsample_factor=1,
-        )
+            np.testing.assert_array_equal(field, 1)
+    output = open_position_collection(case.destination / "sample_deskewed.ome.zarr")
+    data = output.arrays[0].read().result()
+    span = (case.raw.shape[-3] - 1) * case.scene.microscope.scan_step_um
     np.testing.assert_allclose(
-        actual,
-        expected,
-        rtol=4 * np.finfo(np.float32).eps,
-        atol=1e-5 if case.kind == "estimate" else 0,
+        output.spatial_origins_zyx_um[0], (0, -span, 0), atol=0.0005, rtol=0
+    )
+    np.testing.assert_allclose(
+        output.voxel_size_um, (0.115, 0.115, 0.115), atol=0, rtol=0
+    )
+    if case.calibration_photons is not None:
+        expected_calibration = deskew_uniform_expectation(
+            case.raw.shape[-3:], case.calibration_photons, dtype=np.float32
+        )
+        camera = case.scene.microscope.camera
+        sigma = np.sqrt(
+            case.calibration_photons
+            + camera.read_noise_e**2
+            + camera.electrons_per_adu**2 / 12
+        )
+        gain = (
+            2 * case.scene.microscope.pixel_size_um / case.scene.microscope.scan_step_um
+        )
+        # Positive interpolation cannot exceed the variance of one input
+        # camera sample. Use the declared dose and six shot/read-noise SDs.
+        np.testing.assert_allclose(
+            data[0, 0], expected_calibration, rtol=0, atol=6 * gain * sigma
+        )
+        np.testing.assert_array_equal(data[0, 0][expected_calibration == 0], 0)
+    assert_roi_point_accuracy(
+        data[case.sample_timepoint : case.sample_timepoint + 1],
+        case.scene,
+        output.spatial_origins_zyx_um[0],
+        output.voxel_size_um,
+        raw_origin=(0, -span, 0),
+        illumination=field[0, 0] if case.kind != "pending-chunks" else 1.0,
     )

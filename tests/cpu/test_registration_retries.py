@@ -2,10 +2,9 @@
 
 import numpy as np
 import pytest
-import tensorstore as ts
 
 from opm_processing.imageprocessing.tilefusion import (
-    TileFusion,
+    _infer_registration_limits,
 )
 
 
@@ -54,47 +53,39 @@ def test_limits_follow_rejected_peak_and_sampling_without_widening_other_pairs(
 @pytest.mark.unit
 @pytest.mark.parametrize("failed_retry", [False, True])
 def test_selective_registration_reads_only_target_pair_and_preserves_raw_outliers(
-    fusion_operator, monkeypatch, failed_retry
+    tile_fusion, registration_scene, monkeypatch, failed_retry
 ):
     """Read selected pairs while preserving raw links outside the selection."""
-    rng = np.random.default_rng(481)
-    specimen = rng.uniform(0, 1000, (1, 1, 16, 16)).astype(np.float32)
+    specimen = (
+        registration_scene((1, 16, 16), seed=481).expectation[None].astype(np.float32)
+    )
     source_tiles = [specimen.copy() for _ in range(6)]
     if failed_retry:
-        source_tiles[5] = rng.uniform(0, 1000, specimen.shape).astype(np.float32)
+        source_tiles[5] = (
+            registration_scene((1, 16, 16), seed=482)
+            .expectation[None]
+            .astype(np.float32)
+        )
     raw = {
         (0, 1): (0, 2, 3, 0.99),
         (3, 4): (0, 1, 2, 0.99),
         (3, 5): (0, 7, 1, 0.8),  # A prior global outlier remains available.
         (4, 5): (0, 8, 8, 0.99),  # This stale target must be replaced or removed.
     }
-    fusion = fusion_operator(
-        TileFusion,
-        source_tiles=source_tiles[:3],
-        position_arrays=tuple(
-            ts.array(np.stack((source_tiles[position], source_tiles[position + 3])))
-            for position in range(3)
-        ),
-        time_dim=2,
-        position_dim=3,
-        _tile_positions=[(0, 0, 0)] * 6,
-        _tile_shapes=[(1, 16, 16)] * 6,
-        _tiles_by_time=((0, 1, 2), (3, 4, 5)),
-        _pixel_size=(1, 1, 1),
-        _tile_support_zy=[np.ones((1, 16), np.float32)] * 6,
-        _is_2d=True,
-        _max_workers=1,
-        _debug=False,
-        _tile_channel_nonzero={(index, 0): True for index in range(6)},
+    fusion = tile_fusion(
+        source_tiles,
+        [(0, 0, 0)] * 6,
+        time_indices=(0, 0, 0, 1, 1, 1),
         downsample_factors=(1, 1, 1),
         ssim_window=3,
         threshold=0.7,
         max_registration_shift_zyx=(0, 8, 8),
-        pairwise_metrics=raw.copy(),
-        optimized_pairwise_metrics={(0, 1): raw[0, 1], (3, 4): raw[3, 4]},
-        _rejected_registration_links={(0, 2): ((0, 10, 0), (0, 8, 8), 0.6)},
-        _registration_pair_sampling={(0, 1): (1, 2, 2)},
     )
+    fusion._tile_support_zy = [np.ones((1, 16), np.float32)] * 6
+    fusion.pairwise_metrics = raw.copy()
+    fusion.optimized_pairwise_metrics = {(0, 1): raw[0, 1], (3, 4): raw[3, 4]}
+    fusion._rejected_registration_links = {(0, 2): ((0, 10, 0), (0, 8, 8), 0.6)}
+    fusion._registration_pair_sampling = {(0, 1): (1, 2, 2)}
     reads = []
     read_patch = fusion._read_registration_patch
 
@@ -123,34 +114,61 @@ def test_selective_registration_reads_only_target_pair_and_preserves_raw_outlier
 
 @pytest.mark.unit
 @pytest.mark.parametrize(
-    "depth_error,retries,automatic",
-    [(15, 2, True), (16, 2, True), (15, 0, True), (15, 2, False)],
-    ids=("15px", "16px", "no-retries", "explicit-limits"),
+    "depth_error,retries,automatic,context_limit",
+    [
+        (15, 2, True, None),
+        (16, 2, True, None),
+        (15, 0, True, None),
+        (15, 2, False, None),
+        (15, 2, True, (17, 160, 88)),
+        (15, 2, True, (13, 160, 88)),
+    ],
+    ids=(
+        "15px",
+        "16px",
+        "no-retries",
+        "explicit-limits",
+        "within-read-context",
+        "outside-read-context",
+    ),
 )
 def test_real_depth_peak_outside_guard_band_is_remeasured_and_recovered(
     registration_pair,
     shifted_slab_pair,
-    registration_cache,
     depth_error,
     retries,
     automatic,
+    context_limit,
 ):
     """Recover a known physical drift only when retries and automatic limits permit it."""
     pair = shifted_slab_pair((64, 160, 88), 51, (-depth_error, -40, 8), seed=20261017)
+    limits = _infer_registration_limits(
+        pair.positions,
+        [volume.shape for volume in pair.volumes],
+        pair.spacing,
+        (3, 2, 2),
+        30,
+    )
     fusion = registration_pair(
         pair.volumes,
         pair.positions,
         ssim_window=7,
-        _automatic_registration_limits=automatic,
+        max_registration_shift_zyx=None if automatic else limits[0, 1],
+        registration_context_limit_zyx=context_limit,
         registration_retries=retries,
         optimization_rel_threshold=0.5,
         optimization_abs_threshold=1.5,
         channel_to_use=0,
+        reverse_stage_y=True,
+        reverse_stage_z=True,
     )
-    registration_cache(fusion)
     assert fusion.max_registration_shift_zyx[0] == 13
     fusion.register_with_retries()
-    if automatic and retries:
+    if (
+        automatic
+        and retries
+        and (context_limit is None or depth_error < context_limit[0])
+    ):
         assert fusion._registration_retry_count >= 1
         np.testing.assert_allclose(
             fusion.pairwise_metrics[0, 1][:3], pair.expected, atol=1
@@ -160,3 +178,10 @@ def test_real_depth_peak_outside_guard_band_is_remeasured_and_recovered(
         assert fusion._registration_retry_count == 0
         assert (0, 1) not in fusion.pairwise_metrics
         np.testing.assert_array_equal(fusion.global_offsets, np.zeros((2, 3)))
+    if context_limit is not None:
+        assert all(
+            measured <= available
+            for measured, available in zip(
+                fusion.max_registration_shift_zyx, context_limit, strict=True
+            )
+        )

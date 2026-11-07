@@ -145,6 +145,63 @@ def deskew_shape_estimator(
 
 
 @njit(inline="always")
+def deskew_row_coordinates(
+    z: int,
+    y: int,
+    planes: int,
+    ny: int,
+    final_nz: int,
+    step: float,
+    tangent: float,
+    sine: float,
+    cosine: float,
+) -> tuple:
+    """Locate source planes and detector feet without reducing precision.
+
+    Parameters
+    ----------
+    z, y : int
+        Laboratory coordinates in camera-pixel units.
+    planes, ny : int
+        Scan length and detector height.
+    final_nz : int
+        Laboratory height before Z averaging.
+    step : float
+        Scan spacing divided by camera pixel size.
+    tangent, sine, cosine : float
+        Trigonometric functions of the acquisition angle.
+
+    Returns
+    -------
+    tuple
+        Validity, preceding scan, preceding/following detector-row indices,
+        continuous preceding/following detector feet, and following-plane
+        weight. Coordinates and plane weights retain float64 precision;
+        coordinates outside the acquired footprint have a false validity flag.
+    """
+    virtual_plane = y - z / tangent
+    before = int(np.floor(virtual_plane * (1 / step)))
+    za = z / sine
+    displacement = virtual_plane - before * step
+    position_before = za + displacement * cosine
+    position_after = za - (step - displacement) * cosine
+    rb, ra = int(np.floor(position_before)), int(np.floor(position_after))
+    valid = (
+        z < final_nz
+        and before >= 0
+        and before + 1 < planes
+        and rb >= 0
+        and ra >= 0
+        and rb + 1 < ny
+        and ra + 1 < ny
+    )
+    # Perpendicular distances are displacement*sin(theta) and
+    # (step-displacement)*sin(theta). Their common sine cancels in d_other/sum(d).
+    after_weight = min(1.0, max(0.0, displacement / step))
+    return valid, before, rb, ra, position_before, position_after, after_weight
+
+
+@njit(inline="always")
 def deskew_row(
     z: int,
     y: int,
@@ -156,7 +213,7 @@ def deskew_row(
     sine: float,
     cosine: float,
 ) -> tuple:
-    """Locate four source rows without reducing coordinate precision.
+    """Locate four source rows and their float32 interpolation weights.
 
     Parameters
     ----------
@@ -175,12 +232,11 @@ def deskew_row(
     -------
     tuple
         Validity, preceding scan, preceding/following detector rows, and four
-        float32 interpolation weights combining detector-row interpolation with
-        perpendicular-distance weighting between planes. Valid weights sum to
-        one; invalid rows have zero weights.
+        float32 interpolation weights. Valid weights sum to one.
     """
-    virtual_plane = y - z / tangent
-    before = int(np.floor(virtual_plane * (1 / step)))
+    valid, before, rb, ra, position_before, position_after, after_weight = (
+        deskew_row_coordinates(z, y, planes, ny, final_nz, step, tangent, sine, cosine)
+    )
     if z >= final_nz or before < 0 or before + 1 >= planes:
         return (
             False,
@@ -192,16 +248,7 @@ def deskew_row(
             np.float32(0),
             np.float32(0),
         )
-    za = z / sine
-    displacement = virtual_plane - before * step
-    position_before = za + displacement * cosine
-    position_after = za - (step - displacement) * cosine
-    rb, ra = int(np.floor(position_before)), int(np.floor(position_after))
-    valid = rb >= 0 and ra >= 0 and rb + 1 < ny and ra + 1 < ny
     db, da = position_before - rb, position_after - ra
-    # Perpendicular distances are displacement*sin(theta) and
-    # (step-displacement)*sin(theta). Their common sine cancels in d_other/sum(d).
-    after_weight = min(1.0, max(0.0, displacement / step))
     before_weight = 1.0 - after_weight
     return (
         valid,
@@ -213,6 +260,104 @@ def deskew_row(
         np.float32(before_weight * db),
         np.float32(before_weight * (1 - db)),
     )
+
+
+@njit(parallel=True)
+def _deskew_coverage_rows(
+    planes: int,
+    height: int,
+    final_nz: int,
+    final_ny: int,
+    output: np.ndarray,
+    theta: float,
+    step: float,
+    factor: int,
+    origin_zy: tuple[int, int],
+) -> np.ndarray:
+    """Count supported native rows using the interpolation kernel's mapper."""
+    angle = np.radians(theta)
+    tangent, sine, cosine = np.tan(angle), np.sin(angle), np.cos(angle)
+    for task in prange(output.size):
+        row = np.int64(task)
+        z_local, y_local = row // output.shape[1], row % output.shape[1]
+        z_start = (z_local + origin_zy[0]) * factor
+        y = y_local + origin_zy[1]
+        if y < 0 or y >= final_ny:
+            continue
+        count = 0
+        for z in range(z_start, min(z_start + factor, final_nz)):
+            if z >= 0:
+                geometry = deskew_row_coordinates(
+                    z, y, planes, height, final_nz, step, tangent, sine, cosine
+                )
+                count += int(geometry[0])
+        output[z_local, y_local] = np.float32(count) / np.float32(factor)
+    return output
+
+
+def deskew_coverage(
+    input_shape: Sequence[int],
+    output_shape: Sequence[int],
+    theta: float,
+    distance: float,
+    pixel_size: float,
+    *,
+    downsample_factor: int = 1,
+    reverse_deskewed_z: bool = False,
+    origin_zy: tuple[int, int] = (0, 0),
+) -> np.ndarray:
+    """Compute acquired fractions of output Z bins without interpolating pixels.
+
+    Parameters
+    ----------
+    input_shape : sequence of int
+        Source scan, detector-Y and detector-X dimensions.
+    output_shape : sequence of int
+        Requested ZY or ZYX shape; coverage is independent of detector X.
+    theta, distance, pixel_size : float
+        Acquisition angle in degrees, scan interval and detector pitch in microns.
+    downsample_factor : int
+        Native laboratory-Z samples per nominal output bin.
+    reverse_deskewed_z : bool
+        Reverse the calculated Z coverage like the returned deskewed image.
+    origin_zy : tuple of int
+        Global averaged-Z and Y indices of the requested output window.
+
+    Returns
+    -------
+    numpy.ndarray
+        Float32 ZY fraction of each nominal bin sampled inside both source
+        planes. Padding and unsupported rows are zero.
+    """
+    full_shape, *_ = deskew_shape_estimator(
+        input_shape,
+        theta,
+        distance,
+        pixel_size,
+        crop_after_deskew=False,
+        divisible_by=1,
+        downsample_factor=1,
+    )
+    if len(output_shape) not in (2, 3) or any(
+        int(n) != n or n < 1 for n in output_shape
+    ):
+        raise ValueError("Coverage requires a nonempty integer ZY or ZYX shape")
+    if downsample_factor < 1 or int(downsample_factor) != downsample_factor:
+        raise ValueError("Coverage Z averaging must be a positive integer")
+    if len(origin_zy) != 2 or any(int(n) != n for n in origin_zy):
+        raise ValueError("Coverage origin must contain integer ZY indices")
+    coverage = _deskew_coverage_rows(
+        int(input_shape[0]),
+        int(input_shape[1]),
+        int(full_shape[0]),
+        int(full_shape[1]),
+        np.zeros(tuple(map(int, output_shape[:2])), np.float32),
+        theta,
+        distance / pixel_size,
+        int(downsample_factor),
+        tuple(map(int, origin_zy)),
+    )
+    return coverage[::-1].copy() if reverse_deskewed_z else coverage
 
 
 @njit(inline="always")

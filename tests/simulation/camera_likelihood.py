@@ -7,16 +7,346 @@ They are never evaluated on clipped, dark-subtracted pseudo-photon counts.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
-from scipy.special import gammaln, log_ndtr, logsumexp, ndtri, xlogy
+from scipy.ndimage import maximum_filter, minimum_filter, shift
+from scipy.special import gammaln, kl_div, log_ndtr, logsumexp, ndtri, xlogy
 from scipy.stats import poisson
 
+from opm_processing.imageprocessing.camera import camera_correct
+
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from numpy.typing import ArrayLike
 
     from tests.simulation.camera import Camera
+    from tests.simulation.forward_model import Microscope
+
+
+@dataclass(frozen=True)
+class SamplingEnvelope:
+    """Certified camera-rate interval from known means and original detector noise."""
+
+    lower: np.ndarray
+    upper: np.ndarray
+
+    def __post_init__(self) -> None:
+        """Keep shared numerical bounds immutable across individual checks."""
+        for array in (self.lower, self.upper):
+            array.setflags(write=False)
+
+
+@dataclass(frozen=True)
+class SamplingAccuracy:
+    """Absolute camera-likelihood and photon-flux checks on one fixed aperture."""
+
+    inside_envelope: bool
+    deviance: float
+    deviance_bound: float
+    flux: float
+    flux_lower: float
+    flux_upper: float
+
+    @property
+    def accepted(self) -> bool:
+        """Require local, likelihood and total-photon bounds simultaneously."""
+        return (
+            self.inside_envelope
+            and np.isfinite(self.deviance)
+            and np.isfinite(self.deviance_bound)
+            and self.deviance <= self.deviance_bound
+            and self.flux_lower <= self.flux <= self.flux_upper
+        )
+
+
+def sampling_stencil_radii(
+    microscope: Microscope,
+    output_spacing_zyx: Sequence[float],
+    *,
+    z_bin_factor: int = 1,
+) -> tuple[int, int, int]:
+    """Bound contributing native camera pixels by physical geometry alone.
+
+    An inverse camera sample lies within one orthogonal output-cell pitch.
+    A Z bin adds half its native-plane width. Perpendicular projection onto
+    either adjacent acquired plane adds at most one scan interval and one
+    detector-row interval. These bounds contain every contributing sample;
+    they do not reproduce interpolation indices or weights.
+
+    Parameters
+    ----------
+    microscope : Microscope
+        Recorded camera pitch, scan spacing and OPM angle.
+    output_spacing_zyx : sequence of float
+        Physical spacing of the saved orthogonal image.
+    z_bin_factor : int
+        Number of native Z planes averaged into an output bin.
+
+    Returns
+    -------
+    tuple of int
+        Conservative native SYX radii for installed min/max filter operators.
+    """
+    spacing = np.asarray(output_spacing_zyx, np.float64)
+    if spacing.shape != (3,) or np.any(spacing <= 0) or not np.isfinite(spacing).all():
+        raise ValueError("Require three positive orthogonal spacings")
+    if z_bin_factor < 1 or int(z_bin_factor) != z_bin_factor:
+        raise ValueError("Require a positive integer Z-bin factor")
+    pixel = microscope.pixel_size_um
+    step = microscope.scan_step_um
+    angle = np.deg2rad(microscope.angle_deg)
+    z_spread = spacing[0] + (z_bin_factor - 1) * pixel / 2
+    return (
+        int(np.ceil((spacing[1] + z_spread / np.tan(angle)) / step)),
+        int(np.ceil(z_spread / (pixel * np.sin(angle)) + step / pixel * np.cos(angle))),
+        int(np.ceil(spacing[2] / pixel)),
+    )
+
+
+def sampling_stencil_footprint(
+    microscope: Microscope,
+    output_spacing_zyx: Sequence[float],
+    *,
+    z_bin_factor: int = 1,
+    origin_y_error_um: float = 0,
+) -> np.ndarray:
+    """Exclude physically unreachable corners of the native-camera stencil.
+
+    A perpendicular projection onto an adjacent scan plane changes laboratory
+    Y by at most ``step*sin(theta)**2``. Detector-row interpolation adds at
+    most ``pixel*cos(theta)`` and inverse camera sampling one output Y pitch.
+    Native Z averaging leaves Y fixed. This necessary geometric condition
+    retains every positive contributor without reproducing interpolation
+    indices or weights.
+
+    Parameters
+    ----------
+    microscope : Microscope
+        Recorded camera pitch, scan spacing and OPM angle.
+    output_spacing_zyx : sequence of float
+        Saved-grid spacing, including any extra fractional-fusion stencil.
+    z_bin_factor : int
+        Native planes per output Z bin.
+    origin_y_error_um : float
+        Independently declared Y-origin serialization error bound.
+
+    Returns
+    -------
+    numpy.ndarray
+        Immutable centered SYX footprint for installed min/max filters.
+    """
+    radii = sampling_stencil_radii(
+        microscope, output_spacing_zyx, z_bin_factor=z_bin_factor
+    )
+    if not np.isfinite(origin_y_error_um) or origin_y_error_um < 0:
+        raise ValueError("Require a finite nonnegative coordinate-error bound")
+    pixel, step = microscope.pixel_size_um, microscope.scan_step_um
+    angle = np.deg2rad(microscope.angle_deg)
+    offsets = np.meshgrid(
+        *(np.arange(-radius, radius + 1) for radius in radii), indexing="ij"
+    )
+    distance_y = offsets[0] * step + offsets[1] * pixel * np.cos(angle)
+    reach_y = (
+        float(output_spacing_zyx[1])
+        + step * np.sin(angle) ** 2
+        + pixel * abs(np.cos(angle))
+        + origin_y_error_um
+    )
+    arithmetic = 32 * np.finfo(float).eps * max(reach_y, step, pixel)
+    support = np.abs(distance_y) <= reach_y + arithmetic
+    support.setflags(write=False)
+    return support
+
+
+def camera_sampling_envelope(
+    expectation: ArrayLike,
+    raw: ArrayLike,
+    camera: Camera,
+    *,
+    radii: Sequence[int],
+    footprint: ArrayLike | None = None,
+    response: ArrayLike = 1,
+    views: int = 1,
+    z_bin_factor: int = 1,
+    view_offsets_syx: Sequence[Sequence[float]] | None = None,
+) -> SamplingEnvelope:
+    """Bound positive resampling using original optical truth and detector residuals.
+
+    Positive normalized interpolation and fusion weights keep the original
+    calibrated camera inputs divided by detector response inside their local
+    extrema. Installed SciPy min/max filters evaluate those extrema over a
+    conservative physical stencil. The original draws retain actual Poisson,
+    read-noise, ADC and clipping effects; no reconstructed values set bounds.
+    This also remains valid when a fitted flatfield depends on the observations.
+    Original optical means supply the separate likelihood/flux reference and
+    the arithmetic-error scale, rather than a reconstructed brightness fit.
+
+    Parameters
+    ----------
+    expectation : array-like
+        Original noiseless camera photoelectron means, before digitization.
+    raw : array-like
+        Original unsigned camera observations on the same grid.
+    camera : Camera
+        Explicit detector gain and offset.
+    radii : sequence of int
+        Native-camera stencil radii supplied by physical geometry.
+    footprint : array-like or None
+        Optional correlated physical support within the rectangular radii.
+    response : array-like
+        Positive response divided out before image interpolation.
+    views : int
+        Maximum number of independently acquired views mixed by fusion.
+    z_bin_factor : int
+        Native planes per output bin, used to bound arithmetic roundoff.
+    view_offsets_syx : sequence of sequence of float or None
+        Known native-camera displacements of stacked views relative to the
+        target frame. Fractional axes require a one-sample nearest-bound guard
+        in radii. Combine bounds in corrected-photon units.
+
+    Returns
+    -------
+    SamplingEnvelope
+        Immutable camera-rate bounds including the float32 arithmetic margin.
+    """
+    means, codes = np.broadcast_arrays(
+        np.asarray(expectation, np.float64), np.asarray(raw, np.float64)
+    )
+    if view_offsets_syx is not None:
+        offsets = np.asarray(view_offsets_syx, float)
+        if (
+            means.ndim != 4
+            or offsets.shape != (means.shape[0], 3)
+            or not np.isfinite(offsets).all()
+        ):
+            raise ValueError("Require stacked camera views and known SYX offsets")
+        sensitivity = np.broadcast_to(np.asarray(response, float), means.shape[1:])
+        low, high = np.full(means.shape[1:], np.nan), np.full(means.shape[1:], np.nan)
+        for mean, raw, offset in zip(means, codes, offsets, strict=True):
+            bounds = camera_sampling_envelope(
+                mean,
+                raw,
+                camera,
+                radii=radii,
+                footprint=footprint,
+                response=sensitivity,
+                views=max(views, len(offsets)),
+                z_bin_factor=z_bin_factor,
+            )
+            aligned = [
+                shift(
+                    values / sensitivity,
+                    offset,
+                    order=0,
+                    mode="constant",
+                    cval=np.nan,
+                    prefilter=False,
+                )
+                for values in (bounds.lower, bounds.upper)
+            ]
+            low, high = np.fmin(low, aligned[0]), np.fmax(high, aligned[1])
+        return SamplingEnvelope(low * sensitivity, high * sensitivity)
+    sensitivity = np.broadcast_to(np.asarray(response, np.float64), means.shape)
+    radius = np.asarray(radii)
+    if (
+        radius.shape != (means.ndim,)
+        or np.any(radius < 0)
+        or np.any(radius != radius.astype(int))
+        or not np.isfinite(means).all()
+        or np.any(means < 0)
+        or not np.isfinite(codes).all()
+        or not np.isfinite(sensitivity).all()
+        or np.any(sensitivity <= 0)
+        or views < 1
+        or z_bin_factor < 1
+    ):
+        raise ValueError(
+            "Require finite original camera data and positive sampling settings"
+        )
+    observed = camera_correct(
+        codes, camera.offset_adu, camera.electrons_per_adu
+    ).astype(np.float64)
+    calibrated = observed / sensitivity
+    window = tuple(2 * radius.astype(int) + 1)
+    support = None if footprint is None else np.asarray(footprint, bool)
+    if support is not None and (
+        support.shape != window or not support[tuple(radius.astype(int))]
+    ):
+        raise ValueError("Require a centered physical footprint within the stencil")
+    filters = {"size": window} if support is None else {"footprint": support}
+    lower = minimum_filter(calibrated, mode="nearest", **filters) * sensitivity
+    upper = maximum_filter(calibrated, mode="nearest", **filters) * sensitivity
+    # Per view: calibration, four-sample orthogonal interpolation, eight-sample
+    # inverse camera interpolation and normalized fusion take fewer than 64
+    # positive arithmetic operations. Each extra native Z plane adds eight.
+    operations = (64 + 8 * (z_bin_factor - 1)) * (views + 1)
+    error = operations * np.finfo(np.float32).eps
+    if error >= 1:
+        raise ValueError("Sampling arithmetic exceeds the supported precision bound")
+    roundoff = (
+        error / (1 - error) * np.maximum.reduce((means, np.abs(lower), np.abs(upper)))
+    )
+    return SamplingEnvelope(
+        np.maximum(lower - roundoff, 0),
+        np.maximum(upper + roundoff, 0),
+    )
+
+
+def camera_sampling_accuracy(
+    prediction: ArrayLike,
+    expectation: ArrayLike,
+    envelope: SamplingEnvelope,
+    mask: ArrayLike,
+) -> SamplingAccuracy:
+    """Compare absolute camera rates with certified likelihood and flux bounds.
+
+    Poisson KL is convex in its predicted rate, so its maximum over a known
+    interval occurs at an endpoint. A local interval check remains mandatory
+    even when an endpoint is zero and gives an infinite KL bound. Fixed spatial
+    apertures keep opposing stripe errors from cancelling in total photon flux.
+
+    Parameters
+    ----------
+    prediction : array-like
+        Camera-rate prediction sampled from the actual saved reconstruction.
+    expectation : array-like
+        Original simulated noiseless camera means.
+    envelope : SamplingEnvelope
+        Bounds derived solely from original truth and observations.
+    mask : array-like
+        Fixed physical source or background aperture on the camera grid.
+
+    Returns
+    -------
+    SamplingAccuracy
+        Joint local, absolute-likelihood and integrated-flux result.
+    """
+    predicted, expected = np.broadcast_arrays(
+        np.asarray(prediction, np.float64), np.asarray(expectation, np.float64)
+    )
+    selected = np.broadcast_to(np.asarray(mask, bool), expected.shape)
+    if not selected.any() or expected[selected].sum() <= 0:
+        raise ValueError("Accuracy requires a nonempty positive known-camera aperture")
+    low, high = envelope.lower[selected], envelope.upper[selected]
+    rates, actual = expected[selected], predicted[selected]
+    inside = bool(
+        np.isfinite(actual).all() and np.all(actual >= low) and np.all(actual <= high)
+    )
+    divergence = float(2 * kl_div(rates, actual).sum(dtype=np.float64))
+    bound = float(
+        2 * np.maximum(kl_div(rates, low), kl_div(rates, high)).sum(dtype=np.float64)
+    )
+    return SamplingAccuracy(
+        inside,
+        divergence,
+        bound,
+        float(actual.sum(dtype=np.float64)),
+        float(low.sum(dtype=np.float64)),
+        float(high.sum(dtype=np.float64)),
+    )
 
 
 def camera_log_likelihood(

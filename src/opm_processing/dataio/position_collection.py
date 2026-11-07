@@ -89,6 +89,41 @@ class PositionCollection:
         return int(t), len(self.arrays), int(c), int(z), int(y), int(x)
 
 
+def _stage_coordinate_um(value: float, unit: Any) -> float:
+    """Convert a recorded stage value before applying micrometer precision.
+
+    Parameters
+    ----------
+    value : float
+        Recorded coordinate in the declared unit.
+    unit : Any
+        OME length unit or a length-unit name.
+
+    Returns
+    -------
+    float
+        Micrometers rounded to three decimal places after conversion.
+    """
+    factors = {
+        "m": 1e6,
+        "meter": 1e6,
+        "cm": 1e4,
+        "centimeter": 1e4,
+        "mm": 1000.0,
+        "millimeter": 1000.0,
+        "µm": 1.0,
+        "μm": 1.0,
+        "um": 1.0,
+        "micrometer": 1.0,
+        "nm": 0.001,
+        "nanometer": 0.001,
+    }
+    name = str(getattr(unit, "value", unit))
+    if name not in factors:
+        raise ValueError(f"Unsupported stage coordinate unit: {name}")
+    return round_spatial(float(value) * factors[name])
+
+
 def create_position_collection(
     output_path: str | Path,
     shape: Sequence[int],
@@ -103,6 +138,7 @@ def create_position_collection(
     multiscale_factors_yx: Sequence[int] = (),
     multiscale_downsample: str = "stride",
     spatial_offset_um: Sequence[float] = (0.0, 0.0, 0.0),
+    spatial_offsets_zyx_um: Sequence[Sequence[float]] | None = None,
     time_interval_s: float | None = None,
 ) -> PositionCollection:
     """Create a Bf2Raw collection with one TCZYX image per position.
@@ -133,6 +169,8 @@ def create_position_collection(
         Pyramid sampling method: stride or block_mean.
     spatial_offset_um : Sequence[float]
         Image origin in ZYX order, in micrometers.
+    spatial_offsets_zyx_um : Sequence[Sequence[float]] or None
+        Per-position local image origins, overriding the common offset.
     time_interval_s : float or None
         Physical snapshot interval in seconds; None leaves time unitless.
 
@@ -154,18 +192,38 @@ def create_position_collection(
     if any(value < 1 for value in factors):
         raise ValueError("multiscale_factors_yx must contain positive integers")
     factors = tuple(value for value in factors if value == 1 or value <= min(y, x))
-    rounded_stage_positions = (
+    recorded_stage_positions = (
         None
         if stage_positions is None
         else tuple(round_spatial_values(position) for position in stage_positions)
     )
+    origins = (
+        (spatial_offset_um,) * positions
+        if spatial_offsets_zyx_um is None
+        else tuple(round_spatial_values(origin) for origin in spatial_offsets_zyx_um)
+    )
+    if len(origins) != positions or any(len(origin) != 3 for origin in origins):
+        raise ValueError("Expected one ZYX image origin per position")
 
     root_attributes = convert_metadata(attributes or {})
+    if recorded_stage_positions is not None:
+        root_attributes["opm_processing_stage_positions"] = {
+            "axes": ["z", "x", "y"],
+            "unit": "micrometer",
+            "positions": [list(position) for position in recorded_stage_positions],
+        }
     ome_xml = _build_ome_xml(
         shapes_tczyx=[(t, c, z, y, x)] * positions,
         dtype=np.dtype(dtype),
         voxel_size_um=voxel_size_um,
-        origins_zyx_um=rounded_stage_positions,
+        origins_zyx_um=(
+            None
+            if recorded_stage_positions is None
+            else [
+                (z, stage_y, stage_x)
+                for z, stage_x, stage_y in recorded_stage_positions
+            ]
+        ),
         channels=channels,
         time_interval_s=time_interval_s,
         name_prefix="Position",
@@ -226,12 +284,28 @@ def create_position_collection(
             level_x = x // factor
         array_specs.append(((t, c, z, level_y, level_x), np.dtype(dtype)))
     for position in range(positions):
+        position_datasets = []
+        for dataset in datasets:
+            translation = list(dataset.translation_transform.translation)
+            translation[-3:] = (
+                np.asarray(translation[-3:]) - spatial_offset_um + origins[position]
+            ).tolist()
+            translation = round_tczyx_transform(translation)
+            position_datasets.append(
+                v05.Dataset(
+                    path=dataset.path,
+                    coordinateTransformations=[
+                        dataset.scale_transform,
+                        v05.TranslationTransformation(translation=translation),
+                    ],
+                )
+            )
         image = v05.Image(
             multiscales=[
                 v05.Multiscale(
                     name=f"position-{position}",
                     axes=axes,
-                    datasets=datasets,
+                    datasets=position_datasets,
                 )
             ]
         )
@@ -243,7 +317,6 @@ def create_position_collection(
         tuple(handles[f"{position}/{level}"] for position in range(positions))
         for level in range(len(factors))
     )
-    origins = (spatial_offset_um,) * positions
     return PositionCollection(
         path=path,
         arrays=arrays,
@@ -252,7 +325,7 @@ def create_position_collection(
         multiscale_factors_yx=factors,
         multiscale_downsample=multiscale_downsample,
         voxel_size_um=tuple(voxel_size_um),
-        stage_positions_zxy=rounded_stage_positions or (),
+        stage_positions_zxy=recorded_stage_positions or (),
         channel_names=tuple(channels or (f"channel-{index}" for index in range(c))),
         spatial_origins_zyx_um=origins,
         time_interval_s=time_interval_s,
@@ -265,6 +338,7 @@ def create_variable_position_collection(
     voxel_size_um: Sequence[float],
     *,
     spatial_origins_zyx_um: Sequence[Sequence[float]],
+    stage_positions: Sequence[Sequence[float]] | None = None,
     dtype: np.dtype | str = np.uint16,
     channels: Sequence[str] | None = None,
     attributes: dict[str, Any] | None = None,
@@ -287,6 +361,8 @@ def create_variable_position_collection(
         Physical voxel spacing in ZYX order, in micrometers.
     spatial_origins_zyx_um : Sequence[Sequence[float]]
         Per-tile image origins in ZYX order, in micrometers.
+    stage_positions : Sequence[Sequence[float]] or None
+        Recorded source stage positions in ZXY order, separate from ROI image origins.
     dtype : np.dtype | str
         Pixel dtype stored in each series.
     channels : Sequence[str] | None
@@ -312,11 +388,26 @@ def create_variable_position_collection(
     voxel_size = round_spatial_values(voxel_size_um)
     output_dtype = np.dtype(dtype)
     root_attributes = convert_metadata(attributes or {})
+    recorded_positions = (
+        None
+        if stage_positions is None
+        else tuple(round_spatial_values(position) for position in stage_positions)
+    )
+    if recorded_positions is not None:
+        if len(recorded_positions) != len(shapes):
+            raise ValueError("Expected one recorded stage position per ROI series")
+        root_attributes["opm_processing_stage_positions"] = {
+            "axes": ["z", "x", "y"],
+            "unit": "micrometer",
+            "positions": [list(position) for position in recorded_positions],
+        }
     ome_xml = _build_ome_xml(
         shapes,
         output_dtype,
         voxel_size,
-        origins,
+        origins
+        if recorded_positions is None
+        else [(z, sy, sx) for z, sx, sy in recorded_positions],
         channels,
         time_interval_s,
         name_prefix="ROI tile",
@@ -366,7 +457,9 @@ def create_variable_position_collection(
         arrays=arrays,
         attributes=root_attributes,
         voxel_size_um=tuple(voxel_size),
-        stage_positions_zxy=origins,
+        stage_positions_zxy=origins
+        if recorded_positions is None
+        else recorded_positions,
         channel_names=tuple(
             channels or (f"channel-{index}" for index in range(int(shapes[0][1])))
         ),
@@ -576,13 +669,28 @@ def open_position_collection(path: str | Path) -> PositionCollection:
     )
     stage_positions = tuple(
         (
-            float(image.stage_label.z or 0.0),
-            float(image.stage_label.y or 0.0),
-            float(image.stage_label.x or 0.0),
+            _stage_coordinate_um(image.stage_label.z or 0.0, image.stage_label.z_unit),
+            _stage_coordinate_um(image.stage_label.y or 0.0, image.stage_label.y_unit),
+            _stage_coordinate_um(image.stage_label.x or 0.0, image.stage_label.x_unit),
         )
         for image in ome.images
         if image.stage_label is not None
     )
+    if "opm_v2" in root.attrs:
+        # Native acquisition frame records identify physical stage axes;
+        # the legacy processed StageLabel ordering does not apply to them.
+        stage_positions = acquisition.stage_positions_zxy
+    recorded_positions = attributes.get("opm_processing_stage_positions")
+    if recorded_positions is not None:
+        if recorded_positions.get("axes") != ["z", "x", "y"]:
+            raise ValueError("Unsupported recorded stage-coordinate axes or units")
+        stage_positions = tuple(
+            tuple(
+                _stage_coordinate_um(value, recorded_positions["unit"])
+                for value in position
+            )
+            for position in recorded_positions["positions"]
+        )
     return PositionCollection(
         path=collection_path,
         arrays=arrays,

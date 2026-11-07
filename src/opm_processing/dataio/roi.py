@@ -16,8 +16,13 @@ from opm_processing.dataio.ngff import round_spatial, round_spatial_values
 from opm_processing.dataio.position_collection import open_position_collection
 from opm_processing.dataio.processing_state import (
     ProcessingState,
-    processing_state_path,
+    image_processing_state_path,
     resolve_store_path,
+)
+from opm_processing.imageprocessing.coordinates import (
+    STAGE_COORDINATE_VERSION,
+    deskewed_stage_scan_offsets,
+    stage_positions_to_image_coordinates,
 )
 
 ROI_SCHEMA = "opm-processing-roi-v1"
@@ -26,6 +31,66 @@ ROI_PREVIEW_SUFFIXES = (
     "_max_z_decon_deskewed.ome.zarr",
     "_max_z_deskewed.ome.zarr",
 )
+
+
+def _local_coordinate_offsets(
+    collection: Any, acquisition: Any
+) -> tuple[np.ndarray, np.ndarray]:
+    """Separate the retained scan anchor from removable deskew crop offsets.
+
+    Legacy processed pixels can seed a new fusion after their missing scan
+    anchor is reconstructed. ROI inversion must keep that anchor and remove
+    only the crop, so its local scan indices address the retained raw volume.
+    """
+    metadata = collection.attributes.get("opm_processing_coordinates", {})
+    version = metadata.get("version")
+    if version is not None and version != STAGE_COORDINATE_VERSION:
+        raise ValueError(
+            "Processed image uses unsupported stage coordinates; recreate it with process"
+        )
+    local = np.asarray(collection.spatial_origins_zyx_um, dtype=float)
+    scan = np.zeros_like(local)
+    if "stage" in acquisition.mode.lower():
+        scan = deskewed_stage_scan_offsets(acquisition)[: len(local)]
+        if scan.shape != local.shape:
+            raise ValueError(
+                "Processed positions disagree with the recorded stage trajectories"
+            )
+    if version == STAGE_COORDINATE_VERSION:
+        return local, local - scan
+    return local + scan, local
+
+
+def _validate_preview_coordinates(preview: Any, acquisition: Any) -> None:
+    """Reject legacy stage canvases instead of mixing their world frame with new tiles."""
+    version = preview.attrs.get("opm_processing_coordinates", {}).get("version")
+    if "stage" in acquisition.mode.lower() and version != STAGE_COORDINATE_VERSION:
+        raise ValueError(
+            "Stage preview uses earlier image coordinates. Regenerate it with process "
+            "or fuse before selecting or exporting ROIs."
+        )
+
+
+def _validate_saved_roi_coordinates(source: Path, version: str | None) -> None:
+    """Keep saved stage-world bounds tied to their original coordinate contract."""
+    suffix = next(
+        (item for item in ROI_PREVIEW_SUFFIXES if source.name.endswith(item)), None
+    )
+    if suffix is None or not source.exists():
+        return
+    state_path = image_processing_state_path(source, source.name.removesuffix(suffix))
+    if not state_path.is_file():
+        return
+    state = ProcessingState.read(state_path)
+    acquisition = inspect_acquisition(state.source_path())
+    if "stage" not in acquisition.mode.lower():
+        return
+    _validate_preview_coordinates(open_group(source), acquisition)
+    if version != STAGE_COORDINATE_VERSION:
+        raise ValueError(
+            "Saved ROI uses earlier stage image coordinates. Select and export the "
+            "ROI again from the regenerated stage preview."
+        )
 
 
 def _registered_projection_context(
@@ -49,7 +114,7 @@ def _registered_projection_context(
             "ROI export requires the registered maximum-Z projection created by fuse"
         )
     state = ProcessingState.read(
-        processing_state_path(path.parent, path.name[: -len(suffix)])
+        image_processing_state_path(path, path.name[: -len(suffix)])
     )
     processed_path = state.registered_output_for_max_projection(path)
     registration = state.registration(processed_path)
@@ -119,40 +184,35 @@ def projection_tile_footprints(path: str | Path) -> tuple[dict[str, Any], ...]:
     if suffix is None:
         raise ValueError("ROI selection requires a deskewed maximum-Z preview")
     stem = source.name.removesuffix(suffix)
-    state = ProcessingState.read(processing_state_path(source.parent, stem))
+    state = ProcessingState.read(image_processing_state_path(source, stem))
     preview = open_group(source)
+    acquisition = inspect_acquisition(state.source_path())
+    _validate_preview_coordinates(preview, acquisition)
     projection = preview.attrs.get("opm_processing_projection", {})
     registrations = [
         record
         for record in state.document["registration"].values()
-        if record.get("max_projection_path") == source.name
+        if record.get("max_projection_path")
+        and (state.path.parent / record["max_projection_path"]).resolve() == source
     ]
     if registrations and projection.get("placement") != "stage":
         footprints = _registered_tile_footprints(source)
         processed = state.registered_output_for_max_projection(source)
         collection = open_position_collection(processed)
+        _, crop_offsets = _local_coordinate_offsets(collection, acquisition)
         return tuple(
             {
                 **tile,
                 "raw_origin_zyx_um": list(
                     round_spatial_values(
                         np.asarray(tile["origin_zyx_um"])
-                        - np.asarray(
-                            collection.spatial_origins_zyx_um[
-                                int(tile["position_index"])
-                            ]
-                        )
+                        - np.asarray(crop_offsets[int(tile["position_index"])])
                     )
                 ),
             }
             for tile in footprints
         )
 
-    from opm_processing.imageprocessing.coordinates import (
-        stage_positions_to_image_coordinates,
-    )
-
-    acquisition = inspect_acquisition(state.source_path())
     if suffix == suffixes[0]:
         candidates = (
             [resolve_store_path(projection["source_collection"], source.parent)]
@@ -176,19 +236,33 @@ def projection_tile_footprints(path: str | Path) -> tuple[dict[str, Any], ...]:
         collection_path.name.replace("_max_z_", "_", 1)
     )
     full = open_position_collection(full_path)
+    coordinate_metadata = collection.attributes.get("opm_processing_coordinates", {})
+    placement_positions = coordinate_metadata.get(
+        "placement_stage_positions_zxy_um", collection.stage_positions_zxy
+    )
     stage_origins = stage_positions_to_image_coordinates(
-        collection.stage_positions_zxy,
+        placement_positions,
         reverse_z=not acquisition.stage_axis_flips_xyz[2],
     )
+    local_offsets, crop_offsets = _local_coordinate_offsets(full, acquisition)
     fused = isinstance(preview.ome_metadata(), v05.Image)
+    selected_positions = (
+        None
+        if not fused or projection.get("source_position_indices") is None
+        else {int(position) for position in projection["source_position_indices"]}
+    )
     footprints = []
-    for position, (array, stage, offset) in enumerate(
-        zip(collection.arrays, stage_origins, full.spatial_origins_zyx_um, strict=True)
+    for position, (array, stage, offset, crop) in enumerate(
+        zip(collection.arrays, stage_origins, local_offsets, crop_offsets, strict=True)
     ):
-        # Stage-fused projections place the cropped image at the stage origin;
-        # an ordinary collection displays its NGFF local image coordinates.
-        placed = np.asarray(stage) if fused else np.asarray(stage) + offset
-        raw_origin = placed - np.asarray(offset)
+        if selected_positions is not None and position not in selected_positions:
+            continue
+        # Current stage previews include the complete local pixel origin. Older
+        # non-stage fused previews placed cropped pixels at the stage reference.
+        placed = np.asarray(stage) + offset
+        if fused and "opm_processing_coordinates" not in preview.attrs:
+            placed = np.asarray(stage)
+        raw_origin = placed - crop
         dy, dx = collection.voxel_size_um[-2:]
         for time in range(int(array.shape[0])):
             footprints.append(
@@ -222,6 +296,7 @@ class PhysicalRoi:
     pixel_size_yx_um: tuple[float, float]
     position_indices: tuple[int, ...] | None = None
     tile_footprints: tuple[dict[str, Any], ...] = ()
+    coordinate_version: str | None = None
 
     def __post_init__(self) -> None:
         """Require a nonempty physical YX rectangle."""
@@ -248,6 +323,9 @@ class PhysicalRoi:
         bounds = document["bounds_yx_um"]
         grid = document["source_grid"]
         positions = document.get("position_indices")
+        source = Path(document["source_path"]).expanduser().resolve()
+        coordinate_version = document.get("coordinate_version")
+        _validate_saved_roi_coordinates(source, coordinate_version)
         return cls(
             bounds_yx_um=(
                 float(bounds["y"][0]),
@@ -255,7 +333,7 @@ class PhysicalRoi:
                 float(bounds["x"][0]),
                 float(bounds["x"][1]),
             ),
-            source_path=Path(document["source_path"]).expanduser().resolve(),
+            source_path=source,
             grid_origin_yx_um=tuple(float(value) for value in grid["origin_yx_um"]),
             pixel_size_yx_um=tuple(float(value) for value in grid["pixel_size_yx_um"]),
             position_indices=(
@@ -264,6 +342,7 @@ class PhysicalRoi:
                 else tuple(sorted({int(value) for value in positions}))
             ),
             tile_footprints=tuple(document["tile_footprints"]),
+            coordinate_version=coordinate_version,
         )
 
     def write(self, path: str | Path) -> Path:
@@ -281,23 +360,34 @@ class PhysicalRoi:
         """
         roi_path = Path(path).expanduser().resolve()
         roi_path.parent.mkdir(parents=True, exist_ok=True)
-        y0, y1, x0, x1 = self.bounds_yx_um
+        y0, y1, x0, x1 = round_spatial_values(self.bounds_yx_um)
+        footprint_geometry = {"origin_zyx_um", "raw_origin_zyx_um", "bounds_yx_um"}
+        footprints = [
+            {
+                key: list(round_spatial_values(value))
+                if key in footprint_geometry
+                else value
+                for key, value in tile.items()
+            }
+            for tile in self.tile_footprints
+        ]
         document = {
             "schema": ROI_SCHEMA,
             "source_path": str(self.source_path),
             "coordinate_system": "ome-ngff-physical",
+            "coordinate_version": self.coordinate_version,
             "unit": "micrometer",
             "axes": ["y", "x"],
             "bounds_yx_um": {"y": [y0, y1], "x": [x0, x1]},
             "source_grid": {
-                "origin_yx_um": list(self.grid_origin_yx_um),
-                "pixel_size_yx_um": list(self.pixel_size_yx_um),
+                "origin_yx_um": list(round_spatial_values(self.grid_origin_yx_um)),
+                "pixel_size_yx_um": list(round_spatial_values(self.pixel_size_yx_um)),
             },
             "all_z": True,
             "position_indices": (
                 None if self.position_indices is None else list(self.position_indices)
             ),
-            "tile_footprints": list(self.tile_footprints),
+            "tile_footprints": footprints,
         }
         roi_path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
         return roi_path
@@ -627,6 +717,9 @@ def roi_from_world_rectangle(
         pixel_size_yx_um=spacing,
         position_indices=selected or None,
         tile_footprints=selected_footprints,
+        coordinate_version=open_group(source)
+        .attrs.get("opm_processing_coordinates", {})
+        .get("version"),
     )
 
 

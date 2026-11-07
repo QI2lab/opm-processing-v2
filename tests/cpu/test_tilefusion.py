@@ -1,24 +1,26 @@
 """Numerical and storage-boundary unit tests for tile fusion."""
 
+import math
+from itertools import combinations
+
 import numpy as np
 import pytest
-import tensorstore as ts
 
 from opm_processing.imageprocessing import tilefusion as tilefusion_module
 from opm_processing.imageprocessing.coordinates import (
     stage_positions_to_image_coordinates,
 )
-from opm_processing.imageprocessing.maxtilefusion import MaxTileFusion
 from opm_processing.imageprocessing.tilefusion import TileFusion
 
 pytestmark = pytest.mark.unit
 
 
 @pytest.mark.parametrize("half_width", [1, 3, 5])
-def test_registration_similarity_uses_acquired_window_support(half_width):
+def test_registration_similarity_uses_acquired_window_support(
+    half_width, registration_scene
+):
     """Identical oblique samples have unit similarity only with a valid window."""
-    rng = np.random.default_rng(321)
-    image = rng.uniform(10, 100, size=(17, 19, 21)).astype(np.float32)
+    image = registration_scene((17, 19, 21), seed=321).raw.astype(np.float32)
     z, y, _ = np.indices(image.shape)
     mask = np.abs(z - y) < half_width
     score = tilefusion_module._registration_similarity(
@@ -37,7 +39,7 @@ def test_registration_similarity_uses_acquired_window_support(half_width):
 def test_weighted_fusion_rows_preserve_masks_offsets_and_output_range(
     weighted_fusion_case, dtype, strided, shared
 ):
-    """Compare strided weighted pixels with independent separable-weight truth."""
+    """Preserve known affine samples, channel masks and scalar weighted counts."""
     case = weighted_fusion_case
     for source, pixels, channels, gains in zip(
         (case.first, case.second),
@@ -61,24 +63,29 @@ def test_weighted_fusion_rows_preserve_masks_offsets_and_output_range(
             *case.source_origin,
             gains,
         )
-        contribution = case.spatial_weights[None] * channels[:, None, None, None]
-        corrected = pixels if gains is None else pixels * gains[:, None, None, None]
-        case.expected_sum[case.selection] += corrected * contribution
-        case.expected_weight[case.selection] += (
-            contribution * case.support[None, ..., None]
-        )
-    np.testing.assert_array_equal(case.accumulated, case.expected_sum)
+    # Both views have the same prescribed feather weights. Their normalized
+    # mixture has closed-form scalar values: at the first location, a real
+    # black pixel and ten corrected photons give five, not ten. The other
+    # channels exercise absent contributors and a value above uint16 range.
     np.testing.assert_array_equal(
-        case.weights, case.expected_weight[:1] if shared else case.expected_weight
+        case.accumulated[:, 1, 2, 3],
+        np.asarray(case.origin_sum, np.float32) * case.coverage_factor,
     )
-    expected = np.divide(
-        case.expected_sum,
-        case.expected_weight,
-        out=np.zeros_like(case.expected_sum),
-        where=case.expected_weight > 0,
+    negative_position = (1, 2, 3 + case.negative_x)
+    assert case.accumulated[(0, *negative_position)] == (
+        case.negative_sum * case.coverage_factor
     )
-    if dtype == np.uint16:
-        expected = np.clip(expected, 0, 65535).astype(np.uint16)
+    assert case.weights[(0, *negative_position)] == (
+        case.negative_weight * case.coverage_factor
+    )
+    for coordinate, _float_values, _uint_values, weight_values, coverage in case.probes:
+        np.testing.assert_array_equal(
+            case.weights[(slice(None), *coordinate)],
+            np.asarray(weight_values, np.float32) * np.float32(coverage),
+        )
+    np.testing.assert_array_equal(case.accumulated[:, case.untouched], 0)
+    np.testing.assert_array_equal(case.weights[:, case.untouched], 0)
+    unchanged = case.accumulated.copy()
     destination = np.full((3, 4, 7, 12), 173, dtype=dtype)
     if strided:
         tilefusion_module._normalize_block(
@@ -88,9 +95,16 @@ def test_weighted_fusion_rows_preserve_masks_offsets_and_output_range(
         tilefusion_module._normalize_block(
             case.accumulated, case.weights, destination, 0, 0, 1
         )
-    np.testing.assert_array_equal(destination[..., 1:11], expected)
+    normalized = destination[..., 1:11]
+    for coordinate, float_values, uint_values, _weights, _coverage in case.probes:
+        expected = uint_values if dtype == np.uint16 else float_values
+        np.testing.assert_array_equal(normalized[(slice(None), *coordinate)], expected)
+    assert normalized[(0, *negative_position)] == (0 if dtype == np.uint16 else -10)
+    np.testing.assert_array_equal(normalized[:, 1, 3, 3:7], 0)
+    np.testing.assert_array_equal(normalized[:, 2, 2, 3:7], 0)
+    np.testing.assert_array_equal(normalized[:, case.untouched], 0)
     np.testing.assert_array_equal(destination[..., (0, 11)], 173)
-    np.testing.assert_array_equal(case.accumulated, case.expected_sum)
+    np.testing.assert_array_equal(case.accumulated, unchanged)
 
 
 def test_uint16_weighted_fusion_preserves_integer_boundary_rounding() -> None:
@@ -98,9 +112,16 @@ def test_uint16_weighted_fusion_preserves_integer_boundary_rounding() -> None:
     profile = np.linspace(0.1, 1, 128, dtype=np.float32)
     accumulated = np.zeros((1, 1, 1, 1), np.float32)
     weights = np.zeros_like(accumulated)
-    expected_sum = np.float32(0)
-    expected_weight = np.float32(0)
-    for photon_count, x_weight in ((272, profile[73]), (2690, profile[9])):
+    photon_counts = (272, 2690)
+    x_weights = (profile[73], profile[9])
+    feathers = [np.float32(np.float32(0.1) * profile[24]) * x for x in x_weights]
+    expected_sum = np.float32(
+        math.fsum(
+            float(a) * float(w) for a, w in zip(photon_counts, feathers, strict=True)
+        )
+    )
+    expected_weight = np.float32(math.fsum(map(float, feathers)))
+    for photon_count, x_weight in zip(photon_counts, x_weights, strict=True):
         source = np.full(accumulated.shape, photon_count, np.uint16)
         tilefusion_module._accumulate_tile_block(
             accumulated,
@@ -115,11 +136,6 @@ def test_uint16_weighted_fusion_preserves_integer_boundary_rounding() -> None:
             0,
             0,
         )
-        feather = np.float32(np.float32(0.1) * profile[24]) * x_weight
-        expected_sum = np.float32(
-            np.float64(expected_sum) + np.float64(photon_count) * np.float64(feather)
-        )
-        expected_weight = np.float32(expected_weight + feather)
         np.testing.assert_array_equal(source, photon_count)
     np.testing.assert_array_equal(accumulated, expected_sum)
     np.testing.assert_array_equal(weights, expected_weight)
@@ -131,23 +147,22 @@ def test_uint16_weighted_fusion_preserves_integer_boundary_rounding() -> None:
 
 
 def test_max_projection_pyramid_clamps_partial_source_edge_chunks(
-    fusion_operator,
+    projection_fusion,
 ) -> None:
     """Never request factor-rounded source bounds beyond level-zero shape."""
     source = np.arange(1 * 3 * 1 * 17 * 19, dtype=np.uint16).reshape(1, 3, 1, 17, 19)
-    target = np.zeros((1, 3, 1, 2, 2), dtype=np.uint16)
-    fusion = fusion_operator(
-        MaxTileFusion,
+    fusion = projection_fusion(
+        (source,),
+        ((0, 0),),
+        (17, 19),
         chunk_size=512,
-        multiscale_factors_yx=(1, 16),
-        fused_ts=ts.array(source),
     )
-    fusion.multiscale_arrays = (fusion.fused_ts, ts.array(target))
+    fusion.fused_ts.write(source).result()
 
     fusion.write_multiscales()
 
     np.testing.assert_array_equal(
-        fusion.multiscale_arrays[1].read().result(),
+        fusion.multiscale_arrays[-1].read().result(),
         source[..., ::16, ::16],
     )
 
@@ -236,12 +251,8 @@ def test_registration_pairs_include_every_physical_overlap() -> None:
         pixel_size_zyx=(1.0, 1.0, 1.0),
     )
 
-    expected = {
-        (i, j)
-        for i in range(len(positions))
-        for j in range(i + 1, len(positions))
-        if np.all(np.abs(np.asarray(positions[j]) - np.asarray(positions[i])) < 10.0)
-    }
+    # All eight length-ten boxes share the central [8,10]^3 cube.
+    expected = set(combinations(range(8), 2))
     assert set(pairs) == expected
 
 
@@ -261,15 +272,15 @@ def test_registration_pairs_use_each_cropped_tile_shape() -> None:
 
 
 def test_shift_optimization_supports_variable_tiles_per_timepoint(
-    fusion_operator,
+    tile_fusion,
 ) -> None:
     """Optimize global tile IDs without assuming rectangular T-by-P storage."""
-    fusion = fusion_operator(
-        TileFusion,
-        _tile_positions=[(0.0, 0.0, 0.0)] * 5,
-        _tiles_by_time=((0, 1), (2, 3, 4)),
-        pairwise_metrics={(0, 1): (0, 0, 2, 1.0), (2, 4): (0, 3, 0, 1.0)},
+    fusion = tile_fusion(
+        [np.ones((1, 2, 4, 4), np.uint16)] * 5,
+        [(0, 0, 0)] * 5,
+        time_indices=(0, 0, 1, 1, 1),
     )
+    fusion.pairwise_metrics = {(0, 1): (0, 0, 2, 1.0), (2, 4): (0, 3, 0, 1.0)}
 
     fusion.optimize_shifts(method="ONE_ROUND")
 
@@ -295,10 +306,9 @@ def test_block_fusion_does_not_infer_support_from_pixel_values(block_fusion):
         [(0, 0, 0), (0, 0, 2)],
         (2, 3, 6),
         block_shape=[1, 1, 1, 2, 2],
-        chunk_y=2,
-        chunk_x=2,
+        chunk_shape_yx=(2, 2),
         max_in_flight_writes=2,
-        _max_workers=2,
+        max_workers=2,
     )
     fusion._fuse_by_blocks()
 
@@ -365,31 +375,16 @@ def test_zero_channels_keep_single_contributors_and_blend_valid_overlap(
 
 
 def test_zero_registration_channel_is_excluded_before_patch_reads(
-    fusion_operator,
+    tile_fusion,
 ) -> None:
     """Do not schedule registration reads for a pair containing a zero tile."""
-    fusion = fusion_operator(
-        TileFusion,
+    fusion = tile_fusion(
+        [np.ones((1, 4, 4, 4), np.uint16), np.zeros((1, 4, 4, 4), np.uint16)],
+        [(0, 0, 0), (0, 0, 2)],
         downsample_factors=(1, 1, 1),
         ssim_window=3,
         threshold=0.0,
-        pairwise_metrics={},
-        position_dim=2,
-        time_dim=1,
-        z_dim=4,
-        y_dim=4,
-        x_dim=4,
-        _pixel_size=(1.0, 1.0, 1.0),
-        _tile_positions=[(0.0, 0.0, 0.0), (0.0, 0.0, 2.0)],
-        _is_2d=False,
-        _max_workers=1,
         max_registration_shift_zyx=(2, 2, 2),
-        _debug=False,
-        _tile_channel_nonzero={(0, 0): True, (1, 0): False},
-        position_arrays=(
-            ts.array(np.ones((1, 1, 4, 4, 4), np.uint16)),
-            ts.array(np.zeros((1, 1, 4, 4, 4), np.uint16)),
-        ),
     )
 
     fusion.refine_tile_positions_with_cross_correlation(ch_idx=0)
@@ -400,9 +395,9 @@ def test_zero_registration_channel_is_excluded_before_patch_reads(
 @pytest.mark.parametrize("limit_y", (None, 50))
 @pytest.mark.parametrize("depth_overlap", (20, 13))
 def test_depth_registration_handles_large_xy_drift(
-    registration_pair, shifted_slab_pair, block_fusion, limit_y, depth_overlap, capsys
+    registration_pair, shifted_slab_pair, block_fusion, limit_y, depth_overlap
 ):
-    """Recover a thin-Z overlap with 60-pixel Y drift, or explain rejection."""
+    """Recover a thin-Z overlap with 60-pixel Y drift within the prescribed limit."""
     pair = shifted_slab_pair(
         (32, 180, 200), 32 - depth_overlap, (0, -60, 70), seed=71, spacing=(1, 1, 1)
     )
@@ -417,13 +412,9 @@ def test_depth_registration_handles_large_xy_drift(
 
     fusion.refine_tile_positions_with_cross_correlation()
     fusion.optimize_shifts()
-    fusion.report_registration_connectivity()
-
-    output = capsys.readouterr().out
     if limit_y is None:
         assert set(fusion.pairwise_metrics) == {(0, 1)}
         np.testing.assert_allclose(fusion.global_offsets[1], (0, -60, 70), atol=1)
-        assert "Registration warning" not in output
         origins = (
             np.asarray(pair.positions) / pair.spacing
             + fusion.global_offsets
@@ -434,26 +425,27 @@ def test_depth_registration_handles_large_xy_drift(
             origins,
             pair.truth.shape,
             block_shape=[1, 1, 7, 31, 37],
-            fused_ts=ts.array(np.zeros((1, 1, *pair.truth.shape), np.float32)),
             output_dtype=np.dtype(np.float32),
         )
         renderer._fuse_by_blocks()
-        covered = np.zeros(pair.truth.shape, bool)
-        for start, volume in zip(pair.starts, pair.volumes, strict=True):
-            covered[
-                tuple(slice(a, a + n) for a, n in zip(start, volume.shape, strict=True))
-            ] = True
+        actual = renderer.fused_ts.read().result()[0, 0]
         np.testing.assert_allclose(
-            renderer.fused_ts.read().result()[0, 0],
-            np.where(covered, pair.truth, 0),
+            actual,
+            pair.expected_pixels,
             rtol=2e-6,
             atol=0,
         )
+        from opm_processing.imageprocessing.camera import camera_correct
+        from tests.simulation.camera_likelihood import camera_sampling_accuracy
+
+        camera = pair.observation.scene.microscope.camera
+        photons = camera_correct(actual, camera.offset_adu, camera.electrons_per_adu)
+        measured = camera_sampling_accuracy(
+            photons, pair.truth, pair.expected_envelope, pair.accuracy_mask
+        )
+        assert measured.accepted, measured
     else:
         assert fusion.pairwise_metrics == {}
-        assert "exceeded the ZYX shift limits" in output
-        assert "disconnected components" in output
-        assert "not mutually registered" in output
 
 
 @pytest.mark.parametrize("dtype", (np.float32, np.uint16))
@@ -468,21 +460,15 @@ def test_fusion_is_independent_of_blocks_and_workers(
         case.tiles,
         case.origins,
         case.shape,
-        support=case.supports[0],
+        support=case.supports,
         present=case.present,
         block_shape=[1, 1, *block_shape],
-        fused_ts=ts.array(np.zeros(case.expected.shape, dtype)),
         output_dtype=np.dtype(dtype),
-        _variable_roi_tiles=True,
-        _tile_shapes=case.shapes,
-        _tile_support_zy=case.supports,
-        _tile_profiles=case.profiles,
-        _depth_intensity_gains=case.gains,
-        _tiles_by_time=((0, 1, 2), (3, 4, 5)),
-        time_dim=2,
-        chunk_y=block_shape[1],
-        chunk_x=block_shape[2],
-        _max_workers=workers,
+        profiles=case.profiles,
+        depth_gains=case.gains,
+        time_indices=(0, 0, 0, 1, 1, 1),
+        chunk_shape_yx=block_shape[1:],
+        max_workers=workers,
         max_in_flight_writes=2,
         fusion_ram_fraction=0.1 if workers == 2 else 1,
     )

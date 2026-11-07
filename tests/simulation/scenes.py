@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import MappingProxyType
 
 import numpy as np
 
@@ -18,7 +19,20 @@ from tests.simulation.objects import (
 )
 
 
-@dataclass
+def freeze_metadata(value):
+    """Protect cached physical metadata without sharing mutable lists or mappings."""
+    if isinstance(value, dict):
+        return MappingProxyType(
+            {key: freeze_metadata(item) for key, item in value.items()}
+        )
+    if isinstance(value, (tuple, list)):
+        return tuple(freeze_metadata(item) for item in value)
+    if isinstance(value, np.ndarray):
+        value.setflags(write=False)
+    return value
+
+
+@dataclass(frozen=True)
 class OpticalScene:
     """Known fine object and optical calibration for reconstruction comparisons."""
 
@@ -28,9 +42,15 @@ class OpticalScene:
     density: np.ndarray
     psf_axes: tuple[np.ndarray, ...]
     psf_irradiance: np.ndarray
-    illumination_profile: str
     illumination_half_width_um: float
     features: dict
+
+    def __post_init__(self) -> None:
+        """Protect cached optical truth while allowing independent acquisition draws."""
+        for array in (*self.axes, self.density, *self.psf_axes, self.psf_irradiance):
+            array.setflags(write=False)
+
+        object.__setattr__(self, "features", freeze_metadata(self.features))
 
 
 def prepare_scene(
@@ -38,7 +58,6 @@ def prepare_scene(
     microscope: Microscope,
     *,
     parameters: dict,
-    illumination_profile: str = "uniform",
 ) -> OpticalScene:
     """Build fine-grid points, paired lines, a hollow sphere or the MATLAB Siemens target.
 
@@ -50,8 +69,6 @@ def prepare_scene(
         Explicit optical and acquisition calibration.
     parameters : dict
         Specimen extent, sampling and feature dimensions.
-    illumination_profile : str
-        Uniform illumination or a positive long-axis edge taper.
 
     Returns
     -------
@@ -69,10 +86,7 @@ def prepare_scene(
         positions = np.column_stack((starts, starts + gaps)).ravel()
         positions -= (positions[0] + positions[-1]) / 2
         features["positions_x_um"] = positions.tolist()
-        if kind == "line-pairs":
-            features["pair_centers_x_um"] = (
-                positions.reshape(-1, 2).mean(axis=1).tolist()
-            )
+        features["pair_centers_x_um"] = positions.reshape(-1, 2).mean(axis=1).tolist()
     elif kind not in ("points", "sphere", "siemens-star"):
         raise ValueError("Unknown specimen kind")
     axes = tuple(centered_axis(extent, spacing) for extent in half_extent)
@@ -114,7 +128,6 @@ def prepare_scene(
         density,
         psf_axes,
         psf,
-        illumination_profile,
         half_width,
         features,
     )

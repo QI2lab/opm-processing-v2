@@ -18,13 +18,13 @@ from opm_processing.dataio.deconvolution import (
 
 @pytest.mark.unit
 def test_actual_acquisition_without_processing_metadata_generates_psf(
-    simulated_camera, opm_v2_acquisition_factory
+    microscope_parameters, opm_v2_acquisition_factory
 ):
     """Raw writer output supplies geometry while processing supplies default optics."""
-    observed = simulated_camera((17, 32, 36), step=1.2)
-    microscope = observed.microscope
+    microscope = microscope_parameters
+    pixels = np.arange(17 * 32 * 36, dtype=np.uint16).reshape(1, 1, 1, 17, 32, 36)
     dataset = opm_v2_acquisition_factory(
-        observed.raw[None, None, None],
+        pixels,
         channels=(ChannelMetadata(0, "561 + 637", None, 10.0, 10.0),),
         scan_axis_step_um=1.2,
         camera_offset=microscope.camera.offset_adu,

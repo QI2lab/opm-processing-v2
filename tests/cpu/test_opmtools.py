@@ -2,9 +2,12 @@
 
 import numpy as np
 import pytest
-import tensorstore as ts
 
-from opm_processing.imageprocessing.opmtools import deskew_row, orthogonal_deskew
+from opm_processing.imageprocessing.opmtools import (
+    deskew_coverage,
+    deskew_row,
+    orthogonal_deskew,
+)
 
 pytestmark = pytest.mark.usefixtures("small_cpu_kernels")
 
@@ -33,16 +36,54 @@ def test_deskew_x_ramp_retains_partial_z_bins(deskew_field, factor, deskew_round
     """Keep every Z bin and its full divisor, including a partly supported last bin."""
     case = deskew_field
     actual = orthogonal_deskew(case.data, **case.geometry, downsample_factor=factor)
-    response = orthogonal_deskew(
-        np.full(case.data.shape, 1, dtype=np.float32),
-        **case.geometry,
-        downsample_factor=factor,
+    support = deskew_coverage(
+        case.data.shape, actual.shape, **case.geometry, downsample_factor=factor
     )
-    ramp = np.pad(case.data[0, 0], (0, response.shape[-1] - case.data.shape[-1]))
-    np.testing.assert_allclose(actual, response * ramp, **deskew_roundoff)
+    ramp = np.pad(case.data[0, 0], (0, actual.shape[-1] - case.data.shape[-1]))
+    np.testing.assert_allclose(
+        actual, support[..., None] * ramp * (2 / case.step), **deskew_roundoff
+    )
     if factor in (3, 20):
         assert np.any(actual[-1] > 0)
     np.testing.assert_array_equal(actual[:, 0], 0)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("factor", [1, 2, 3, 20])
+@pytest.mark.parametrize(
+    "deskew_field, supported_y, width",
+    [
+        (("constant", 0.115, (4, 4, 1)), (2, 3, 4), 8),
+        (("constant", 0.23, (4, 4, 1)), (2, 4, 6), 12),
+    ],
+    indirect=["deskew_field"],
+)
+def test_constant_box_has_prescribed_coverage(
+    deskew_field, factor, supported_y, width, deskew_roundoff
+):
+    """Retain a known constant box's three interior rows and zero every other cell.
+
+    At 30 degrees, four detector rows span exactly two laboratory-Z samples.
+    Z=0 has its following foot outside the sensor. At Z=1, projecting onto
+    the two acquired planes leaves both detector feet within [0,3) only at
+    the three prescribed Y coordinates. This supplies a complete analytical
+    image, independent of the production mapper used by workflow fixtures.
+    """
+    case = deskew_field
+    actual = orthogonal_deskew(case.data, **case.geometry, downsample_factor=factor)
+    shape = (2 if factor == 1 else 1, width, 4)
+    assert actual.shape == shape
+    coverage = np.zeros(shape[:2], np.float32)
+    coverage[1 if factor == 1 else 0, supported_y] = np.float32(1 / factor)
+    expected = np.zeros(shape, np.float32)
+    expected[..., 0] = coverage * np.float32(0.24 * 2 / case.step)
+    np.testing.assert_allclose(actual, expected, **deskew_roundoff)
+    np.testing.assert_array_equal(
+        deskew_coverage(
+            case.data.shape, shape, **case.geometry, downsample_factor=factor
+        ),
+        coverage,
+    )
 
 
 @pytest.mark.unit
@@ -166,7 +207,6 @@ def test_deskewed_stage_tiles_blend_without_boundary_seams(
         support=case.support,
         x_profile=case.x_profile,
         block_shape=[1, 1, 2, 13, 5],
-        fused_ts=ts.array(np.zeros((1, 1, *case.shape), np.float32)),
         output_dtype=np.dtype(np.float32),
     )
     fusion._fuse_by_blocks()
@@ -174,12 +214,11 @@ def test_deskewed_stage_tiles_blend_without_boundary_seams(
     np.testing.assert_allclose(actual, case.expected, rtol=8e-7, atol=0)
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 @pytest.mark.parametrize("factor", [3, 20])
 @pytest.mark.parametrize("mode", ["full", "roi", "cropped"])
-@pytest.mark.parametrize("deskew_field", [("x", 0.4)], indirect=True)
 def test_saved_deskew_retains_complete_z_extent(
-    deskew_processing_case, factor, deskew_roundoff
+    deskew_processing_case, factor, assert_roi_point_accuracy
 ):
     """Save every supported Z bin and the correct physical full-volume or ROI extent."""
     from opm_processing.dataio.position_collection import open_position_collection
@@ -199,7 +238,20 @@ def test_saved_deskew_retains_complete_z_extent(
     )
     saved = open_position_collection(case.path)
     actual = saved.arrays[0][0, 0].read().result()
-    np.testing.assert_allclose(actual, case.expected, **deskew_roundoff)
+    assert actual.shape == case.expected_shape
+    processing_metadata = saved.attributes["opm_processing"]
+    assert processing_metadata["timing"]["n_acquired_planes"] == 24
+    assert_roi_point_accuracy(
+        actual[None, None],
+        case.truth,
+        saved.spatial_origins_zyx_um[0],
+        saved.voxel_size_um,
+    )
+    width = case.acquisition.index_sizes["x"] - (2 if case.roi is not None else 0)
+    # The finite optical object contains genuine vacuum, even inside the
+    # camera aperture. Require exact padding zeros without inventing photons.
+    np.testing.assert_array_equal(actual[..., :width][case.support == 0], 0)
+    np.testing.assert_array_equal(actual[..., width:], 0)
     assert np.any(actual[-1] > 0)
     assert saved.voxel_size_um[0] == pytest.approx(
         round(factor * case.acquisition.pixel_size_um, 3)
@@ -216,11 +268,7 @@ def test_saved_deskew_retains_complete_z_extent(
         max_workers=1,
     )
     support = fusion._tile_support_zy[0]
-    first_value = 14 if case.roi is not None else 10
-    gain = 2 * case.acquisition.pixel_size_um / case.acquisition.scan_axis_step_um
-    np.testing.assert_allclose(
-        support, case.expected[..., 0] / (first_value * gain), atol=1e-7, rtol=1e-6
-    )
+    np.testing.assert_allclose(support, case.support, atol=1e-7, rtol=1e-6)
     np.testing.assert_allclose(fusion._tile_positions[0], case.origin, atol=1e-12)
     if case.roi is None:
         width = case.acquisition.index_sizes["x"]

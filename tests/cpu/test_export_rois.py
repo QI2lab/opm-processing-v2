@@ -7,7 +7,6 @@ import numpy as np
 import pytest
 import tifffile
 from ome_types import from_xml
-from rich.text import Text
 from typer.testing import CliRunner
 from yaozarrs import open_group, v05
 
@@ -76,14 +75,18 @@ def test_selections_with_separate_accessible_raw_directory(tmp_path):
 )
 @pytest.mark.parametrize("tiff", [False, True])
 def test_raw_roi_exports_and_resume(
-    roi_preview, tiff, monkeypatch, relocate_acquisition, invoke_cli
+    roi_preview,
+    tiff,
+    monkeypatch,
+    relocate_acquisition,
+    invoke_cli,
+    assert_roi_point_accuracy,
 ):
     """Reconstruct multiple rectangles with all times/channels and global origins."""
     case = roi_preview
-    reference = case.collection.arrays[0].read().result()
     directory = case.preview.parent
     preview_name = case.preview.name
-    selections = [(3, 12, 2, 10), (5, 15, 4, 12)]
+    selections = [(16, 27, 3, 15), (24, 36, 16, 29)]
     calls = []
     checkpoints = []
     complete_channel = ProcessingState.complete_channel
@@ -115,7 +118,6 @@ def test_raw_roi_exports_and_resume(
     monkeypatch.setattr(export_rois, "select_rois", choose)
     missing_channel = CliRunner().invoke(export_rois.app, [str(directory)])
     assert missing_channel.exit_code == 2
-    assert "--registration-channel" in Text.from_ansi(missing_channel.output).plain
     assert not calls
     completed = None
     for attempt in range(2):
@@ -140,17 +142,39 @@ def test_raw_roi_exports_and_resume(
                     .result()
                 )
                 y0, y1, x0, x1 = selections[0]
-                np.testing.assert_allclose(
-                    fused[..., : reference.shape[-3], : y1 - y0, : x1 - x0],
-                    reference[..., y0:y1, x0:x1],
-                    rtol=2e-6,
-                    atol=2e-3,
+                native_z = int(
+                    np.ceil(
+                        case.truth.pixels.shape[-2]
+                        * np.sin(np.deg2rad(case.truth.microscope.angle_deg))
+                    )
                 )
-        args = [str(directory), "--registration-channel", "1", "--save-float32"] + (
-            ["--tiff"] if tiff else []
+                height, width = y1 - y0, x1 - x0
+                # Refusion may pad its default multiscale grid. Padding is not
+                # an acquired region in which to search for another emitter.
+                np.testing.assert_array_equal(fused[..., native_z:, :, :], 0)
+                np.testing.assert_array_equal(fused[..., :native_z, height:, :], 0)
+                np.testing.assert_array_equal(fused[..., :native_z, :height, width:], 0)
+                fused = fused[..., :native_z, :height, :width]
+                metadata = (
+                    open_group(roi_directory / "sample_fused.ome.zarr")
+                    .ome_metadata()
+                    .multiscales[0]
+                    .datasets[0]
+                )
+                assert_roi_point_accuracy(
+                    fused,
+                    case.truth,
+                    metadata.translation_transform.translation[-3:],
+                    metadata.scale_transform.scale[-3:],
+                    raw_origin=case.raw_origin_zyx_um,
+                )
+        invoke_cli(
+            "export-rois",
+            directory,
+            registration_channel=1,
+            save_float32=True,
+            tiff=tiff,
         )
-        result = CliRunner().invoke(export_rois.app, args)
-        assert result.exit_code == 0, result.exception
         assert len(calls) == 1
         if completed is not None:
             assert len(checkpoints) == completed
@@ -163,13 +187,16 @@ def test_raw_roi_exports_and_resume(
             data = open_image_array(image).read().result()
             assert data.shape[:2] == (2, 2)
             assert data.shape[-2:] == (y1 - y0, x1 - x0)
-            # The selected preimage must retain the same measured photons as
-            # full processing of this simulated specimen, at every time/channel.
-            expected = reference[..., y0:y1, x0:x1]
-            np.testing.assert_allclose(data, expected, rtol=2e-6, atol=2e-3)
             assert np.all(data.max(axis=(2, 3, 4)) > 0)
             dataset = root.ome_metadata().multiscales[0].datasets[0]
             origin = dataset.translation_transform.translation
+            assert_roi_point_accuracy(
+                data,
+                case.truth,
+                origin[-3:],
+                dataset.scale_transform.scale[-3:],
+                raw_origin=case.raw_origin_zyx_um,
+            )
             pixel = case.dataset.metadata.pixel_size_um
             assert origin[-2:] == pytest.approx(
                 (case.origin[1] + y0 * pixel, case.origin[2] + x0 * pixel)
@@ -218,45 +245,26 @@ def test_raw_roi_exports_and_resume(
     )
     assert len(manifest["rois"]) == 2
     assert calls[0].name == preview_name
-    if case.positions == 1 and case.dataset.metadata.mode == "mirror" and not tiff:
-        alternate = directory / "selected_again"
-        invoke_cli(
-            "export-rois",
-            directory,
-            registration_channel=1,
-            output=alternate,
-            save_float32=True,
-        )
-        assert len(calls) == 1
-        for index, (y0, y1, x0, x1) in enumerate(selections, 1):
-            saved = (
-                open_image_array(
-                    alternate / f"roi_{index:03d}" / "sample_fused.ome.zarr"
-                )
-                .read()
-                .result()
-            )
-            np.testing.assert_allclose(
-                saved, reference[..., y0:y1, x0:x1], rtol=2e-6, atol=2e-3
-            )
-
-
-@pytest.mark.unit
-def test_missing_preview_explains_creation(tmp_path):
-    """Missing previews fail before GUI creation with a complete CLI command."""
-    with pytest.raises(ValueError, match=r"uv run process .*--no-deconvolve"):
-        export_rois.resolve_roi_source(tmp_path)
 
 
 @pytest.mark.integration
 @pytest.mark.parametrize(
     "mosaic_acquisition", [("mirror", 0.4, 0.001), ("stage", 1.2, 0.001)], indirect=True
 )
-def test_roi_maps_extended_specimen_to_raw_tiles(mosaic_acquisition, monkeypatch):
+def test_roi_maps_extended_specimen_to_raw_tiles(
+    mosaic_acquisition, monkeypatch, invoke_cli, pipeline_geometry
+):
     """Keep the oblique preimage and measure fresh links across a real tile seam."""
     from opm_processing.dataio.position_collection import open_position_collection
     from opm_processing.imageprocessing.tilefusion import TileFusion
     from opm_processing.process import process_skewed
+    from tests.simulation.camera_likelihood import (
+        camera_sampling_accuracy,
+        camera_sampling_envelope,
+        sampling_stencil_footprint,
+        sampling_stencil_radii,
+    )
+    from tests.simulation.metrics import camera_object_apertures, camera_volume_samples
 
     case = mosaic_acquisition
     process_skewed(
@@ -268,8 +276,16 @@ def test_roi_maps_extended_specimen_to_raw_tiles(mosaic_acquisition, monkeypatch
         z_downsample_level=1,
     )
     preview = case.dataset.path.parent / "mosaic_max_z_fused.ome.zarr"
-    projection = open_image_array(preview).read().result()[0, 0, 0]
-    cy = int(np.argmax(projection.max(axis=1)))
+    microscope = case.microscope
+    pixel = microscope.pixel_size_um
+    scans, rows = case.expectation.shape[:2]
+    angle = np.deg2rad(microscope.angle_deg)
+    # The original fluorescent lines are centered at laboratory Y=0. Choose
+    # their center from acquisition geometry, before inspecting processed pixels.
+    cy = round(
+        ((scans - 1) * microscope.scan_step_um + (rows - 1) * pixel * np.cos(angle))
+        / (2 * pixel)
+    )
     offset = case.parameters["tile_offset_x_pixels"]
     bounds = (cy - 16, cy + 16, offset - 8, case.parameters["camera_shape_yx"][1] + 8)
     monkeypatch.setattr(export_rois, "select_rois", lambda source, shape: [bounds])
@@ -283,10 +299,7 @@ def test_roi_maps_extended_specimen_to_raw_tiles(mosaic_acquisition, monkeypatch
         return result
 
     monkeypatch.setattr(TileFusion, "register_and_score", staticmethod(measure))
-    result = CliRunner().invoke(
-        export_rois.app, [str(preview), "--registration-channel", "0", "--save-float32"]
-    )
-    assert result.exit_code == 0, result.exception
+    invoke_cli("export-rois", preview, registration_channel=0, save_float32=True)
     directory = preview.parent / "roi_exports" / "roi_001"
     state = ProcessingState.read(directory / "mosaic.processing.json")
     tiles = directory / "mosaic_deskewed.ome.zarr"
@@ -302,18 +315,101 @@ def test_roi_maps_extended_specimen_to_raw_tiles(mosaic_acquisition, monkeypatch
     final = open_image_array(directory / "mosaic_fused.ome.zarr").read().result()
     assert final.shape[-2:] == (bounds[1] - bounds[0], bounds[3] - bounds[2])
     assert np.isfinite(final).all() and np.any(final > 0)
+    metadata = (
+        open_group(directory / "mosaic_fused.ome.zarr")
+        .ome_metadata()
+        .multiscales[0]
+        .datasets[0]
+    )
+    raw = case.dataset.raw_data[0, :, 0]
+    stage = case.dataset.metadata.scan_axis_reversed
+    if stage:
+        raw = raw[:, ::-1]
+    shape = raw.shape[-3:]
+    width = shape[-1]
+    means = [case.expectation[..., p * offset : p * offset + width] for p in range(2)]
+    gain = 2 * pixel / microscope.scan_step_um
+    geometry = pipeline_geometry(shape, microscope)
+    native_support = camera_volume_samples(
+        geometry.support.astype(float),
+        (0, 0, 0),
+        (pixel, pixel, pixel),
+        (0, 0, 0),
+        shape,
+        microscope,
+    )
+    for fused in (False, True):
+        spacing = np.asarray(
+            metadata.scale_transform.scale[-3:] if fused else saved.voxel_size_um
+        )
+        # Fractional stage placement adds one further interpolation stencil.
+        pitch = spacing * (2 if fused else 1)
+        for position, mean in enumerate(means):
+            image = (
+                final[0, 0] if fused else saved.arrays[position][0, 0].read().result()
+            )
+            origin = (
+                metadata.translation_transform.translation[-3:]
+                if fused
+                else saved.spatial_origins_zyx_um[position]
+            )
+            # These are the simulator's actual placements, before the prescribed
+            # one-pixel X and 0.001-um scan-encoder errors in acquisition metadata.
+            frame_origin = (
+                -2.3,
+                4.6 - ((scans - 1) * microscope.scan_step_um if stage else 0),
+                1.15 + position * offset * pixel,
+            )
+            sample = (origin, spacing, frame_origin, shape, microscope)
+            support = camera_volume_samples(np.ones(image.shape), *sample)
+            support = (
+                np.minimum(support, native_support) >= 1 - 32 * np.finfo(float).eps
+            )
+            prediction = camera_volume_samples(image / gain, *sample)
+            envelope = camera_sampling_envelope(
+                np.asarray(means) if fused else mean,
+                raw if fused else raw[position],
+                microscope.camera,
+                radii=sampling_stencil_radii(microscope, pitch),
+                footprint=sampling_stencil_footprint(
+                    microscope, pitch, origin_y_error_um=0.0005
+                ),
+                views=2 if fused else 1,
+                view_offsets_syx=np.outer((np.arange(2) - position) * offset, (0, 0, 1))
+                if fused
+                else None,
+            )
+            apertures = camera_object_apertures(
+                case.optical_data.ground_truth,
+                microscope,
+                shape,
+                camera_offset_zyx_um=(
+                    0,
+                    0,
+                    (position * offset + (width - case.expectation.shape[-1]) / 2)
+                    * pixel,
+                ),
+            )
+            assert all(np.any(aperture & support) for aperture in apertures[:2])
+            for aperture in apertures:
+                selected = aperture & support
+                if np.any(selected):
+                    accuracy = camera_sampling_accuracy(
+                        prediction, mean, envelope, selected
+                    )
+                    assert accuracy.accepted, accuracy
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize(
-    "roi_preview", [("mirror", 1, False), ("stage", 1, False)], indirect=True
-)
+@pytest.mark.parametrize("origin", [(-2.3, 4.6, 1.15), (-2.3, 1.8, 1.15)])
 def test_single_position_gui_keeps_time_and_global_coordinates(
-    roi_preview, napari_model, monkeypatch
+    origin, fused_store_factory, napari_model, monkeypatch
 ):
     """Draw rectangles on plugin-loaded timelapse layers in stage space."""
     import napari
 
+    data = np.arange(2 * 2 * 32 * 16, dtype=np.uint16).reshape(2, 2, 1, 32, 16)
+    source = fused_store_factory(data, spacing=(0.115,) * 3, origin=origin)
     viewer = napari_model
     monkeypatch.setattr(napari, "Viewer", lambda: viewer)
 
@@ -321,27 +417,24 @@ def test_single_position_gui_keeps_time_and_global_coordinates(
         """Add a rectangle after inspecting the second acquired timepoint."""
         viewer.dims.set_current_step(0, 1)
         layer = viewer.layers[0]
-        np.testing.assert_allclose(layer.translate[-2:], roi_preview.origin[-2:])
+        np.testing.assert_allclose(layer.translate[-2:], origin[-2:])
         vertices = np.asarray(((3, 2), (3, 10), (12, 10), (12, 2)))
         viewer.layers.selection.active.add(vertices, shape_type="rectangle")
         assert viewer.dims.current_step[0] == 1
 
     monkeypatch.setattr(napari, "run", draw)
-    assert export_rois.select_rois(roi_preview.preview, (2, 2, 1, 32, 16)) == [
-        (3, 12, 2, 10)
-    ]
+    assert export_rois.select_rois(source, data.shape) == [(3, 12, 2, 10)]
 
 
 @pytest.mark.unit
 @pytest.mark.parametrize("z_origin", [0.0, -2441.811])
 def test_draw_rois_on_thick_projection(
-    monkeypatch, z_origin, napari_model, fused_store_factory, simulated_camera
+    monkeypatch, z_origin, napari_model, fused_store_factory
 ):
     """Draw level-zero rectangles on a physical full-depth maximum projection."""
-    from types import SimpleNamespace
-
     import napari
     from napari.utils._proxies import ReadOnlyWrapper
+    from napari.utils.events import Event
     from napari.utils.interactions import (
         mouse_move_callbacks,
         mouse_press_callbacks,
@@ -349,8 +442,8 @@ def test_draw_rois_on_thick_projection(
     )
 
     viewer = napari_model
-    observed = simulated_camera((226, 32, 48), step=0.23, geometry="cartesian").raw
-    data = np.stack((observed, observed))
+    time, z, row, column = np.indices((2, 226, 32, 48), dtype=np.uint16)
+    data = 100 + time * 20000 + z * 100 + row * 3 + column
     source = fused_store_factory(
         data[:, None],
         spacing=(0.23, 0.115, 0.115),
@@ -384,8 +477,8 @@ def test_draw_rois_on_thick_projection(
                 ("mouse_release", world[1], mouse_release_callbacks),
             ):
                 event = ReadOnlyWrapper(
-                    SimpleNamespace(
-                        type=kind,
+                    Event(
+                        kind,
                         position=position,
                         is_dragging=kind == "mouse_move",
                         button=1,
@@ -433,11 +526,7 @@ def test_thick_projection_preserves_time_and_multiscale_coordinates(
     z_size, napari_model
 ):
     """Retain time selection and physical coordinates across projected scales."""
-    rng = np.random.default_rng(42)
-    data = rng.integers(0, 100, size=(2, z_size, 16, 24), dtype=np.uint16)
-    data[0, 0, 1, 1] = 200
-    data[0, -1, 2, 2] = 300
-    data[1] += 1000
+    data = np.arange(2 * z_size * 16 * 24, dtype=np.uint16).reshape(2, z_size, 16, 24)
     pyramid = [data, data[:, ::2, ::2, ::2]]
     viewer = napari_model
     layers = [

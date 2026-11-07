@@ -34,7 +34,7 @@ from yaozarrs import open_group, v05
 from opm_processing.dataio.acquisition import inspect_acquisition
 from opm_processing.dataio.processing_state import (
     ProcessingState,
-    processing_state_path,
+    image_processing_state_path,
 )
 
 if TYPE_CHECKING:
@@ -469,7 +469,7 @@ def load_export_metadata(image_store: Path) -> tuple[OME, dict[str, str]]:
     stem = export_source_stem(image_store)
     template = OME(creator="opm-processing-v2")
     provenance = {}
-    state_path = processing_state_path(image_store.parent, stem)
+    state_path = image_processing_state_path(image_store, stem)
     if state_path.is_file():
         state = ProcessingState.read(state_path)
         provenance["ProcessingState"] = json.dumps(state.document, ensure_ascii=False)

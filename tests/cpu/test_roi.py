@@ -13,6 +13,7 @@ from opm_processing.dataio.position_collection import (
     create_variable_position_collection,
     open_position_collection,
 )
+from opm_processing.dataio.processing_state import ProcessingState
 from opm_processing.dataio.roi import (
     PhysicalRoi,
     align_bounds_to_grid,
@@ -20,14 +21,16 @@ from opm_processing.dataio.roi import (
     roi_from_world_rectangle,
     world_roi_to_skewed_bounds,
 )
+from opm_processing.imageprocessing.maxtilefusion import regenerate_fused_max_projection
 from opm_processing.imageprocessing.tilefusion import TileFusion
 
 
 @pytest.mark.unit
 def test_napari_world_rectangle_round_trips_grid_and_all_z(
-    record_registration, fused_store_factory, tmp_path: Path
+    record_registration, fused_store_factory, acquisition_factory, tmp_path: Path
 ) -> None:
     """Save a pyramid-independent ROI plus every overlapping stage-Z level."""
+    acquisition_factory(np.zeros((1, 10, 1, 1, 2, 2), np.uint16), mode="projection")
     source = tmp_path / "sample_max_z_fused.ome.zarr"
     fused_store_factory(
         np.zeros((1, 1, 1, 8, 8), np.uint16),
@@ -71,9 +74,11 @@ def test_napari_world_rectangle_round_trips_grid_and_all_z(
 def test_napari_image_pixels_are_converted_to_ngff_physical_coordinates(
     record_registration,
     fused_store_factory,
+    acquisition_factory,
     tmp_path: Path,
 ) -> None:
     """Apply NGFF translation after mapping the Shapes layer to Image data."""
+    acquisition_factory(np.zeros((1, 1, 1, 1, 2, 2), np.uint16), mode="projection")
     source = tmp_path / "sample_max_z_fused.ome.zarr"
     fused_store_factory(
         np.zeros((1, 1, 1, 5000, 5000), np.uint16),
@@ -162,9 +167,11 @@ def test_registered_tile_origin_is_selected_per_timepoint() -> None:
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("external", [False, True])
 def test_roi_fusion_keeps_multiple_stage_z_levels_and_crops_only_yx(
     record_registration,
     tmp_path: Path,
+    external,
     acquisition_factory,
 ) -> None:
     """Filter arbitrary source positions while preserving their complete Z span."""
@@ -175,15 +182,16 @@ def test_roi_fusion_keeps_multiple_stage_z_levels_and_crops_only_yx(
         (1.0, 1.0, 1.0),
         stage_positions=((0.0, 0.0, 0.0), (5.0, 0.0, 0.0), (0.0, 100.0, 100.0)),
     )
+    observed = np.arange(100, 116, dtype=np.uint16).reshape(1, 4, 4)
     for array in collection.arrays:
-        array.write(np.ones(array.shape, dtype=np.uint16)).result()
+        array.write(observed[None, None]).result()
     tiles = [
         {"time_index": 0, "position_index": 0, "origin_zyx_um": [0, 0, 0]},
         {"time_index": 0, "position_index": 1, "origin_zyx_um": [5, 0, 0]},
         {"time_index": 0, "position_index": 2, "origin_zyx_um": [0, 100, 100]},
     ]
     acquisition_factory(
-        np.ones((1, 3, 1, 1, 4, 4), np.uint16),
+        np.broadcast_to(observed, (1, 3, 1, 1, 4, 4)),
         mode="projection",
         pixel_size_um=1.0,
         scan_axis_step_um=1.0,
@@ -218,6 +226,7 @@ def test_roi_fusion_keeps_multiple_stage_z_levels_and_crops_only_yx(
 
     fusion = TileFusion(
         processed_path,
+        output_dir=tmp_path / "rendered" if external else None,
         roi_selection=roi,
         max_workers=1,
         reverse_stage_y=False,
@@ -234,10 +243,20 @@ def test_roi_fusion_keeps_multiple_stage_z_levels_and_crops_only_yx(
     assert fusion.offset_um == (0.0, -2.0, -1.0)
     assert fusion.unpadded_shape == (6, 5, 4)
     fusion.run()
-    written = open_group(tmp_path / "sample_fused.ome.zarr")["0"].to_tensorstore()
+    fused = fusion.output_dir / "sample_fused.ome.zarr"
+    written = open_group(fused)["0"].to_tensorstore()
     expected = np.zeros((1, 1, 6, 5, 4), dtype=np.uint16)
-    expected[..., (0, 5), 2:5, 1:4] = 1
+    expected[..., (0, 5), 2:5, 1:4] = observed[..., :3, :3]
     np.testing.assert_array_equal(written.read().result()[..., :6, :5, :4], expected)
+    state = ProcessingState.read(tmp_path / "sample.processing.json")
+    assert state.registered_output_for_fused(fused) == processed_path
+    assert state.registration(processed_path)["tiles"] == tiles
+    maximum = fusion.output_dir / "sample_max_z_fused.ome.zarr"
+    regenerate_fused_max_projection(fused, maximum, max_workers=1)
+    np.testing.assert_array_equal(
+        open_group(maximum)["0"].to_tensorstore().read().result(),
+        written.read().result().max(axis=2, keepdims=True),
+    )
 
 
 @pytest.mark.unit
@@ -276,8 +295,13 @@ def test_variable_roi_tiles_are_stored_cropped_and_reopened(
             (0.0, 12.0, 22.0),
         ),
     )
-    collection.arrays[0].write(np.full(shapes[0], 10, dtype=np.uint16)).result()
-    collection.arrays[1].write(np.full(shapes[1], 30, dtype=np.uint16)).result()
+    observed = tuple(
+        np.arange(np.prod(shape[-3:]), dtype=np.uint16).reshape(shape[-3:])
+        + 100 * (index + 1)
+        for index, shape in enumerate(shapes)
+    )
+    for array, pixels in zip(collection.arrays, observed, strict=True):
+        array.write(pixels[None, None]).result()
     # Z=0 has no valid deskew interpolation; Z=1 is supported throughout
     # both interior Y crops. Store physically valid synthetic tile data.
     for array in collection.arrays:
@@ -339,9 +363,11 @@ def test_variable_roi_tiles_are_stored_cropped_and_reopened(
     fused = np.asarray(fusion.fused_ts.read().result())
     assert fused.shape == (1, 1, 2, 8, 6)
     expected = np.zeros((1, 1, 2, 8, 6), np.uint16)
-    expected[..., :4, :4] = 10
-    expected[..., 2:7, 2:5] = 30
-    expected[..., 2:4, 2:4] = 20
+    expected[..., :4, :4] = observed[0]
+    expected[..., 2:7, 2:5] = observed[1]
+    expected[..., 2:4, 2:4] = (
+        (observed[0][:, 2:4, 2:4].astype(np.float32) + observed[1][:, :2, :2]) / 2
+    ).astype(np.uint16)
     expected[:, :, 0] = 0
     np.testing.assert_array_equal(fused, expected)
 

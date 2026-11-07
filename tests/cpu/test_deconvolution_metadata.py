@@ -54,25 +54,6 @@ def test_planar_data_does_not_require_scan_spacing(acquisition_metadata):
     )
 
 
-@pytest.mark.parametrize("suffix", [".npy", ".ome.tif"])
-def test_measured_psfs_preserve_pixels_without_theoretical_calibration(
-    tmp_path, acquisition_metadata, suffix
-):
-    """Load measured optical samples unchanged using NumPy and tifffile readers."""
-    from tifffile import imwrite
-
-    kernel = np.arange(27, dtype=np.float32).reshape(3, 3, 3)
-    kernel /= kernel.sum()
-    path = tmp_path / f"measured_psf{suffix}"
-    if suffix == ".npy":
-        np.save(path, kernel)
-    else:
-        imwrite(path, kernel, photometric="minisblack", metadata={"axes": "ZYX"})
-    kernels, parameters = load_deconvolution_psfs(acquisition_metadata, [path])
-    np.testing.assert_array_equal(kernels[0], kernel)
-    assert parameters is None
-
-
 @pytest.mark.parametrize("count", [0, 2])
 def test_measured_psf_count_must_match_recorded_channels(
     tmp_path, acquisition_metadata, count
@@ -281,26 +262,6 @@ def test_missing_required_calibration_is_an_explicit_error(acquisition_metadata,
 
 
 @pytest.mark.parametrize("unit, multiplier", [("micrometer", 1), ("nanometer", 1000)])
-def test_camera_pitch_uses_recorded_ngff_units(
-    deconvolution_acquisition, unit, multiplier
-):
-    """Convert the recorded NGFF camera pitch into micrometers."""
-    case = deconvolution_acquisition
-    image = open_group(case.path)["0"]
-    ome = image.attrs["ome"]
-    multiscale = ome["multiscales"][0]
-    scales = multiscale["datasets"][0]["coordinateTransformations"][0]["scale"]
-    for index, axis in enumerate(multiscale["axes"]):
-        if axis["name"] in ("x", "y"):
-            axis["unit"] = unit
-            scales[index] = case.metadata.pixel_size_um * multiplier
-    update_group_attributes(case.path / "0", {"ome": ome})
-    assert inspect_acquisition(case.path).pixel_size_um == pytest.approx(
-        case.metadata.pixel_size_um
-    )
-
-
-@pytest.mark.parametrize("unit, multiplier", [("micrometer", 1), ("nanometer", 1000)])
 def test_collection_reads_ngff_spacing_and_origin_in_physical_units(
     deconvolution_acquisition, unit, multiplier
 ):
@@ -316,6 +277,43 @@ def test_collection_reads_ngff_spacing_and_origin_in_physical_units(
     transforms[0]["scale"][-3:] = [value * multiplier for value in spacing]
     transforms[1]["translation"][-3:] = [value * multiplier for value in origin]
     update_group_attributes(path / "0", {"ome": metadata})
+    assert inspect_acquisition(path).pixel_size_um == pytest.approx(0.12)
     collection = open_position_collection(path)
     np.testing.assert_allclose(collection.voxel_size_um, spacing, atol=1e-14)
     np.testing.assert_allclose(collection.spatial_origins_zyx_um, [origin], atol=1e-14)
+
+
+@pytest.mark.parametrize("psf_format", ["npy", "tif"])
+def test_measured_psf_bytes_resolve_loading_and_resume_identity(
+    measured_psf_calibration, acquisition_metadata, processing_state
+):
+    """Load actual calibration pixels and invalidate durable identity when they change."""
+    from opm_processing.process import file_sha256
+
+    case = measured_psf_calibration
+    kernels, parameters = load_deconvolution_psfs(acquisition_metadata, [case.path])
+    np.testing.assert_array_equal(kernels[0], case.kernel)
+    assert parameters is None
+    configuration = {
+        "deconvolution": {
+            "psf_parameters": parameters,
+            "psf_sha256": [file_sha256(case.path)],
+        }
+    }
+    output = processing_state.path.parent / "calibrated.ome.zarr"
+    processing_state.initialize_run(output, configuration=configuration, overwrite=True)
+    case.write(case.kernel * 2)
+    updated, updated_parameters = load_deconvolution_psfs(
+        acquisition_metadata, [case.path]
+    )
+    np.testing.assert_array_equal(updated[0], case.kernel * 2)
+    resolved = {
+        "deconvolution": {
+            "psf_parameters": updated_parameters,
+            "psf_sha256": [file_sha256(case.path)],
+        }
+    }
+    assert resolved != configuration
+    with pytest.raises(ValueError, match="incompatible"):
+        processing_state.initialize_run(output, configuration=resolved, overwrite=False)
+    assert processing_state.run(output)["configuration"] == configuration

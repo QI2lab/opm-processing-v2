@@ -98,6 +98,17 @@ def register_and_fuse(
             help="Physical ROI JSON saved by export-rois.",
         ),
     ] = None,
+    output_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--output-dir",
+            file_okay=False,
+            help=(
+                "Folder for fused OME-Zarr volume and maximum-Z images. "
+                "Registration remains beside the processed tiles."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Register processed OPM tiles, fuse them, and save a maximum projection.
 
@@ -128,11 +139,11 @@ def register_and_fuse(
     optimization_abs_threshold : float
         Minimum residual cutoff in effective registration sampling bins.
     max_registration_shift_zyx : tuple[int, int, int] or None
-        Maximum ZYX corrections in pixels; None derives limits from stage spacing
-        and scan geometry for each overlap.
+        Maximum ZYX corrections in pixels; None reads recorded acquisition
+        overlaps and bounds each pair using stage and scan geometry.
     normalize_depth_intensity : bool
         Match registered depth layers using channel gains shared across XY tiles
-        at each depth and timepoint. Save the gains alongside the fused image.
+        at each depth and timepoint. Save the gains beside the processed tiles.
     registration_retries : int
         Maximum automatic search expansions; each remeasures only expanded
         pairs and refits the full graph. Zero disables retries; explicit limits
@@ -145,6 +156,9 @@ def register_and_fuse(
     roi : pathlib.Path or None
         Saved ROI restricting positions and fused YX bounds while
         retaining every Z plane; None fuses the full acquisition.
+    output_dir : pathlib.Path or None
+        Fused image destination; None writes beside the processed input.
+        Registration and depth-gain records remain beside the processed tiles.
 
     Returns
     -------
@@ -153,13 +167,16 @@ def register_and_fuse(
     """
     if regenerate_max_z:
         try:
-            output_dir, _processed_path, stem, _source_path = resolve_fusion_input(
+            input_dir, _processed_path, stem, _source_path = resolve_fusion_input(
                 root_path
             )
         except FileNotFoundError:
             acquisition_path = resolve_acquisition_path(root_path)
-            output_dir = acquisition_path.parent
+            input_dir = acquisition_path.parent
             stem = acquisition_stem(acquisition_path)
+        output_dir = (
+            input_dir if output_dir is None else output_dir.expanduser().resolve()
+        )
     else:
         status = fusion_backend_status(max_workers=max_workers)
         if require_gpu:
@@ -190,8 +207,10 @@ def register_and_fuse(
             registration_retries=registration_retries,
             roi_selection=None if roi is None else PhysicalRoi.read(roi),
             normalize_depth_intensity=normalize_depth_intensity,
+            output_dir=output_dir,
         )
         print(f"Fusion input: {tile_fuser.data}")
+        print(f"Fusion output directory: {tile_fuser.output_dir}")
         tile_fuser.run()
         output_dir = tile_fuser.output_dir
         stem = tile_fuser.acquisition_name

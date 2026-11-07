@@ -5,11 +5,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import numpy as np
+from yaozarrs import v05
+
+from opm_processing.dataio.timing import time_axis
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
-
-    from yaozarrs import v05
 
 SPATIAL_DECIMALS = 3
 
@@ -60,6 +61,79 @@ def round_tczyx_transform(values: Sequence[float]) -> list[float]:
         Transform preserving T and C and rounding the spatial values.
     """
     return [float(values[0]), float(values[1]), *round_spatial_values(values[2:])]
+
+
+def tczyx_image_metadata(
+    spatial_scales: Sequence[Sequence[float]],
+    spatial_origins: Sequence[Sequence[float]],
+    *,
+    time_interval_s: float | None = None,
+    time_origin_s: float = 0.0,
+    name: str | None = None,
+    omero: v05.Omero | None = None,
+    round_coordinates: bool = True,
+) -> v05.Image:
+    """Describe a root TCZYX image using calibrated per-level spatial transforms.
+
+    Parameters
+    ----------
+    spatial_scales : sequence of sequence of float
+        Per-level ZYX voxel spacings in micrometers.
+    spatial_origins : sequence of sequence of float
+        Per-level ZYX origins in micrometers.
+    time_interval_s : float or None
+        Recorded snapshot interval; None keeps the time axis unitless.
+    time_origin_s : float
+        Time coordinate of the first stored snapshot.
+    name : str or None
+        Optional multiscale image name.
+    omero : yaozarrs.v05.Omero or None
+        Optional channel display metadata.
+    round_coordinates : bool
+        Round spatial transforms to the processing precision. False preserves
+        explicitly supplied coordinates, including historical acquisition data.
+
+    Returns
+    -------
+    yaozarrs.v05.Image
+        Canonical axes and consecutive dataset paths with the supplied transforms.
+    """
+    axis, interval = time_axis(time_interval_s)
+    datasets = []
+    for level, (scale, origin) in enumerate(
+        zip(spatial_scales, spatial_origins, strict=True)
+    ):
+        scale_tczyx = [interval, 1.0, *(float(value) for value in scale)]
+        origin_tczyx = [float(time_origin_s), 0.0, *(float(value) for value in origin)]
+        if round_coordinates:
+            scale_tczyx = round_tczyx_transform(scale_tczyx)
+            origin_tczyx = round_tczyx_transform(origin_tczyx)
+        datasets.append(
+            v05.Dataset(
+                path=str(level),
+                coordinateTransformations=[
+                    v05.ScaleTransformation(scale=scale_tczyx),
+                    v05.TranslationTransformation(translation=origin_tczyx),
+                ],
+            )
+        )
+    return v05.Image(
+        multiscales=[
+            v05.Multiscale(
+                name=name,
+                axes=[
+                    axis,
+                    {"name": "c", "type": "channel"},
+                    *(
+                        {"name": dimension, "type": "space", "unit": "micrometer"}
+                        for dimension in "zyx"
+                    ),
+                ],
+                datasets=datasets,
+            )
+        ],
+        omero=omero,
+    )
 
 
 def downsample_yx(

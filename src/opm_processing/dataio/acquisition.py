@@ -68,6 +68,59 @@ class AcquisitionMetadata:
     plane_period_s: float | None = None
     timing_source: str | None = None
     deconvolution: dict[str, Any] | None = None
+    scan_axis_overlap_um: float | None = None
+    scan_axis_overlap: float | None = None
+    tile_axis_overlap: float | None = None
+    z_axis_overlap: float | None = None
+
+    @property
+    def registration_overlap_zyx_um(self) -> tuple[float | None, ...]:
+        """Convert recorded tile overlaps to physical processed-image ZYX extents.
+
+        Stage scans record scan overlap in micrometers; that setting takes
+        precedence over the fractional scan overlap retained in the config.
+        Camera extents use the raw crop and angle, independent of processing
+        crops or downsampling. Missing settings remain unknown.
+        """
+        if self.pixel_size_um is None:
+            return (
+                None,
+                self.scan_axis_overlap_um if self.mode == "stage" else None,
+                None,
+            )
+        camera_y = self.index_sizes["y"] * self.pixel_size_um
+        camera_x = self.index_sizes["x"] * self.pixel_size_um
+        depth_extent = None
+        scan_extent = camera_y
+        if not self.is_2d:
+            if self.angle_deg is None:
+                scan_extent = None
+            else:
+                angle = math.radians(self.angle_deg)
+                depth_extent = camera_y * math.sin(angle)
+                scan_extent = (
+                    None
+                    if self.scan_span_um is None
+                    else self.scan_span_um + camera_y * math.cos(angle)
+                )
+        depth = (
+            None
+            if depth_extent is None or self.z_axis_overlap is None
+            else depth_extent * self.z_axis_overlap
+        )
+        scan = (
+            None
+            if scan_extent is None or self.scan_axis_overlap is None
+            else scan_extent * self.scan_axis_overlap
+        )
+        if self.mode == "stage" and self.scan_axis_overlap_um is not None:
+            scan = self.scan_axis_overlap_um
+        tile = (
+            None
+            if self.tile_axis_overlap is None
+            else camera_x * self.tile_axis_overlap
+        )
+        return (depth, scan, tile)
 
     def validate_processing_calibration(self) -> None:
         """Reject missing or invalid recorded camera and scan calibration."""
@@ -293,13 +346,6 @@ class AcquisitionMetadata:
         bool
             Whether scan samples must be reversed before production deskewing.
         """
-        # During a stage scan the sample moves opposite the stage trajectory in
-        # the stationary OPM imaging plane. The deskew convention follows sample
-        # coordinates, so stage-scan samples must always be reversed regardless
-        # of whether the recorded stage positions increase or decrease.
-        if "stage" in self.mode.lower():
-            return True
-
         if (
             self.scan_axis is not None
             and self.scan_axis in "xyz"
@@ -316,7 +362,19 @@ class AcquisitionMetadata:
                 if end[axis] != start[axis]
             ]
             if deltas:
+                if "stage" in self.mode.lower():
+                    if min(deltas) < 0 < max(deltas):
+                        raise ValueError(
+                            "Stage trajectories with mixed scan directions are not supported"
+                        )
+                    # Image Y increases opposite physical scan-stage X. A
+                    # positive stage trajectory must therefore be reordered;
+                    # a negative trajectory is already in image order.
+                    return sum(deltas) > 0
                 return sum(deltas) < 0
+        if "stage" in self.mode.lower():
+            # Legacy records without signed endpoints used positive X scans.
+            return True
         orientation_key = (
             "camera_mirror_orientation"
             if "mirror" in self.mode
@@ -344,9 +402,31 @@ class AcquisitionMetadata:
         result["tile_count"] = self.tile_count
         result["scan_position_count"] = self.scan_position_count
         result["scan_span_um"] = self.scan_span_um
+        result["registration_overlap_zyx_um"] = self.registration_overlap_zyx_um
         result["channel_count"] = len(self.channels)
         result["stage_axis_flips_xyz"] = self.stage_axis_flips_xyz
         result["scan_axis_reversed"] = self.scan_axis_reversed
+        for name in (
+            "stage_positions_zxy",
+            "scan_start_positions_xyz",
+            "scan_end_positions_xyz",
+        ):
+            result[name] = tuple(
+                tuple(round(float(value), 3) for value in position)
+                for position in result[name]
+            )
+        for name in (
+            "pixel_size_um",
+            "scan_axis_step_um",
+            "scan_span_um",
+            "scan_axis_overlap_um",
+        ):
+            if result[name] is not None:
+                result[name] = round(float(result[name]), 3)
+        result["registration_overlap_zyx_um"] = tuple(
+            None if value is None else round(float(value), 3)
+            for value in result["registration_overlap_zyx_um"]
+        )
         return result
 
 
@@ -401,6 +481,10 @@ def resolve_acquisition_path(path: str | Path) -> Path:
     # the root, so use yaozarrs to disambiguate without opening pixel arrays.
     opm_v2_stores = []
     for store in stores:
+        # A reference-backed acquisition may sit beside its original bare
+        # array. Only groups can carry the current acquisition manifest.
+        if (store / ".zarray").is_file() and not (store / ".zgroup").is_file():
+            continue
         root = yaozarrs.open_group(store)
         if "opm_v2" in root.attrs:
             opm_v2_stores.append(store)
@@ -901,6 +985,25 @@ def _inspect_ome_zarr(path: Path, root: ZarrGroup) -> AcquisitionMetadata:
     camera = first_metadata.get("Camera", {})
     opm_frame = first_metadata.get("OPM", {})
     config = opm.get("configuration", {}).get("acq_config", {})
+    overlap_settings = {}
+    positions_config = config.get("Positions", {})
+    for name in (
+        "scan_axis_overlap_um",
+        "scan_axis_overlap",
+        "tile_axis_overlap",
+        "z_axis_overlap",
+    ):
+        if positions_config.get(name) is None:
+            continue
+        value = _number(positions_config[name])
+        if (
+            value is None
+            or not math.isfinite(value)
+            or value < 0
+            or (name != "scan_axis_overlap_um" and value >= 1)
+        ):
+            raise ValueError(f"Invalid recorded Positions.{name}")
+        overlap_settings[name] = value
     daq_config = config.get("DAQ", {})
     if not channel_names:
         found: dict[int, str] = {}
@@ -1008,6 +1111,7 @@ def _inspect_ome_zarr(path: Path, root: ZarrGroup) -> AcquisitionMetadata:
         else None,
         plane_period_s=plane_period_s,
         timing_source=timing_source,
+        **overlap_settings,
     )
 
 
@@ -1057,6 +1161,10 @@ def open_acquisition_datastore(
         else inspect_acquisition(acquisition)
     )
     root = yaozarrs.open_group(metadata.path)
+    if "opm_processing_refkv" in root.attrs:
+        from opm_processing.dataio.refkv_reader import open_refkv_datastore
+
+        return open_refkv_datastore(metadata)
     arrays = [root[array_path].to_tensorstore() for array_path in metadata.array_paths]
     return ts.stack(arrays, axis=1)
 

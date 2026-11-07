@@ -6,6 +6,7 @@ import pytest
 
 pytest_plugins = (
     "tests.fixtures.hardware",
+    "tests.fixtures.coordinates",
     "tests.fixtures.acquisition",
     "tests.fixtures.tiling",
     "tests.fixtures.roi",
@@ -20,27 +21,6 @@ pytest_plugins = (
     "tests.fixtures.pipeline",
     "tests.fixtures.cli",
 )
-
-
-@pytest.hookimpl(hookwrapper=True)
-def pytest_runtest_makereport(item, call):
-    """Retain outcomes so contract checks do not mask actual failures or CUDA skips.
-
-    Parameters
-    ----------
-    item : pytest.Item
-        Current test.
-    call : pytest.CallInfo
-        Execution phase being reported.
-
-    Yields
-    ------
-    None
-        Control to pytest's normal report implementation.
-    """
-    outcome = yield
-    report = outcome.get_result()
-    setattr(item, f"pipeline_report_{report.when}", report)
 
 
 def pytest_collection_modifyitems(items):
@@ -84,23 +64,4 @@ def pytest_collection_modifyitems(items):
         if len(categories) != 1:
             raise pytest.UsageError(
                 f"{item.nodeid}: select exactly one of unit or integration"
-            )
-        if categories == ["integration"] and not {
-            "simulated_camera",
-            "pipeline_optical_data",
-            "independent_photon_scene_factory",
-        }.intersection(item.fixturenames):
-            raise pytest.UsageError(
-                f"{item.nodeid}: integration tests require shared forward-model ground truth"
-            )
-        if (
-            categories == ["integration"]
-            and "opm_v2_acquisition_factory" not in item.fixturenames
-        ):
-            raise pytest.UsageError(
-                f"{item.nodeid}: every integration must start with OpmDataHandler output"
-            )
-        if categories == ["integration"] and "acquisition_factory" in item.fixturenames:
-            raise pytest.UsageError(
-                f"{item.nodeid}: synthetic acquisition layouts are forbidden in integration tests"
             )

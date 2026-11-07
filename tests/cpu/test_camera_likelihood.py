@@ -43,7 +43,7 @@ def test_adc_likelihood_normalizes_and_predicts_photon_statistics(
         assert probability[100] == pytest.approx(expected, rel=1e-13)
 
 
-@pytest.mark.parametrize("rate", [0.2, 2, 100], scope="module")
+@pytest.mark.parametrize("rate", [0.2, 2, 100])
 @pytest.mark.parametrize("rate_factor", [0.5, 2])
 def test_held_out_camera_likelihood_favors_true_rate_without_brightness_fit(
     rate, rate_factor, camera_calibration, camera_likelihood_sample
@@ -141,3 +141,67 @@ def test_directional_rayleigh_measurement_matches_airy_first_minimum():
     assert dip == pytest.approx(0.26497, abs=5e-5)
     with pytest.raises(ValueError, match="first minimum"):
         first_minimum(radius, np.exp(-(radius**2)))
+
+
+@pytest.mark.parametrize(
+    "artifact", ["correct", "gain", "dim", "stripes", "zero", "zero-unbounded"]
+)
+def test_camera_sampling_bounds_detect_photon_and_spatial_errors(
+    camera_sampling_case, artifact
+):
+    """Known detector noise cannot conceal a twenty-percent or mean-preserving stripe error."""
+    from opm_processing.imageprocessing.camera import camera_correct
+    from tests.simulation.camera_likelihood import (
+        SamplingEnvelope,
+        camera_sampling_accuracy,
+        camera_sampling_envelope,
+    )
+    from tests.simulation.metrics import (
+        camera_flux_accuracy,
+        camera_noise_accuracy,
+        camera_partition_apertures,
+    )
+
+    case = camera_sampling_case
+    expected, camera = case.expectation, case.camera
+    envelope = camera_sampling_envelope(
+        expected, case.raw, camera, radii=case.radii, footprint=case.footprint
+    )
+    # Identity sampling is an allowed positive interpolation: its central
+    # coefficient is one. Its noise is the actual physical camera draw.
+    prediction = camera_correct(
+        case.raw, camera.offset_adu, camera.electrons_per_adu
+    ).astype(np.float64)
+    original_flux = prediction.sum(dtype=np.float64)
+    if artifact == "gain":
+        prediction *= 1.2
+    elif artifact == "dim":
+        prediction *= 0.8
+    elif artifact == "stripes":
+        prediction += np.where(np.arange(prediction.shape[-1]) % 2, 1, -1) * (
+            0.2 * case.nominal
+        )
+        assert prediction.sum(dtype=np.float64) == original_flux
+    elif artifact in ("zero", "zero-unbounded"):
+        prediction.fill(0)
+        if artifact == "zero-unbounded":
+            envelope = SamplingEnvelope(np.zeros_like(expected), expected * 2)
+    measured = camera_sampling_accuracy(
+        prediction, expected, envelope, np.ones(expected.shape, bool)
+    )
+    assert measured.accepted == (artifact == "correct"), measured
+    # The inverse-solver target uses this same independently observed optical
+    # phantom. Its likelihood and calibrated-noise scores must distinguish the
+    # same absolute gain and spatial errors without fitting a reconstruction.
+    inverse_accuracy = camera_noise_accuracy(
+        prediction, expected, camera, np.ones(expected.shape, bool)
+    )
+    assert inverse_accuracy.accepted == (artifact == "correct"), inverse_accuracy
+    flux_accuracy = [
+        camera_flux_accuracy(prediction, expected, camera, aperture)
+        for aperture in camera_partition_apertures(expected.shape)
+    ]
+    assert all(flux_accuracy) == (artifact == "correct")
+    if artifact == "stripes":
+        assert measured.flux_lower <= measured.flux <= measured.flux_upper
+        assert not measured.inside_envelope

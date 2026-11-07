@@ -56,7 +56,6 @@ from opm_processing.dataio.processing_state import (
     ProcessingState,
     processing_state_path,
 )
-from opm_processing.dataio.ptv import mark_ptv_tile, publish_processing_state_ptv
 from opm_processing.dataio.roi import (
     PhysicalRoi,
     world_roi_to_skewed_bounds,
@@ -66,6 +65,8 @@ from opm_processing.imageprocessing.camera import (
     illumination_correct,
 )
 from opm_processing.imageprocessing.coordinates import (
+    STAGE_COORDINATE_VERSION,
+    deskewed_stage_scan_offsets,
     stage_z_level_indices,
 )
 from opm_processing.imageprocessing.maxtilefusion import MaxTileFusion
@@ -1014,7 +1015,10 @@ def plan_roi_tiles(
             if crop_y0 >= crop_y1 or crop_x0 >= crop_x1:
                 continue
             output_origin = (
-                round_spatial(registered_origin[0]),
+                round_spatial(
+                    registered_origin[0]
+                    + 0.5 * (z_downsample_level - 1) * pixel_size_um
+                ),
                 round_spatial(local_origin_y + crop_y0 * pixel_size_um),
                 round_spatial(local_origin_x + crop_x0 * pixel_size_um),
             )
@@ -1649,6 +1653,7 @@ def process_skewed(
     stage_positions = apply_stage_axis_flips(stage_positions_raw, stage_axis_flips)
     stage_z_indices = stage_z_level_indices(stage_positions_raw)
     stage_z_flipped = stage_axis_flips[2]
+    scan_origin_offsets = deskewed_stage_scan_offsets(acquisition)
 
     # Estimate the shape of one deskewed volume.
     deskew_input_shape = (
@@ -1782,8 +1787,27 @@ def process_skewed(
         round_spatial(pixel_size_um),
         round_spatial(pixel_size_um),
     )
+    image_origin_offsets = scan_origin_offsets + np.array(
+        (0.5 * (z_downsample_level - 1) * pixel_size_um, crop_y * pixel_size_um, 0)
+    )
+    coordinate_attributes = {
+        "opm_processing_coordinates": {
+            "version": STAGE_COORDINATE_VERSION,
+            "stage_axes": ["z", "x", "y"],
+            "stage_positions_zxy_um": stage_positions_raw[:pos_shape].round(3).tolist(),
+            "placement_stage_positions_zxy_um": stage_positions[:pos_shape]
+            .round(3)
+            .tolist(),
+            "stage_axis_flips_xyz": list(stage_axis_flips),
+            "image_axes": ["z", "y", "x"],
+            "image_origin_reference": "recorded-stage-plus-local-ngff-translation",
+            "camera_reference": "first-stored-detector-pixel",
+            "stage_position_reference": "recorded-acquisition-frame-coordinates",
+        }
+    }
     processing_configuration = {
         "kind": output_kind,
+        "coordinates": STAGE_COORDINATE_VERSION,
         "calibration": {
             "camera_offset_adu": camera_offset,
             "camera_conversion": camera_conversion,
@@ -1885,6 +1909,9 @@ def process_skewed(
             roi_output_shapes,
             deskewed_voxel_size_um,
             spatial_origins_zyx_um=[plan["origin_zyx_um"] for plan in roi_plans],
+            stage_positions=[
+                stage_positions_raw[int(plan["position_index"])] for plan in roi_plans
+            ],
             time_interval_s=acquisition.volume_interval_s,
             attributes=acquisition.timing_attributes(),
             channels=channels,
@@ -1903,9 +1930,9 @@ def process_skewed(
             output_shape,
             deskewed_voxel_size_um,
             time_interval_s=acquisition.volume_interval_s,
-            attributes=acquisition.timing_attributes(),
-            stage_positions=stage_positions[:pos_shape],
-            spatial_offset_um=(0, crop_y * pixel_size_um, 0),
+            attributes={**acquisition.timing_attributes(), **coordinate_attributes},
+            stage_positions=stage_positions_raw[:pos_shape],
+            spatial_offsets_zyx_um=image_origin_offsets[:pos_shape],
             channels=channels,
             dtype=output_dtype,
             overwrite=True,
@@ -1946,6 +1973,9 @@ def process_skewed(
             round_spatial(crop_y * pixel_size_um),
             0.0,
         )
+        max_z_origin_offsets = image_origin_offsets + np.array(
+            (max_z_offset_um[0], 0, 0)
+        )
         max_z_output_shape = tuple(int(value) for value in max_z_datastore_shape)
         if (live_manifest is not None or resume) and max_z_output_path.exists():
             max_z_collection = open_resume_collection(
@@ -1964,12 +1994,12 @@ def process_skewed(
                 max_z_output_shape,
                 max_z_voxel_size_um,
                 time_interval_s=acquisition.volume_interval_s,
-                attributes=acquisition.timing_attributes(),
-                stage_positions=stage_positions[:pos_shape],
+                attributes={**acquisition.timing_attributes(), **coordinate_attributes},
+                stage_positions=stage_positions_raw[:pos_shape],
                 channels=channels,
                 dtype=output_dtype,
                 multiscale_factors_yx=max_z_factors_yx,
-                spatial_offset_um=max_z_offset_um,
+                spatial_offsets_zyx_um=max_z_origin_offsets[:pos_shape],
                 overwrite=True,
             )
         if max_z_collection.time_interval_s != acquisition.volume_interval_s:
@@ -2017,9 +2047,6 @@ def process_skewed(
         resume=state_resume,
         output_preexisting=output_preexisting,
     )
-    ptv_export_enabled = acquisition.volume_interval_s is not None
-    if ptv_export_enabled:
-        publish_processing_state_ptv(output_path, processing_state)
     if max_projection:
         if state_resume and max_z_output_preexisting:
             try:
@@ -2405,13 +2432,6 @@ def process_skewed(
                 pos_idx,
                 zero_channels=tile_zero_channels,
             )
-            if ptv_export_enabled:
-                mark_ptv_tile(
-                    output_path,
-                    int(t_idx),
-                    int(pos_idx),
-                    zero_channels=tile_zero_channels,
-                )
             if max_projection:
                 processing_state.complete_tile(max_z_output_path, t_idx, pos_idx)
 
@@ -2444,7 +2464,9 @@ def process_skewed(
             tile_positions = stage_positions
 
         tile_fusion = MaxTileFusion(
-            ts_dataset=max_z_ts_store,
+            ts_dataset=max_z_ts_store
+            if pos_range is None
+            else max_z_ts_store[pos_range[0] : pos_range[1]],
             tile_positions=tile_positions,
             output_path=fused_output_path,
             pixel_size=np.asarray(
@@ -2452,6 +2474,16 @@ def process_skewed(
                 dtype=np.float64,
             ),
             spatial_offset_z_um=float(max_z_collection.spatial_origins_zyx_um[0][0]),
+            spatial_offsets_zyx_um=(
+                max_z_collection.spatial_origins_zyx_um
+                if pos_range is None
+                else max_z_collection.spatial_origins_zyx_um[
+                    pos_range[0] : pos_range[1]
+                ]
+            ),
+            source_position_indices=(
+                None if pos_range is None else range(pos_range[0], pos_range[1])
+            ),
             source_collection=max_z_output_path,
             time_interval_s=max_z_collection.time_interval_s,
             reverse_stage_z=not stage_z_flipped,
@@ -2652,8 +2684,20 @@ def process_projection(
         )
     )
     voxel_size_um = (1.0, pixel_size_um, pixel_size_um)
+    coordinate_attributes = {
+        "opm_processing_coordinates": {
+            "version": STAGE_COORDINATE_VERSION,
+            "stage_axes": ["z", "x", "y"],
+            "stage_positions_zxy_um": stage_positions_raw.round(3).tolist(),
+            "placement_stage_positions_zxy_um": stage_positions.round(3).tolist(),
+            "stage_axis_flips_xyz": list(stage_axis_flips),
+            "image_axes": ["z", "y", "x"],
+            "image_origin_reference": "recorded-stage-plus-local-ngff-translation",
+        }
+    }
     processing_configuration = {
         "kind": output_kind,
+        "coordinates": STAGE_COORDINATE_VERSION,
         "timing": acquisition.timing_attributes(),
         "dtype": output_dtype.name,
         "detector_gain_x": None
@@ -2703,8 +2747,8 @@ def process_projection(
             datastore.shape,
             voxel_size_um,
             time_interval_s=acquisition.volume_interval_s,
-            attributes=acquisition.timing_attributes(),
-            stage_positions=stage_positions,
+            attributes={**acquisition.timing_attributes(), **coordinate_attributes},
+            stage_positions=stage_positions_raw,
             channels=channels,
             overwrite=True,
             dtype=output_dtype,
@@ -2864,6 +2908,7 @@ def process_projection(
         tile_fusion = MaxTileFusion(
             ts_dataset=ts_store,
             tile_positions=tile_positions,
+            spatial_offsets_zyx_um=np.zeros((len(tile_positions), 3)),
             output_path=fused_output_path,
             pixel_size=np.asarray((pixel_size_um, pixel_size_um), dtype=np.float32),
             time_range=time_range,

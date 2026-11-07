@@ -882,6 +882,47 @@ class _Convolution:
         return result
 
 
+def _full_data_update(
+    observed: Array,
+    denominator: Array,
+    adjoint: Callable,
+    sensitivity: Array,
+    variance: np.float32,
+) -> Array:
+    """Compute the same full-data RL multiplier with or without consensus.
+
+    Parameters
+    ----------
+    observed : array-like
+        Calibrated measured counts.
+    denominator : array-like
+        Positive forward prediction including the read-noise variance shift.
+    adjoint : callable
+        Adjoint of the measurement operator.
+    sensitivity : array-like
+        Positive adjoint image of unit measured values.
+    variance : float
+        Read-noise variance in calibrated units.
+
+    Returns
+    -------
+    array-like
+        Nonnegative sensitivity-normalized multiplicative RL update.
+    """
+    xp = cp.get_array_module(observed)
+    if xp is np:
+        measured_ratio = np.empty_like(observed)
+        for slab in _host_slices(observed.shape):
+            np.add(observed[slab], variance, out=measured_ratio[slab])
+            measured_ratio[slab] /= denominator[slab]
+    else:
+        measured_ratio = (observed + variance) / denominator
+    update = adjoint(measured_ratio)
+    update /= sensitivity
+    xp.maximum(update, 0, out=update)
+    return update
+
+
 def _iterate_rlgc(
     observed: Array,
     shape: tuple[int, int, int],
@@ -1015,14 +1056,10 @@ def _iterate_rlgc(
                 del half2
                 consensus = smooth(half1, sensitivity)
                 del half1
-                measured_ratio = np.empty_like(observed)
-                for slab in _host_slices(observed.shape):
-                    np.add(observed[slab], variance, out=measured_ratio[slab])
-                    measured_ratio[slab] /= denominator[slab]
-                ratio = adjoint(measured_ratio)
-                del measured_ratio, denominator
-                ratio /= sensitivity
-                np.maximum(ratio, 0, out=ratio)
+                ratio = _full_data_update(
+                    observed, denominator, adjoint, sensitivity, variance
+                )
+                del denominator
                 updated = ratio
                 for slab in _host_slices(recon.shape):
                     updated[slab] *= recon[slab]
@@ -1032,8 +1069,9 @@ def _iterate_rlgc(
                 half1 = adjoint(2 * (split1 + variance) / denominator) / sensitivity
                 half2 = adjoint(2 * (split2 + variance) / denominator) / sensitivity
                 consensus = smooth((half1 - 1) * (half2 - 1), sensitivity)
-                ratio = adjoint((observed + variance) / denominator) / sensitivity
-                xp.maximum(ratio, 0, out=ratio)
+                ratio = _full_data_update(
+                    observed, denominator, adjoint, sensitivity, variance
+                )
                 updated = filter_update(recon, ratio, consensus)
             fraction, delta, reason = _gc_stopping_metrics(
                 recon, updated, consensus, limit, max_delta
@@ -1047,9 +1085,9 @@ def _iterate_rlgc(
                 del predicted, denominator, split1, split2, half1, half2
                 del ratio, consensus
         else:
-            ratio = (
-                adjoint(observed / xp.maximum(predicted, xp.float32(1e-12)))
-                / sensitivity
+            denominator = xp.maximum(predicted + variance, xp.float32(1e-12))
+            ratio = _full_data_update(
+                observed, denominator, adjoint, sensitivity, variance
             )
             xp.maximum(ratio, 0, out=ratio)
             updated = recon * ratio
@@ -1058,7 +1096,7 @@ def _iterate_rlgc(
                 xp.max(xp.abs(updated - recon)) / xp.maximum(xp.max(updated), 1e-12)
             )
             reason = "relative_change" if delta < max_delta else None
-            del predicted, ratio
+            del predicted, denominator, ratio
         recon = updated
         completed += 1
         if callback is not None:

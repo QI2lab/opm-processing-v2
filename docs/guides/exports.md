@@ -90,29 +90,109 @@ MP4s are lossy presentation copies. See
 [export-projections](../reference/cli/export-projections.md) and
 [encode-projections](../reference/cli/encode-projections.md) for options.
 
-## AO grid and pupil overlays
+## AO publication pupil grids
 
 ```bash
-uv run python scripts/export_ao_overview.py "/path/to/acquisition" --channel 1
+uv run python scripts/export_ao_overview.py "/path/to/acquisition"
 ```
 
-The script writes an `ao_overview` directory with a projection overview PNG,
-`ao_grid_pupils.tiff`, coordinate provenance JSON, and one coefficient plot per
-correction region. The TIFF has a transparent RGBA page for each AO depth at the
-selected timepoint, at the exact level-zero projection dimensions. Use
-`--depth-index 0` for a single-page overlay and a different `--output` directory
-for an additional selection. Background image pixels are included only in the
-overview PNG.
+The exporter reads saved `grid_pos_*/ao_results.zarr` stores directly and writes
+one PNG and SVG per depth in `ao_publication`. The figures follow
+`sjs_opm_scripts/analysis/ao_grid_phase_plots.py`: two columns, a 12 by 5-inch
+canvas per row, 0.2 subplot spacing, normalized circular pupils, linear plus/minus
+2-pi colors, and per-panel colorbars with 30-point text and pi ticks.
 
-Pupil reconstruction and coefficient plots use the selected
-`sjs_opm_scripts/ao_scripts/parse_ao_grid_results.py` directly. The default looks
-for that repository beside this checkout; use `--ao-reader` for another location.
-WaveKit ordering and RMS normalization come from that reader. Pupils default to
-the final saved coefficient state and its 488 nm wavelength convention; change
-`--coefficient-state` or `--wavelength-nm` explicitly when needed. A shared color
-range compares regions; `--phase-limit` sets a fixed symmetric limit in radians.
+Saved coefficients are read through the portable local
+`scripts/ao_saved_results.py`; an external SJS checkout is optional.
+Pupil reconstruction uses the local WaveKit modal convention and RMS
+normalization, checked against analytical circular modes. The default state is
+final phase at 488 nm.
+`--coefficient-state`, `--wavelength-nm`, `--timepoint`, and `--depth-index`
+select the saved data. `--ao-reader` and `--plot-reference` accept explicit reader
+and formatting reference paths, including the original SJS files.
+`--output` selects the destination; `--overwrite` replaces generated
+outputs there.
 
-Grid placement uses planned AO positions, recorded stage-to-laboratory scan
-compensation, and interpolated registered tile translations for the selected
-depth. The JSON records the resulting full-resolution pupil centers and the
-reference implementation's hash. Existing generated files require `--overwrite`.
+Use `--coefficients` to additionally save starting, final and signed-change
+coefficient bars with the local reader. An explicit external reader uses its own
+plotting and save method. `ao_publication.json` records
+source/reference provenance and the original starting and final coefficients.
+
+To also place the pupils over the fused tissue projection:
+
+```bash
+uv run python scripts/export_ao_overview.py "/path/to/acquisition" --tissue-overlay
+```
+
+Each Z level produces its own tissue PNG and SVG with SJS pupil colors and a
+small, unlabeled colorbar beside each correction. Region labels are omitted.
+Titles and all other text are also omitted. Each image includes an unlabeled
+spatial scale bar calibrated from the projection's NGFF
+transforms. `--scale-bar-um` sets its length; otherwise
+the exporter selects a suitable length automatically. `--channel` selects the
+tissue channel and `--projection` supplies an explicit fused maximum-Z store.
+The pupil symbols default to a 112.5 µm display diameter, set by
+`--pupil-diameter-um`.
+
+Use `--planned-grid` to divide the full calibrated acquisition area into the
+requested number of equal AO cells, placing each saved correction in the middle
+of its intended cell. The grid dimensions come from the recorded AO configuration;
+the original correction order is preserved. This illustrates intended coverage,
+independent of the recorded sampling positions and acquired-tile assignments.
+Grid lines use alpha 0.3 so underlying tissue remains visible.
+
+Add `--full-resolution` to read the native projection level and export a PNG at
+the source image's pixel dimensions, with one source sample per output pixel.
+The SVG retains the native tissue image. Without this flag, the exporter uses
+a pyramid preview and a figure-sized PNG. Grid placement, pupil size, and the
+scale bar use the calibration of the selected image level.
+
+Use `--local-z-projection` for a separate tissue background at each AO depth.
+This reads the native fused 3D volume and computes each maximum inside that
+layer's acquisition-defined camera ROIs. Detector ROI height, pixel size, OPM
+angle, and recorded stage Z define each slab; its registration transform maps
+the slab into the existing fused image. The projection follows each tile's
+local XYZ bounds and preserves the common full-resolution XY canvas.
+
+Local projection implies `--full-resolution`. The manifest records the camera
+geometry, mapped voxel ROIs, projection hashes, and per-layer display limits.
+Overlapping acquired slabs retain the signal already blended in the fused
+volume. Saved XY ROI selections with `all_z` do not define separate depth slabs.
+
+Overlay pupils identify representative centers of source-tile groups inferred
+from the saved historical AO assignment plans. They do not mark calibrated AO
+measurement sites or outline correction boundaries. This tissue composition
+extends the standalone SJS pupil figure. Standalone grids retain every saved
+correction. The tissue PNG/SVG and placement/scale-bar provenance are saved
+alongside them.
+
+## Repair legacy stage coordinates without rewriting pixels
+
+For the uniform, positive, uncropped stage-scan geometry supported by the repair
+validator, prepare a metadata-only plan:
+
+```bash
+uv run python scripts/repair_stage_coordinates.py "/path/to/acquisition" --plan repair-plan.json
+uv run python scripts/repair_stage_coordinates.py --apply repair-plan.json
+```
+
+For data split across acquisition and processing/output directories, name both
+roots explicitly:
+
+```bash
+uv run python scripts/repair_stage_coordinates.py "/path/to/acquisition" --additional-root "/path/to/processing" --plan repair-plan.json
+```
+
+The split-root plan follows the journal's existing artifact links and labels
+every metadata change and dependency with its root. Unreferenced older fused
+stores are reported separately and left untouched. Before any replacement, it
+creates verified metadata backups and manifests on every volume being changed.
+An interrupted repair restores already replaced metadata across those roots.
+
+The plan lists every JSON or OME-XML change and its original and replacement
+hashes. Applying it backs up the original metadata before changing local image
+translations, OME stage labels, registered tile origins, and fused transforms.
+Raw acquisition files, array metadata, image chunks, and TIFF exports are outside
+the write whitelist. Changed inputs invalidate the plan; an applied plan is
+idempotent. Existing TIFF and ROI exports remain historical and are reported
+separately. Create new ROI exports after repair.

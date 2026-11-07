@@ -14,7 +14,6 @@ from opm_processing.dataio.acquisition import (
     open_acquisition_datastore,
 )
 from opm_processing.dataio.position_collection import (
-    create_position_collection,
     open_position_collection,
     update_group_attributes,
 )
@@ -75,22 +74,13 @@ def test_scan_metadata_retains_all_physical_scan_planes(
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("downsample", ["stride", "block_mean"])
-def test_position_collection_multiscales_round_spatial_metadata(
-    tmp_path: Path,
-    downsample,
+def test_position_collection_multiscales_preserve_spatial_metadata(
+    spatial_metadata_collection,
 ) -> None:
-    """Round NGFF spacing/origins and preserve block-center coordinates."""
-    path = tmp_path / "rounded_projection.ome.zarr"
-    collection = create_position_collection(
-        path,
-        (1, 1, 1, 1, 17, 21),
-        (0.34567, 0.11549, 0.11651),
-        stage_positions=((1.23456, 2.34567, 3.45678),),
-        spatial_offset_um=(4.56789, 5.67891, 6.78912),
-        multiscale_factors_yx=(2, 4),
-        multiscale_downsample=downsample,
-    )
+    """Round micrometer metadata to three decimals and preserve block centers."""
+    collection = spatial_metadata_collection
+    path = collection.path
+    downsample = collection.multiscale_downsample
 
     assert collection.multiscale_factors_yx == (1, 2, 4)
     reduction = np.ceil if downsample == "stride" else np.floor
@@ -101,27 +91,17 @@ def test_position_collection_multiscales_round_spatial_metadata(
     metadata = reopened["0"].ome_metadata()
     assert isinstance(metadata, v05.Image)
     datasets = metadata.multiscales[0].datasets
-    expected_scales = (
-        [1.0, 1.0, 0.346, 0.115, 0.117],
-        [1.0, 1.0, 0.346, 0.23, 0.234],
-        [1.0, 1.0, 0.346, 0.46, 0.468],
-    )
-    expected_translations = (
-        [0.0, 0.0, 4.568, 5.679, 6.789],
-        [0.0, 0.0, 4.568, 5.679, 6.789],
-        [0.0, 0.0, 4.568, 5.679, 6.789],
-    )
-    for dataset, scale, translation in zip(
-        datasets, expected_scales, expected_translations, strict=False
-    ):
-        assert dataset.scale_transform.scale == scale
+    for dataset, factor in zip(datasets, (1, 2, 4), strict=True):
+        np.testing.assert_allclose(
+            dataset.scale_transform.scale,
+            (1, 1, 0.346, round(0.115 * factor, 3), round(0.117 * factor, 3)),
+            rtol=0,
+            atol=1e-12,
+        )
         assert dataset.translation_transform is not None
-        expected_origin = np.asarray(translation)
+        expected_origin = np.asarray((0, 0, 4.568, 5.679, 6.789))
         if downsample == "block_mean":
-            factor = scale[-1] / expected_scales[0][-1]
-            expected_origin[-2:] += (
-                0.5 * (factor - 1) * np.array(expected_scales[0][-2:])
-            )
+            expected_origin[-2:] += 0.5 * (factor - 1) * np.asarray((0.115, 0.117))
         np.testing.assert_allclose(
             dataset.translation_transform.translation,
             expected_origin,
@@ -180,6 +160,74 @@ def test_current_stage_metadata_is_discovered_without_array_open(
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("scan_um", [None, 0, 30])
+def test_recorded_overlap_uses_raw_geometry_and_stage_distance(
+    current_opm_v2_stage_scan, scan_um
+):
+    """Read producer overlaps, prioritizing a recorded stage-scan distance."""
+    path = current_opm_v2_stage_scan
+    opm = dict(open_group(path).attrs["opm_v2"])
+    positions = {
+        "scan_axis_overlap": 0.15,
+        "tile_axis_overlap": 0.25,
+        "z_axis_overlap": 0.3,
+    }
+    if scan_um is not None:
+        positions["scan_axis_overlap_um"] = scan_um
+    opm["configuration"]["acq_config"]["Positions"] = positions
+    update_group_attributes(path, {"opm_v2": opm})
+
+    metadata = inspect_acquisition(path)
+    scan_overlap = (
+        (0.8 + 4 * 0.115 * np.cos(np.deg2rad(30))) * 0.15
+        if scan_um is None
+        else scan_um
+    )
+    np.testing.assert_allclose(
+        metadata.registration_overlap_zyx_um,
+        (4 * 0.115 * 0.5 * 0.3, scan_overlap, 5 * 0.115 * 0.25),
+    )
+    assert metadata.to_dict()["scan_axis_overlap_um"] == scan_um
+    assert metadata.to_dict()["registration_overlap_zyx_um"] == (
+        0.069,
+        round(scan_overlap, 3),
+        0.144,
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("scan_axis_overlap_um", -1),
+        ("scan_axis_overlap", 15),
+        ("tile_axis_overlap", float("nan")),
+        ("z_axis_overlap", "invalid"),
+    ],
+)
+def test_invalid_recorded_overlap_is_not_silently_guessed(
+    current_opm_v2_stage_scan, name, value
+):
+    """Reject invalid producer settings before constructing search bounds."""
+    path = current_opm_v2_stage_scan
+    opm = dict(open_group(path).attrs["opm_v2"])
+    opm["configuration"]["acq_config"]["Positions"] = {name: value}
+    # Use a serializable nonfinite spelling; the inspector must reject it.
+    if isinstance(value, float) and np.isnan(value):
+        opm["configuration"]["acq_config"]["Positions"][name] = "nan"
+    update_group_attributes(path, {"opm_v2": opm})
+    with pytest.raises(ValueError, match=f"Positions.{name}"):
+        inspect_acquisition(path)
+
+
+@pytest.mark.unit
+def test_missing_overlap_metadata_remains_unknown(current_opm_v2_stage_scan):
+    """Absent overlap settings must not invent an acquisition percentage."""
+    metadata = inspect_acquisition(current_opm_v2_stage_scan)
+    assert metadata.registration_overlap_zyx_um == (None, None, None)
+
+
+@pytest.mark.unit
 def test_current_stage_collection_opens_as_virtual_tpczyx(
     current_opm_v2_stage_scan: Path,
 ) -> None:
@@ -235,18 +283,29 @@ def test_single_position_root_image_opens_as_virtual_tpczyx(
 @pytest.mark.integration
 @pytest.mark.parametrize("save_float32", [False, True])
 def test_single_position_mirror_timelapse_preserves_calibrated_fluorescence(
-    calibrated_mirror_timelapse, processing_options, save_float32
+    calibrated_mirror_timelapse,
+    processing_options,
+    save_float32,
+    assert_roi_point_accuracy,
 ):
-    """Reopen all timepoints and compare with the analytical 30-degree Jacobian."""
+    """Reopen each exposure and retain original optical sources in physical coordinates."""
     run = calibrated_mirror_timelapse
     process(root_path=run.path, save_float32=save_float32, **processing_options)
     output = open_position_collection(
         run.path.parent / "single_mirror_deskewed.ome.zarr"
     )
-    assert output.shape[:3] == (3, 1, 1)
+    assert output.shape == (3, 1, 1, *run.shape_zyx)
+    actual = output.arrays[0].read().result()
     dtype = np.float32 if save_float32 else np.uint16
-    for time, expected in enumerate(run.expected):
-        actual = output.arrays[0][time, 0].read().result()
-        assert actual.dtype == dtype
-        np.testing.assert_allclose(actual, expected.astype(dtype), rtol=2e-6, atol=1e-5)
+    assert actual.dtype == dtype
+    np.testing.assert_array_equal(
+        open_acquisition_datastore(run.path).read().result(), run.truth.pixels
+    )
+    assert output.spatial_origins_zyx_um == ((0.0, 0.0, 0.0),)
+    assert_roi_point_accuracy(
+        actual,
+        run.truth,
+        output.spatial_origins_zyx_um[0],
+        output.voxel_size_um,
+    )
     assert "opm_v2" not in output.attributes

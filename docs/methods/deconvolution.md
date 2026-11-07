@@ -147,6 +147,9 @@ so identical seed numbers do not imply identical random halves.
 The existing accepted-update fraction threshold of 0.001 and maximum absolute
 change divided by `max(max(reconstruction), 1e-12)` threshold of 0.001 remain active.
 Ordinary RL has no built-in stopping rule for noisy data.
+Both modes use the same full-data RL multiplier, including the configured
+read-noise variance shift. Disabling gradient consensus removes the local gate
+and consensus stopping; it does not select a different full-data update.
 
 ## PSFs, response and execution
 

@@ -23,8 +23,10 @@ PROCESSING_STATE_SCHEMA = "opm-processing-state"
 PROCESSING_STATE_VERSION = 1
 
 
-def resolve_store_path(recorded_path: str | Path, directory: str | Path) -> Path:
-    """Prefer a store beside the current input over its recorded location.
+def resolve_store_path(
+    recorded_path: str | Path, directory: str | Path, *, prefer_local: bool = False
+) -> Path:
+    """Resolve a recorded store using its explicit or colocated reference policy.
 
     Parameters
     ----------
@@ -32,14 +34,20 @@ def resolve_store_path(recorded_path: str | Path, directory: str | Path) -> Path
         Historical absolute path or directory-relative store link.
     directory : str or pathlib.Path
         Current command input or journal directory.
+    prefer_local : bool
+        Prefer a same-named store beside the current input. Live manifests use
+        this policy so copied acquisitions do not select their original data.
 
     Returns
     -------
     pathlib.Path
-        Existing same-named local store, otherwise the recorded location.
+        Existing absolute location unless a colocated store is preferred,
+        otherwise a local store or the recorded directory-relative location.
         Windows basenames remain portable when data is moved between platforms.
     """
     recorded = Path(recorded_path).expanduser()
+    if not prefer_local and recorded.is_absolute() and recorded.exists():
+        return recorded.resolve()
     windows_path = PureWindowsPath(recorded_path)
     name = windows_path.name if windows_path.drive else recorded.name
     directory = Path(directory).expanduser().resolve()
@@ -92,6 +100,39 @@ def processing_state_path(output_root: Path, acquisition_stem: str) -> Path:
     """
     root = Path(output_root).expanduser().resolve()
     return root / f"{acquisition_stem}.processing.json"
+
+
+def processing_state_image_attributes(
+    state_path: Path, image_path: Path
+) -> dict[str, Any]:
+    """Link an external fused image to its journal without copying registration."""
+    state_path = Path(state_path).expanduser().resolve()
+    image_path = Path(image_path).expanduser().resolve()
+    if state_path.parent == image_path.parent:
+        return {}
+    return {
+        "opm_processing": {
+            "processing_state": _source_record(state_path, image_path),
+        }
+    }
+
+
+def image_processing_state_path(image_path: Path, acquisition_stem: str) -> Path:
+    """Resolve a fused image's journal link, falling back to its local companion."""
+    image_path = Path(image_path).expanduser().resolve()
+    metadata_path = image_path / "zarr.json"
+    if metadata_path.is_file():
+        attributes = json.loads(metadata_path.read_text(encoding="utf-8")).get(
+            "attributes", {}
+        )
+        reference = attributes.get("opm_processing", {}).get("processing_state")
+        if reference:
+            if "relative_path" in reference:
+                relative = (image_path / reference["relative_path"]).resolve()
+                if relative.is_file():
+                    return relative
+            return Path(reference["path"]).expanduser().resolve()
+    return processing_state_path(image_path.parent, acquisition_stem)
 
 
 def convert_metadata(value: Any) -> Any:
@@ -320,6 +361,14 @@ class ProcessingState:
                 f"Processing output must be inside {self.path.parent}: {output}"
             ) from error
 
+    def _artifact_key(self, artifact_path: Path) -> str:
+        """Identify a fused artifact, allowing another folder or Windows drive."""
+        artifact = Path(artifact_path).expanduser().resolve()
+        try:
+            return Path(os.path.relpath(artifact, self.path.parent)).as_posix()
+        except ValueError:
+            return artifact.as_posix()
+
     def initialize_run(
         self,
         output_path: Path,
@@ -355,11 +404,10 @@ class ProcessingState:
                 raise ValueError(
                     f"Existing processing run is incompatible with {output_path}"
                 )
-            # The fingerprint establishes exact compatibility before backfilling
-            # self-contained export evidence for an older resumable journal.
-            if "configuration" not in existing or "dataset_id" not in existing:
+            # Backfill settings only after the fingerprint proves compatibility
+            # with an older resumable journal.
+            if "configuration" not in existing:
                 existing["configuration"] = convert_metadata(configuration)
-                existing.setdefault("dataset_id", str(uuid4()))
             self.save()
             return
         record = {
@@ -367,7 +415,6 @@ class ProcessingState:
             "completed_tiles": [],
             "zero_channels": [],
             "configuration": convert_metadata(configuration),
-            "dataset_id": str(uuid4()),
         }
         if series:
             record["roi_series"] = series
@@ -622,7 +669,8 @@ class ProcessingState:
             Final registered tile records including source indices and physical origins.
         """
         record = self.registration(output_path)
-        fused_key = self._run_key(fused_path)
+        fused_key = self._artifact_key(fused_path)
+        record.pop("max_projection_path", None)
         for previous in self.document["registration"].values():
             if previous.get("fused_path") == fused_key:
                 previous.pop("max_projection_path", None)
@@ -648,7 +696,7 @@ class ProcessingState:
             Registered maximum-Z image derived from the fused artifact.
         """
         record = self.registration(output_path)
-        record["max_projection_path"] = self._run_key(max_projection_path)
+        record["max_projection_path"] = self._artifact_key(max_projection_path)
         self.save()
 
     def registered_output_for_fused(self, fused_path: Path) -> Path:
@@ -664,7 +712,7 @@ class ProcessingState:
         Path
             Source processed tile collection for the registered fusion.
         """
-        fused_key = self._run_key(fused_path)
+        fused_key = self._artifact_key(fused_path)
         matches = [
             key
             for key, record in self.document["registration"].items()
@@ -690,7 +738,7 @@ class ProcessingState:
         Path
             Source processed tile collection for the projection.
         """
-        projection_key = self._run_key(path)
+        projection_key = self._artifact_key(path)
         matches = [
             key
             for key, record in self.document["registration"].items()
