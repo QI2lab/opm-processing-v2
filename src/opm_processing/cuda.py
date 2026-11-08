@@ -1,6 +1,5 @@
-"""CUDA runtime library loading for wheel-based Linux installations."""
+"""CUDA runtime library loading for Windows and Linux installations."""
 
-import ctypes
 import os
 import sys
 import sysconfig
@@ -8,18 +7,18 @@ import warnings
 from pathlib import Path
 
 _CUDA_LIBRARIES = (
-    ("cuda_runtime", ("libcudart.so.12",)),
-    ("cuda_nvrtc", ("libnvrtc.so.12",)),
-    ("cuda_cupti", ("libcupti.so.12",)),
-    ("cufft", ("libcufft.so.11",)),
-    ("cublas", ("libcublasLt.so.12", "libcublas.so.12")),
-    ("curand", ("libcurand.so.10",)),
-    ("cusparse", ("libcusparse.so.12",)),
-    ("cusolver", ("libcusolver.so.11", "libcusolverMg.so.11")),
-    ("nvjitlink", ("libnvJitLink.so.12",)),
+    "cudart",
+    "nvrtc",
+    "cupti",
+    "cufft",
+    "cublas",
+    "curand",
+    "cusparse",
+    "cusolver",
+    "cusolverMg",
+    "nvJitLink",
 )
 
-_CUDA_LIBRARY_HANDLES: list[ctypes.CDLL] = []
 _CUDA_PRELOAD_ATTEMPTED = False
 _CUPY_CUDA_PATH_WARNING_FILTER = (
     "ignore:CUDA path could not be detected:UserWarning:cupy._environment"
@@ -72,11 +71,11 @@ def suppress_spurious_cupy_cuda_path_warning() -> None:
 
 
 def preload_cuda_libraries() -> None:
-    """Load CUDA wheel libraries globally before importing GPU frameworks.
+    """Load available CUDA libraries before importing GPU frameworks.
 
-    Linux NVIDIA wheels keep shared libraries in package-specific ``lib``
-    directories that are not always visible to the dynamic linker. Missing
-    libraries are ignored so CPU-only environments continue to import normally.
+    NVIDIA's loader discovers libraries and their dependencies, handles platform
+    differences and retains their handles. Missing packages or optional libraries
+    are ignored so CPU-only environments continue to import normally.
 
     Returns
     -------
@@ -85,36 +84,17 @@ def preload_cuda_libraries() -> None:
     """
     global _CUDA_PRELOAD_ATTEMPTED
 
-    if _CUDA_PRELOAD_ATTEMPTED or not sys.platform.startswith("linux"):
+    if _CUDA_PRELOAD_ATTEMPTED or not sys.platform.startswith(("linux", "win32")):
         return
     _CUDA_PRELOAD_ATTEMPTED = True
 
-    roots = tuple(
-        dict.fromkeys(
-            (
-                Path(sysconfig.get_path("purelib")) / "nvidia",
-                Path(sys.prefix)
-                / "lib"
-                / f"python{sys.version_info.major}.{sys.version_info.minor}"
-                / "site-packages"
-                / "nvidia",
-            )
-        )
-    )
-    for package, library_names in _CUDA_LIBRARIES:
-        for library_name in library_names:
-            library_path = next(
-                (
-                    root / package / "lib" / library_name
-                    for root in roots
-                    if (root / package / "lib" / library_name).is_file()
-                ),
-                None,
-            )
-            if library_path is None:
-                continue
-            try:
-                handle = ctypes.CDLL(str(library_path), mode=ctypes.RTLD_GLOBAL)
-            except OSError:
-                continue
-            _CUDA_LIBRARY_HANDLES.append(handle)
+    try:
+        from cuda.pathfinder import DynamicLibNotFoundError, load_nvidia_dynamic_lib
+    except ImportError:
+        # CPU installations need not provide CuPy's CUDA loader dependency.
+        return
+    for name in _CUDA_LIBRARIES:
+        try:
+            load_nvidia_dynamic_lib(name)
+        except DynamicLibNotFoundError:
+            continue
