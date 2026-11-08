@@ -68,6 +68,7 @@ import math
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from types import ModuleType
 
 import numpy as np
 import psutil
@@ -82,13 +83,13 @@ from cupy import ElementwiseKernel
 from cupyx.scipy.fft import next_fast_len as next_gpu_fft_size
 
 # -----------------------------------------------------------------------------
-# CUDA kernel: multiplicative RL step gated by the existing consensus sign rule
+# Equation (5): apply the ordinary RL step only for positive consensus.
 # -----------------------------------------------------------------------------
 filter_update = ElementwiseKernel(
     "float32 recon, float32 HTratio, float32 consensus_map",
     "float32 out",
     """
-    bool skip = consensus_map < 0;
+    bool skip = consensus_map <= 0;
     out = skip ? recon : recon * HTratio
     """,
     "filter_update",
@@ -99,6 +100,56 @@ Array = np.ndarray | cp.ndarray
 
 GC_UPDATED_FRACTION_LIMIT = 0.001
 GC_RELATIVE_CHANGE_LIMIT = 0.001
+
+
+@dataclass
+class _RlgcCheckpoint:
+    """Park a chunk's continuation in RAM, retaining only its owned rollback cores.
+
+    CuPy 14's Generator has no public host-state serialization. Preserve its
+    actual XORWOW and binomial-cache bytes rather than reseeding or replacing
+    its generator. All transfers finish before device storage is released.
+    """
+
+    retained_scan: slice
+    estimate: np.ndarray | None = None
+    rng: object = None
+    rng_buffers: tuple[np.ndarray, np.ndarray] | None = None
+    iterations: int = 0
+    first_kl_stop: int | None = None
+    accepted: np.ndarray | None = None
+    provisional: np.ndarray | None = None
+
+    def restore(self, xp: ModuleType) -> tuple[Array, object]:
+        """Restore the same reconstruction and random stream on the backend."""
+        if xp is cp:
+            self.rng.bit_generator._state = cp.asarray(
+                self.rng_buffers[0], blocking=True
+            )
+            self.rng._binomial_state = cp.asarray(self.rng_buffers[1], blocking=True)
+            return cp.asarray(self.estimate, blocking=True), self.rng
+        return self.estimate, self.rng
+
+    def park(self, recon: Array, rng: object, completed: int) -> np.ndarray:
+        """Offload all mutable device state after a completed iteration."""
+        self.iterations = completed
+        self.rng = rng
+        if cp.get_array_module(recon) is cp:
+            buffers = (rng.bit_generator._state, rng._binomial_state)
+            if self.rng_buffers is None:
+                self.rng_buffers = tuple(cp.asnumpy(value) for value in buffers)
+            else:
+                for value, host in zip(buffers, self.rng_buffers, strict=True):
+                    value.get(out=host, blocking=True)
+            rng.bit_generator._state = None
+            rng._binomial_state = None
+            if self.estimate is None:
+                self.estimate = cp.asnumpy(recon)
+            else:
+                recon.get(out=self.estimate, blocking=True)
+        else:
+            self.estimate = recon
+        return self.estimate
 
 
 def _host_slices(shape: tuple[int, ...]) -> Iterator[slice]:
@@ -126,12 +177,10 @@ def _gc_stopping_metrics(
     limit: float,
     max_delta: float,
 ) -> tuple[float, float, str | None]:
-    """Evaluate gc_deconv.m's stopping conditions for native and sparse solvers.
+    """Evaluate optional accepted-fraction and relative-change stopping limits.
 
-    Reference: gc_deconv.m, revision 0340af0d7a4c5d92a97a1b443dfedb367dfb9f3d,
-    stopping metrics and final OR condition. Siemens_rdnoise_plot.m supplies
-    limit1=limit2=0.001. Negative consensus values reject updates; zero accepts.
-    The strict inequalities and 1e-12 denominator floor are from that code.
+    The accepted fraction follows the strictly positive gate in paper Eq. (5).
+    These additional limits are distinct from the paper's KL stopping rule.
 
     Parameters
     ----------
@@ -140,7 +189,7 @@ def _gc_stopping_metrics(
     recon : array-like
         Current nonnegative object estimate.
     consensus : array-like
-        Consensus field; nonnegative entries permit an update.
+        Consensus field; strictly positive entries permit an update.
     limit : float
         Minimum accepted-update fraction.
     max_delta : float
@@ -156,13 +205,13 @@ def _gc_stopping_metrics(
         rejected = 0
         peak, change = np.float32(0), np.float32(0)
         for slab in _host_slices(recon.shape):
-            rejected += np.count_nonzero(consensus[slab] < 0)
+            rejected += np.count_nonzero(consensus[slab] <= 0)
             peak = np.maximum(peak, np.max(recon[slab]))
             change = np.maximum(change, np.max(np.abs(recon[slab] - previous[slab])))
         fraction = float(recon.size - rejected) / recon.size
         delta = float(change / np.maximum(peak, 1e-12))
     else:
-        fraction = float(recon.size - xp.count_nonzero(consensus < 0)) / recon.size
+        fraction = float(recon.size - xp.count_nonzero(consensus <= 0)) / recon.size
         denominator = xp.maximum(xp.max(recon), 1e-12)
         delta = float(xp.max(xp.abs(recon - previous)) / denominator)
     reason = (
@@ -439,23 +488,21 @@ def split_kl_scores(
     split2: cp.ndarray,
     scratch: cp.ndarray,
 ) -> tuple[float, float]:
-    """MATLAB's normalized D(Ax || half), evaluated on acquired pixels.
+    """Evaluate two directed, normalized KL divergences on equal-sized grids.
 
-    Store these two scores and compare with the preceding iteration's scores,
-    as gc_deconv.m does. The new halves are fresh draws, not held-out data.
-    Clip negative FFT roundoff only for this statistic; predictions used in
-    the multiplicative update are unchanged.
+    Score the acquired camera prediction against each data half. Clip negative
+    FFT roundoff only for this statistic; reconstruction is unchanged.
 
     Parameters
     ----------
     predicted : array-like
-        Predicted intensities at acquired pixels.
+        Camera prediction on the same grid as the data halves.
     split1 : array-like
         First measured half image in the same geometry.
     split2 : array-like
         Second measured half image in the same geometry.
     scratch : array-like
-        Reusable workspace matching the acquired-pixel shape.
+        Reusable workspace matching the common array shape.
 
     Returns
     -------
@@ -586,78 +633,45 @@ class RlgcChunkState:
 def _split_observed_counts(
     observed: cp.ndarray, rng: cp.random.Generator
 ) -> cp.ndarray:
-    """Return do_binosplit.m's first, unclipped half for psplit=0.5.
+    """Split integer events binomially and allocate fractional counts symmetrically.
 
-    MATLAB rounds halfway away from zero. Below rounded count 150 it uses a
-    binomial draw; otherwise it uses a Gaussian with mean n/2 and variance n/4,
-    replacing out-of-range draws by n/2. Every pixel also receives U*(J-n),
-    U uniform on [0,1), including negative rounding remainders. Both dummy
-    distributions and the uniform draw are generated every call, as in MATLAB.
-    The caller forms J-first BEFORE independently clipping the two halves.
+    Integer photon counts follow exact Poisson thinning at every count level.
+    For S=n+f, draw Binomial(n, 0.5) and independently assign f to either half
+    with equal probability. Both halves have mean S/2, preserve S by subtraction,
+    and stay nonnegative. Their conditional variance is (n+f**2)/4. This is an
+    approximation for fractional camera counts, not exact Poisson thinning.
 
     Parameters
     ----------
     observed : array-like
-        Nonnegative counts including the read-noise variance shift, when used.
+        Nonnegative calibrated counts, including any read-noise variance shift.
     rng : numpy.random.Generator or cupy.random.Generator
-        Random generator on the same backend as observed.
+        Generator on the same backend as observed.
 
     Returns
     -------
     array-like
-        Unclipped first half, including the signed fractional remainder.
+        Nonnegative first half; the caller forms observed minus this draw.
     """
     xp = cp.get_array_module(observed)
     if xp is np and observed.ndim:
         first = np.empty_like(observed, dtype=np.float32)
-        # Keep the original order of the three global random draws: binomial,
-        # Gaussian, then uniform. Only their temporary work arrays are slabbed.
         for slab in _host_slices(observed.shape):
-            values = observed[slab]
-            whole = np.floor(values)
-            counts = (whole + (values - whole >= 0.5)).astype(np.int64)
-            first[slab] = rng.binomial(np.where(counts >= 150, 1, counts), p=0.5)
-        for slab in _host_slices(observed.shape):
-            values = observed[slab]
-            whole = np.floor(values)
-            counts = (whole + (values - whole >= 0.5)).astype(np.int64)
-            high = counts >= 150
-            high_n = np.where(high, counts, 1).astype(np.float32)
-            candidate = high_n * 0.5 + np.sqrt(high_n * 0.25) * rng.standard_normal(
-                values.shape, dtype=np.float32
+            first[slab] = rng.binomial(observed[slab].astype(np.int64), p=0.5)
+    else:
+        first = rng.binomial(observed.astype(xp.int64), p=0.5).astype(xp.float32)
+    slabs = _host_slices(observed.shape) if xp is np and observed.ndim else (Ellipsis,)
+    for slab in slabs:
+        remainder = observed[slab] - xp.floor(observed[slab])
+        if bool(xp.any(remainder)):
+            first[slab] += remainder * (
+                rng.random(remainder.shape, dtype=xp.float32) < 0.5
             )
-            candidate = np.where(
-                (candidate >= high_n) | (candidate < 0), high_n * 0.5, candidate
-            )
-            np.copyto(first[slab], candidate, where=high)
-        for slab in _host_slices(observed.shape):
-            values = observed[slab]
-            whole = np.floor(values)
-            counts = (whole + (values - whole >= 0.5)).astype(np.int64)
-            first[slab] += rng.random(values.shape, dtype=np.float32) * (
-                values - counts.astype(np.float32)
-            )
-        return first
-    whole = xp.floor(observed)
-    counts = (whole + (observed - whole >= 0.5)).astype(xp.int64)
-    high_counts = counts >= 150
-    low_n = xp.where(high_counts, 1, counts)
-    first_low = rng.binomial(low_n, p=0.5).astype(xp.float32)
-    high_n = xp.where(high_counts, counts, 1).astype(xp.float32)
-    first_high = high_n * 0.5 + xp.sqrt(high_n * 0.25) * rng.standard_normal(
-        observed.shape, dtype=xp.float32
-    )
-    first_high = xp.where(
-        (first_high >= high_n) | (first_high < 0), high_n * 0.5, first_high
-    )
-    first = xp.where(high_counts, first_high, first_low)
-    return first + rng.random(observed.shape, dtype=xp.float32) * (
-        observed - counts.astype(xp.float32)
-    )
+    return first
 
 
 def _read_noise_variance(read_noise: float) -> np.float32:
-    """Convert calibrated RMS noise to the variance used by gc_deconv.m.
+    """Convert calibrated RMS noise to the shifted-count variance.
 
     Parameters
     ----------
@@ -667,7 +681,7 @@ def _read_noise_variance(read_noise: float) -> np.float32:
     Returns
     -------
     float
-        Variance used in the MATLAB shifted-count approximation.
+        Variance used in the shifted-count approximation.
 
     Raises
     ------
@@ -683,7 +697,13 @@ def _read_noise_variance(read_noise: float) -> np.float32:
 def _split_calibrated_counts(
     observed: cp.ndarray, rng: cp.random.Generator, variance: np.float32
 ) -> tuple[cp.ndarray, cp.ndarray]:
-    """Apply gc_deconv.m's shifted split, half-variance subtraction and clipping.
+    """Split the nonnegative shifted counts for the read-noise approximation.
+
+    Rieger et al. (2024), https://doi.org/10.1364/OE.524683 , split M+variance
+    and subtract variance/2 from each half. For an RL half exposure the variance
+    is also variance/2, so the shifted RL ratio simplifies to 2*Q/(Ax+variance),
+    where Q is a shifted half. Retaining Q avoids negative intermediate counts
+    and the bias from independently clipping variance-subtracted half images.
 
     Parameters
     ----------
@@ -697,25 +717,15 @@ def _split_calibrated_counts(
     Returns
     -------
     tuple of array-like
-        Two independently clipped, variance-corrected half images.
+        Nonnegative complementary halves of observed plus variance.
     """
-    xp = cp.get_array_module(observed)
     shifted = observed if variance == 0 else observed + variance
     first = _split_observed_counts(shifted, rng)
-    if xp is np:
-        second = np.empty_like(first)
-        np.subtract(shifted, first, out=second)
-        first -= np.float32(0.5) * variance
-        np.maximum(first, 0, out=first)
-        second -= np.float32(0.5) * variance
-        np.maximum(second, 0, out=second)
-        return first, second
-    second = shifted - first
-    return xp.maximum(first - 0.5 * variance, 0), xp.maximum(second - 0.5 * variance, 0)
+    return first, shifted - first
 
 
 def _calibrated_observations(image: np.ndarray) -> np.ndarray:
-    """Retain finite nonnegative calibrated estimates without quantization loss.
+    """Retain finite calibrated counts, clipping negative estimates at zero.
 
     Parameters
     ----------
@@ -725,7 +735,7 @@ def _calibrated_observations(image: np.ndarray) -> np.ndarray:
     Returns
     -------
     numpy.ndarray
-        Finite, nonnegative float32 observations.
+        Finite nonnegative float32 observations without count quantization.
     """
     observed = np.asarray(image, dtype=np.float32)
     if not np.isfinite(observed).all():
@@ -899,6 +909,9 @@ def _iterate_rlgc(
     logger: logging.Logger | None,
     log_prefix: str,
     callback: Callable | None,
+    _checkpoint: _RlgcCheckpoint | None = None,
+    _retained_region: tuple[slice, ...] | None = None,
+    _finalize: bool = False,
 ) -> Array:
     """Iterate RL/RLGC independently of geometry and FFT tiling.
 
@@ -915,7 +928,7 @@ def _iterate_rlgc(
     smooth : callable
         Apply the optical smoothing used by the consensus gate.
     region : tuple of slice
-        Unpadded acquired-pixel region used for KL and stopping metrics.
+        Unpadded acquired-pixel region used for KL scoring.
     gradient_consensus : bool
         Use the reference GC gate and split-image stopping when True.
     max_iterations : int or None
@@ -927,17 +940,23 @@ def _iterate_rlgc(
     rng_seed : int or None
         Seed for fresh half-image splits.
     use_kl : bool
-        Enable the reference two-half KL stopping comparison.
+        Enable the notebook's prediction-to-half KL rule and rollback.
     read_noise : float
         RMS read noise in calibrated observation units.
     initial_estimate : numpy.ndarray or None
-        Initial object; None selects the constant mean observation.
+        Initial object; None selects the constant mean of acquired observations.
     logger : logging.Logger or None
         Destination for solver diagnostics.
     log_prefix : str
         Context prepended to diagnostic messages.
     callback : callable or None
-        Observer receiving the iteration index and completed estimate.
+        Observer receiving provisional iterates, including any later rejected by KL.
+    _checkpoint : _RlgcCheckpoint or None
+        Park or resume this chunk for the shared KL-selected iteration budget.
+    _retained_region : tuple of slice or None
+        Owned object-grid window saved at the first KL trigger.
+    _finalize : bool
+        Return only owned output at the known shared budget, discarding state.
 
     Returns
     -------
@@ -949,16 +968,33 @@ def _iterate_rlgc(
     if logger is not None:
         logger.info("%spreparing sensitivity and reconstruction state", log_prefix)
     sensitivity = xp.maximum(adjoint(xp.ones_like(observed)), xp.float32(1e-12))
-    recon = (
-        xp.full(shape, xp.mean(observed), dtype=xp.float32)
-        if initial_estimate is None
-        else xp.asarray(initial_estimate).copy()
-    )
-    rng = xp.random.default_rng(rng_seed) if gradient_consensus else None
+    if _checkpoint is not None and _checkpoint.estimate is not None:
+        recon, rng = _checkpoint.restore(xp)
+        completed = _checkpoint.iterations
+    else:
+        recon = (
+            xp.full(shape, xp.mean(observed[region]), dtype=xp.float32)
+            if initial_estimate is None
+            else xp.asarray(initial_estimate).copy()
+        )
+        rng = xp.random.default_rng(rng_seed) if gradient_consensus else None
+        completed = 0
     use_kl = bool(use_kl and gradient_consensus)
+    if _checkpoint is not None and _checkpoint.first_kl_stop is not None:
+        use_kl = False
+        limit = max_delta = 0
     scratch = xp.empty(observed[region].shape, dtype=xp.float32) if use_kl else None
-    previous_kl = (np.inf, np.inf)
-    completed = 0
+    previous_scores = (np.inf, np.inf)
+    previous_recon = None
+    # Iteration two keeps both current and rollback estimates. Reserve that
+    # extra live array before the first update so allocation fallback happens
+    # before any completed work, through the caller's actual CUDA allocator.
+    rollback_reserve = (
+        xp.empty_like(recon)
+        if xp is cp and _checkpoint is not None and use_kl and completed == 0
+        else None
+    )
+    pause_after_update = False
     reason = "max_iterations"
     while max_iterations is None or completed < max_iterations:
         if logger is not None:
@@ -976,12 +1012,37 @@ def _iterate_rlgc(
             split1, split2 = _split_calibrated_counts(observed, rng, variance)
             if use_kl:
                 scores = split_kl_scores(
-                    predicted[region], split1[region], split2[region], scratch
+                    predicted[region],
+                    xp.maximum(split1[region] - 0.5 * variance, 0),
+                    xp.maximum(split2[region] - 0.5 * variance, 0),
+                    scratch,
                 )
-                if scores[0] > previous_kl[0] and scores[1] > previous_kl[1]:
-                    reason = "split_kl"
-                    break
-                previous_kl = scores
+                if scores[0] > previous_scores[0] and scores[1] > previous_scores[1]:
+                    if _checkpoint is None:
+                        recon = previous_recon
+                        completed -= 1
+                        reason = "split_kl"
+                        break
+                    owned = (
+                        _retained_region
+                        if _retained_region is not None
+                        else np.s_[:, :, :]
+                    )
+                    accepted = previous_recon[owned]
+                    provisional = recon[owned]
+                    _checkpoint.accepted = (
+                        cp.asnumpy(accepted) if xp is cp else accepted.copy()
+                    )
+                    _checkpoint.provisional = (
+                        cp.asnumpy(provisional) if xp is cp else provisional.copy()
+                    )
+                    del accepted, provisional
+                    _checkpoint.first_kl_stop = completed - 1
+                    # Complete this already prepared step once, preserving its
+                    # exact split and RNG position for a later continuation.
+                    pause_after_update = True
+                previous_scores = scores
+                previous_recon = recon
             if logger is not None:
                 logger.info(
                     "%siteration=%d backprojecting and evaluating consensus",
@@ -995,51 +1056,57 @@ def _iterate_rlgc(
                 np.add(denominator, variance, out=denominator)
                 np.maximum(denominator, np.float32(1e-12), out=denominator)
                 del predicted
-                split1 += variance
                 split1 *= 2
                 split1 /= denominator
                 half1 = adjoint(split1)
                 del split1
                 half1 /= sensitivity
-                split2 += variance
                 split2 *= 2
                 split2 /= denominator
                 half2 = adjoint(split2)
                 del split2
                 half2 /= sensitivity
-                half1 -= 1
-                half2 -= 1
-                half1 *= half2
-                del half2
-                consensus = smooth(half1, sensitivity)
-                del half1
-                ratio = _full_data_update(
-                    observed, denominator, adjoint, sensitivity, variance
-                )
-                del denominator
+            else:
+                denominator = xp.maximum(predicted + variance, xp.float32(1e-12))
+                half1 = adjoint(2 * split1 / denominator) / sensitivity
+                half2 = adjoint(2 * split2 / denominator) / sensitivity
+            # Eq. (4): smooth the product of ADDITIVE object changes. The
+            # spatially varying x**2 factor must be inside the blurring operator.
+            half1 -= 1
+            half1 *= recon
+            half2 -= 1
+            half2 *= recon
+            half1 *= half2
+            del half2
+            consensus = smooth(half1, sensitivity)
+            del half1
+            ratio = _full_data_update(
+                observed, denominator, adjoint, sensitivity, variance
+            )
+            if xp is np:
                 updated = ratio
                 for slab in _host_slices(recon.shape):
                     updated[slab] *= recon[slab]
-                    np.copyto(updated[slab], recon[slab], where=consensus[slab] < 0)
+                    np.copyto(updated[slab], recon[slab], where=consensus[slab] <= 0)
             else:
-                denominator = xp.maximum(predicted + variance, xp.float32(1e-12))
-                half1 = adjoint(2 * (split1 + variance) / denominator) / sensitivity
-                half2 = adjoint(2 * (split2 + variance) / denominator) / sensitivity
-                consensus = smooth((half1 - 1) * (half2 - 1), sensitivity)
-                ratio = _full_data_update(
-                    observed, denominator, adjoint, sensitivity, variance
-                )
                 updated = filter_update(recon, ratio, consensus)
-            fraction, delta, reason = _gc_stopping_metrics(
-                recon, updated, consensus, limit, max_delta
-            )
+            if (use_kl or (limit <= 0 and max_delta <= 0)) and (
+                logger is None or not logger.isEnabledFor(logging.INFO)
+            ):
+                fraction, delta, reason = None, None, None
+            else:
+                fraction, delta, reason = _gc_stopping_metrics(
+                    recon, updated, consensus, limit, max_delta
+                )
+                if use_kl:
+                    reason = None
             if xp is np:
-                del ratio, consensus
+                del denominator, ratio, consensus
             else:
                 # These arrays belong only to this iteration. Keeping their
                 # bindings alive while the next split is allocated doubles the
                 # working set and can defeat scan-chunk allocation fallback.
-                del predicted, denominator, split1, split2, half1, half2
+                del predicted, denominator, split1, split2
                 del ratio, consensus
         else:
             denominator = xp.maximum(predicted + variance, xp.float32(1e-12))
@@ -1056,6 +1123,8 @@ def _iterate_rlgc(
             del predicted, denominator, ratio
         recon = updated
         completed += 1
+        if rollback_reserve is not None:
+            rollback_reserve = None
         if callback is not None:
             callback(completed, recon)
         if logger is not None:
@@ -1066,10 +1135,17 @@ def _iterate_rlgc(
                 fraction,
                 delta,
             )
-        if reason is not None:
+        if pause_after_update or reason is not None:
             break
     else:
         reason = "max_iterations"
+    if _checkpoint is not None:
+        if _finalize:
+            _checkpoint.iterations = completed
+            _checkpoint.estimate = _checkpoint.rng = _checkpoint.rng_buffers = None
+            owned = recon[_retained_region]
+            return cp.asnumpy(owned) if xp is cp else owned.copy()
+        return _checkpoint.park(recon, rng, completed)
     if logger is not None:
         label = {"consensus_fraction": "limit", "relative_change": "max_delta"}.get(
             reason, reason
@@ -1103,8 +1179,10 @@ def _rlgc_once(
     initial_estimate: np.ndarray | None = None,
     callback: Callable | None = None,
     storage: str = "gpu",
+    _checkpoint: _RlgcCheckpoint | None = None,
+    _finalize: bool = False,
 ) -> np.ndarray:
-    """Deconvolve calibrated data with the MATLAB RLGC update and stopping rules.
+    """Deconvolve calibrated data with the paper's RL and consensus equations.
 
     Parameters
     ----------
@@ -1124,7 +1202,7 @@ def _rlgc_once(
         Maximum retained scan planes per FFT tile. Overlap-save evaluates the
         same global operator; splits and stopping never run independently by tile.
     limit, max_delta : float
-        Reference accepted-voxel fraction and maximum-relative-change thresholds.
+        Existing accepted-voxel fraction and maximum-relative-change thresholds.
     max_iterations : int or None
         Optional safety cap. None uses reference GC stopping without a cap.
         Ordinary RL requires an explicit cap or a positive max_delta.
@@ -1133,16 +1211,24 @@ def _rlgc_once(
     detector_response : numpy.ndarray or None
         Positive YX sensitivity in the measurement operator, not input division.
     use_kl : bool
-        Enable the reference both-halves prediction-to-split KL stopping rule.
+        Enable the notebook's both-halves KL stopping and rollback on the
+        acquired camera prediction.
     gradient_consensus : bool
         False selects ordinary RL for controlled comparisons using the same optics.
     initial_estimate : numpy.ndarray or None
-        Positive reconstruction-grid initialization. None uses mean observations.
+        Positive reconstruction-grid initialization. None uses mean observations,
+        adjusted to object units for nonunit detector response or boundary operators.
     callback : callable or None
-        Receives each completed iteration number and its device array. Copy any
-        state that must outlive the callback; it does not control convergence.
+        Receives each provisional iteration number and its device array. KL
+        stopping can roll back the last iterate. Copy state that must outlive
+        the callback; it does not control convergence. Native arrays include
+        symmetric padding.
     storage : str
         Backend for reconstruction state, gpu or host; FFTs always execute on CUDA.
+    _checkpoint : _RlgcCheckpoint or None
+        Per-chunk continuation for the shared KL-selected iteration budget.
+    _finalize : bool
+        Return owned output instead of parking another continuation.
     gpu_id, safe_mode, pad_yx, normalize_psf, release_memory, logger, log_prefix
         Device, compatibility, padding, normalization and execution diagnostics.
         safe_mode is retained for compatibility; KL always requires both halves.
@@ -1191,6 +1277,14 @@ def _rlgc_once(
         raise ValueError("Convergence thresholds must be finite and nonnegative")
     if not gradient_consensus and max_iterations is None and max_delta == 0:
         raise ValueError("Ordinary RL requires a bound or relative-change threshold")
+    if (
+        gradient_consensus
+        and not use_kl
+        and max_iterations is None
+        and limit == 0
+        and max_delta == 0
+    ):
+        raise ValueError("RLGC requires a stopping threshold or iteration bound")
     if storage not in ("gpu", "host"):
         raise ValueError("storage must be gpu or host")
     xp = cp if storage == "gpu" else np
@@ -1200,7 +1294,13 @@ def _rlgc_once(
     fine_shape = ((image.shape[0] - 1) * factor + 1, *image.shape[1:])
     try:
         with cp.cuda.Device(gpu_id):
-            pads = _linear_fft_pad_width(fine_shape, psf.shape, pad_yx=pad_yx)
+            if not np.any(image):
+                if logger is not None:
+                    logger.info("%sstop=empty_observation iterations=0", log_prefix)
+                return np.zeros(fine_shape, dtype=np.float32)
+            pads = _linear_fft_pad_width(
+                fine_shape, psf.shape, pad_yx=pad_yx or boundary == "zero"
+            )
             padded_shape = tuple(
                 n + sum(p) for n, p in zip(fine_shape, pads, strict=True)
             )
@@ -1258,6 +1358,15 @@ def _rlgc_once(
                     visible[indices[(indices >= 0) & (indices < fine_shape[0])]] = True
                 if not visible.all():
                     unsupported_scan = xp.asarray(np.flatnonzero(~visible))
+
+            interaction_otf = (
+                convolve.otf * convolve.adjoint_otf
+                if gradient_consensus
+                and field is None
+                and xp is cp
+                and convolve.tile_shape == convolve.shape
+                else None
+            )
 
             def blur(values: Array, adjoint: bool = False) -> Array:
                 """Convolve on the selected reflected or zero-extended object grid.
@@ -1327,7 +1436,7 @@ def _rlgc_once(
                 Parameters
                 ----------
                 product : array-like
-                    Product of the two relative half-image update directions.
+                    Product of the two additive half-image object changes.
                 sensitivity : array-like
                     Adjoint image of unit detector values.
 
@@ -1341,7 +1450,7 @@ def _rlgc_once(
                         if xp is cp and convolve.tile_shape == convolve.shape:
                             return fft_conv(
                                 product,
-                                convolve.otf * convolve.otf.conj(),
+                                interaction_otf,
                                 padded_shape,
                             )
                     else:
@@ -1350,9 +1459,9 @@ def _rlgc_once(
                         padded = xp.zeros(padded_shape, dtype=xp.float32)
                         padded[core] = product
                         if xp is cp and convolve.tile_shape == convolve.shape:
-                            return fft_conv(
-                                padded, convolve.otf * convolve.otf.conj(), padded_shape
-                            )[core].copy()
+                            return fft_conv(padded, interaction_otf, padded_shape)[
+                                core
+                            ].copy()
                         return convolve(convolve(padded), adjoint=True)[core].copy()
                 return adjoint(forward(product)) / sensitivity
 
@@ -1366,6 +1475,25 @@ def _rlgc_once(
                     raise ValueError(
                         "initial_estimate must be finite, positive and match the reconstruction grid"
                     )
+            elif (_checkpoint is None or _checkpoint.estimate is None) and (
+                field is not None or not reflected or not normalize_psf
+            ):
+                # Normalized KL cannot identify an intensity-scale error.
+                # Calibrate the constant initial object through A1 before KL
+                # can roll back to it. Broadcasting retains only a scalar here.
+                unit_mass = xp.sum(
+                    forward(xp.ones(shape, dtype=xp.float32)), dtype=xp.float64
+                )
+                level = xp.sum(observed, dtype=xp.float64) / unit_mass
+                initial_estimate = xp.broadcast_to(level.astype(xp.float32), shape)
+            retained_region = None
+            if _checkpoint is not None:
+                start, stop, _ = _checkpoint.retained_scan.indices(fine_shape[0])
+                offset = core[0].start if reflected else 0
+                retained_region = (
+                    slice(start + offset, stop + offset),
+                    *(core[1:] if reflected else (slice(None), slice(None))),
+                )
             recon = _iterate_rlgc(
                 observed,
                 shape,
@@ -1384,12 +1512,20 @@ def _rlgc_once(
                 logger=logger,
                 log_prefix=log_prefix,
                 callback=callback,
+                _checkpoint=_checkpoint,
+                _retained_region=retained_region,
+                _finalize=_finalize,
             )
-            result = recon[core] if boundary == "reflect" else recon
+            if _finalize:
+                return recon
+            result = recon[core] if reflected else recon
+            if _checkpoint is not None:
+                return result
             return cp.asnumpy(result) if xp is cp else result.copy()
     finally:
         if release_memory:
-            clear_rlgc_caches(clear_memory_pool=True)
+            with cp.cuda.Device(gpu_id):
+                clear_rlgc_caches(clear_memory_pool=True)
 
 
 def _is_gpu_memory_error(exc: BaseException) -> bool:
