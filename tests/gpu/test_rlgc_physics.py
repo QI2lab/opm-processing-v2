@@ -308,7 +308,7 @@ def test_gc_stopping_uses_prescribed_fraction_and_change_limits(
 @pytest.mark.parametrize("factor", [1, 3, 4])
 @pytest.mark.parametrize("crop_scan", [None, 5])
 def test_optical_forward_adjoint_matches_scipy(
-    cupy_gpu, optical_setup, registration_scene, factor, crop_scan
+    cupy_gpu, optical_setup, aperiodic_registration_object, factor, crop_scan
 ):
     """Check the actual optical operator against independent CPU convolution."""
     cp = cupy_gpu
@@ -319,8 +319,12 @@ def test_optical_forward_adjoint_matches_scipy(
     psf /= psf.sum()
     shape = (31, 17, 19)
     selection = (slice(None, None, factor), slice(None), slice(None))
-    obj = registration_scene(shape, seed=34).raw.astype(np.float32)
-    measured = registration_scene(obj[selection].shape, seed=35).raw.astype(np.float32)
+    obj = aperiodic_registration_object(shape, seed=34).astype(np.float32)
+    measured = aperiodic_registration_object(obj[selection].shape, seed=35).astype(
+        np.float32
+    )
+    obj /= obj.max()
+    measured /= measured.max()
     pads = solver._linear_fft_pad_width(shape, psf.shape)
     padded_shape = tuple(n + sum(p) for n, p in zip(shape, pads, strict=False))
     core = solver._observed_region_slices(padded_shape, pads)

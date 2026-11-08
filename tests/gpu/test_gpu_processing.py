@@ -1,6 +1,6 @@
 """Correctness tests for the CUDA image-processing paths.
 
-These unit tests use small synthetic microscopy volumes. Every test compares
+These unit tests use known analytical operands and simulated camera data. Each compares
 GPU output with an independent result or checks a
 quantitative reconstruction/registration property.
 
@@ -27,11 +27,14 @@ from tests.registration import (
 pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("cupy_gpu")]
 
 
-def test_fft_convolution_matches_direct_reference(cupy_gpu, registration_scene):
+def test_fft_convolution_matches_direct_reference(
+    cupy_gpu, aperiodic_registration_object
+):
     """Exercise cuFFT and validate all voxels against direct convolution."""
     cp = cupy_gpu
     rlgc = importlib.import_module("opm_processing.imageprocessing.rlgc")
-    image = registration_scene((6, 8, 10), seed=8).raw.astype(np.float32)
+    image = aperiodic_registration_object((6, 8, 10), seed=8).astype(np.float32)
+    image /= image.max()
     psf = np.zeros((3, 3, 3), dtype=np.float32)
     psf[1, 1, 1] = 5
     psf[0, 1, 1] = 2
@@ -88,9 +91,9 @@ def test_kld_matches_independent_probability_definition(
 
 @pytest.mark.parametrize("applied_shift", ((1.0, -2.0, 3.0), (0.6, -2.3, 3.4)))
 def test_exact_signal_registration_recovers_known_3d_translation(
-    cupy_gpu, registration_scene, applied_shift
+    cupy_gpu, aperiodic_registration_object, applied_shift
 ):
-    """Register noiseless optical means under declared exact signal transforms."""
+    """Register known analytical objects under declared exact signal transforms."""
     cp = cupy_gpu
     try:
         import cucim  # noqa: F401
@@ -101,7 +104,7 @@ def test_exact_signal_registration_recovers_known_3d_translation(
     if not tilefusion.USING_GPU or tilefusion.xp is not cp:
         pytest.fail("TileFusion silently selected its CPU registration backend")
 
-    fixed = registration_scene((11, 39, 43), seed=22).expectation.astype(np.float32)
+    fixed = aperiodic_registration_object((11, 39, 43), seed=22).astype(np.float32)
     applied_shift = np.array(applied_shift, dtype=np.float32)
     if np.any(applied_shift != np.rint(applied_shift)):
         # The Fourier shift defines an exact periodic fractional translation;

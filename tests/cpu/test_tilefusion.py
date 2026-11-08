@@ -17,10 +17,10 @@ pytestmark = pytest.mark.unit
 
 @pytest.mark.parametrize("half_width", [1, 3, 5])
 def test_registration_similarity_uses_acquired_window_support(
-    half_width, registration_scene
+    half_width, aperiodic_registration_object
 ):
     """Identical oblique samples have unit similarity only with a valid window."""
-    image = registration_scene((17, 19, 21), seed=321).raw.astype(np.float32)
+    image = aperiodic_registration_object((17, 19, 21), seed=321).astype(np.float32)
     z, y, _ = np.indices(image.shape)
     mask = np.abs(z - y) < half_width
     score = tilefusion_module._registration_similarity(
@@ -453,7 +453,7 @@ def test_depth_registration_handles_large_xy_drift(
 def test_fusion_is_independent_of_blocks_and_workers(
     fusion_mosaic, block_fusion, dtype, block_shape, workers
 ):
-    """Recover one physical field across crop, coverage, channel and time boundaries."""
+    """Recover one known object across crop, coverage, channel and time boundaries."""
     case = fusion_mosaic
     block_shape = case.shape if block_shape is None else block_shape
     fusion = block_fusion(

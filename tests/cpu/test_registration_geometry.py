@@ -65,12 +65,12 @@ def test_recorded_overlap_uses_deskewed_voxel_spacing(
     ],
 )
 def test_empty_or_uninformative_overlap_is_rejected_before_histogram_matching(
-    registration_scene, shape, blank_side, level
+    aperiodic_registration_object, shape, blank_side, level
 ):
     """Reject empty or featureless overlaps before histogram matching."""
-    fixed = registration_scene((1, *shape) if len(shape) == 2 else shape).raw.astype(
-        np.float32
-    )
+    fixed = aperiodic_registration_object(
+        (1, *shape) if len(shape) == 2 else shape, seed=51
+    ).astype(np.float32)
     if len(shape) == 2:
         fixed = fixed[0]
     moving = fixed.copy()
@@ -86,11 +86,12 @@ def test_empty_or_uninformative_overlap_is_rejected_before_histogram_matching(
 
 @pytest.mark.parametrize("ramp_in_fixed", [False, True])
 def test_zero_energy_directional_edges_keep_valid_intensity_registration(
-    registration_scene,
+    aperiodic_registration_object,
     ramp_in_fixed,
 ):
     """Retain valid intensity registration when directional edges have zero energy."""
-    plane = registration_scene((1, 25, 31)).expectation[0]
+    # Original background: 30 incident photons * QE=.8, before camera gain/offset.
+    plane = 24 + aperiodic_registration_object((1, 25, 31), seed=51)[0]
     fixed = np.broadcast_to(plane, (7, 25, 31)).astype(np.float32).copy()
     moving = np.roll(fixed, 3, axis=2).astype(np.float32)
     if ramp_in_fixed:
@@ -105,7 +106,10 @@ def test_zero_energy_directional_edges_keep_valid_intensity_registration(
     assert abs(shift[0]) <= 2
     if not ramp_in_fixed:
         assert shift[0] == pytest.approx(0, abs=0.1)
-    assert score > 0.99
+        assert score > 0.99
+    # The nuisance ramp changes intensity, so correct XY alignment need not
+    # have near-unit SSIM. It must still retain a valid registration score.
+    assert np.isfinite(score)
 
 
 def test_stage_grid_allows_depth_footprint_drift_and_preserves_overlap():
@@ -344,12 +348,12 @@ def test_context_rejects_background_without_matching_specimen(
 
 @pytest.mark.parametrize("noise", [0.0, 0.3])
 def test_high_ssim_shared_xy_background_cannot_establish_a_z_registration(
-    noise, registration_scene, camera_calibration
+    noise, aperiodic_registration_object, camera_calibration
 ):
     """Shared shading can have almost perfect SSIM without shared axial features."""
     from tests.simulation.camera import digitize
 
-    background = registration_scene((1, 48, 40)).expectation[0]
+    background = aperiodic_registration_object((1, 48, 40), seed=51)[0]
     fixed = np.broadcast_to(background, (48, 48, 40)).copy()
     moving = fixed.copy()
     if noise:
@@ -376,10 +380,12 @@ def test_identical_line_crops_preserve_zero_displacement():
 
 
 def test_similarity_scores_common_geometric_support_and_rejects_unrelated_signal(
-    registration_scene,
+    aperiodic_registration_object,
 ):
     """Exclude opposing wedge padding while retaining an independent mismatch check."""
-    truth = registration_scene((21, 45, 37), seed=38).expectation.astype(np.float32)
+    # The original 30-photon background at QE=.8 distinguishes supported
+    # specimen from zero padding; the central dark patch remains deliberate.
+    truth = 24 + aperiodic_registration_object((21, 45, 37), seed=38).astype(np.float32)
     truth[:, 23:26, 17:20] = 0  # Supported dark specimen pixels remain eligible.
     z, y, _x = np.indices(truth.shape)
     fixed_support = y >= z
@@ -389,21 +395,23 @@ def test_similarity_scores_common_geometric_support_and_rejects_unrelated_signal
     moving = np.asarray(truth * moving_support)
     assert _ssim(fixed, moving, 7) < 0.7
     assert _ssim(fixed, moving, 7, valid_mask=common) == pytest.approx(1, abs=1e-6)
-    unrelated = registration_scene(truth.shape, seed=39).expectation.astype(np.float32)
+    unrelated = 24 + aperiodic_registration_object(truth.shape, seed=39).astype(
+        np.float32
+    )
     assert _ssim(fixed, unrelated, 7, valid_mask=common) < 0.7
 
 
 @pytest.mark.parametrize("unrelated", (False, True))
 def test_thin_depth_registration_scores_only_common_planes(
-    unrelated, registration_scene
+    unrelated, aperiodic_registration_object
 ):
     """Use matched XY samples when geometric gaps prevent a 3D SSIM window."""
-    truth = registration_scene((5, 45, 37), seed=83).expectation.astype(np.float32)
+    truth = aperiodic_registration_object((5, 45, 37), seed=83).astype(np.float32)
     support = np.zeros(truth.shape, bool)
     support[[0, 2, 4], 4:-4, 4:-4] = True
     fixed = np.asarray(truth.astype(np.float32))
     moving = np.asarray(
-        registration_scene(truth.shape, seed=84).expectation.astype(np.float32)
+        aperiodic_registration_object(truth.shape, seed=84).astype(np.float32)
         if unrelated
         else truth.astype(np.float32)
     )

@@ -9,7 +9,6 @@ import numpy as np
 import pytest
 import tensorstore as ts
 
-from opm_processing.imageprocessing.opmpsf import centered_sensor_axes
 from opm_processing.imageprocessing.tilefusion import (
     TileFusion,
 )
@@ -149,7 +148,7 @@ def registration_pair(tile_fusion):
                 **options,
             },
         )
-        # Cartesian optical slabs are fully supported numerical inputs.
+        # Cartesian unit operands are fully supported numerical inputs.
         fusion._tile_support_zy = [
             np.ones(volume.shape[:2], np.float32) for volume in volumes
         ]
@@ -253,7 +252,7 @@ def retry_fusion(tile_fusion):
 
 @pytest.fixture(scope="session")
 def registration_specimen(microscope_parameters):
-    """Share immutable physical landmarks across camera and exact-signal units."""
+    """Share immutable landmark truth for analytical units and oblique cameras."""
     from tests.simulation.scenes import prepare_scene
 
     @lru_cache(maxsize=8)
@@ -264,9 +263,7 @@ def registration_specimen(microscope_parameters):
         )
         spacing = np.array((microscope.scan_step_um, *[microscope.pixel_size_um] * 2))
         half_extent = np.maximum((np.asarray(shape) - 1) * spacing / 2, spacing)
-        # Coordinates are object positions, not random image intensities. The
-        # same vectorial PSF and pixel integration used by all optics tests
-        # form these photons before the calibrated camera digitizes them.
+        # These are object positions, not simulated camera intensities.
         count = max(32, int(np.prod(2 * half_extent) * 4))
         centers = np.random.default_rng(seed).uniform(
             -half_extent, half_extent, (count, 3)
@@ -281,51 +278,6 @@ def registration_specimen(microscope_parameters):
         )
 
     return create
-
-
-@pytest.fixture(scope="session")
-def registration_scene(registration_specimen):
-    """Render the shared physical landmarks through real optics and camera noise."""
-    from tests.fixtures.optics import CameraObservation
-    from tests.simulation.camera import digitize
-    from tests.simulation.forward_model import Acquisition, forward_model
-    from tests.simulation.scenes import freeze_metadata
-
-    @lru_cache(maxsize=8)
-    def optical_data(shape, *, seed=51):
-        """Reuse immutable landmark optics for the specified specimen seed."""
-        scene = registration_specimen(shape, seed=seed)
-        microscope = scene.microscope
-        dose = forward_model(
-            scene.density,
-            Acquisition(
-                scene.axes,
-                shape,
-                geometry="cartesian",
-                camera_photon_budget=(1000, 30),
-                output="object",
-            ),
-            microscope,
-        )
-        means = forward_model(
-            dose,
-            Acquisition(scene.axes, shape, geometry="cartesian", output="expectation"),
-            microscope,
-        )
-        return scene, microscope, freeze_metadata(means)
-
-    def render(shape, *, seed=51):
-        """Draw unsigned camera samples without retaining detector realizations."""
-        scene, microscope, means = optical_data(shape, seed=seed)
-        raw = digitize(means, microscope.camera, seed=seed)
-        return CameraObservation(
-            ground_truth=scene,
-            microscope=microscope,
-            expectation=means,
-            raw=freeze_metadata(raw),
-        )
-
-    return render
 
 
 @pytest.fixture
@@ -364,15 +316,34 @@ def aperiodic_registration_object(registration_specimen):
     return create
 
 
-@pytest.fixture
-def registration_observation_pair(registration_scene):
-    """Observe one fixed emission dose on independently digitized sensor grids."""
+@pytest.fixture(scope="session")
+def registration_observation_pair(registration_specimen):
+    """Blur Cartesian processed-coordinate unit objects, then digitize independently."""
     from tests.simulation.camera import digitize
+    from tests.simulation.forward_model import Acquisition, forward_model
+    from tests.simulation.scenes import freeze_metadata
 
+    @lru_cache(maxsize=2)
     def create(shape, delta, *, seed=51):
-        """Translate actual sensor coordinates without copying a camera-noise field."""
+        """Crop known shifted operands without copying a camera-noise field."""
         delta = np.asarray(delta, int)
-        scene = registration_scene(tuple(np.asarray(shape) + abs(delta)), seed=seed)
+        union_shape = tuple(np.asarray(shape) + abs(delta))
+        specimen = registration_specimen(union_shape, seed=seed)
+        scene = SimpleNamespace(
+            expectation=forward_model(
+                specimen.density,
+                Acquisition(
+                    specimen.axes,
+                    union_shape,
+                    geometry="cartesian",
+                    camera_photon_budget=(1000, 30),
+                    output="expectation",
+                ),
+                specimen.microscope,
+            ),
+            microscope=specimen.microscope,
+        )
+        scene.expectation = freeze_metadata(scene.expectation)
         starts = (np.maximum(0, -delta), np.maximum(0, delta))
         volumes, means = [], []
         for index, start in enumerate(starts):
@@ -380,15 +351,17 @@ def registration_observation_pair(registration_scene):
                 slice(offset, offset + length)
                 for offset, length in zip(start, shape, strict=True)
             )
-            # These are windows on the same calibrated sensor grid. Reuse the
-            # optical means, then draw independent camera noise for each view.
+            # These are analytical Cartesian operands, not raw OPM frames.
             expected = scene.expectation[selection]
             means.append(expected)
             volumes.append(
                 digitize(expected, scene.microscope.camera, seed=seed + index + 1)
             )
         return SimpleNamespace(
-            volumes=tuple(volumes), means=tuple(means), starts=starts, scene=scene
+            volumes=freeze_metadata(volumes),
+            means=freeze_metadata(means),
+            starts=freeze_metadata(starts),
+            scene=scene,
         )
 
     return create
@@ -396,7 +369,7 @@ def registration_observation_pair(registration_scene):
 
 @pytest.fixture
 def shifted_slab_pair(registration_observation_pair):
-    """Share known translated slabs with independent detector realizations."""
+    """Share known Cartesian slabs with independent detector realizations."""
     from tests.simulation.camera_likelihood import (
         SamplingEnvelope,
         camera_sampling_envelope,
@@ -408,7 +381,7 @@ def shifted_slab_pair(registration_observation_pair):
         """Return paired pixels, nominal placement and independent exact shifts."""
         shift = np.asarray(correction, dtype=int)
         delta = shift + np.array((nominal_step, 0, 0))
-        observation = registration_observation_pair(shape, delta, seed=seed)
+        observation = registration_observation_pair(shape, tuple(delta), seed=seed)
         union_shape = observation.scene.expectation.shape
         total = np.zeros(union_shape, np.float64)
         count = np.zeros(union_shape, np.uint8)
@@ -437,19 +410,6 @@ def shifted_slab_pair(registration_observation_pair):
         expected_pixels = np.divide(
             total, count, out=np.zeros_like(total), where=count > 0
         )
-        microscope = observation.scene.microscope
-        coordinate_axes = centered_sensor_axes(
-            union_shape, (microscope.scan_step_um, *[microscope.pixel_size_um] * 2)
-        )
-        extent = tuple(axis[-1] for axis in coordinate_axes)
-        halo = observation.scene.microscope.psf_half_extent_zyx_um
-        interior = np.ones(union_shape, bool)
-        for dimension, (axis, half_extent, margin) in enumerate(
-            zip(coordinate_axes, extent, halo, strict=True)
-        ):
-            reshape = [1, 1, 1]
-            reshape[dimension] = len(axis)
-            interior &= np.abs(axis).reshape(reshape) < half_extent - margin
         return SimpleNamespace(
             volumes=observation.volumes,
             positions=[(0, 0, 0), (nominal_step * spacing[0], 0, 0)],
@@ -460,7 +420,7 @@ def shifted_slab_pair(registration_observation_pair):
             observation=observation,
             expected_pixels=expected_pixels,
             expected_envelope=SamplingEnvelope(low, high),
-            accuracy_mask=interior & (count > 0),
+            accuracy_mask=count > 0,
         )
 
     return create
@@ -490,13 +450,17 @@ def projection_fusion(tmp_path):
 
 
 @pytest.fixture
-def fusion_mosaic(registration_scene):
-    """Prescribe one laboratory field seen by cropped, attenuated, partial tiles."""
+def fusion_mosaic(aperiodic_registration_object):
+    """Prescribe a Cartesian unit object with attenuated, partial tile operands."""
+    from opm_processing.process import format_processed_output
+
     shape = (28, 46, 69)
-    # Retain the fractional calibrated intensity of this float-output case.
-    # Integer-cast boundary arithmetic is checked separately using
-    # explicitly prescribed scalar weights and photon counts.
-    field = registration_scene(shape).raw.astype(np.float32) + np.float32(0.375)
+    # Preserve the prescribed integer intensity + fractional offset, avoiding
+    # cast boundaries while testing masks, gains and block layouts exactly.
+    field = aperiodic_registration_object(shape, seed=51)
+    assert 0 <= field.min() <= field.max() <= np.iinfo(np.uint16).max
+    field = format_processed_output(field, save_float32=False).astype(np.float32)
+    field += np.float32(0.375)
     field[:, 2, 4] = 0  # Real darkness inside valid support.
     tiles, origins, supports, profiles, gains, present = (
         [],

@@ -24,10 +24,10 @@ def test_depth_gain_fit_is_robust_and_anchors_unobserved_depths():
 
 def test_normalization_matches_depths_and_preserves_xy_brightness(
     tile_fusion,
-    registration_scene,
+    aperiodic_registration_object,
 ):
     """Invert known Beer attenuation while preserving threefold XY contrast."""
-    specimen = registration_scene((24, 64, 64), seed=31).raw.astype(np.float32)
+    specimen = aperiodic_registration_object((24, 64, 64), seed=31).astype(np.float32)
     arrays = []
     attenuation_per_um = np.log((2.0, 4.0)) / 8.0
     for depth, xy_gain in ((0, 1), (0, 3), (1, 1), (1, 3)):
