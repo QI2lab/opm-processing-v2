@@ -11,7 +11,6 @@ from yaozarrs import open_group, v05
 
 from opm_processing.dataio.acquisition import (
     AcquisitionMetadata,
-    _event_parts,
     _initial_frame_metadata,
     acquisition_stem,
     inspect_acquisition,
@@ -20,58 +19,7 @@ from opm_processing.dataio.processing_state import (
     ProcessingState,
     image_processing_state_path,
 )
-
-
-def hardware_timing(
-    frames: list[dict], channel_count: int, scan_positions: int
-) -> dict[str, Any]:
-    """Calculate hardware-triggered timing from actual camera frame exposures.
-
-    Parameters
-    ----------
-    frames : list of dict
-        Camera frame records in either supported acquisition metadata format.
-    channel_count : int
-        Number of stored camera channels, including combined-laser images once.
-    scan_positions : int
-        Acquired scan positions, including planes subsequently discarded.
-
-    Returns
-    -------
-    dict
-        Channel-ordered exposures and volume time in milliseconds. Unknown
-        exposures remain None; software arrival times and requested camera
-        settings do not determine hardware timing.
-    """
-    exposures: list[float | None] = [None] * channel_count
-    for frame in frames:
-        if frame.get("exposure_time") is not None:
-            exposure, factor = frame["exposure_time"], 1000
-        elif frame.get("exposure_ms") is not None:
-            exposure, factor = frame["exposure_ms"], 1
-        else:
-            continue
-        try:
-            value = round(float(exposure) * factor, 2)
-        except (TypeError, ValueError) as error:
-            raise ValueError("Invalid camera frame exposure") from error
-        if isinstance(exposure, bool) or not math.isfinite(value) or value <= 0:
-            raise ValueError("Camera frame exposures must be finite and positive")
-        index, _ = _event_parts(frame)
-        channel = int(index.get("c", 0))
-        if not 0 <= channel < channel_count:
-            raise ValueError(
-                "Camera frame channel index is outside the stored channels"
-            )
-        if exposures[channel] is not None and exposures[channel] != value:
-            raise ValueError("Camera frame exposures vary between scans or positions")
-        exposures[channel] = value
-    volume = (
-        round(scan_positions * sum(exposures), 6)
-        if exposures and all(value is not None for value in exposures)
-        else None
-    )
-    return {"frame_exposure_ms": exposures, "volume_time_ms": volume}
+from opm_processing.dataio.timing import hardware_timing
 
 
 def raw_report(acquisition: AcquisitionMetadata) -> dict[str, Any]:

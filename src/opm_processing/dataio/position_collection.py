@@ -17,7 +17,7 @@ from ome_types.model import (
     StageLabel,
     UnitsLength,
 )
-from yaozarrs import open_group, v05
+from yaozarrs import open_group
 from yaozarrs.write.v05 import Bf2RawBuilder
 
 from opm_processing.dataio.acquisition import inspect_acquisition
@@ -26,6 +26,7 @@ from opm_processing.dataio.ngff import (
     round_spatial,
     round_spatial_values,
     round_tczyx_transform,
+    tczyx_image_metadata,
 )
 from opm_processing.dataio.processing_state import convert_metadata
 from opm_processing.dataio.timing import read_time_interval, time_axis
@@ -179,7 +180,7 @@ def create_position_collection(
     PositionCollection
         Ordered array handles and physical metadata for the collection.
     """
-    t_axis, t_scale = time_axis(time_interval_s)
+    _, t_scale = time_axis(time_interval_s)
     if multiscale_downsample not in ("stride", "block_mean"):
         raise ValueError('multiscale_downsample must be "stride" or "block_mean"')
 
@@ -236,16 +237,9 @@ def create_position_collection(
         overwrite=overwrite,
         extra_attributes=root_attributes,
     )
-    axes = [
-        t_axis,
-        {"name": "c", "type": "channel"},
-        {"name": "z", "type": "space", "unit": "micrometer"},
-        {"name": "y", "type": "space", "unit": "micrometer"},
-        {"name": "x", "type": "space", "unit": "micrometer"},
-    ]
     datasets = []
     array_specs = []
-    for level, factor in enumerate(factors):
+    for factor in factors:
         scale = round_tczyx_transform(
             (
                 t_scale,
@@ -267,15 +261,7 @@ def create_position_collection(
                 spatial_offset_um[2] + center_shift * voxel_size_um[2],
             )
         )
-        datasets.append(
-            v05.Dataset(
-                path=str(level),
-                coordinateTransformations=[
-                    v05.ScaleTransformation(scale=scale),
-                    v05.TranslationTransformation(translation=translation),
-                ],
-            )
-        )
+        datasets.append((scale[-3:], translation[-3:]))
         if multiscale_downsample == "stride":
             level_y = (y + factor - 1) // factor
             level_x = (x + factor - 1) // factor
@@ -284,30 +270,17 @@ def create_position_collection(
             level_x = x // factor
         array_specs.append(((t, c, z, level_y, level_x), np.dtype(dtype)))
     for position in range(positions):
-        position_datasets = []
-        for dataset in datasets:
-            translation = list(dataset.translation_transform.translation)
-            translation[-3:] = (
-                np.asarray(translation[-3:]) - spatial_offset_um + origins[position]
-            ).tolist()
-            translation = round_tczyx_transform(translation)
-            position_datasets.append(
-                v05.Dataset(
-                    path=dataset.path,
-                    coordinateTransformations=[
-                        dataset.scale_transform,
-                        v05.TranslationTransformation(translation=translation),
-                    ],
-                )
+        position_origins = [
+            round_spatial_values(
+                np.asarray(translation) - spatial_offset_um + origins[position]
             )
-        image = v05.Image(
-            multiscales=[
-                v05.Multiscale(
-                    name=f"position-{position}",
-                    axes=axes,
-                    datasets=position_datasets,
-                )
-            ]
+            for _, translation in datasets
+        ]
+        image = tczyx_image_metadata(
+            [scale for scale, _ in datasets],
+            position_origins,
+            time_interval_s=time_interval_s,
+            name=f"position-{position}",
         )
         builder.add_series(str(position), image, array_specs)
 
@@ -381,7 +354,7 @@ def create_variable_position_collection(
     PositionCollection
         Ordered cropped tile handles and their physical origins.
     """
-    t_axis, t_scale = time_axis(time_interval_s)
+    time_axis(time_interval_s)
     shapes = tuple(tuple(int(value) for value in shape) for shape in shapes_tczyx)
     origins = tuple(round_spatial_values(origin) for origin in spatial_origins_zyx_um)
 
@@ -420,33 +393,12 @@ def create_variable_position_collection(
         overwrite=overwrite,
         extra_attributes=root_attributes,
     )
-    axes = [
-        t_axis,
-        {"name": "c", "type": "channel"},
-        {"name": "z", "type": "space", "unit": "micrometer"},
-        {"name": "y", "type": "space", "unit": "micrometer"},
-        {"name": "x", "type": "space", "unit": "micrometer"},
-    ]
-    scale = round_tczyx_transform((t_scale, 1, *voxel_size))
     for series, (shape, origin) in enumerate(zip(shapes, origins, strict=False)):
-        image = v05.Image(
-            multiscales=[
-                v05.Multiscale(
-                    name=f"roi-tile-{series}",
-                    axes=axes,
-                    datasets=[
-                        v05.Dataset(
-                            path="0",
-                            coordinateTransformations=[
-                                v05.ScaleTransformation(scale=scale),
-                                v05.TranslationTransformation(
-                                    translation=round_tczyx_transform((0, 0, *origin))
-                                ),
-                            ],
-                        )
-                    ],
-                )
-            ]
+        image = tczyx_image_metadata(
+            [voxel_size],
+            [origin],
+            time_interval_s=time_interval_s,
+            name=f"roi-tile-{series}",
         )
         builder.add_series(str(series), image, ((shape, output_dtype),))
 

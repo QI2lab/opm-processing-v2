@@ -7,19 +7,20 @@ trajectory; pixel arrays are not opened until requested explicitly.
 
 from __future__ import annotations
 
-import codecs
 import json
 import math
 import re
 from dataclasses import asdict, dataclass, replace
+from itertools import islice
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any
 
+import ijson
 import typer
 import yaozarrs
 from yaozarrs import ZarrGroup, v05
 
-from opm_processing.dataio.timing import hardware_volume_interval
+from opm_processing.dataio.timing import hardware_timing, hardware_volume_interval
 
 if TYPE_CHECKING:
     import tensorstore as ts
@@ -583,48 +584,14 @@ def _initial_frame_metadata(path: Path, count: int) -> list[dict[str, Any]]:
     """
     if count < 1:
         return []
-    import tensorstore as ts
-
-    path = Path(path).resolve()
-    store = ts.KvStore.open({"driver": "file", "path": str(path.parent) + "/"}).result()
-    size = path.stat().st_size
-    offset = 0
-    utf8 = codecs.getincrementaldecoder("utf-8")()
-    marker = '"frame_metadata"'
-    decoder = json.JSONDecoder()
-    buffer = ""
-    cursor: int | None = None
-    frames: list[dict[str, Any]] = []
-    while len(frames) < count:
-        if cursor is None:
-            marker_index = buffer.find(marker)
-            if marker_index >= 0:
-                array_start = buffer.find("[", marker_index + len(marker))
-                if array_start >= 0:
-                    cursor = array_start + 1
-        if cursor is not None:
-            while len(frames) < count:
-                while cursor < len(buffer) and buffer[cursor] in " \t\r\n,":
-                    cursor += 1
-                if cursor < len(buffer) and buffer[cursor] == "]":
-                    return frames
-                try:
-                    value, end = decoder.raw_decode(buffer, cursor)
-                except json.JSONDecodeError:
-                    break
-                frames.append(value)
-                cursor = end
-        if offset >= size:
-            if cursor is None:
-                return []
-            if frames:
-                return frames
-            raise ValueError(f"Invalid frame_metadata array: {path}")
-        end = min(offset + 64 * 1024, size)
-        chunk = store.read(path.name, byte_range=slice(offset, end)).result().value
-        offset = end
-        buffer += utf8.decode(chunk, final=offset == size)
-    return frames
+    with Path(path).open("rb") as stream:
+        frames = ijson.items(
+            stream, "attributes.ome_writers.frame_metadata.item", use_float=True
+        )
+        try:
+            return list(islice(frames, count))
+        except ijson.JSONError as exc:
+            raise ValueError(f"Invalid frame_metadata array: {path}") from exc
 
 
 def _first_by_channel(frames: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
@@ -844,35 +811,27 @@ def _camera_timing(
     ValueError
         Recorded exposures are invalid or change across frames or positions.
     """
-    exposures = {}
+    exposures = None
     sources = set()
     for frames in frame_sets:
-        present = set()
-        for frame in frames:
-            field = "exposure_time" if "exposure_time" in frame else "exposure_ms"
-            if frame.get(field) is None:
-                continue
-            value = _number(frame[field])
-            if value is None or not math.isfinite(value) or value <= 0:
-                raise ValueError(f"Invalid camera exposure: {field}={frame[field]!r}")
-            milliseconds = round(value * (1000 if field == "exposure_time" else 1), 2)
-            if milliseconds <= 0:
-                raise ValueError("Camera exposure rounds to zero at 0.01 ms precision")
-            index, _ = _event_parts(frame)
-            channel = _integer(index.get("c"))
-            if channel in exposures and exposures[channel] != milliseconds:
-                raise ValueError(
-                    "Recorded hardware exposures change across frames or positions"
-                )
-            exposures[channel] = milliseconds
-            present.add(channel)
-            sources.add(field)
-        if present != set(range(channel_count)):
+        recorded = hardware_timing(frames, channel_count, 1)["frame_exposure_ms"]
+        if not recorded or any(value is None for value in recorded):
             return None, None
-    if not exposures:
+        if exposures is not None and exposures != recorded:
+            raise ValueError(
+                "Recorded hardware exposures change across frames or positions"
+            )
+        exposures = recorded
+        sources.update(
+            "exposure_time" if frame.get("exposure_time") is not None else "exposure_ms"
+            for frame in frames
+            if frame.get("exposure_time") is not None
+            or frame.get("exposure_ms") is not None
+        )
+    if exposures is None:
         return None, None
     return (
-        math.fsum(exposures.values()) / 1000,
+        math.fsum(exposures) / 1000,
         f"recorded camera {'/'.join(sorted(sources))}; rounded to 0.01 ms",
     )
 

@@ -1,8 +1,14 @@
 """Physical snapshot cadence shared by processed OME-Zarr writers."""
 
-from math import isfinite
+from __future__ import annotations
 
-from yaozarrs import v05
+from math import isfinite
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from typing import Any
+
+    from yaozarrs import v05
 
 
 def time_axis(interval_s: float | None) -> tuple[dict, float]:
@@ -98,3 +104,68 @@ def read_time_interval(multiscale: v05.Multiscale) -> float | None:
     if any(value != values[0] for value in values):
         raise ValueError("Pyramid levels disagree on physical time scale")
     return values[0]
+
+
+def hardware_timing(
+    frames: list[dict], channel_count: int, scan_positions: int
+) -> dict[str, Any]:
+    """Calculate hardware-triggered timing from actual camera frame exposures.
+
+    Parameters
+    ----------
+    frames : list of dict
+        Camera frame records in either supported acquisition metadata format.
+    channel_count : int
+        Number of stored camera channels, including combined-laser images once.
+    scan_positions : int
+        Acquired scan positions, including planes subsequently discarded.
+
+    Returns
+    -------
+    dict
+        Channel-ordered exposures and volume time in milliseconds. Unknown
+        exposures remain None; software arrival times and requested camera
+        settings do not determine hardware timing.
+    """
+    from opm_processing.dataio.acquisition import _event_parts, _integer, _number
+
+    exposures: list[float | None] = [None] * channel_count
+    for frame in frames:
+        if frame.get("exposure_time") is not None:
+            exposure, factor = frame["exposure_time"], 1000
+        elif frame.get("exposure_ms") is not None:
+            exposure, factor = frame["exposure_ms"], 1
+        else:
+            continue
+        try:
+            value = float(exposure) * factor
+        except (TypeError, ValueError) as error:
+            raise ValueError("Invalid camera exposure") from error
+        if isinstance(exposure, bool) or not isfinite(value) or value <= 0:
+            raise ValueError("Invalid camera exposure: require a finite positive value")
+        value = round(value, 2)
+        if value <= 0:
+            raise ValueError("Camera exposure rounds to zero at 0.01 ms precision")
+        index, _ = _event_parts(frame)
+        raw_channel = index.get("c", 0)
+        try:
+            channel = _integer(raw_channel, -1)
+        except (ValueError, OverflowError) as error:
+            raise ValueError(
+                "Camera frame channel index is outside the stored channels"
+            ) from error
+        if _number(raw_channel) != channel or not 0 <= channel < channel_count:
+            raise ValueError(
+                "Camera frame channel index is outside the stored channels"
+            )
+        if exposures[channel] is not None and exposures[channel] != value:
+            raise ValueError(
+                "Recorded hardware exposures change; camera exposures vary between scans or positions"
+            )
+        exposures[channel] = value
+    volume = (
+        round(scan_positions * sum(exposures), 6)
+        if exposures and all(value is not None for value in exposures)
+        else None
+    )
+    return {"frame_exposure_ms": exposures, "volume_time_ms": volume}
