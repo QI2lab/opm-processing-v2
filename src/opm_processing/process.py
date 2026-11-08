@@ -3059,8 +3059,14 @@ def process_projection(
             acquisition_stem(root_path) + "_stagefused.ome.zarr"
         )
         tile_fusion = MaxTileFusion(
-            ts_dataset=ts_store,
+            ts_dataset=ts_store
+            if pos_range is None
+            else ts_store[pos_range[0] : pos_range[1]],
             tile_positions=tile_positions,
+            source_position_indices=None
+            if pos_range is None
+            else range(pos_range[0], pos_range[1]),
+            source_collection=output_path,
             spatial_offsets_zyx_um=np.zeros((len(tile_positions), 3)),
             output_path=fused_output_path,
             pixel_size=np.asarray((pixel_size_um, pixel_size_um), dtype=np.float32),

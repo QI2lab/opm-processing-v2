@@ -151,31 +151,31 @@ def write_synthetic_acquisition_zarr(
 @pytest.fixture
 def opm_v2_projection_zarr(request, simulated_camera, opm_v2_acquisition_factory):
     """Simulate spectral/time observations and persist them with OpmDataHandler."""
-    mode, illumination_factor = getattr(request, "param", ("projection", 1.0))
-    shape = (2, 1, 2, 16, 18)
+    mode, illumination_factor, *counts = getattr(request, "param", ("projection", 1.0))
+    positions = counts[0] if counts else 1
+    shape = (2, positions, 2, 16, 18)
     raw_data = np.empty(shape, dtype=np.uint16)
     expectation = np.empty(shape, dtype=np.float64)
     source_expectation = np.empty_like(expectation)
-    for time in range(shape[0]):
-        for channel in range(shape[2]):
-            observation = simulated_camera(
-                (1, *shape[-2:]),
-                geometry="cartesian",
-                # Uniform excitation scales the emission dose before optics
-                # and detection; this factor does not change detector QE.
-                exposure=(1 + time / 4 + channel / 2) * illumination_factor,
-                seed=42 + 100 * time + channel,
-                # A prescribed calibration dose supports absolute camera-noise
-                # accuracy without clipping the ADC, including doubled exposure.
-                budget=(1000, 2000),
-            )
-            # The prescribed input factor fixes the reference-illumination
-            # photon dose independently of the saved flatfield or processing.
-            source_expectation[time, 0, channel] = (
-                observation.expectation[0] / illumination_factor
-            )
-            expectation[time, 0, channel] = observation.expectation[0]
-            raw_data[time, 0, channel] = observation.raw[0]
+    for time, position, channel in np.ndindex(shape[:3]):
+        observation = simulated_camera(
+            (1, *shape[-2:]),
+            geometry="cartesian",
+            # Uniform excitation scales the emission dose before optics
+            # and detection; this factor does not change detector QE.
+            exposure=(1 + time / 4 + channel / 2 + position / 8) * illumination_factor,
+            seed=42 + 100 * time + 10 * position + channel,
+            # A prescribed calibration dose supports absolute camera-noise
+            # accuracy without clipping the ADC, including doubled exposure.
+            budget=(1000, 2000),
+        )
+        # The prescribed input factor fixes the reference-illumination
+        # photon dose independently of the saved flatfield or processing.
+        source_expectation[time, position, channel] = (
+            observation.expectation[0] / illumination_factor
+        )
+        expectation[time, position, channel] = observation.expectation[0]
+        raw_data[time, position, channel] = observation.raw[0]
     assert expectation.min() >= 1000
     assert raw_data.max() < np.iinfo(np.uint16).max
     dataset = opm_v2_acquisition_factory(
@@ -183,7 +183,9 @@ def opm_v2_projection_zarr(request, simulated_camera, opm_v2_acquisition_factory
         name="opm_v2_projection",
         mode=mode,
         suffix=".zarr",
-        stage_positions_zxy=((4.0, 20.0, 30.0),),
+        stage_positions_zxy=tuple(
+            (4.0, 20.0, 30.0 + p * 2.3) for p in range(positions)
+        ),
     )
     dataset.expectation = expectation[:, :, :, None]
     dataset.source_expectation = source_expectation[:, :, :, None]
@@ -396,6 +398,7 @@ def opm_v2_acquisition_factory(tmp_path):
         frame_metadatas=None,
         frame_exposure_ms=10.0,
         live_manifest=None,
+        camera_read_noise_e=None,
         **overrides,
     ):
         """Deliver every planned camera frame through the real writer lifecycle."""
@@ -445,6 +448,11 @@ def opm_v2_acquisition_factory(tmp_path):
                         "Camera": {
                             "offset": metadata.camera_offset,
                             "e_to_ADU": metadata.camera_conversion,
+                            **(
+                                {"read_noise_e": camera_read_noise_e}
+                                if camera_read_noise_e is not None
+                                else {}
+                            ),
                         },
                         "OPM": {
                             "angle_deg": metadata.angle_deg,
