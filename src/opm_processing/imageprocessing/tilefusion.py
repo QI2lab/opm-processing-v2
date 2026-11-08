@@ -674,7 +674,8 @@ def _bounded_phase_correlation_peak(
     frequency_product = xp.fft.fftn(fixed) * xp.fft.fftn(moving).conj()
     magnitude = xp.abs(frequency_product)
     epsilon = xp.finfo(magnitude.dtype).eps
-    frequency_product /= xp.maximum(magnitude, epsilon)
+    # Match skimage/cuCIM's phase normalization before restricting physical lags.
+    frequency_product /= xp.maximum(magnitude, 100 * epsilon)
     cross_correlation = xp.abs(xp.fft.ifftn(frequency_product))
 
     valid_peak = xp.ones(cross_correlation.shape, dtype=xp.bool_)
@@ -1373,9 +1374,9 @@ def _infer_registration_limits(
     nearest-face overlap, or the tile extent on untiled axes. Depth pairs
     additionally allow the oblique-plane footprint displacement dz*cot(theta)
     along image Y. This is a search allowance, not a shear of tile origins.
-    Depth-face pairs require at least three actually matched planes rather
-    than capping Z at half the nominal intersection. Other axes retain at
-    least half their overlap.
+    Depth-face pairs retain three matched planes where available rather than
+    capping Z at half the nominal intersection. Thinner tiles have zero Z
+    allowance. Other axes retain at least half their overlap.
 
     Parameters
     ----------
@@ -1473,6 +1474,7 @@ def _infer_registration_limits(
         separation = np.abs(positions[right] - positions[left]) / spacing
         depth_pair = (
             not is_2d
+            and separation[0] > 0
             and int(np.argmax(separation / np.minimum(shapes[left], shapes[right])))
             == 0
         )
@@ -1482,7 +1484,7 @@ def _infer_registration_limits(
             # A correction towards the other tile increases the overlap. Do
             # not limit that correction by the small nominal intersection.
             # The contextual search checks actual common geometric support.
-            cap[0] = min(shapes[left, 0], shapes[right, 0]) - 3
+            cap[0] = max(0, min(shapes[left, 0], shapes[right, 0]) - 3)
         budget = np.minimum(np.ceil(budget), cap)
         if is_2d:
             budget[0] = 0
@@ -3981,7 +3983,7 @@ class TileFusion:
             "overlap_roi": "depth-context-lateral-fallback-axial-contrast-refinement-v4",
             "downsample": ("upstream-block-reduce-with-adaptive-zyx-ssim-support-v2"),
             "phase_registration": (
-                "phase-supported-periodic-aliases-and-masked-normalized-correlation-v11"
+                "phase-supported-periodic-aliases-and-upstream-normalization-v12"
             ),
             "score": ("retained-full-resolution-grid-ssim-supported-window-v8"),
             "downsample_factors_zyx": list(self.downsample_factors),
