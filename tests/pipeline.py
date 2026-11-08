@@ -2,6 +2,7 @@
 
 import importlib
 from functools import partial
+from itertools import pairwise
 
 import numpy as np
 import tensorstore as ts
@@ -230,6 +231,169 @@ def assert_fused_ngff(case):
             base[:, :, ::factor, ::factor, ::factor],
         )
     return base
+
+
+def test_large_noisy_scene_acquisition_to_fusion(
+    large_noisy_acquisition,
+    deconvolve,
+    pipeline_runner,
+    pipeline_geometry,
+    pipeline_camera_accuracy,
+    tmp_path,
+):
+    """Process full noisy specimens across real RLGC, deskew and storage tiles."""
+    from scipy.special import kl_div
+
+    from opm_processing.imageprocessing.opmpsf import camera_grid_center
+
+    case = large_noisy_acquisition
+    dataset, microscope = case.dataset, case.microscope
+    metadata = inspect_acquisition(dataset.path)
+    assert np.prod(metadata.shape[-3:]) >= 1_000_000
+    np.testing.assert_array_equal(
+        open_acquisition_datastore(metadata).read().result(), dataset.raw_data
+    )
+    result = pipeline_runner(
+        dataset,
+        deconvolve=deconvolve,
+        crop_scan=24 if deconvolve else None,
+        output=tmp_path / "processed",
+        fusion_chunk=(128, 128),
+    )
+    factor = scan_upsample_from_metadata(metadata) if deconvolve else 1
+    geometry = pipeline_geometry(metadata.shape[-3:], microscope, scan_factor=factor)
+    for position, array in enumerate(result.collection.arrays):
+        saved = array[0, 0].read().result()
+        assert saved.shape == geometry.shape and saved.dtype == np.float32
+        np.testing.assert_array_equal(saved[~geometry.support], 0)
+        calibrated = camera_correct(
+            dataset.raw_data[0, position, 0],
+            microscope.camera.offset_adu,
+            microscope.camera.electrons_per_adu,
+        )
+        if metadata.scan_axis_reversed:
+            calibrated = calibrated[::-1].copy()
+        if deconvolve:
+            run = result.deconvolution_runs[position]
+            observed = run["forward"]
+            assert len(run["chunks"]) > 2
+            halo = int(np.ceil(run["psf_shape"][0] / factor))
+            for chunk in run["chunks"]:
+                assert chunk["input_shape"][0] < metadata.shape[-3]
+                assert chunk["input_shape"][0] <= 24 // factor + 2 * halo + 1
+            chunks = sorted(
+                observed["chunks"], key=lambda chunk: chunk["destination"].start
+            )
+            assert len(chunks) > 2
+            assert chunks[0]["destination"].start == 0
+            assert chunks[-1]["destination"].stop == metadata.shape[-3]
+            assert all(
+                left["destination"].stop == right["destination"].start
+                for left, right in pairwise(chunks)
+            )
+            assert (
+                chunks[-1]["destination"].stop - chunks[-1]["destination"].start
+                < chunks[0]["destination"].stop
+            )
+            assert all(chunk["shared"] for chunk in chunks)
+            for chunk in chunks:
+                assert 1 <= chunk["visits"] <= 2
+                assert chunk["updates"] == list(range(1, len(chunk["updates"]) + 1))
+                assert (
+                    observed["iterations"]
+                    <= len(chunk["updates"])
+                    <= observed["iterations"] + 2
+                )
+            baseline = observed["input_prediction"]
+            if baseline is None:
+                baseline = observed["initial_prediction"]
+            source = case.source[:: case.sampling_factor]
+            assert source.any()
+            assert (
+                kl_div(case.expectation[source], observed["prediction"][source]).sum()
+                < kl_div(case.expectation[source], baseline[source]).sum()
+            )
+            calibrated = result.reconstructions[position]
+        expected = orthogonal_deskew(
+            calibrated,
+            theta=microscope.angle_deg,
+            distance=microscope.scan_step_um / factor,
+            pixel_size=microscope.pixel_size_um,
+            downsample_factor=1,
+        )
+        np.testing.assert_array_equal(saved, expected)
+
+    # Only fixed source geometry selects foreground for execution coverage.
+    source = case.source if deconvolve else case.source[:: case.sampling_factor]
+    foreground = (
+        orthogonal_deskew(
+            source.astype(np.float32),
+            theta=microscope.angle_deg,
+            distance=microscope.scan_step_um / factor,
+            pixel_size=microscope.pixel_size_um,
+            downsample_factor=1,
+        )
+        > 0
+    )
+    covered = np.zeros(geometry.shape, bool)
+    tile_shape = result.deskew_runs[0]["tile_shape"]
+    for origin, shape in result.deskew_tiles:
+        assert np.all(np.asarray(shape) <= tile_shape)
+        covered[tuple(slice(a, a + n) for a, n in zip(origin, shape, strict=True))] = (
+            True
+        )
+    assert covered.all() and len(result.deskew_tiles) > 8
+    crossings = 0
+    for axis in range(3):
+        borders = {
+            origin[axis] for origin, _shape in result.deskew_tiles if origin[axis]
+        }
+        crossings += sum(
+            np.any(
+                np.take(foreground, border - 1, axis=axis)
+                & np.take(foreground, border, axis=axis)
+            )
+            for border in borders
+        )
+    assert crossings >= 2
+    assert any(
+        origin[axis] % tile_shape[axis]
+        and origin[axis] + shape[axis] == geometry.shape[axis]
+        for origin, shape in result.deskew_tiles
+        for axis in range(3)
+    )
+    if not deconvolve:
+        means = np.broadcast_to(
+            case.expectation[None, None, None], dataset.raw_data.shape
+        )
+        center = camera_grid_center(
+            metadata.shape[-3:],
+            microscope.pixel_size_um,
+            microscope.scan_step_um,
+            microscope.angle_deg,
+        )
+        pipeline_camera_accuracy(
+            result, means, microscope, metadata.mode, source_y_half_um=center[1]
+        )
+    fused = assert_fused_ngff(result)
+    np.testing.assert_allclose(
+        np.diff(np.asarray(result.fusion._tile_positions), axis=0), 0, atol=1e-8
+    )
+    origin = np.asarray(result.fusion._tile_positions)[0]
+    start = np.rint(
+        (origin - result.fusion.offset_um) / result.collection.voxel_size_um
+    ).astype(int)
+    selection = tuple(
+        slice(a, a + n) for a, n in zip(start, geometry.shape, strict=True)
+    )
+    expected = (
+        sum(array[0, 0].read().result() for array in result.collection.arrays) / 2
+    )
+    np.testing.assert_allclose(
+        fused[(0, 0, *selection)], expected, rtol=8 * np.finfo(np.float32).eps
+    )
+    state = ProcessingState.read(result.fusion.processing_state.path)
+    assert state.completed_tiles(result.processed) == {(0, 0), (0, 1)}
 
 
 def test_extended_mosaic_acquisition_to_fusion(

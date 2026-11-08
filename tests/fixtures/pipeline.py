@@ -754,6 +754,54 @@ def pipeline_case(
 
 
 @pytest.fixture
+def large_noisy_acquisition(
+    request,
+    noisy_extended_scene,
+    simulation_parameters,
+    opm_v2_acquisition_factory,
+    small_cpu_kernels,
+):
+    """Write independent full-field views of a shared noisy extended specimen."""
+    mode, factor = request.param
+    microscope, expected, raw, source, _dark = noisy_extended_scene
+    microscope = replace(microscope, scan_step_um=microscope.scan_step_um * factor)
+    expected = expected[::factor]
+    pixels = np.stack(
+        (
+            raw[::factor],
+            digitize(
+                expected,
+                microscope.camera,
+                seed=simulation_parameters["camera_seed"] + 1,
+            ),
+        )
+    )[None, :, None]
+    if mode == "stage":
+        pixels = pixels[:, :, :, ::-1].copy()
+    pixel = microscope.pixel_size_um
+    dataset = opm_v2_acquisition_factory(
+        pixels,
+        name="large_scene",
+        mode=mode,
+        pixel_size_um=pixel,
+        scan_axis_step_um=microscope.scan_step_um,
+        angle_deg=microscope.angle_deg,
+        camera_offset=microscope.camera.offset_adu,
+        camera_conversion=microscope.camera.electrons_per_adu,
+        camera_read_noise_e=microscope.camera.read_noise_e,
+        stage_positions_zxy=((2.3, -4.6, 1.15), (2.3, -4.6, 1.15 + pixel)),
+    )
+    microscope = replace(microscope, scan_step_um=dataset.metadata.scan_axis_step_um)
+    return SimpleNamespace(
+        dataset=dataset,
+        microscope=microscope,
+        expectation=expected,
+        source=source,
+        sampling_factor=factor,
+    )
+
+
+@pytest.fixture
 def mosaic_acquisition(
     request,
     pipeline_optical_data,
