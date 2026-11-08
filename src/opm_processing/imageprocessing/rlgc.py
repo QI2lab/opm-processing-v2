@@ -79,6 +79,7 @@ preload_cuda_libraries()
 
 import cupy as cp
 from cupy import ElementwiseKernel
+from cupyx.scipy.fft import next_fast_len as next_gpu_fft_size
 
 # -----------------------------------------------------------------------------
 # CUDA kernel: multiplicative RL step gated by the existing consensus sign rule
@@ -95,8 +96,6 @@ filter_update = ElementwiseKernel(
 
 
 Array = np.ndarray | cp.ndarray
-
-_fft_cache_3d: dict[tuple[int, int, int, int], cp.ndarray] = {}
 
 GC_UPDATED_FRACTION_LIMIT = 0.001
 GC_RELATIVE_CHANGE_LIMIT = 0.001
@@ -189,15 +188,8 @@ def clear_rlgc_caches(clear_memory_pool: bool = False) -> None:
     -------
     None
     """
-    _fft_cache_3d.clear()
     try:
         cp.fft.config.get_plan_cache().clear()
-    except Exception:
-        pass
-    try:
-        import cupyx
-
-        cupyx.scipy.fft.clear_plan_cache()
     except Exception:
         pass
     if clear_memory_pool:
@@ -205,34 +197,6 @@ def clear_rlgc_caches(clear_memory_pool: bool = False) -> None:
         cp.cuda.Stream.null.synchronize()
         cp.get_default_memory_pool().free_all_blocks()
         cp.get_default_pinned_memory_pool().free_all_blocks()
-
-
-def next_gpu_fft_size(x: int) -> int:
-    """
-    Return the smallest FFT-friendly size >= ``x`` with prime factors in {2, 3}.
-
-    Parameters
-    ----------
-    x : int
-        Minimum desired length.
-
-    Returns
-    -------
-    int
-        Next 2-3-smooth length >= ``x``.
-    """
-    if x <= 1:
-        return 1
-    n = x
-    while True:
-        m = n
-        while (m % 2) == 0:
-            m //= 2
-        while (m % 3) == 0:
-            m //= 3
-        if m == 1:
-            return n
-        n += 1
 
 
 def _axis_linear_fft_padding(
@@ -327,27 +291,21 @@ def pad_psf(
     psf = cp.zeros(image_shape, dtype=cp.float32)
     psf[: psf_temp.shape[0], : psf_temp.shape[1], : psf_temp.shape[2]] = psf_temp
 
-    # Center the PSF
-    for axis, axis_size in enumerate(psf.shape):
-        psf = cp.roll(psf, int(axis_size / 2), axis=axis)
-    for axis, axis_size in enumerate(psf_temp.shape):
-        psf = cp.roll(psf, -int(axis_size / 2), axis=axis)
-
-    psf = cp.fft.ifftshift(psf)
+    psf = cp.roll(psf, tuple(-(size // 2) for size in psf_temp.shape), axis=(0, 1, 2))
     if normalize:
         s = cp.sum(psf)
         psf = psf / (s if s != 0 else 1.0)
-    return psf.astype(cp.float32)
+    return psf.astype(cp.float32, copy=False)
 
 
 def fft_conv(
     image: cp.ndarray, H: cp.ndarray, shape: tuple[int, int, int]
 ) -> cp.ndarray:
     """
-    Linear convolution via FFT with cached buffers (no clipping).
+    Convolution using the transform output as its frequency workspace.
 
-    This computes ``irfftn(rfftn(image) * H, s=shape)`` with preallocated
-    work buffers. No clipping is applied here-this matches the reference
+    This computes ``irfftn(rfftn(image) * H, s=shape)`` without a redundant
+    spectrum buffer or copy. No clipping is applied here-this matches the reference
     implementation used to compute predictions, ratios and consensus.
 
     Parameters
@@ -364,17 +322,9 @@ def fft_conv(
     cupy.ndarray
         Convolved array in object space (float32).
     """
-    device_id = int(cp.cuda.Device().id)
-    cache_key = (device_id, *shape)
-    if cache_key not in _fft_cache_3d:
-        z, y, x = shape
-        freq_shape = (z, y, x // 2 + 1)
-        _fft_cache_3d[cache_key] = cp.empty(freq_shape, dtype=cp.complex64)
-
-    fft_buf = _fft_cache_3d[cache_key]
-    fft_buf[...] = cp.fft.rfftn(image)
-    fft_buf[...] *= H
-    return cp.fft.irfftn(fft_buf, s=shape).astype(cp.float32, copy=False)
+    spectrum = cp.fft.rfftn(image)
+    spectrum *= H
+    return cp.fft.irfftn(spectrum, s=shape).astype(cp.float32, copy=False)
 
 
 def _observed_region_slices(
@@ -429,9 +379,15 @@ def _kl_div_into(
         return _host_kl_div_into(p, q, scratch)
     probability_p = p + 1e-4
     probability_q = q + 1e-4
-    probability_p = probability_p / xp.sum(probability_p)
-    probability_q = probability_q / xp.sum(probability_q)
-    scratch[...] = probability_p * (xp.log(probability_p) - xp.log(probability_q))
+    probability_p /= xp.sum(probability_p)
+    probability_q /= xp.sum(probability_q)
+    # Preserve float32 operation order while reusing the dead q buffer. The
+    # second KL evaluation also retains a rollback estimate; materializing every
+    # logarithm and arithmetic result can exceed an otherwise fitting chunk.
+    xp.log(probability_p, out=scratch)
+    xp.log(probability_q, out=probability_q)
+    scratch -= probability_q
+    scratch *= probability_p
     scratch[xp.isnan(scratch)] = 0
     return float(xp.sum(scratch))
 
@@ -848,6 +804,7 @@ class _Convolution:
         self.otf = cp.fft.rfftn(
             pad_psf(cp.asarray(psf), self.tile_shape, normalize=normalize)
         )
+        self.adjoint_otf = self.otf.conj()
 
     def __call__(self, values: Array, *, adjoint: bool = False) -> Array:
         """Convolve a global estimate using shared GPU FFT workspace.
@@ -865,7 +822,7 @@ class _Convolution:
             Convolution on the same backend and grid as values.
         """
         xp = cp.get_array_module(values)
-        otf = self.otf.conj() if adjoint else self.otf
+        otf = self.adjoint_otf if adjoint else self.otf
         if self.tile_shape == self.shape:
             result = fft_conv(cp.asarray(values), otf, self.shape)
             return result if xp is cp else cp.asnumpy(result)
