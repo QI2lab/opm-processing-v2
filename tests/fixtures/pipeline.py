@@ -9,19 +9,17 @@ import numpy as np
 import pytest
 
 from opm_processing.dataio.deconvolution import scan_upsample_from_metadata
-from opm_processing.imageprocessing.opmpsf import camera_grid_center
 from opm_processing.imageprocessing.opmtools import (
     deskew_coverage,
     deskew_shape_estimator,
 )
-from opm_processing.imageprocessing.tilefusion import TileFusion
-from tests.simulation.camera import digitize
-from tests.simulation.forward_model import (
-    Acquisition,
-    Microscope,
-    forward_model,
+from opm_processing.imageprocessing.tilefusion import (
+    DEFAULT_REGISTRATION_DOWNSAMPLE,
+    TileFusion,
 )
-from tests.simulation.scenes import OpticalScene, prepare_scene
+from tests.simulation.camera import digitize
+from tests.simulation.forward_model import Microscope
+from tests.simulation.scenes import OpticalScene
 
 
 @dataclass(frozen=True)
@@ -32,7 +30,8 @@ class PipelineOpticalData:
     expectation: np.ndarray
     source_expectation: np.ndarray | None
     ground_truth: OpticalScene
-    source_density: np.ndarray | None
+    native_scan_planes: int
+    first_native_scan_index: int
 
 
 @pytest.fixture
@@ -88,11 +87,11 @@ def pipeline_camera_accuracy(pipeline_geometry):
         *,
         source_y_half_um,
         offsets_x=None,
-        regions=None,
+        scan_center_offset_um=0.0,
     ):
         """Check fixed source/background apertures without fitting photons or spatial shifts."""
         shape = means.shape[-3:]
-        scans, rows, columns = shape
+        scans, rows = shape[:2]
         pixel, step = microscope.pixel_size_um, microscope.scan_step_um
         angle = np.deg2rad(microscope.angle_deg)
         span = (scans - 1) * step
@@ -110,7 +109,11 @@ def pipeline_camera_accuracy(pipeline_geometry):
         mask = coverage >= 1 - 32 * np.finfo(float).eps
         native_scan = (np.arange(scans) - (scans - 1) / 2) * step
         native_row = (np.arange(rows) - (rows - 1) / 2) * pixel
-        camera_y = native_scan[:, None] + native_row[None] * np.cos(angle)
+        camera_y = (
+            native_scan[:, None]
+            + native_row[None] * np.cos(angle)
+            + scan_center_offset_um
+        )
         # The physical analysis window comes from the original object and PSF
         # support. No reconstructed value selects the scored samples.
         mask &= (np.abs(camera_y) <= source_y_half_um)[..., None]
@@ -148,9 +151,7 @@ def pipeline_camera_accuracy(pipeline_geometry):
             origin_y_error_um=origin_error,
         )
 
-        def score(
-            image, origin, frame_origin, expected, response, envelope, selections
-        ):
+        def score(image, origin, frame_origin, expected, response, envelope):
             prediction = (
                 camera_volume_samples(
                     image / gain,
@@ -162,19 +163,11 @@ def pipeline_camera_accuracy(pipeline_geometry):
                 )
                 * response
             )
-            for selection in selections:
-                selected = mask.copy()
-                selected[..., : selection.start] = False
-                selected[..., selection.stop :] = False
-                measured = camera_sampling_accuracy(
-                    prediction, expected, envelope, selected
-                )
-                # Noisy ADC samples may be zero at positive true rates. Their
-                # certified sampling/noise intervals, including zeros, apply.
-                assert measured.inside_envelope, measured
-                assert measured.flux_lower <= measured.flux <= measured.flux_upper, (
-                    measured
-                )
+            measured = camera_sampling_accuracy(prediction, expected, envelope, mask)
+            # Noisy ADC samples may be zero at positive true rates. Their
+            # certified sampling/noise intervals, including zeros, apply.
+            assert measured.inside_envelope, measured
+            assert measured.flux_lower <= measured.flux <= measured.flux_upper, measured
 
         for time in range(means.shape[0]):
             for channel in range(means.shape[2]):
@@ -183,9 +176,6 @@ def pipeline_camera_accuracy(pipeline_geometry):
                 )
                 for position in range(positions):
                     expected = means[time, position, channel]
-                    selections = (
-                        [slice(0, columns)] if regions is None else regions[position]
-                    )
                     image = (
                         result.collection.arrays[position][time, channel]
                         .read()
@@ -207,7 +197,6 @@ def pipeline_camera_accuracy(pipeline_geometry):
                         expected,
                         response,
                         own_bounds,
-                        selections,
                     )
                     native_offsets_x = (offsets_x - offsets_x[position]) / pixel
                     np.testing.assert_allclose(
@@ -233,7 +222,6 @@ def pipeline_camera_accuracy(pipeline_geometry):
                         expected,
                         response,
                         fused_bounds,
-                        selections,
                     )
 
     return check
@@ -373,11 +361,7 @@ def pipeline_runner(
                 "fuse",
                 processed,
                 blend_pixels=blend,
-                downsample_factors=(1, 1, 1),
                 registration_channel=dataset.raw_data.shape[2] - 1,
-                ssim_window=3,
-                registration_threshold=0.1,
-                max_registration_shift_zyx=(2, 2, 2),
                 chunk_shape_yx=fusion_chunk,
                 max_workers=1,
                 normalize_depth_intensity=False,
@@ -532,8 +516,10 @@ def pipeline_illumination_calibration(
 
 
 @pytest.fixture(scope="session")
-def pipeline_optical_data(microscope_parameters, simulation_parameters):
-    """Cache physical emission doses and camera means for repeated fields and mosaics.
+def pipeline_optical_data(
+    microscope_parameters, simulation_parameters, simulated_camera
+):
+    """Reuse native optical camera fields for repeated exposures and mosaics.
 
     Returns
     -------
@@ -542,113 +528,64 @@ def pipeline_optical_data(microscope_parameters, simulation_parameters):
         fields for extended mosaics.
     """
 
-    @lru_cache(maxsize=4)
-    def dosed_object(illumination, mosaic, scan_extent_factor, kind):
-        """Set exposure once, before querying coarse or refined sensor grids."""
+    @lru_cache(maxsize=2)
+    def native_data(illumination, mosaic, tiled, kind):
+        """Set exposure once before selecting acquired scan planes."""
         reference_step = simulation_parameters["microscope"]["scan_step_um"]
-        microscope = replace(microscope_parameters, scan_step_um=reference_step)
-        settings = simulation_parameters["pipeline_mosaic" if mosaic else "pipeline"]
         kind = kind or ("line-pairs" if mosaic else "points")
-        specimen = simulation_parameters["specimens"][kind]
-        if mosaic:
-            specimen = {
-                "half_extent_zyx_um": settings["half_extent_zyx_um"],
-                "features": dict(
-                    specimen["features"], length_um=settings["line_length_um"]
-                ),
-            }
-        scene = prepare_scene(kind, microscope, parameters=specimen)
-        height, width = settings["camera_shape_yx"]
+        height, width = simulation_parameters["camera_shape_yx"]
+        scans = simulation_parameters[
+            "tiled_scan_planes" if tiled else "whole_scan_planes"
+        ]
         shape = (
-            round(settings["scan_extent_um"] * scan_extent_factor / reference_step) + 1,
+            scans,
             height,
-            width + settings.get("tile_offset_x_pixels", 0),
+            width
+            + (
+                simulation_parameters["pipeline_mosaic"]["tile_offset_x_pixels"]
+                if mosaic
+                else 0
+            ),
         )
-        acquisition = Acquisition(
-            scene.axes,
-            shape,
-            illumination_profile="edge-taper" if illumination else "uniform",
-            # A declared high-background calibration exposure makes photon-gain
-            # and stripe accuracy measurable above the original detector noise.
-            # This dose is fixed before digitization and never refitted to a
-            # coarse grid, a noisy observation or a reconstruction.
-            camera_photon_budget=(3000, 4000),
-            output="object",
+        options = {
+            "kind": kind,
+            "large": True,
+            "illumination_profile": "edge-taper" if illumination else "uniform",
+            "step": reference_step,
+            "conversion": microscope_parameters.camera.electrons_per_adu,
+        }
+        # Both fields use the same source exposure, fixed before camera noise.
+        data = simulated_camera(shape, budget=(3000, 4000), **options)
+        source = (
+            simulated_camera(shape, budget=(3000, 0), **options).expectation
+            if mosaic
+            else None
         )
-        dose = forward_model(scene.density, acquisition, microscope)
-        dose.setflags(write=False)
-        source = None
-        if mosaic:
-            source = forward_model(
-                scene.density,
-                replace(acquisition, camera_photon_budget=(3000, 0)),
-                microscope,
-            )
-            source.setflags(write=False)
-        return scene, dose, source
+        return data, source
 
-    @lru_cache(maxsize=6)
+    @lru_cache(maxsize=2)
     def create(
-        step, illumination=False, *, mosaic=False, scan_extent_factor=1, kind=None
+        step, illumination=False, *, mosaic=False, tiled=False, kind=None, phase=0
     ):
         """Sample one unchanged physical emission field at the requested scan pitch."""
-        scene, dose, source_density = dosed_object(
-            illumination, mosaic, scan_extent_factor, kind
+        data, native_source = native_data(illumination, mosaic, tiled, kind)
+        microscope = replace(data.microscope, scan_step_um=step)
+        native_step = simulation_parameters["microscope"]["scan_step_um"]
+        factor = round(step / native_step)
+        assert factor >= 1 and np.isclose(step, factor * native_step)
+        assert 0 <= phase < factor
+        expected = data.expectation[phase::factor]
+        source = None if native_source is None else native_source[phase::factor]
+        return PipelineOpticalData(
+            microscope,
+            expected,
+            source,
+            data.ground_truth,
+            data.expectation.shape[0],
+            phase,
         )
-        microscope = replace(scene.microscope, scan_step_um=step)
-        settings = simulation_parameters["pipeline_mosaic" if mosaic else "pipeline"]
-        height, width = settings["camera_shape_yx"]
-        shape = (
-            round(settings["scan_extent_um"] * scan_extent_factor / step) + 1,
-            height,
-            width + settings.get("tile_offset_x_pixels", 0),
-        )
-        acquisition = Acquisition(scene.axes, shape, output="expectation")
-        expected = forward_model(dose, acquisition, microscope)
-        expected.setflags(write=False)
-        source = None
-        if mosaic:
-            source = forward_model(source_density, acquisition, microscope)
-            source.setflags(write=False)
-        return PipelineOpticalData(microscope, expected, source, scene, source_density)
 
     return create
-
-
-@pytest.fixture
-def pipeline_source_image(pipeline_geometry):
-    """Project only the original physical emitters onto a laboratory camera grid."""
-
-    def project(data, *, scan_factor=1):
-        """Identify bright physical seams without deskewing production input pixels."""
-        microscope = data.microscope
-        geometry = pipeline_geometry(
-            data.expectation.shape, microscope, scan_factor=scan_factor
-        )
-        pixel = microscope.pixel_size_um
-        center = camera_grid_center(
-            data.expectation.shape,
-            pixel_size_um=pixel,
-            scan_axis_step_um=microscope.scan_step_um,
-            theta_deg=microscope.angle_deg,
-        )
-        axes = tuple(
-            np.arange(size) * pixel - origin
-            for size, origin in zip(geometry.shape, center, strict=True)
-        )
-        return forward_model(
-            data.source_density,
-            Acquisition(
-                data.ground_truth.axes,
-                geometry.shape,
-                sensor_axes=axes,
-                geometry="cartesian",
-                output="expectation",
-            ),
-            microscope,
-        )
-
-    return project
 
 
 @pytest.fixture
@@ -678,14 +615,24 @@ def pipeline_case(
     Notes
     -----
     Both positions observe the same physical field with independent camera
-    noise. Position 1 reports an erroneous one-pixel lateral stage shift.
+    noise. Position 1 reports an erroneous lateral shift of one registration-grid
+    pixel (five native detector pixels).
     BaSiC runs in its production worker process. Camera calibration, RLGC,
     orthogonal interpolation, registration and fusion execute normally, with
     native TensorStore storage in pytest temporary directories.
     """
     mode, illumination, step, crop = request.param
+    native_step = simulation_parameters["microscope"]["scan_step_um"]
+    native_scans = simulation_parameters[
+        "tiled_scan_planes" if crop is not None else "whole_scan_planes"
+    ]
+    phase = (native_scans - 1) % round(step / native_step) if mode == "stage" else 0
     optical_data = pipeline_optical_data(
-        step, illumination, kind="line-pairs" if deconvolve else None
+        step,
+        illumination,
+        tiled=crop is not None,
+        kind="line-pairs" if deconvolve else None,
+        phase=phase,
     )
     microscope, expectation = (
         optical_data.microscope,
@@ -702,16 +649,26 @@ def pipeline_case(
         raw = raw[:, :, :, ::-1].copy()
     assert raw.max() < 2**microscope.camera.bit_depth - 1
     pixel = microscope.pixel_size_um
+    registration_error_pixels = DEFAULT_REGISTRATION_DOWNSAMPLE[-1]
+    native_step = simulation_parameters["microscope"]["scan_step_um"]
+    missing_span = (optical_data.native_scan_planes - 1) * native_step - (
+        raw.shape[-3] - 1
+    ) * step
+    stage_scan = -4.6
     dataset = opm_v2_acquisition_factory(
         raw,
         name="pipeline",
         mode=mode,
         camera_offset=microscope.camera.offset_adu,
         camera_conversion=microscope.camera.electrons_per_adu,
+        camera_read_noise_e=microscope.camera.read_noise_e,
         pixel_size_um=pixel,
         scan_axis_step_um=step,
         angle_deg=microscope.angle_deg,
-        stage_positions_zxy=((2.3, -4.6, 1.15), (2.3, -4.6, 1.15 + pixel)),
+        stage_positions_zxy=(
+            (2.3, stage_scan, 1.15),
+            (2.3, stage_scan, 1.15 + registration_error_pixels * pixel),
+        ),
         acquired_plane_count=raw.shape[-3],
         plane_period_s=simulation_parameters["pipeline"]["plane_period_s"],
     )
@@ -742,6 +699,7 @@ def pipeline_case(
                 "half_extent_zyx_um"
             ][1]
             - microscope.psf_half_extent_zyx_um[1],
+            scan_center_offset_um=phase * native_step - missing_span / 2,
         )
     return SimpleNamespace(
         **vars(result),
@@ -750,6 +708,7 @@ def pipeline_case(
         support=geometry.support,
         expectation=expectation,
         optical_data=optical_data,
+        registration_error_pixels=registration_error_pixels,
     )
 
 
@@ -764,11 +723,13 @@ def large_noisy_acquisition(
     """Write independent full-field views of a shared noisy extended specimen."""
     mode, factor = request.param
     microscope, expected, raw, source, _dark = noisy_extended_scene
+    native_scan_planes = expected.shape[0]
+    phase = (native_scan_planes - 1) % factor if mode == "stage" else 0
     microscope = replace(microscope, scan_step_um=microscope.scan_step_um * factor)
-    expected = expected[::factor]
+    expected = expected[phase::factor]
     pixels = np.stack(
         (
-            raw[::factor],
+            raw[phase::factor],
             digitize(
                 expected,
                 microscope.camera,
@@ -779,6 +740,8 @@ def large_noisy_acquisition(
     if mode == "stage":
         pixels = pixels[:, :, :, ::-1].copy()
     pixel = microscope.pixel_size_um
+    registration_error_pixels = DEFAULT_REGISTRATION_DOWNSAMPLE[-1]
+    stage_scan = -4.6
     dataset = opm_v2_acquisition_factory(
         pixels,
         name="large_scene",
@@ -789,7 +752,10 @@ def large_noisy_acquisition(
         camera_offset=microscope.camera.offset_adu,
         camera_conversion=microscope.camera.electrons_per_adu,
         camera_read_noise_e=microscope.camera.read_noise_e,
-        stage_positions_zxy=((2.3, -4.6, 1.15), (2.3, -4.6, 1.15 + pixel)),
+        stage_positions_zxy=(
+            (2.3, stage_scan, 1.15),
+            (2.3, stage_scan, 1.15 + registration_error_pixels * pixel),
+        ),
     )
     microscope = replace(microscope, scan_step_um=dataset.metadata.scan_axis_step_um)
     return SimpleNamespace(
@@ -798,6 +764,8 @@ def large_noisy_acquisition(
         expectation=expected,
         source=source,
         sampling_factor=factor,
+        sampling_phase=phase,
+        native_scan_planes=native_scan_planes,
     )
 
 
@@ -819,16 +787,20 @@ def mosaic_acquisition(
     """
     mode, step, *encoder_errors = request.param
     scan_encoder_error_um = encoder_errors[0] if encoder_errors else 0.0
-    scan_extent_factor = encoder_errors[1] if len(encoder_errors) > 1 else 1
+    layout = encoder_errors[1] if len(encoder_errors) > 1 else "tiled"
+    assert layout in ("whole", "tiled")
+    native_step = simulation_parameters["microscope"]["scan_step_um"]
+    native_scans = simulation_parameters[f"{layout}_scan_planes"]
+    phase = (native_scans - 1) % round(step / native_step) if mode == "stage" else 0
     optical_data = pipeline_optical_data(
-        step, mosaic=True, scan_extent_factor=scan_extent_factor
+        step, mosaic=True, tiled=layout == "tiled", phase=phase
     )
     microscope, expectation = (
         optical_data.microscope,
         optical_data.expectation,
     )
     parameters = simulation_parameters["pipeline_mosaic"]
-    height, width = parameters["camera_shape_yx"]
+    height, width = simulation_parameters["camera_shape_yx"]
     offset = parameters["tile_offset_x_pixels"]
     raw = np.empty((1, 2, 1, expectation.shape[0], height, width), np.uint16)
     for position in range(2):
@@ -842,6 +814,7 @@ def mosaic_acquisition(
         raw = raw[:, :, :, ::-1].copy()
     assert raw.max() < 2**microscope.camera.bit_depth - 1
     pixel = microscope.pixel_size_um
+    stage_scan = -4.6
     dataset = opm_v2_acquisition_factory(
         raw,
         name="mosaic",
@@ -852,8 +825,12 @@ def mosaic_acquisition(
         camera_offset=microscope.camera.offset_adu,
         camera_conversion=microscope.camera.electrons_per_adu,
         stage_positions_zxy=(
-            (2.3, -4.6, 1.15),
-            (2.3, -4.6 + scan_encoder_error_um, 1.15 + (offset + 1) * pixel),
+            (2.3, stage_scan, 1.15),
+            (
+                2.3,
+                stage_scan + scan_encoder_error_um,
+                1.15 + (offset + DEFAULT_REGISTRATION_DOWNSAMPLE[-1]) * pixel,
+            ),
         ),
         camera_read_noise_e=microscope.camera.read_noise_e,
     )
@@ -864,4 +841,5 @@ def mosaic_acquisition(
         source_expectation=optical_data.source_expectation,
         parameters=parameters,
         optical_data=optical_data,
+        tiled=layout == "tiled",
     )

@@ -47,7 +47,7 @@ def test_projection_output_preserves_calibration_geometry_and_provenance(
     label = "2d" if fixture.metadata.mode == "stage" else "projection"
     output_path = output_dir / f"{fixture.path.stem}_{label}.ome.zarr"
     collection = open_position_collection(output_path)
-    assert collection.shape == (2, fixture.metadata.tile_count, 2, 1, 16, 18)
+    assert collection.shape == fixture.raw_data.shape
     assert collection.channel_names == fixture.metadata.channel_names
     assert collection.voxel_size_um == (1.0, 0.115, 0.115)
     np.testing.assert_allclose(
@@ -82,9 +82,16 @@ def test_projection_output_preserves_calibration_geometry_and_provenance(
     else:
         from yaozarrs import open_group
 
-        expected = np.zeros((2, 2, 1, 16, 40), dtype=actual.dtype)
-        for position, start in zip(positions, (0, 20), strict=True):
-            expected[..., start : start + 18] = format_processed_output(
+        height, width = fixture.raw_data.shape[-2:]
+        stride = width + 2
+        actual = open_image_array(fused_path).read().result()
+        assert actual.shape[:4] == (2, 2, 1, height)
+        # The production canvas pads the physical footprint to eight pixels.
+        assert actual.shape[-1] % 8 == 0
+        assert 0 <= actual.shape[-1] - (width + stride) < 8
+        expected = np.zeros_like(actual)
+        for position, start in zip(positions, (0, stride), strict=True):
+            expected[..., start : start + width] = format_processed_output(
                 camera_correct(
                     fixture.raw_data[:, position],
                     fixture.metadata.camera_offset,
@@ -92,7 +99,6 @@ def test_projection_output_preserves_calibration_geometry_and_provenance(
                 ),
                 save_float32,
             )
-        actual = open_image_array(fused_path).read().result()
         eps = np.finfo(np.float32).eps
         np.testing.assert_allclose(
             actual, expected, rtol=2 * eps / (1 - 2 * eps), atol=0

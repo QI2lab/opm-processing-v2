@@ -127,6 +127,12 @@
       }
     }
   },
+  "camera_shape_yx": [
+    256,
+    1900
+  ],
+  "whole_scan_planes": 50,
+  "tiled_scan_planes": 200,
   "kinds": [
     "line-pairs",
     "sphere"
@@ -195,21 +201,10 @@
     }
   },
   "pipeline_mosaic": {
-    "half_extent_zyx_um": [
-      0.8,
-      7.0,
-      7.4
-    ],
-    "line_length_um": 12.0,
-    "scan_extent_um": 38.4,
-    "camera_shape_yx": [
-      32,
-      80
-    ],
     "tile_offset_x_pixels": 48,
     "fusion_chunk_shape_yx": [
-      8,
-      8
+      32,
+      128
     ],
     "blend_pixels_zyx": [
       0,
@@ -218,16 +213,9 @@
     ]
   },
   "large_scene": {
-    "line_length_um": 48.0,
-    "scan_extent_um": 76.8,
-    "minimum_camera_rows": 257
+    "line_length_um": 48.0
   },
   "pipeline": {
-    "plane_period_s": 0.02,
-    "scan_extent_um": 7.2,
-    "camera_shape_yx": [
-      32,
-      36
-    ]
+    "plane_period_s": 0.02
   }
 }

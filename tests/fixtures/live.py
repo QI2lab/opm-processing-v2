@@ -98,6 +98,7 @@ def opm_v2_live_acquisition_factory(tmp_path, opm_v2_acquisition_factory):
         name="sample",
         illumination=None,
         camera_conversion=0.24,
+        camera_read_noise_e=None,
     ):
         """Deliver actual frames through the upstream publisher and TensorStore writer."""
         path = tmp_path / f"{name}.ome.zarr"
@@ -128,6 +129,7 @@ def opm_v2_live_acquisition_factory(tmp_path, opm_v2_acquisition_factory):
             ),
             stage_positions_zxy=tuple(map(tuple, document["stage_positions_zxy"])),
             camera_conversion=document["camera_e_to_adu"],
+            camera_read_noise_e=camera_read_noise_e,
             orientations=tuple(document["orientations"].items()),
         )
         field_path = tmp_path / f"{name}_illumination.ome.tif"
@@ -210,11 +212,13 @@ def live_occupancy_case(
     uniform_camera_scene,
     opm_v2_live_acquisition_factory,
     microscope_parameters,
+    simulation_parameters,
 ):
     """Publish a dark detector-defect channel and independently observed sample."""
     threshold = 6 * microscope_parameters.camera.read_noise_e
     fields = np.broadcast_to(
-        np.asarray((0.1, signal_field), np.float32)[:, None, None], (2, 24, 256)
+        np.asarray((0.1, signal_field), np.float32)[:, None, None],
+        (2, *simulation_parameters["camera_shape_yx"]),
     ).copy()
     scene = uniform_camera_scene(
         channels=2,
@@ -234,6 +238,7 @@ def live_occupancy_case(
         name="live_empty",
         illumination=fields,
         camera_conversion=scene.microscope.camera.electrons_per_adu,
+        camera_read_noise_e=scene.microscope.camera.read_noise_e,
     )
     return SimpleNamespace(
         dataset=dataset,
@@ -336,10 +341,14 @@ def live_wait_case(
         scene, pixels = ensemble.scene, ensemble.raw
         sample_timepoint = ensemble.sample_timepoint
     else:
-        scene = roi_camera_scene(shape=(24, 33, 33))
+        scene = roi_camera_scene()
         pixels, sample_timepoint = scene.pixels, 0
     raw = pixels[..., ::-1, :, :].copy()
-    produced = opm_v2_live_acquisition_factory(raw, camera_conversion=1.0)
+    produced = opm_v2_live_acquisition_factory(
+        raw,
+        camera_conversion=1.0,
+        camera_read_noise_e=scene.microscope.camera.read_noise_e,
+    )
     acquisition, manifest, log = processing.open_live_acquisition(tmp_path)
     produced.manifest, produced.log = manifest, log
     produced.illumination_path.unlink()

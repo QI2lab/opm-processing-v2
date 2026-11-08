@@ -30,13 +30,22 @@ def test_as_acquired_combined_channel_deconvolution(
     small_cpu_kernels,
     assert_reconstruction_storage,
     production_forward_predictions,
+    simulation_parameters,
     kind,
 ):
     """Improve true camera likelihood without injecting PSF calibration into raw data."""
     from opm_processing.imageprocessing import rlgc
     from opm_processing.imageprocessing.opmtools import orthogonal_deskew
 
-    observed = simulated_camera((17, 32, 36), kind=kind, step=1.2, budget=(3000, 4000))
+    observed = simulated_camera(
+        (
+            simulation_parameters["whole_scan_planes"],
+            *simulation_parameters["camera_shape_yx"],
+        ),
+        kind=kind,
+        step=1.2,
+        budget=(3000, 4000),
+    )
     microscope = observed.microscope
     dataset = opm_v2_acquisition_factory(
         observed.raw[None, None, None],
@@ -45,13 +54,14 @@ def test_as_acquired_combined_channel_deconvolution(
         scan_axis_step_um=1.2,
         camera_offset=microscope.camera.offset_adu,
         camera_conversion=microscope.camera.electrons_per_adu,
+        camera_read_noise_e=microscope.camera.read_noise_e,
         stage_positions_zxy=((0.0, 0.0, 0.0),),
     )
     original_attributes = dict(open_group(dataset.path).attrs)
     assert "opm_processing" not in original_attributes
     assert "multiscales" in original_attributes["ome"]
     metadata = inspect_acquisition(dataset.path)
-    assert not metadata.deconvolution
+    assert "psf_parameters" not in (metadata.deconvolution or {})
     np.testing.assert_array_equal(
         open_acquisition_datastore(metadata).read().result(), dataset.raw_data
     )
@@ -76,7 +86,10 @@ def test_as_acquired_combined_channel_deconvolution(
     )
     assert dict(open_group(dataset.path).attrs) == original_attributes
     (recovered,) = reconstructed
-    assert recovered.shape == (49, 32, 36)
+    assert recovered.shape == (
+        (observed.raw.shape[0] - 1) * 3 + 1,
+        *observed.raw.shape[1:],
+    )
     measured = production_forward_predictions[-1]
     # Sparse progress is measured against the actual production initializer,
     # with both predictions evaluated on the acquired camera planes.

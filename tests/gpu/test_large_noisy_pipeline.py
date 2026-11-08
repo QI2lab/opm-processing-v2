@@ -12,14 +12,18 @@ pytestmark = [
     pytest.mark.parametrize("deconvolve", [True]),
     pytest.mark.parametrize(
         "noisy_extended_scene",
-        [(kind, "uniform", 1) for kind in ("line-pairs", "sphere")],
+        [
+            (kind, "uniform", 1, layout)
+            for kind in ("line-pairs", "sphere")
+            for layout in ("whole", "tiled")
+        ],
         indirect=True,
-        ids=("line-pairs", "sphere"),
+        ids=("line-whole50", "line-tiled200", "sphere-whole50", "sphere-tiled200"),
     ),
     pytest.mark.parametrize(
         "large_noisy_acquisition",
-        [("stage", 1), ("mirror", 3)],
+        [(mode, factor) for mode in ("stage", "mirror") for factor in (1, 3)],
         indirect=True,
-        ids=("stage-native", "mirror-sparse3"),
+        ids=("stage-native", "stage-sparse3", "mirror-native", "mirror-sparse3"),
     ),
 ]

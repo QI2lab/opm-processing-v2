@@ -85,6 +85,15 @@ sampling/noise intervals. Reconstruction checks use independent optical truth,
 KL recovery and measured noise behavior, without unvalidated six-sigma photon
 totals or chi-square noise-floor gates.
 
+Physical raw-camera fixtures use `(scan, tilt row, orthogonal column)` order:
+native 0.4-µm scans have `(50, 256, 1900)` samples for whole-volume cases and
+`(200, 256, 1900)` for tiled cases. Coarser scans select the same physical
+exposures with fewer planes; preserve the original sensor coordinates and stage
+acquisition direction instead of re-centering the smaller arrays. Analytical
+operator and probability references may use the small arrays their equations
+require. Physical accuracy apertures need PSF margins in the actual observed
+camera or ROI, with no exception to accommodate an undersized fixture.
+
 Extend existing acquisition workflows for interruption/resume, moves and copies,
 separate raw/output directories, cached registration, numerical projections and
 ROI/TIFF export. Preserve metadata and journals; assert current paths, pixels,

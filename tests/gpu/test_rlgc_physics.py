@@ -351,7 +351,20 @@ def test_optical_forward_adjoint_matches_scipy(
 
 @pytest.mark.parametrize("factor", (1, 3), ids=("native", "sparse3"))
 @pytest.mark.parametrize(
-    "crop_scan", (None, 12, 18), ids=("whole", "tiles12", "tiles18")
+    "noisy_extended_scene,crop_scan",
+    [
+        pytest.param(
+            (kind, profile, budget, layout),
+            crop,
+            id=f"{kind}-{profile}-dose{budget}-{layout}{crop or 50}",
+        )
+        for kind in ("line-pairs", "sphere")
+        for profile in ("uniform", "edge-taper")
+        for budget in range(3)
+        for layout, crop in (("whole", None), ("tiled", 29), ("tiled", 39))
+    ],
+    indirect=["noisy_extended_scene"],
+    scope="session",
 )
 def test_tiled_gc_recovers_noisy_extended_objects_without_rl_noise(
     cupy_gpu,
@@ -371,11 +384,19 @@ def test_tiled_gc_recovers_noisy_extended_objects_without_rl_noise(
     from tests.simulation.forward_model import camera_psf
 
     microscope, expectation, raw, source, dark = noisy_extended_scene
+    assert raw.shape == (50 if crop_scan is None else 200, 256, 1900)
     psf, _ = camera_psf(microscope)
     camera = microscope.camera
     observed = camera_correct(
         raw[::factor], camera.offset_adu, camera.electrons_per_adu
     )
+    # Sparse acquisition ends at native plane 48 or 198. Preserve the original
+    # physical origin and compare only the fine grid between acquired endpoints.
+    fine_scan = (observed.shape[0] - 1) * factor + 1
+    expectation, source, dark = (
+        array[:fine_scan] for array in (expectation, source, dark)
+    )
+    assert fine_scan == raw.shape[0] - (factor == 3)
     assert observed.size >= 1_000_000
     options = {
         "crop_scan": source.shape[0] if crop_scan is None else crop_scan,
@@ -397,6 +418,7 @@ def test_tiled_gc_recovers_noisy_extended_objects_without_rl_noise(
     with monkeypatch.context() as execution:
         execution.setattr(solver, "Slicer", observe_slicer)
         recovered = rlgc(observed, psf, logger=logger, **options)
+    assert recovered.shape == source.shape
     measured = production_forward_predictions[-1]
     chunks = measured["chunks"]
     messages = "\n".join(

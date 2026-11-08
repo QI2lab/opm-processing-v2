@@ -32,6 +32,7 @@ def opm_v2_frame_metadata(
     runner_time_ms: float,
     hardware_triggered: bool | None = None,
     exposure_ms: float | None = 10.0,
+    camera_read_noise_e: float | None = None,
     additional_event_metadata: dict | None = None,
     frame_format: Literal["mda_event", "event_index"] = "mda_event",
 ) -> dict:
@@ -46,6 +47,11 @@ def opm_v2_frame_metadata(
             "camera_crop_y": camera_shape_yx[0],
             "offset": camera_offset,
             "e_to_ADU": camera_conversion,
+            **(
+                {"read_noise_e": camera_read_noise_e}
+                if camera_read_noise_e is not None
+                else {}
+            ),
         },
         "OPM": opm_metadata,
         "Stage": stage_metadata,
@@ -149,46 +155,69 @@ def write_synthetic_acquisition_zarr(
 
 
 @pytest.fixture
-def opm_v2_projection_zarr(request, simulated_camera, opm_v2_acquisition_factory):
+def opm_v2_projection_zarr(
+    request,
+    simulated_camera,
+    opm_v2_acquisition_factory,
+    simulation_parameters,
+    uniform_optical_calibration,
+):
     """Simulate spectral/time observations and persist them with OpmDataHandler."""
     mode, illumination_factor, *counts = getattr(request, "param", ("projection", 1.0))
     positions = counts[0] if counts else 1
-    shape = (2, positions, 2, 16, 18)
+    from tests.simulation.camera import digitize
+
+    shape = (2, positions, 2, *simulation_parameters["camera_shape_yx"])
     raw_data = np.empty(shape, dtype=np.uint16)
     expectation = np.empty(shape, dtype=np.float64)
-    source_expectation = np.empty_like(expectation)
     for time, position, channel in np.ndindex(shape[:3]):
+        exposure = (1 + time / 4 + channel / 2 + position / 8) * illumination_factor
         observation = simulated_camera(
             (1, *shape[-2:]),
             geometry="cartesian",
             # Uniform excitation scales the emission dose before optics
             # and detection; this factor does not change detector QE.
-            exposure=(1 + time / 4 + channel / 2 + position / 8) * illumination_factor,
+            exposure=exposure,
             seed=42 + 100 * time + 10 * position + channel,
             # A prescribed calibration dose supports absolute camera-noise
             # accuracy without clipping the ADC, including doubled exposure.
-            budget=(1000, 2000),
+            budget=(1000, 0),
         )
-        # The prescribed input factor fixes the reference-illumination
-        # photon dose independently of the saved flatfield or processing.
-        source_expectation[time, position, channel] = (
-            observation.expectation[0] / illumination_factor
+        # The uniform fluorescent background spans the full physical detector,
+        # independently of the compact point object's finite storage domain.
+        optical = (
+            observation.expectation[0]
+            + exposure
+            * uniform_optical_calibration(
+                observation.microscope,
+                (1, *shape[-2:]),
+                geometry="cartesian",
+                photon_budget=(2000, 0),
+            )[0]
         )
-        expectation[time, position, channel] = observation.expectation[0]
-        raw_data[time, position, channel] = observation.raw[0]
-    assert expectation.min() >= 1000
+        expectation[time, position, channel] = optical
+        raw_data[time, position, channel] = digitize(
+            optical,
+            observation.microscope.camera,
+            seed=42 + 100 * time + 10 * position + channel,
+        )
     assert raw_data.max() < np.iinfo(np.uint16).max
     dataset = opm_v2_acquisition_factory(
         raw_data[:, :, :, None],
         name="opm_v2_projection",
         mode=mode,
         suffix=".zarr",
+        camera_read_noise_e=observation.microscope.camera.read_noise_e,
         stage_positions_zxy=tuple(
-            (4.0, 20.0, 30.0 + p * 2.3) for p in range(positions)
+            (
+                4.0,
+                20.0,
+                30.0 + p * (shape[-1] + 2) * observation.microscope.pixel_size_um,
+            )
+            for p in range(positions)
         ),
     )
     dataset.expectation = expectation[:, :, :, None]
-    dataset.source_expectation = source_expectation[:, :, :, None]
     dataset.microscope = observation.microscope
     return dataset
 
@@ -655,11 +684,12 @@ def calibrated_mirror_timelapse(roi_camera_scene, opm_v2_acquisition_factory):
     """Write independently noisy exposures containing both original optical emitters."""
     from opm_processing.imageprocessing.opmtools import deskew_shape_estimator
 
-    scene = roi_camera_scene(times=3, shape=(4, 32, 32))
+    scene = roi_camera_scene(times=3)
     dataset = opm_v2_acquisition_factory(
         scene.pixels,
         name="single_mirror",
         camera_conversion=1.0,
+        camera_read_noise_e=scene.microscope.camera.read_noise_e,
         stage_positions_zxy=((0.0, 0.0, 0.0),),
         frame_exposure_ms=5.0021029411764706,
     )

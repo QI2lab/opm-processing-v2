@@ -154,6 +154,7 @@ def assert_uniform_photon_accuracy():
 @pytest.fixture(scope="session")
 def uniform_optical_calibration():
     """Share immutable uniform-phantom means with excitation applied before blur."""
+    from dataclasses import replace
     from functools import lru_cache
 
     from opm_processing.imageprocessing.opmpsf import centered_sensor_axes
@@ -170,6 +171,9 @@ def uniform_optical_calibration():
         geometry="oblique",
     ):
         """Cover the entire sensor footprint and emission-PSF support before sampling."""
+        # Uniform calibration has no sub-pixel structure; keep its established
+        # 0.1 um optical grid instead of allocating a finer full-detector volume.
+        microscope = replace(microscope, fine_spacing_um=0.1)
         pixel = microscope.pixel_size_um
         angle = np.deg2rad(microscope.angle_deg)
         scan, row, column = centered_sensor_axes(
@@ -191,7 +195,7 @@ def uniform_optical_calibration():
             )
         )
         means = forward_model(
-            np.ones(tuple(map(len, axes)), dtype=np.float32),
+            np.broadcast_to(np.float32(1), tuple(map(len, axes))),
             Acquisition(
                 axes,
                 shape,
@@ -213,7 +217,7 @@ def illumination_calibration_ensemble(roi_camera_scene, uniform_optical_calibrat
     """Provide identifiable optical calibration before the unchanged point sample."""
     from tests.simulation.camera import digitize
 
-    scene = roi_camera_scene(shape=(24, 33, 33))
+    scene = roi_camera_scene()
     microscope = scene.microscope
     # Constant emission over the full optical support makes illumination
     # identifiable independently of sparse sample structure at timepoint1.
@@ -229,9 +233,15 @@ def illumination_calibration_ensemble(roi_camera_scene, uniform_optical_calibrat
 
 @pytest.fixture
 def illumination_observations(
-    request, microscope_parameters, uniform_optical_calibration
+    request,
+    microscope_parameters,
+    uniform_optical_calibration,
+    simulation_parameters,
+    tmp_path,
+    opm_v2_acquisition_factory,
 ):
     """Observe a uniform optical calibration object at prescribed exposures."""
+    from opm_processing.dataio.acquisition import open_acquisition_datastore
     from tests.simulation.camera import digitize
     from tests.simulation.camera_likelihood import (
         SamplingEnvelope,
@@ -241,7 +251,8 @@ def illumination_observations(
     kind = request.param
     tiled = kind == "tiles"
     positions, channels = (6, 2) if tiled else (2, 2 if kind == "masked" else 1)
-    height, width = (64, 128) if tiled else (32, 64)
+    height, width = simulation_parameters["camera_shape_yx"]
+    scans = simulation_parameters["tiled_scan_planes" if tiled else "whole_scan_planes"]
     y = np.linspace(-1, 1, height, dtype=np.float32)[:, None]
     x = np.linspace(-1, 1, width, dtype=np.float32)[None, :]
     if tiled:
@@ -251,7 +262,7 @@ def illumination_observations(
                 1 - 0.22 * y + 0.16 * x - 0.06 * y * x,
             )
         )
-        detector_x = 78
+        detector_x = round(width * 78 / 128)
         stripe = 1 - 0.12 * np.exp(-0.5 * ((np.arange(width) - detector_x) / 3) ** 2)
         fields *= stripe[None, None]
         fields /= fields.mean(axis=(1, 2), keepdims=True)
@@ -264,19 +275,18 @@ def illumination_observations(
     camera = microscope.camera
     optical_mean = uniform_optical_calibration(
         microscope,
-        (12, height, width),
+        (scans, height, width),
         photon_budget=(5000 / microscope.quantum_efficiency, 0),
     )
     source = float(optical_mean.mean())
     np.testing.assert_allclose(optical_mean, source, rtol=2e-5)
-    levels = np.linspace(0.75, 1.25, 12)[:, None, None]
-    means = optical_mean[None, None] * levels * fields[:, :, None]
-    raw = digitize(
-        means,
-        camera,
-        seed=71,
-    )[None]
-    assert raw.max() < 2**camera.bit_depth - 1
+    levels = np.linspace(0.75, 1.25, scans)[:, None, None]
+    raw = np.lib.format.open_memmap(
+        tmp_path / "illumination_camera.npy",
+        mode="w+",
+        dtype=np.uint16,
+        shape=(1, positions, channels, scans, height, width),
+    )
     coordinates = np.zeros((positions, 3))
     coordinates[:, 1] = np.arange(positions) * 100 if tiled else 20
     coordinates[:, 0] = np.arange(positions) * 10
@@ -291,36 +301,56 @@ def illumination_observations(
         int(np.ceil(2 * (height - 1) / (height // 2 - 1))),
         int(np.ceil(2 * (width - 1) / (width // 2 - 1))),
     )
-    envelopes = []
+    eligible = np.ones((positions, channels), bool) if mask is None else mask[0]
+    envelopes = [None] * channels
     for channel in range(channels):
-        eligible = np.ones(positions, bool) if mask is None else mask[0, :, channel]
-        if eligible.any():
-            expected[channel] = fields[eligible, channel].max(axis=0)
-            bounds = [
-                camera_sampling_envelope(
-                    means[position, channel],
-                    raw[0, position, channel],
+        if eligible[:, channel].any():
+            expected[channel] = fields[eligible[:, channel], channel].max(axis=0)
+        for position in range(positions):
+            # Form and digitize one real camera view before retaining its bytes
+            # on disk. The full acquisition still reaches the opm-v2 writer.
+            means = optical_mean * levels * fields[position, channel]
+            pixels = digitize(means, camera, seed=71 + 10 * position + channel)
+            assert pixels.max() < 2**camera.bit_depth - 1
+            raw[0, position, channel] = pixels
+            if eligible[position, channel]:
+                bounds = camera_sampling_envelope(
+                    means,
+                    pixels,
                     camera,
                     radii=radii,
                     response=levels,
-                    views=int(eligible.sum()),
+                    views=int(eligible[:, channel].sum()),
                 )
-                for position in np.flatnonzero(eligible)
-            ]
-            envelopes.append(
-                SamplingEnvelope(
-                    np.maximum.reduce(
-                        [(bound.lower / levels).min(axis=0) for bound in bounds]
-                    ),
-                    np.maximum.reduce(
-                        [(bound.upper / levels).max(axis=0) for bound in bounds]
-                    ),
+                reduced = SamplingEnvelope(
+                    (bounds.lower / levels).min(axis=0),
+                    (bounds.upper / levels).max(axis=0),
                 )
-            )
-        else:
-            envelopes.append(None)
+                previous = envelopes[channel]
+                envelopes[channel] = (
+                    reduced
+                    if previous is None
+                    else SamplingEnvelope(
+                        np.maximum(previous.lower, reduced.lower),
+                        np.maximum(previous.upper, reduced.upper),
+                    )
+                )
+                del bounds
+            del means, pixels
+    raw.flush()
+    dataset = opm_v2_acquisition_factory(
+        raw,
+        name="illumination_observations",
+        camera_offset=camera.offset_adu,
+        camera_conversion=camera.electrons_per_adu,
+        camera_read_noise_e=camera.read_noise_e,
+        pixel_size_um=microscope.pixel_size_um,
+        scan_axis_step_um=microscope.scan_step_um,
+        angle_deg=microscope.angle_deg,
+        stage_positions_zxy=tuple(map(tuple, coordinates)),
+    )
     return SimpleNamespace(
-        datastore=ts.array(raw),
+        datastore=open_acquisition_datastore(dataset.metadata),
         offset=camera.offset_adu,
         conversion=camera.electrons_per_adu,
         coordinates=coordinates,
@@ -374,11 +404,12 @@ def illumination_fit_case(monkeypatch, topology, storage):
 
 @pytest.fixture
 def constant_illumination_acquisition(
-    opm_v2_acquisition_factory, uniform_camera_scene, scan_planes
+    opm_v2_acquisition_factory, uniform_camera_scene, scan_planes, simulation_parameters
 ):
     """Persist independent optical exposures through the real acquisition writer."""
     fields = np.broadcast_to(
-        np.array([2, 1.25], np.float32)[:, None, None], (2, 24, 256)
+        np.array([2, 1.25], np.float32)[:, None, None],
+        (2, *simulation_parameters["camera_shape_yx"]),
     ).copy()
     scene = uniform_camera_scene(
         times=2,
@@ -393,5 +424,6 @@ def constant_illumination_acquisition(
         stage_positions_zxy=((10, 20, 30), (0, 20, 30)),
         camera_offset=scene.microscope.camera.offset_adu,
         camera_conversion=scene.microscope.camera.electrons_per_adu,
+        camera_read_noise_e=scene.microscope.camera.read_noise_e,
     )
     return SimpleNamespace(dataset=dataset, fields=fields[None], scene=scene)

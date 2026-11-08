@@ -29,7 +29,10 @@ def orthogonal_registration_pair(request, simulation_parameters, registration_sp
         "distance": calibration["scan_step_um"],
         "pixel_size": calibration["pixel_size_um"],
     }
-    shape = (20, 48, 48)
+    shape = (
+        simulation_parameters["whole_scan_planes"],
+        *simulation_parameters["camera_shape_yx"],
+    )
     delta_y, delta_x = request.param
     error = np.array([0, 2 * bool(delta_y), 2 * bool(delta_x)])
     origins = [np.zeros(3), np.array([0, delta_y, delta_x])]
@@ -248,11 +251,19 @@ def deskew_mosaic(deskew_field, deskew_output, factor):
 
 
 @pytest.fixture
-def deskew_processing_case(factor, mode, opm_v2_acquisition_factory, roi_camera_scene):
+def deskew_processing_case(
+    factor, mode, opm_v2_acquisition_factory, roi_camera_scene, simulation_parameters
+):
     """Provide original optical emitters, actual producer files and physical bounds."""
     from opm_processing.dataio.roi import PhysicalRoi
 
-    scene = roi_camera_scene(shape=(24, 33, 33))
+    shape = (
+        simulation_parameters[
+            "tiled_scan_planes" if mode == "cropped" else "whole_scan_planes"
+        ],
+        *simulation_parameters["camera_shape_yx"],
+    )
+    scene = roi_camera_scene(shape=shape)
     microscope = scene.microscope
     geometry = {
         "theta": microscope.angle_deg,
@@ -263,6 +274,7 @@ def deskew_processing_case(factor, mode, opm_v2_acquisition_factory, roi_camera_
         scene.pixels,
         name="deskew_tail",
         camera_conversion=1.0,
+        camera_read_noise_e=microscope.camera.read_noise_e,
         stage_positions_zxy=((0, 0, 0),),
     )
     source_shape = scene.pixels.shape[-3:]
@@ -330,11 +342,13 @@ def stage_placement_acquisition(
     simulation_parameters,
     microscope_parameters,
     independent_photon_scene_factory,
+    crop,
 ):
     """Image one fixed point through the shared physical oblique camera model."""
     from dataclasses import replace
 
     from opm_processing.dataio.acquisition import ChannelMetadata
+    from opm_processing.imageprocessing.opmpsf import camera_grid_center
     from tests.fixtures.acquisition import opm_v2_frame_metadata
     from tests.simulation.camera import digitize
     from tests.simulation.forward_model import Acquisition, forward_model
@@ -342,10 +356,16 @@ def stage_placement_acquisition(
 
     pixel_um = simulation_parameters["microscope"]["pixel_size_um"]
     angle = simulation_parameters["microscope"]["angle_deg"]
-    step_um = 0.23
-    scans, camera_height, camera_width = 40, 64, 48
+    step_um = simulation_parameters["microscope"]["scan_step_um"]
+    scans = simulation_parameters["tiled_scan_planes" if crop else "whole_scan_planes"]
+    camera_height, camera_width = simulation_parameters["camera_shape_yx"]
     theta = np.deg2rad(angle)
-    bead_zyx_um = np.asarray((20, 64, 24)) * pixel_um
+    bead_zyx_um = pixel_um * np.rint(
+        camera_grid_center(
+            (scans, camera_height, camera_width), pixel_um, step_um, angle
+        )
+        / pixel_um
+    )
     stage_z_values_um = -np.asarray((0, 6, 12)) * pixel_um
     microscope = replace(microscope_parameters, scan_step_um=step_um, angle_deg=angle)
     scene = independent_photon_scene_factory()
@@ -433,6 +453,7 @@ def stage_placement_acquisition(
                     pixel_size_um=pixel_um,
                     camera_offset=microscope.camera.offset_adu,
                     camera_conversion=microscope.camera.electrons_per_adu,
+                    camera_read_noise_e=microscope.camera.read_noise_e,
                     runner_time_ms=float(position * scans + scan)
                     * simulation_parameters["pipeline"]["plane_period_s"]
                     * 1000,
@@ -455,4 +476,5 @@ def stage_placement_acquisition(
     dataset.means = means
     dataset.ground_truth = scene
     dataset.stage_z_values_um = stage_z_values_um
+    dataset.bead_zyx_um = bead_zyx_um
     return dataset

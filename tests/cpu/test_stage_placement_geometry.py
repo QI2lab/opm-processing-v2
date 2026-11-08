@@ -65,7 +65,7 @@ def test_physical_stage_z_translation_preserves_registered_xy(
         peaks.append(np.unravel_index(np.argmax(volume), volume.shape))
     # The independent forward model fixes the bead in physical coordinates.
     # A common scan-length error must not disappear in a relative comparison.
-    expected_peak_um = np.asarray((20, 64, 24)) * pixel_um
+    expected_peak_um = case.bead_zyx_um
     placed_peaks = np.asarray(peaks) * pixel_um + origins
     np.testing.assert_allclose(
         (placed_peaks - expected_peak_um) / pixel_um, 0.0, atol=1 + 1e-8
@@ -73,8 +73,11 @@ def test_physical_stage_z_translation_preserves_registered_xy(
     np.testing.assert_allclose(
         (placed_peaks - placed_peaks[0]) / pixel_um, 0.0, atol=1 + 1e-8
     )
-    crop_y = int(np.ceil(64 * np.cos(np.deg2rad(angle)))) if crop else 0
-    np.testing.assert_allclose(np.asarray(peaks)[:, 1:] - (64 - crop_y, 24), 0, atol=1)
+    crop_y = (
+        int(np.ceil(case.raw_data.shape[-2] * np.cos(np.deg2rad(angle)))) if crop else 0
+    )
+    expected_yx = expected_peak_um[1:] / pixel_um - (crop_y, 0)
+    np.testing.assert_allclose(np.asarray(peaks)[:, 1:] - expected_yx, 0, atol=1)
     fusion.run()
     np.testing.assert_allclose(fusion.global_offsets, 0.0, atol=1.0)
     assert len(fusion.pairwise_metrics) >= 2
@@ -207,9 +210,10 @@ def test_physical_stage_z_translation_preserves_registered_xy(
                 + raw_origins[position]
                 - expected_peak_um,
             )
-            assert all(np.any(aperture & support) for aperture in apertures[:2])
-            for aperture in apertures:
+            for index, aperture in enumerate(apertures):
                 selected = aperture & support
+                if index < 2:
+                    assert selected.any()
                 if np.any(selected):
                     accuracy = camera_sampling_accuracy(
                         prediction, mean, envelope, selected

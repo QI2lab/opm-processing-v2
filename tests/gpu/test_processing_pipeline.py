@@ -16,7 +16,7 @@ pytestmark = [
             (mode, illumination, step, crop)
             for mode in ("stage", "mirror")
             for step in (0.4, 1.2)
-            for illumination, crop in ((False, None), (True, 4))
+            for illumination, crop in ((False, None), (True, 39))
         ],
         indirect=True,
         ids=[

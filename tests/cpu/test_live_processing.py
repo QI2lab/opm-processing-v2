@@ -234,8 +234,9 @@ def test_live_processing_preserves_original_optical_emitters(
     dataset = opm_v2_live_acquisition_factory(
         raw,
         name="live",
-        illumination=np.ones((1, 32, 32), np.float32),
+        illumination=np.ones((1, *raw.shape[-2:]), np.float32),
         camera_conversion=1.0,
+        camera_read_noise_e=scene.microscope.camera.read_noise_e,
     )
     root = relocate_acquisition(tmp_path, copy=save_float32)
     assert dataset.path.exists() == save_float32
@@ -253,7 +254,11 @@ def test_live_processing_preserves_original_optical_emitters(
         # Offline live-wait finds the supplied field in the current directory.
         field = root / "live_flatfield.ome.tif"
         processing = importlib.import_module("opm_processing.process")
-        processing.write_flatfield(field, np.ones((1, 1, 32, 32), np.float32), 0.115)
+        processing.write_flatfield(
+            field,
+            np.ones((1, 1, *raw.shape[-2:]), np.float32),
+            scene.microscope.pixel_size_um,
+        )
         args.extend(("--live-wait", "--flatfield-correction"))
     if save_float32:
         args.append("--save-float32")
@@ -265,14 +270,15 @@ def test_live_processing_preserves_original_optical_emitters(
     assert np.dtype(actual.dtype) == expected_dtype
     assert actual.shape == deskew_uniform_expectation(raw.shape[-3:], 1).shape
     stage_anchor = np.asarray((-30.0, -100.0, 200.0))
+    scan_extent = round((raw.shape[-3] - 1) * scene.microscope.scan_step_um, 3)
     assert_roi_point_accuracy(
         actual[None, None],
         scene,
         stage_anchor + output.spatial_origins_zyx_um[0],
         output.voxel_size_um,
-        raw_origin=(-30.0, -102.8, 200.0),
+        raw_origin=stage_anchor + np.asarray((0, -scan_extent, 0)),
     )
-    assert output.spatial_origins_zyx_um[0] == (0.0, -2.8, 0.0)
+    assert output.spatial_origins_zyx_um[0] == (0.0, -scan_extent, 0.0)
     state = ProcessingState.read(root / "live.processing.json")
     assert state.completed_tiles(root / "live_deskewed.ome.zarr") == {(0, 0)}
     if save_float32:

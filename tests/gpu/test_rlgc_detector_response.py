@@ -11,7 +11,7 @@ from scipy.special import kl_div
 @pytest.mark.integration
 @pytest.mark.parametrize(
     "mosaic_acquisition",
-    [("mirror", 0.4, 0.001, 2), ("stage", 1.2, 0.001, 2)],
+    [("mirror", 0.4, 0.001), ("stage", 1.2, 0.001)],
     indirect=True,
 )
 def test_roi_deconvolves_recorded_sampling(
@@ -69,14 +69,16 @@ def test_roi_deconvolves_recorded_sampling(
     native_shape = case.dataset.raw_data.shape[-3:]
     # The original line object is at laboratory Y=0 on the centered sensor.
     # Place that physical site in the saved preview grid without reading pixels.
+    native_step = microscope.scan_step_um / round(microscope.scan_step_um / 0.4)
     source_y = (
-        4.6
+        -case.dataset.metadata.stage_positions_zxy[0][1]
         + camera_grid_center(
-            native_shape,
+            (case.optical_data.native_scan_planes, *native_shape[1:]),
             microscope.pixel_size_um,
-            microscope.scan_step_um,
+            native_step,
             microscope.angle_deg,
         )[1]
+        - case.optical_data.first_native_scan_index * native_step
     )
     if case.dataset.metadata.scan_axis_reversed:
         source_y -= (native_shape[0] - 1) * microscope.scan_step_um
@@ -85,7 +87,8 @@ def test_roi_deconvolves_recorded_sampling(
         (source_y - grid.translation_transform.translation[-2])
         / grid.scale_transform.scale[-2]
     )
-    bounds = (center - 16, center + 16, 40, 88)
+    source_x = (case.expectation.shape[-1] - 1) // 2
+    bounds = (center - 16, center + 16, source_x - 32, source_x + 32)
     monkeypatch.setattr(export_rois, "select_rois", lambda source, shape: [bounds])
     processing = importlib.import_module("opm_processing.process")
     solver = importlib.import_module("opm_processing.imageprocessing.rlgc")
@@ -583,7 +586,7 @@ def test_saved_fluorescence_with_detector_response(
         )
     )
     settings = state.run(case.output)["configuration"]["deconvolution"]
-    assert settings["read_noise"] == 0
+    assert settings["read_noise"] == case.scene.microscope.camera.read_noise_e
     assert settings["psf_parameters"] is not None
     assert settings["psf_sha256"] is None
     run(case.dataset.path, **case.options, resume=True)

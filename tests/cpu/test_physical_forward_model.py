@@ -289,13 +289,20 @@ def test_subsampling_selects_the_same_physical_exposures(
     scene = independent_photon_scene_factory()
     p = scene.microscope
     shape = acquisition_shape(scene)
+    sensor_axes = centered_sensor_axes(
+        shape, (p.scan_step_um, p.pixel_size_um, p.pixel_size_um)
+    )
     dense = forward_model(
-        scene.density, Acquisition(scene.axes, shape, output="expectation"), p
+        scene.density,
+        Acquisition(scene.axes, sensor_axes=sensor_axes, output="expectation"),
+        p,
     )
     coarse = forward_model(
         scene.density,
         Acquisition(
-            scene.axes, ((shape[0] - 1) // factor + 1, *shape[1:]), output="expectation"
+            scene.axes,
+            sensor_axes=(sensor_axes[0][::factor], *sensor_axes[1:]),
+            output="expectation",
         ),
         replace(p, scan_step_um=p.scan_step_um * factor),
     )

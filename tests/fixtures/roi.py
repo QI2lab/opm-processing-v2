@@ -40,6 +40,7 @@ def roi_preview(
         pixels,
         mode=mode,
         camera_conversion=1.0,
+        camera_read_noise_e=scene.microscope.camera.read_noise_e,
         stage_positions_zxy=scene.stage_positions_zxy,
         acquired_plane_count=pixels.shape[-3],
         plane_period_s=simulation_parameters["pipeline"]["plane_period_s"],
@@ -108,27 +109,42 @@ def roi_run(tmp_path: Path, opm_v2_acquisition_factory, roi_camera_scene):
     from types import SimpleNamespace
 
     from opm_processing.dataio.roi import PhysicalRoi
+    from opm_processing.imageprocessing.opmtools import deskew_shape_estimator
 
     process = importlib.import_module("opm_processing.process")
     scene = roi_camera_scene(positions=3, channels=3, vary_positions=True)
     scene.stage_positions_zxy = ((0.0, 0.0, 0.0),) * 3
     pixels = scene.pixels
     dataset = opm_v2_acquisition_factory(
-        pixels, camera_conversion=1.0, stage_positions_zxy=scene.stage_positions_zxy
+        pixels,
+        camera_conversion=1.0,
+        camera_read_noise_e=scene.microscope.camera.read_noise_e,
+        stage_positions_zxy=scene.stage_positions_zxy,
     )
     source, metadata = dataset.path, dataset.metadata
+    pixel = scene.microscope.pixel_size_um
+    halo = np.asarray(scene.microscope.psf_half_extent_zyx_um)[1:]
+    low = np.floor((scene.centers_zyx_um[:, 1:].min(axis=0) - halo) / pixel)
+    high = np.ceil((scene.centers_zyx_um[:, 1:].max(axis=0) + halo) / pixel)
+    height, width = deskew_shape_estimator(
+        pixels.shape[-3:],
+        scene.microscope.angle_deg,
+        scene.microscope.scan_step_um,
+        pixel,
+        crop_after_deskew=False,
+    )[0][1:]
     roi = PhysicalRoi(
-        bounds_yx_um=(2.07, 4.14, 0.46, 3.22),
+        bounds_yx_um=tuple(np.array((low[0], high[0], low[1], high[1])) * pixel),
         source_path=tmp_path / "sample_max_z_fused.ome.zarr",
         grid_origin_yx_um=(0.0, 0.0),
-        pixel_size_yx_um=(0.115, 0.115),
+        pixel_size_yx_um=(pixel, pixel),
         position_indices=(1, 2),
         tile_footprints=tuple(
             {
                 "time_index": 0,
                 "position_index": position,
                 "origin_zyx_um": [0.0, 0.0, 0.0],
-                "bounds_yx_um": [0.0, 6.4, 0.0, 3.68],
+                "bounds_yx_um": [0.0, height * pixel, 0.0, width * pixel],
             }
             for position in (1, 2)
         ),
@@ -148,7 +164,7 @@ def roi_run(tmp_path: Path, opm_v2_acquisition_factory, roi_camera_scene):
 
 
 @pytest.fixture
-def roi_camera_scene(simulated_camera):
+def roi_camera_scene(simulated_camera, simulation_parameters):
     """Share actual optical observations and original physical point locations.
 
     Returns
@@ -161,10 +177,13 @@ def roi_camera_scene(simulated_camera):
 
     from opm_processing.imageprocessing.opmpsf import camera_grid_center
 
-    def create(
-        *, times=1, positions=1, channels=1, vary_positions=False, shape=(8, 32, 32)
-    ):
+    def create(*, times=1, positions=1, channels=1, vary_positions=False, shape=None):
         """Render the existing physical point object without a new image simulator."""
+        if shape is None:
+            shape = (
+                simulation_parameters["whole_scan_planes"],
+                *simulation_parameters["camera_shape_yx"],
+            )
         pixels = np.empty((times, positions, channels, *shape), np.uint16)
         means = np.empty(pixels.shape, np.float64)
         for time, position, channel in np.ndindex(pixels.shape[:3]):

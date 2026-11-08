@@ -86,7 +86,20 @@ def test_raw_roi_exports_and_resume(
     case = roi_preview
     directory = case.preview.parent
     preview_name = case.preview.name
-    selections = [(16, 27, 3, 15), (24, 36, 16, 29)]
+    microscope = case.truth.microscope
+    pixel = microscope.pixel_size_um
+    centers = (
+        case.truth.centers_zyx_um[:, 1:]
+        + np.asarray(case.raw_origin_zyx_um)[1:]
+        - np.asarray(case.origin)[1:]
+    ) / pixel
+    margins = np.ceil(np.asarray(microscope.psf_half_extent_zyx_um)[1:] / pixel)
+    selections = [
+        tuple(np.array((low[0], high[0], low[1], high[1]), dtype=int))
+        for low, high in zip(
+            np.floor(centers - margins), np.ceil(centers + margins) + 1, strict=True
+        )
+    ]
     calls = []
     checkpoints = []
     complete_channel = ProcessingState.complete_channel
@@ -256,9 +269,11 @@ def test_roi_maps_extended_specimen_to_raw_tiles(
 ):
     """Keep the oblique preimage and measure fresh links across a real tile seam."""
     from opm_processing.dataio.position_collection import open_position_collection
+    from opm_processing.imageprocessing.opmpsf import camera_grid_center
     from opm_processing.imageprocessing.tilefusion import TileFusion
     from opm_processing.process import process_skewed
     from tests.simulation.camera_likelihood import (
+        SamplingEnvelope,
         camera_sampling_accuracy,
         camera_sampling_envelope,
         sampling_stencil_footprint,
@@ -278,16 +293,19 @@ def test_roi_maps_extended_specimen_to_raw_tiles(
     preview = case.dataset.path.parent / "mosaic_max_z_fused.ome.zarr"
     microscope = case.microscope
     pixel = microscope.pixel_size_um
-    scans, rows = case.expectation.shape[:2]
-    angle = np.deg2rad(microscope.angle_deg)
+    native_step = case.optical_data.ground_truth.microscope.scan_step_um
+    reference_center = camera_grid_center(
+        (case.optical_data.native_scan_planes, *case.expectation.shape[1:]),
+        pixel,
+        native_step,
+        microscope.angle_deg,
+    )
+    reference_center[1] -= case.optical_data.first_native_scan_index * native_step
     # The original fluorescent lines are centered at laboratory Y=0. Choose
     # their center from acquisition geometry, before inspecting processed pixels.
-    cy = round(
-        ((scans - 1) * microscope.scan_step_um + (rows - 1) * pixel * np.cos(angle))
-        / (2 * pixel)
-    )
+    cy = round(reference_center[1] / pixel)
     offset = case.parameters["tile_offset_x_pixels"]
-    bounds = (cy - 16, cy + 16, offset - 8, case.parameters["camera_shape_yx"][1] + 8)
+    bounds = (cy - 16, cy + 16, offset - 8, case.dataset.raw_data.shape[-1] + 8)
     monkeypatch.setattr(export_rois, "select_rois", lambda source, shape: [bounds])
     measurements = []
     register = TileFusion.register_and_score
@@ -326,6 +344,7 @@ def test_roi_maps_extended_specimen_to_raw_tiles(
     if stage:
         raw = raw[:, ::-1]
     shape = raw.shape[-3:]
+    stage_z, stage_scan, stage_x = case.dataset.metadata.stage_positions_zxy[0]
     width = shape[-1]
     means = [case.expectation[..., p * offset : p * offset + width] for p in range(2)]
     gain = 2 * pixel / microscope.scan_step_um
@@ -354,11 +373,12 @@ def test_roi_maps_extended_specimen_to_raw_tiles(
                 else saved.spatial_origins_zyx_um[position]
             )
             # These are the simulator's actual placements, before the prescribed
-            # one-pixel X and 0.001-um scan-encoder errors in acquisition metadata.
+            # five-native-pixel X and 0.001-um scan-encoder metadata errors.
             frame_origin = (
-                -2.3,
-                4.6 - ((scans - 1) * microscope.scan_step_um if stage else 0),
-                1.15 + position * offset * pixel,
+                -stage_z,
+                -stage_scan
+                - ((shape[0] - 1) * microscope.scan_step_um if stage else 0),
+                stage_x + position * offset * pixel,
             )
             sample = (origin, spacing, frame_origin, shape, microscope)
             support = camera_volume_samples(np.ones(image.shape), *sample)
@@ -379,23 +399,34 @@ def test_roi_maps_extended_specimen_to_raw_tiles(
                 if fused
                 else None,
             )
+            record = next(
+                item for item in records if item["position_index"] == position
+            )
+            start, stop, x0, x1 = record["skewed_bounds_sx"]
+            selection = (slice(start, stop), slice(None), slice(x0, x1))
+            local_shape = (stop - start, shape[1], x1 - x0)
+            local_center = camera_grid_center(
+                local_shape, pixel, microscope.scan_step_um, microscope.angle_deg
+            )
+            local_center += np.asarray(
+                (0, start * microscope.scan_step_um, (x0 + position * offset) * pixel)
+            )
             apertures = camera_object_apertures(
                 case.optical_data.ground_truth,
                 microscope,
-                shape,
-                camera_offset_zyx_um=(
-                    0,
-                    0,
-                    (position * offset + (width - case.expectation.shape[-1]) / 2)
-                    * pixel,
-                ),
+                local_shape,
+                camera_offset_zyx_um=local_center - reference_center,
             )
-            assert all(np.any(aperture & support) for aperture in apertures[:2])
-            for aperture in apertures:
-                selected = aperture & support
+            local_envelope = SamplingEnvelope(
+                envelope.lower[selection], envelope.upper[selection]
+            )
+            for index, aperture in enumerate(apertures):
+                selected = aperture & support[selection]
+                if index < 2:
+                    assert selected.any()
                 if np.any(selected):
                     accuracy = camera_sampling_accuracy(
-                        prediction, mean, envelope, selected
+                        prediction[selection], mean[selection], local_envelope, selected
                     )
                     assert accuracy.accepted, accuracy
 

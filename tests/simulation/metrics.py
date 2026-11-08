@@ -11,19 +11,6 @@ from opm_processing.imageprocessing.opmpsf import (
 )
 
 
-def camera_partition_apertures(shape):
-    """Provide whole-camera and fixed detector row/column photon-count regions."""
-    masks = [np.ones(shape, bool)]
-    for axis in (-2, -1):
-        for index in range(shape[axis]):
-            mask = np.zeros(shape, bool)
-            selector = [slice(None)] * len(shape)
-            selector[axis] = index
-            mask[tuple(selector)] = True
-            masks.append(mask)
-    return tuple(masks)
-
-
 def poisson_log_ratio_moments(expectation, prediction):
     """Exact mean and variance of log p(N|lambda)/p(N|mu), N~Pois(lambda).
 
@@ -125,42 +112,37 @@ def camera_object_apertures(
     neighborhoods are fixed independently of reconstructed values. Detector
     row/column subsets preserve sensitivity to broad compensating stripes.
     """
+    from tests.simulation.forward_model import camera_psf
+
     pixel, step = microscope.pixel_size_um, microscope.scan_step_um
     angle = np.deg2rad(microscope.angle_deg)
     x, y, z = get_skewed_coords(shape, pixel, step, angle)
     center = camera_grid_center(shape, pixel, step, microscope.angle_deg)
     coordinates = tuple(
-        coordinate + offset
-        for coordinate, offset in zip(
-            (
-                np.broadcast_to(z - center[0], shape),
-                np.broadcast_to(y - center[1], shape),
-                np.broadcast_to(x - center[2], shape),
-            ),
-            camera_offset_zyx_um,
-            strict=True,
+        coordinate - midpoint + offset
+        for coordinate, midpoint, offset in zip(
+            (z, y, x), center, camera_offset_zyx_um, strict=True
         )
     )
     radius = 0.61 * microscope.wavelength_um / microscope.numerical_aperture
     interior = np.ones(shape, bool)
-    for index, (coordinate, axis, halo) in enumerate(
-        zip(
-            coordinates,
-            ground_truth.axes,
-            microscope.psf_half_extent_zyx_um,
-            strict=True,
-        )
+    for coordinate, axis, halo in zip(
+        coordinates,
+        ground_truth.axes,
+        microscope.psf_half_extent_zyx_um,
+        strict=True,
     ):
-        if ground_truth.kind == "line-pairs" and index == 0:
-            # These thin known cylinders have a finite background slab rather
-            # than a full axial PSF halo. Score the original physical slab near
-            # the cylinders, including their two-Rayleigh background region.
-            extent = ground_truth.features["diameter_um"] / 2 + 2 * radius
-            interior &= (coordinate >= max(axis[0], -extent)) & (
-                coordinate <= min(axis[-1], extent)
-            )
-            continue
         interior &= (coordinate >= axis[0] + halo) & (coordinate <= axis[-1] - halo)
+    # A valid physical reference also needs the full declared optical support
+    # inside this observed camera ROI, not just inside the original specimen.
+    kernel, _ = camera_psf(microscope)
+    for axis, (length, support) in enumerate(zip(shape, kernel.shape, strict=True)):
+        indices = np.arange(length)
+        dimensions = [1] * len(shape)
+        dimensions[axis] = length
+        interior &= (
+            (indices >= support // 2) & (indices < length - support // 2)
+        ).reshape(dimensions)
     distance = np.full(shape, np.inf)
     if ground_truth.kind == "line-pairs":
         features = ground_truth.features
@@ -200,9 +182,14 @@ def camera_object_apertures(
     background = interior & (distance >= 2 * radius)
     if not source.any() or not background.any():
         raise ValueError("The physical camera field must acquire source and background")
-    masks = [source, background]
-    for partition in camera_partition_apertures(shape)[1:]:
-        selected = partition & interior
-        if selected.any():
-            masks.append(selected)
-    return tuple(masks)
+    yield source
+    yield background
+    for axis in (-2, -1):
+        for index in range(shape[axis]):
+            partition = [slice(None)] * len(shape)
+            partition[axis] = slice(index, index + 1)
+            partition = tuple(partition)
+            if interior[partition].any():
+                selected = np.zeros(shape, bool)
+                selected[partition] = interior[partition]
+                yield selected

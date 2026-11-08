@@ -172,14 +172,18 @@ def test_tiled_deskew_matches_global_grid(
 
 @pytest.mark.unit
 @pytest.mark.parametrize(
-    "noisy_extended_scene",
-    [(kind, "uniform", 1) for kind in ("line-pairs", "sphere")],
-    indirect=True,
-    ids=("line-pairs", "sphere"),
+    "noisy_extended_scene,layout",
+    [
+        pytest.param((kind, "uniform", 1, layout), layout, id=f"{kind}-{layout}")
+        for kind in ("line-pairs", "sphere")
+        for layout in ("whole", "tiled")
+    ],
+    indirect=["noisy_extended_scene"],
+    scope="session",
 )
 @pytest.mark.parametrize("scan_factor", (1, 3), ids=("native", "sparse3"))
 def test_large_noisy_deskew_preserves_scientific_bounds_across_tiles(
-    noisy_extended_scene, scan_factor, tmp_path, monkeypatch
+    noisy_extended_scene, layout, scan_factor, tmp_path, monkeypatch
 ):
     """Deskew real noisy optical scenes through bounded Ryomen output tiles."""
     from dataclasses import replace
@@ -196,6 +200,7 @@ def test_large_noisy_deskew_preserves_scientific_bounds_across_tiles(
     from tests.simulation.metrics import camera_volume_samples
 
     microscope, expectation, raw, source, _dark = noisy_extended_scene
+    assert raw.shape == (50 if layout == "whole" else 200, 256, 1900)
     microscope = replace(microscope, scan_step_um=microscope.scan_step_um * scan_factor)
     expectation, raw, source = (
         array[::scan_factor] for array in (expectation, raw, source)
@@ -210,12 +215,15 @@ def test_large_noisy_deskew_preserves_scientific_bounds_across_tiles(
         "pixel_size": pixel,
         "downsample_factor": z_bin,
     }
-    whole = orthogonal_deskew(data, **geometry)
+    shape = opmtools.deskew_shape_estimator(
+        data.shape, **geometry, crop_after_deskew=False
+    )[0]
+    whole = orthogonal_deskew(data, **geometry) if layout == "tiled" else None
     output = np.lib.format.open_memmap(
-        tmp_path / "deskew.npy", mode="w+", dtype=np.float32, shape=whole.shape
+        tmp_path / "deskew.npy", mode="w+", dtype=np.float32, shape=tuple(shape)
     )
     output[:] = np.nan
-    tile_shape = (5, 32, 40)
+    tile_shape = (8, 128, 256) if layout == "tiled" else None
     slicers, visits = [], []
     interpolate = opmtools.interpolate_rows
 
@@ -234,29 +242,35 @@ def test_large_noisy_deskew_preserves_scientific_bounds_across_tiles(
         execution.setattr(opmtools, "Slicer", observe_slicer)
         execution.setattr(opmtools, "interpolate_rows", observe_rows)
         tiled = orthogonal_deskew(data, **geometry, tile_shape=tile_shape, out=output)
-    assert tiled is output and slicers == [len(visits)] and len(visits) > 8
-    np.testing.assert_array_equal(tiled, whole)
-    covered = np.zeros(tiled.shape, bool)
-    foreground = orthogonal_deskew(source.astype(np.float32), **geometry) > 0
-    for origin, shape in visits:
-        assert np.all(np.asarray(shape) <= tile_shape)
-        selection = tuple(
-            slice(start, start + size)
-            for start, size in zip(origin, shape, strict=True)
-        )
-        covered[selection] = True
-    assert covered.all()
-    crossings = 0
-    for axis in range(3):
-        borders = sorted({origin[axis] for origin, _shape in visits if origin[axis]})
-        crossings += sum(
-            np.any(
-                np.take(foreground, border - 1, axis=axis)
-                & np.take(foreground, border, axis=axis)
+    assert tiled is output and slicers == [len(visits)]
+    if layout == "tiled":
+        assert len(visits) > 8
+        np.testing.assert_array_equal(tiled, whole)
+        covered = np.zeros(tiled.shape, bool)
+        foreground = orthogonal_deskew(source.astype(np.float32), **geometry) > 0
+        for origin, shape in visits:
+            assert np.all(np.asarray(shape) <= tile_shape)
+            selection = tuple(
+                slice(start, start + size)
+                for start, size in zip(origin, shape, strict=True)
             )
-            for border in borders
-        )
-    assert crossings >= 2
+            covered[selection] = True
+        assert covered.all()
+        crossings = 0
+        for axis in range(3):
+            borders = sorted(
+                {origin[axis] for origin, _shape in visits if origin[axis]}
+            )
+            crossings += sum(
+                np.any(
+                    np.take(foreground, border - 1, axis=axis)
+                    & np.take(foreground, border, axis=axis)
+                )
+                for border in borders
+            )
+        assert crossings >= 2
+    else:
+        assert visits == [((0, 0, 0), tiled.shape)]
     coverage_zy = deskew_coverage(data.shape, tiled.shape, **geometry)
     support = (coverage_zy[..., None] > 0) & (
         np.arange(tiled.shape[-1]) < data.shape[-1]
@@ -364,7 +378,10 @@ def test_saved_deskew_retains_complete_z_extent(
     actual = saved.arrays[0][0, 0].read().result()
     assert actual.shape == case.expected_shape
     processing_metadata = saved.attributes["opm_processing"]
-    assert processing_metadata["timing"]["n_acquired_planes"] == 24
+    assert (
+        processing_metadata["timing"]["n_acquired_planes"]
+        == case.truth.pixels.shape[-3]
+    )
     assert_roi_point_accuracy(
         actual[None, None],
         case.truth,
