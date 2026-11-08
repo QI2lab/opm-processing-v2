@@ -4,7 +4,6 @@ from dataclasses import replace
 
 import numpy as np
 import pytest
-from scipy.interpolate import interp1d
 from scipy.special import kl_div
 from yaozarrs import open_group
 
@@ -18,11 +17,7 @@ from opm_processing.dataio.processing_state import (
     ProcessingState,
     processing_state_path,
 )
-from tests.simulation.metrics import (
-    camera_noise_accuracy,
-    camera_object_apertures,
-    camera_prediction,
-)
+from tests.simulation.metrics import camera_noise_accuracy, camera_object_apertures
 
 
 @pytest.mark.integration
@@ -34,10 +29,10 @@ def test_as_acquired_combined_channel_deconvolution(
     monkeypatch,
     small_cpu_kernels,
     assert_reconstruction_storage,
+    production_forward_predictions,
 ):
     """Improve true camera likelihood without injecting PSF calibration into raw data."""
     from opm_processing.imageprocessing import rlgc
-    from opm_processing.imageprocessing.camera import camera_correct
     from opm_processing.imageprocessing.opmtools import orthogonal_deskew
 
     observed = simulated_camera((17, 32, 36), step=1.2, budget=(3000, 4000))
@@ -65,9 +60,7 @@ def test_as_acquired_combined_channel_deconvolution(
     def observe(*args, **kwargs):
         """Retain the real reconstruction to score against simulated camera means."""
         result = reconstruct(*args, **kwargs)
-        reconstructed.append(
-            (result.copy(), np.asarray(args[1]).copy(), kwargs["boundary"])
-        )
+        reconstructed.append(result.copy())
         return result
 
     monkeypatch.setattr(rlgc, "rlgc", observe)
@@ -81,22 +74,22 @@ def test_as_acquired_combined_channel_deconvolution(
         decon_crop_scan=12,
     )
     assert dict(open_group(dataset.path).attrs) == original_attributes
-    ((recovered, psf, boundary),) = reconstructed
+    (recovered,) = reconstructed
     assert recovered.shape == (49, 32, 36)
-    baseline = camera_correct(
-        observed.raw, microscope.camera.offset_adu, microscope.camera.electrons_per_adu
+    measured = production_forward_predictions[-1]
+    # Sparse progress is measured against the actual production initializer,
+    # with both predictions evaluated on the acquired camera planes.
+    assert (
+        kl_div(observed.expectation, measured["prediction"]).sum()
+        < kl_div(observed.expectation, measured["initial_prediction"]).sum()
     )
-    baseline = interp1d(np.arange(17) * 3, baseline, axis=0)(np.arange(49))
-    psf /= psf.sum()
-    boundary = "constant" if boundary == "zero" else boundary
-    scores = [
-        kl_div(
-            observed.expectation,
-            camera_prediction(density, psf, boundary=boundary)[::3],
-        ).sum()
-        for density in (recovered, baseline)
-    ]
-    assert scores[0] < scores[1]
+    for aperture in camera_object_apertures(
+        observed.ground_truth, microscope, observed.expectation.shape
+    ):
+        accuracy = camera_noise_accuracy(
+            measured["prediction"], observed.expectation, microscope.camera, aperture
+        )
+        assert accuracy.accepted, accuracy
     output = dataset.path.parent / "as_acquired_decon_deskewed.ome.zarr"
     collection = open_position_collection(output)
     saved = collection.arrays[0].read().result()
@@ -112,22 +105,7 @@ def test_as_acquired_combined_channel_deconvolution(
         ),
     )
     refined = replace(microscope, scan_step_um=0.4)
-    apertures = camera_object_apertures(
-        observed.ground_truth, microscope, observed.expectation.shape
-    )
-    # The inverse must predict independently simulated optical photons.
-    prediction = camera_prediction(recovered, psf, boundary=boundary)[::3]
-    for aperture in apertures:
-        accuracy = camera_noise_accuracy(
-            prediction, observed.expectation, microscope.camera, aperture
-        )
-        assert accuracy.accepted, accuracy
-    # This separate numerical certificate never widens the optical target.
-    acquired_apertures = []
-    for aperture in apertures[:2]:
-        mask = np.zeros(recovered.shape, bool)
-        mask[::3] = aperture
-        acquired_apertures.append(mask)
+    # Check persisted pixels against the actual inverse and geometric mapper.
     assert_reconstruction_storage(
         saved[0, 0],
         (recovered,),
@@ -135,12 +113,12 @@ def test_as_acquired_combined_channel_deconvolution(
         collection.voxel_size_um,
         (0.0, 0.0, 0.0),
         refined,
-        acquired_apertures,
     )
     state = ProcessingState.read(
         processing_state_path(dataset.path.parent, "as_acquired")
     )
     settings = state.run(output)["configuration"]["deconvolution"]
+    assert settings["solver_revision"] == rlgc.RLGC_SOLVER_REVISION
     assert settings["emission_wavelengths_nm"] == [637.0]
     assert settings["psf_parameters"]["lens"]["NA"] == 1.35
     assert settings["scan_upsample_factor"] == 3

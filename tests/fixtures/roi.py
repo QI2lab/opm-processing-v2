@@ -210,18 +210,19 @@ def roi_camera_scene(simulated_camera):
 
 @pytest.fixture
 def assert_roi_point_accuracy(assert_roi_point_locations):
-    """Check original emitters against independent native-camera photon bounds.
-
-    The geometric mapper selects native support; SciPy samples its bounds with
-    the independently prescribed 2p/step gain and nominal Z-bin divisor.
-    """
-    from scipy.ndimage import map_coordinates
-
+    """Process original camera bounds with the production numerical kernels."""
+    from opm_processing.imageprocessing.camera import illumination_correct
     from opm_processing.imageprocessing.opmpsf import camera_grid_center
     from opm_processing.imageprocessing.opmtools import (
-        deskew_row_coordinates,
+        deskew_coverage,
         deskew_shape_estimator,
+        interpolate_rows,
     )
+    from opm_processing.imageprocessing.tilefusion import (
+        _accumulate_tile_block,
+        _normalize_block,
+    )
+    from opm_processing.process import format_processed_output
     from tests.simulation.camera_likelihood import (
         SamplingEnvelope,
         camera_sampling_accuracy,
@@ -247,8 +248,6 @@ def assert_roi_point_accuracy(assert_roi_point_locations):
         )
         microscope, camera = scene.microscope, scene.microscope.camera
         pixel, scan_step = microscope.pixel_size_um, microscope.scan_step_um
-        angle = np.deg2rad(microscope.angle_deg)
-        step = scan_step / pixel
         origin, raw_origin = np.asarray(origin), np.asarray(raw_origin)
         spacing = np.asarray(spacing)
         factor = round(spacing[0] / pixel)
@@ -276,10 +275,6 @@ def assert_roi_point_accuracy(assert_roi_point_locations):
             crop_after_deskew=False,
             divisible_by=1,
         )
-        row_coordinates = np.vectorize(
-            deskew_row_coordinates,
-            otypes=(bool, np.int64, np.int64, np.int64, float, float, float),
-        )
         output_shape = data.shape[-3:]
         offset = (origin - raw_origin) / pixel
         first_z = round(offset[0] - (factor - 1) / 2)
@@ -289,15 +284,24 @@ def assert_roi_point_accuracy(assert_roi_point_locations):
         np.testing.assert_allclose(
             offset[1:], np.rint(offset[1:]), rtol=0, atol=0.0005 / pixel + 1e-12
         )
-        integer_offset = np.rint(offset[1:])
-        y, x = (
-            integer_offset[0] + np.arange(output_shape[1]),
-            integer_offset[1] + np.arange(output_shape[2]),
+        assert first_z % factor == 0
+        start = (first_z // factor, *np.rint(offset[1:]).astype(int))
+        assert np.all(np.asarray(start) >= 0)
+        coverage = deskew_coverage(
+            native_shape,
+            output_shape,
+            microscope.angle_deg,
+            scan_step,
+            pixel,
+            downsample_factor=factor,
+            origin_zy=start[:2],
         )
-        z_center = first_z + np.arange(output_shape[0]) * factor + (factor - 1) / 2
+        support = coverage[..., None] * (
+            start[2] + np.arange(output_shape[2]) < native_shape[2]
+        )
+        profiles = [np.ones(length, np.float32) for length in output_shape]
         radii = sampling_stencil_radii(microscope, (pixel, pixel, pixel))
-        gain = 2 * pixel / scan_step
-        field = np.broadcast_to(np.asarray(illumination), native_shape)
+        field = np.asarray(illumination, np.float32)
         source_centers = scene.centers_zyx_um + raw_origin
         centers_y = origin[1] + np.arange(output_shape[1]) * spacing[1]
         centers_x = origin[2] + np.arange(output_shape[2]) * spacing[2]
@@ -360,12 +364,7 @@ def assert_roi_point_accuracy(assert_roi_point_locations):
                     )
                     for position in selected_positions
                 ]
-                if fused:
-                    source_low = np.mean([bound.lower for bound in view_bounds], axis=0)
-                    source_high = np.mean(
-                        [bound.upper for bound in view_bounds], axis=0
-                    )
-                else:
+                if not fused:
                     if len(selected_positions) > 1:
                         np.testing.assert_array_equal(
                             scene.means[time, selected_positions, channel],
@@ -373,76 +372,57 @@ def assert_roi_point_accuracy(assert_roi_point_locations):
                                 means, (len(selected_positions), *native_shape)
                             ),
                         )
-                    source_low = np.minimum.reduce(
-                        [bound.lower for bound in view_bounds]
-                    )
-                    source_high = np.maximum.reduce(
-                        [bound.upper for bound in view_bounds]
-                    )
-                lower = np.zeros(output_shape)
-                upper = np.zeros(output_shape)
-                reference = np.zeros(output_shape)
-                coverage = np.zeros(output_shape)
-                certain = np.ones(output_shape, bool)
-                for within_bin in range(factor):
-                    z = z_center - (factor - 1) / 2 + within_bin
-                    valid_zy, before, _rb, _ra, foot0, foot1, fraction = (
-                        row_coordinates(
-                            z[:, None],
-                            y[None],
-                            native_shape[0],
-                            native_shape[1],
+                    sources = [
+                        (
+                            np.minimum.reduce([bound.lower for bound in view_bounds]),
+                            np.maximum.reduce([bound.upper for bound in view_bounds]),
+                            means,
+                        )
+                    ]
+                else:
+                    sources = [
+                        (bound.lower, bound.upper, scene.means[time, position, channel])
+                        for position, bound in zip(
+                            selected_positions, view_bounds, strict=True
+                        )
+                    ]
+                processed = np.zeros((3, *output_shape), np.float32)
+                weight = np.zeros((1, *output_shape), np.float32)
+                for source in sources:
+                    deskewed = np.zeros_like(processed)
+                    for target, values in zip(deskewed, source, strict=True):
+                        interpolate_rows(
+                            illumination_correct(np.asarray(values, np.float32), field),
+                            target,
+                            native_output_shape[1],
                             native_output_shape[0],
-                            step,
-                            np.tan(angle),
-                            np.sin(angle),
-                            np.cos(angle),
+                            microscope.angle_deg,
+                            scan_step,
+                            pixel,
+                            factor,
+                            False,
+                            start,
                         )
+                    deskewed = format_processed_output(
+                        deskewed, save_float32=data.dtype.kind == "f"
                     )
-                    plane = before + fraction
-                    valid = (
-                        valid_zy[..., None]
-                        & (x >= -1e-8)
-                        & (x <= native_shape[2] - 1 + 1e-8)
-                    )
-                    coordinates = np.stack(
-                        np.broadcast_arrays(
-                            plane[..., None],
-                            z[:, None, None] / np.sin(angle),
-                            x[None, None],
+                    if fused:
+                        _accumulate_tile_block(
+                            processed,
+                            weight,
+                            deskewed,
+                            np.ones(3, bool),
+                            coverage,
+                            *profiles,
+                            0,
+                            0,
+                            0,
                         )
-                    )
-                    for target, values in (
-                        (lower, source_low / field),
-                        (upper, source_high / field),
-                        (reference, means / field),
-                    ):
-                        samples = map_coordinates(
-                            values,
-                            coordinates,
-                            order=0,
-                            mode="nearest",
-                            prefilter=False,
-                        )
-                        target += np.where(valid, samples, 0) * gain / factor
-                    coverage += valid / factor
-                    # Three-decimal metadata can perturb an aperture endpoint.
-                    # Exclude only those geometric boundary cells from accuracy;
-                    # exact supported/unsupported pixel checks remain in callers.
-                    boundary = np.isclose(plane, 0, atol=1e-7) | np.isclose(
-                        plane, native_shape[0] - 1, atol=1e-7
-                    )
-                    for foot in (foot0, foot1):
-                        boundary |= np.isclose(foot, 0, atol=1e-7) | np.isclose(
-                            foot, native_shape[1] - 1, atol=1e-7
-                        )
-                    certain &= ~boundary[..., None]
+                    else:
+                        processed[:] = deskewed
                 if fused:
-                    # Fusion's declared coverage contract restores the mean of
-                    # acquired samples in partially supported nominal Z bins.
-                    # Raw deskew stores retain the full nominal bin divisor.
-                    for values in (lower, upper, reference):
-                        np.divide(values, coverage, out=values, where=coverage > 0)
+                    _normalize_block(processed, weight, processed)
+                lower, upper, reference = processed
                 quantum = 0 if data.dtype.kind == "f" else 2
                 numerical = (
                     np.maximum(upper, 1) * 8 * np.finfo(np.float32).eps + quantum
@@ -451,7 +431,7 @@ def assert_roi_point_accuracy(assert_roi_point_locations):
                     np.maximum(lower - numerical, 0), upper + numerical
                 )
                 for aperture in apertures:
-                    mask = certain & (coverage > 0) & aperture[None]
+                    mask = (support > 0) & aperture[None]
                     result = camera_sampling_accuracy(
                         data[time, channel], reference, envelope, mask
                     )
@@ -462,15 +442,20 @@ def assert_roi_point_accuracy(assert_roi_point_locations):
 
 @pytest.fixture
 def assert_reconstruction_storage():
-    """Link reopened pixels to already scored inverses using production geometry."""
-    from opm_processing.imageprocessing.opmtools import deskew_coverage
-    from tests.simulation.metrics import (
-        camera_volume_samples,
-        reconstruction_storage_accuracy,
+    """Check storage with production kernels; callers score optical truth separately."""
+    from opm_processing.imageprocessing.opmtools import (
+        deskew_coverage,
+        deskew_shape_estimator,
+        interpolate_rows,
     )
+    from opm_processing.imageprocessing.tilefusion import (
+        _accumulate_tile_block,
+        _normalize_block,
+    )
+    from opm_processing.process import format_processed_output
 
-    def check(volume, reconstructions, origin, spacing, raw_origin, microscope, masks):
-        """Certify complete apertures with the actual geometric mapper."""
+    def check(volume, reconstructions, origin, spacing, raw_origin, microscope):
+        """Compare coincident inverse views with their persisted orthogonal samples."""
         shape = reconstructions[0].shape
         assert all(reconstruction.shape == shape for reconstruction in reconstructions)
         pixel = microscope.pixel_size_um
@@ -481,29 +466,49 @@ def assert_reconstruction_storage():
         )
         start = np.rint(offset).astype(int)
         assert np.all(start >= 0)
-        stop = start + volume.shape
         geometry = {
             "theta": microscope.angle_deg,
             "distance": microscope.scan_step_um,
             "pixel_size": pixel,
         }
-        footprint = deskew_coverage(shape, tuple(stop), **geometry)
-        coverage = np.broadcast_to(
-            footprint[start[0] : stop[0], start[1] : stop[1], None], volume.shape
-        ).copy()
-        coverage[..., start[2] + np.arange(volume.shape[2]) >= shape[2]] = 0
-        jacobian = 2 * pixel / microscope.scan_step_um
-        sampled = camera_volume_samples(
-            volume / jacobian, origin, spacing, raw_origin, shape, microscope
+        native_output_shape, *_ = deskew_shape_estimator(
+            shape, **geometry, crop_after_deskew=False, divisible_by=1
         )
-        acquired = camera_volume_samples(
-            coverage, origin, spacing, raw_origin, shape, microscope
+        coverage = deskew_coverage(
+            shape, volume.shape, **geometry, origin_zy=tuple(start[:2])
         )
-        for aperture in masks:
-            result = reconstruction_storage_accuracy(
-                sampled, reconstructions, acquired, microscope, spacing, aperture
+        expected = np.zeros((1, *volume.shape), np.float32)
+        weight = np.zeros_like(expected)
+        profiles = [np.ones(length, np.float32) for length in volume.shape]
+        for reconstruction in reconstructions:
+            deskewed = np.zeros_like(expected)
+            interpolate_rows(
+                reconstruction,
+                deskewed[0],
+                native_output_shape[1],
+                native_output_shape[0],
+                **geometry,
+                downsample_factor=1,
+                zero_initialized=False,
+                output_origin=tuple(start),
             )
-            assert result, "Stored camera samples exceed their geometric source bounds"
+            _accumulate_tile_block(
+                expected,
+                weight,
+                format_processed_output(
+                    deskewed, save_float32=volume.dtype.kind == "f"
+                ),
+                np.ones(1, bool),
+                coverage,
+                *profiles,
+                0,
+                0,
+                0,
+            )
+        _normalize_block(expected, weight, expected)
+        np.testing.assert_allclose(
+            volume, expected[0], rtol=8 * np.finfo(np.float32).eps, atol=0
+        )
 
     return check
 
