@@ -25,7 +25,7 @@ from functools import lru_cache
 from typing import Literal
 
 import numpy as np
-from scipy.signal import fftconvolve
+from scipy.signal import oaconvolve
 
 from opm_processing.imageprocessing.opmpsf import (
     centered_sensor_axes,
@@ -392,21 +392,19 @@ def forward_model(
         if metadata.output == "object"
         else None
     )
-    components = (
-        (ground_truth,)
-        if budget is None
-        else (ground_truth, np.ones_like(ground_truth))
-    )
-    for index, density in enumerate(components):
-        irradiance = np.maximum(
-            fftconvolve(
-                density * illumination,
-                psf,
-                mode="same" if metadata.output == "irradiance" else "full",
-            )
-            * spacing**3,
-            0,
+    for index in range(1 if budget is None else 2):
+        if budget is not None and budget[index] == 0:
+            continue
+        density = ground_truth if index == 0 else np.ones_like(ground_truth)
+        irradiance = oaconvolve(
+            density
+            if metadata.illumination_profile == "uniform"
+            else density * illumination,
+            psf,
+            mode="same" if metadata.output == "irradiance" else "full",
         )
+        irradiance *= spacing**3
+        np.maximum(irradiance, 0, out=irradiance)
         if metadata.output == "irradiance":
             return irradiance * metadata.exposure
         optical_axes = tuple(
@@ -448,6 +446,11 @@ def forward_model(
             incident += response
     if object_density is not None:
         return object_density
+    if incident is None:
+        incident = np.zeros(
+            tuple(map(len, sensor_axes)),
+            dtype=np.result_type(ground_truth.dtype, np.float32),
+        )
     expected = incident * (microscope.quantum_efficiency * metadata.exposure)
     expected += metadata.background_electrons
     if metadata.output == "expectation":
