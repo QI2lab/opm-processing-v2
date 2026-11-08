@@ -393,7 +393,7 @@ def line_figure(profile: str, factor: int, view: str) -> plt.Figure:
         0.065,
         0.04,
         f"Fixed cut at {'Y' if view == 'XY' else 'Z'} = {cut:.3f} µm. PSNR uses the full displayed GT projection, not the 1D cut.\n"
-        f"Best recorded RL: highest PSNR among the saved iteration checkpoints through I={RL_ITERATIONS:,}. RLGC: MATLAB read-noise correction ({READ_NOISE:g} RMS), KL enabled.\n"
+        f"Best recorded RL: highest PSNR among the saved iteration checkpoints through I={RL_ITERATIONS:,}. RLGC: read-noise compensation ({READ_NOISE:g} RMS), KL enabled.\n"
         f"Incident photon levels are before QE. Intensities are unscaled. Pair spacings: {GAPS} µm.",
         fontsize=9,
         linespacing=1.45,
@@ -552,7 +552,7 @@ def sphere_figure(photons: int, profile: str, factor: int) -> plt.Figure:
         0.025,
         "XY, XZ and YZ maximum-intensity projections. Each row shares its GT intensity scale; brighter values saturate white.\n"
         f"RL best recorded: highest saved XZ PSNR at I={info['best_iteration']}; the same 3D reconstruction is shown in all views.\n"
-        f"RL endpoint I={RL_ITERATIONS:,}. RLGC uses MATLAB read-noise correction ({READ_NOISE:g} RMS) and reference stopping with KL enabled. No intensity fitting.",
+        f"RL endpoint I={RL_ITERATIONS:,}. RLGC uses read-noise compensation ({READ_NOISE:g} RMS) and reference stopping with KL enabled. No intensity fitting.",
         fontsize=9,
         linespacing=1.4,
     )
@@ -685,7 +685,7 @@ def points_figure(profile: str, factor: int) -> plt.Figure:
         0.025,
         "Rows: source/background incident photons per camera pixel before QE. Shared GT display scale within each row.\n"
         "Zero-background conditions retain source shot noise and camera read noise.\n"
-        f"RL best: highest recorded XZ PSNR through I={RL_ITERATIONS:,}. RLGC: reference read-noise correction ({READ_NOISE:g} RMS), KL enabled.\n"
+        f"RL best: highest recorded XZ PSNR through I={RL_ITERATIONS:,}. RLGC: read-noise compensation ({READ_NOISE:g} RMS), KL enabled.\n"
         "No reconstruction intensity fitting.",
         fontsize=9,
         linespacing=1.4,

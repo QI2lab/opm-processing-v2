@@ -210,11 +210,6 @@
       80
     ],
     "tile_offset_x_pixels": 48,
-    "deskew_tile_shape_zyx": [
-      8,
-      64,
-      32
-    ],
     "fusion_chunk_shape_yx": [
       8,
       8
