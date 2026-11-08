@@ -5,6 +5,9 @@ import pytest
 from skimage.measure import block_reduce
 
 from opm_processing.imageprocessing import tilefusion
+from tests.registration import (
+    test_bounded_peak_matches_upstream_phase_normalization as test_bounded_peak_matches_upstream_phase_normalization,
+)
 
 pytestmark = pytest.mark.unit
 
