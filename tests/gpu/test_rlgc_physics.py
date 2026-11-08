@@ -6,6 +6,7 @@ Numerical assertions use production operators, SciPy and the shared simulator.
 import importlib
 import logging
 from functools import partial
+from itertools import pairwise
 
 import numpy as np
 import pytest
@@ -355,18 +356,24 @@ def test_tiled_gc_recovers_noisy_extended_objects_without_rl_noise(
     crop_scan,
     caplog,
     production_forward_predictions,
+    monkeypatch,
 ):
-    """Select actual KL stops in whole and tiled noisy objects before RL noise grows."""
+    """Check KL-selected source recovery and vacuum noise against iteration-matched RL."""
     import re
 
+    from ryomen import Slicer
+
     from opm_processing.imageprocessing.rlgc import rlgc
+    from tests.simulation.forward_model import camera_psf
     from tests.simulation.metrics import camera_flux_accuracy
 
-    microscope, expectation, psf, raw, source, dark = noisy_extended_scene
+    microscope, expectation, raw, source, dark = noisy_extended_scene
+    psf, _ = camera_psf(microscope)
     camera = microscope.camera
     observed = camera_correct(
         raw[::factor], camera.offset_adu, camera.electrons_per_adu
     )
+    assert observed.size >= 1_000_000
     options = {
         "crop_scan": source.shape[0] if crop_scan is None else crop_scan,
         "scan_upsample_factor": factor,
@@ -375,8 +382,20 @@ def test_tiled_gc_recovers_noisy_extended_objects_without_rl_noise(
     }
     logger = logging.getLogger(__name__)
     caplog.set_level(logging.INFO, logger=__name__)
-    recovered = rlgc(observed, psf, logger=logger, **options)
+    solver = importlib.import_module("opm_processing.imageprocessing.rlgc")
+    slicers = []
+
+    def observe_slicer(*args, **kwargs):
+        """Record the real Ryomen layout without replacing its crops."""
+        result = Slicer(*args, **kwargs)
+        slicers.append((kwargs["crop_size"], kwargs["overlap"], len(result)))
+        return result
+
+    with monkeypatch.context() as execution:
+        execution.setattr(solver, "Slicer", observe_slicer)
+        recovered = rlgc(observed, psf, logger=logger, **options)
     measured = production_forward_predictions[-1]
+    chunks = measured["chunks"]
     messages = "\n".join(
         record.getMessage() for record in caplog.records if record.name == __name__
     )
@@ -397,8 +416,35 @@ def test_tiled_gc_recovers_noisy_extended_objects_without_rl_noise(
     )
     boundaries = {stop for _, stop in retained if stop < source.shape[0]}
     if crop_scan is not None:
+        ((crop, overlap, count),) = slicers
+        assert count >= 3 and 3 <= len(chunks) <= count
+        assert crop[0] < observed.shape[0]
+        assert crop[1:] == observed.shape[1:] and overlap[0] > 0
+        assert retained[0][0] == 0 and retained[-1][1] == source.shape[0]
+        assert all(left[1] == right[0] for left, right in pairwise(retained))
         assert sum(source[b - 1].any() and source[b].any() for b in boundaries) >= 2
         assert retained[-1][1] - retained[-1][0] < retained[0][1] - retained[0][0]
+    else:
+        assert not slicers and len(chunks) == 1
+    for record in chunks:
+        assert record["updates"] == list(range(1, len(record["updates"]) + 1))
+        assert iterations <= len(record["updates"]) <= iterations + 2
+        assert 1 <= record["visits"] <= 2
+        assert record["shared"] == (crop_scan is not None)
+        if crop_scan is not None:
+            # Native observations include their reflected computational halo;
+            # sparse observations retain only actual camera samples.
+            object_scan = record["object_shape"][0]
+            assert object_scan < source.shape[0]
+            if factor == 1:
+                pads = solver._linear_fft_pad_width(
+                    (crop[0], *observed.shape[1:]), psf.shape
+                )
+                assert object_scan <= crop[0] + sum(pads[0])
+            else:
+                assert record["observed_shape"][0] <= crop[0] + 1
+                assert object_scan <= crop[0] * factor + 1
+            assert record["object_shape"][1:] == record["observed_shape"][1:]
     # Nearest acquired samples on either side, including every refined-grid
     # phase. PSF-support neighborhoods overlap throughout these small chunks.
     interface = np.zeros(source.shape[0], dtype=bool)
@@ -422,6 +468,7 @@ def test_tiled_gc_recovers_noisy_extended_objects_without_rl_noise(
         max_delta=0,
         **options,
     )
+    ordinary_prediction = production_forward_predictions[-1]["prediction"]
     predicted = measured["prediction"]
     baseline_prediction = measured["input_prediction"]
     if baseline_prediction is None:
@@ -441,13 +488,15 @@ def test_tiled_gc_recovers_noisy_extended_objects_without_rl_noise(
         actual = predicted[region]
         blurred = baseline_prediction[region]
         gc_error = kl_div(true, actual).sum(dtype=np.float64)
+        rl_error = kl_div(true, ordinary_prediction[region]).sum(dtype=np.float64)
         baseline_error = kl_div(true, blurred).sum(dtype=np.float64)
         logger.info(
-            "crop_scan=%s region=%s acquired_samples=%d kl_gc=%.9g kl_baseline=%.9g bias_e=%.9g rmse_e=%.9g",
+            "crop_scan=%s region=%s acquired_samples=%d kl_gc=%.9g kl_rl=%.9g kl_baseline=%.9g bias_e=%.9g rmse_e=%.9g",
             crop_scan,
             name,
             region.sum(),
             gc_error,
+            rl_error,
             baseline_error,
             np.mean(actual - true, dtype=np.float64),
             np.sqrt(np.mean((actual - true) ** 2, dtype=np.float64)),

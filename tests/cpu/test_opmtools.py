@@ -172,6 +172,130 @@ def test_tiled_deskew_matches_global_grid(
 
 @pytest.mark.unit
 @pytest.mark.parametrize(
+    "noisy_extended_scene",
+    [(kind, "uniform", 1) for kind in ("line-pairs", "sphere")],
+    indirect=True,
+    ids=("line-pairs", "sphere"),
+)
+@pytest.mark.parametrize("scan_factor", (1, 3), ids=("native", "sparse3"))
+def test_large_noisy_deskew_preserves_scientific_bounds_across_tiles(
+    noisy_extended_scene, scan_factor, tmp_path, monkeypatch
+):
+    """Deskew real noisy optical scenes through bounded Ryomen output tiles."""
+    from dataclasses import replace
+
+    from ryomen import Slicer
+
+    from opm_processing.imageprocessing import opmtools
+    from opm_processing.imageprocessing.camera import camera_correct
+    from tests.simulation.camera_likelihood import (
+        camera_sampling_accuracy,
+        camera_sampling_envelope,
+        sampling_stencil_radii,
+    )
+    from tests.simulation.metrics import camera_volume_samples
+
+    microscope, expectation, raw, source, _dark = noisy_extended_scene
+    microscope = replace(microscope, scan_step_um=microscope.scan_step_um * scan_factor)
+    expectation, raw, source = (
+        array[::scan_factor] for array in (expectation, raw, source)
+    )
+    camera, pixel = microscope.camera, microscope.pixel_size_um
+    data = camera_correct(raw, camera.offset_adu, camera.electrons_per_adu)
+    assert data.size >= 1_000_000
+    z_bin = 5
+    geometry = {
+        "theta": microscope.angle_deg,
+        "distance": microscope.scan_step_um,
+        "pixel_size": pixel,
+        "downsample_factor": z_bin,
+    }
+    whole = orthogonal_deskew(data, **geometry)
+    output = np.lib.format.open_memmap(
+        tmp_path / "deskew.npy", mode="w+", dtype=np.float32, shape=whole.shape
+    )
+    output[:] = np.nan
+    tile_shape = (5, 32, 40)
+    slicers, visits = [], []
+    interpolate = opmtools.interpolate_rows
+
+    def observe_slicer(*args, **kwargs):
+        """Observe the actual upstream scheduler without replacing its tiles."""
+        result = Slicer(*args, **kwargs)
+        slicers.append(len(result))
+        return result
+
+    def observe_rows(*args):
+        """Record actual origins while executing the unchanged interpolation."""
+        visits.append((args[-1], args[1].shape))
+        return interpolate(*args)
+
+    with monkeypatch.context() as execution:
+        execution.setattr(opmtools, "Slicer", observe_slicer)
+        execution.setattr(opmtools, "interpolate_rows", observe_rows)
+        tiled = orthogonal_deskew(data, **geometry, tile_shape=tile_shape, out=output)
+    assert tiled is output and slicers == [len(visits)] and len(visits) > 8
+    np.testing.assert_array_equal(tiled, whole)
+    covered = np.zeros(tiled.shape, bool)
+    foreground = orthogonal_deskew(source.astype(np.float32), **geometry) > 0
+    for origin, shape in visits:
+        assert np.all(np.asarray(shape) <= tile_shape)
+        selection = tuple(
+            slice(start, start + size)
+            for start, size in zip(origin, shape, strict=True)
+        )
+        covered[selection] = True
+    assert covered.all()
+    crossings = 0
+    for axis in range(3):
+        borders = sorted({origin[axis] for origin, _shape in visits if origin[axis]})
+        crossings += sum(
+            np.any(
+                np.take(foreground, border - 1, axis=axis)
+                & np.take(foreground, border, axis=axis)
+            )
+            for border in borders
+        )
+    assert crossings >= 2
+    coverage_zy = deskew_coverage(data.shape, tiled.shape, **geometry)
+    support = (coverage_zy[..., None] > 0) & (
+        np.arange(tiled.shape[-1]) < data.shape[-1]
+    )
+    np.testing.assert_array_equal(tiled[~support], 0)
+    assert 0 < coverage_zy[-1].max() < 1 and np.any(tiled[-1] > 0)
+    # Bin centers, photon-volume conversion and the source aperture are fixed
+    # by the physical acquisition. No reconstructed intensity chooses a region.
+    origin = ((z_bin - 1) * pixel / 2, 0, 0)
+    spacing = (z_bin * pixel, pixel, pixel)
+    gain = 2 * pixel / microscope.scan_step_um
+    prediction = camera_volume_samples(
+        tiled / gain, origin, spacing, (0, 0, 0), data.shape, microscope
+    )
+    coverage = camera_volume_samples(
+        coverage_zy[..., None] * (np.arange(tiled.shape[-1]) < data.shape[-1]),
+        origin,
+        spacing,
+        (0, 0, 0),
+        data.shape,
+        microscope,
+    )
+    aperture = source & (coverage >= 1 - 32 * np.finfo(np.float32).eps)
+    assert aperture.any()
+    bounds = camera_sampling_envelope(
+        expectation,
+        raw,
+        camera,
+        radii=sampling_stencil_radii(microscope, spacing, z_bin_factor=z_bin),
+        z_bin_factor=z_bin,
+    )
+    accuracy = camera_sampling_accuracy(prediction, expectation, bounds, aperture)
+    assert accuracy.inside_envelope, accuracy
+    assert accuracy.flux_lower <= accuracy.flux <= accuracy.flux_upper, accuracy
+    output.flush()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
     "option,value",
     [
         ("downsample_factor", 0),

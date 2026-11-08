@@ -74,6 +74,14 @@ RLGC reconstruction quality and stopping evaluations use the shared noisy
 line-pair and sphere scenes, with native and sparse scan sampling in whole-volume
 and tiled layouts.
 
+Large-scene units and writer-backed integrations share the same physical camera
+simulation. Require foreground across multiple observed tile borders and verify
+actual Ryomen execution, shifted final deskew crops and callback continuation
+without replay. Check dark-noise variance in known optical vacuum, excluding
+spatially varying fluorescent background. Noisy deskew samples use certified
+sampling/noise intervals; fitted inverse rates retain their separate accuracy
+checks.
+
 Extend existing acquisition workflows for interruption/resume, moves and copies,
 separate raw/output directories, cached registration, numerical projections and
 ROI/TIFF export. Preserve metadata and journals; assert current paths, pixels,
