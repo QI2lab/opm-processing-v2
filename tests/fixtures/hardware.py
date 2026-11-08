@@ -123,8 +123,18 @@ def production_forward_predictions(monkeypatch, request):
             destination = slice(start, stop)
             owned = slice(start - int(source_start), stop - int(source_start))
         entry = run["chunks"].setdefault(
-            prefix, {"destination": destination, "history": deque(maxlen=2)}
+            prefix,
+            {
+                "destination": destination,
+                "history": deque(maxlen=2),
+                "visits": 0,
+                "observed_shape": observed.shape,
+                "object_shape": shape,
+                "updates": [],
+                "shared": kwargs.get("_checkpoint") is not None,
+            },
         )
+        entry["visits"] += 1
         if observed.shape == shape and "input_prediction" not in entry:
             values = forward(observed)[region][owned]
             entry["input_prediction"] = (
@@ -154,6 +164,7 @@ def production_forward_predictions(monkeypatch, request):
             """Observe final full-state predictions before production crops them."""
             nonlocal completed
             completed = number
+            entry["updates"].append(number)
             if state is not None and (
                 (state.first_kl_stop is not None and not kwargs.get("_finalize"))
                 or number == kwargs["max_iterations"]
@@ -212,6 +223,20 @@ def production_forward_predictions(monkeypatch, request):
             np.zeros(np.shape(image), dtype=np.float32) if run["factor"] == 1 else None
         )
         record["iterations"] = accepted
+        record["chunks"] = [
+            {
+                name: entry[name]
+                for name in (
+                    "destination",
+                    "visits",
+                    "observed_shape",
+                    "object_shape",
+                    "updates",
+                    "shared",
+                )
+            }
+            for entry in run["chunks"].values()
+        ]
         for entry in run["chunks"].values():
             final = entry.get("final")
             if final is None:

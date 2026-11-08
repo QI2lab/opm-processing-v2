@@ -217,6 +217,11 @@
       8
     ]
   },
+  "large_scene": {
+    "line_length_um": 48.0,
+    "scan_extent_um": 76.8,
+    "minimum_camera_rows": 257
+  },
   "pipeline": {
     "plane_period_s": 0.02,
     "scan_extent_um": 7.2,

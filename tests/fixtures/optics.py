@@ -90,12 +90,24 @@ def independent_photon_scene_factory(microscope_parameters, simulation_parameter
     from tests.simulation.scenes import prepare_scene
 
     @lru_cache(maxsize=2)
-    def build(kind="points"):
+    def build(kind="points", *, large=False):
         """Reuse physical scenes on the shared calibrated fine grid."""
+        specimen = simulation_parameters["specimens"][kind]
+        if large and kind == "line-pairs":
+            z, _, x = specimen["half_extent_zyx_um"]
+            length = simulation_parameters["large_scene"]["line_length_um"]
+            specimen = {
+                "half_extent_zyx_um": (
+                    z,
+                    length / 2 + microscope_parameters.psf_half_extent_zyx_um[1],
+                    x,
+                ),
+                "features": dict(specimen["features"], length_um=length),
+            }
         return prepare_scene(
             kind,
             microscope_parameters,
-            parameters=simulation_parameters["specimens"][kind],
+            parameters=specimen,
         )
 
     return build
@@ -121,6 +133,8 @@ def simulated_camera(
         shape,
         *,
         kind="points",
+        large=False,
+        illumination_profile="uniform",
         step=0.4,
         conversion=0.25,
         geometry="oblique",
@@ -128,7 +142,7 @@ def simulated_camera(
         budget=None,
     ):
         """Reuse immutable optical formation independently of detector noise."""
-        scene = independent_photon_scene_factory(kind)
+        scene = independent_photon_scene_factory(kind, large=large)
         microscope = replace(
             microscope_parameters,
             scan_step_um=step,
@@ -143,6 +157,7 @@ def simulated_camera(
                 scene.axes,
                 shape,
                 geometry=geometry,
+                illumination_profile=illumination_profile,
                 exposure=exposure,
                 camera_photon_budget=(
                     tuple(simulation_parameters["photon_budgets"][0])
@@ -159,6 +174,8 @@ def simulated_camera(
         shape,
         *,
         kind="points",
+        large=False,
+        illumination_profile="uniform",
         step=0.4,
         conversion=0.25,
         geometry="oblique",
@@ -170,6 +187,8 @@ def simulated_camera(
         scene, microscope, expectation = optical_data(
             shape,
             kind=kind,
+            large=large,
+            illumination_profile=illumination_profile,
             step=step,
             conversion=conversion,
             geometry=geometry,
@@ -748,41 +767,60 @@ def production_point_acquisition(
     )
 
 
-@pytest.fixture(scope="session", params=("line-pairs", "sphere"))
-def noisy_extended_scene(request, microscope_parameters, simulation_parameters):
+@pytest.fixture(
+    scope="session",
+    params=[
+        (kind, profile, budget)
+        for kind in ("line-pairs", "sphere")
+        for profile in ("uniform", "edge-taper")
+        for budget in range(3)
+    ],
+    ids=lambda case: f"{case[0]}-{case[1]}-dose{case[2]}",
+)
+def noisy_extended_scene(
+    request,
+    microscope_parameters,
+    simulation_parameters,
+    independent_photon_scene_factory,
+    simulated_camera,
+):
     """Observe fixed extended emitters with calibrated noisy camera exposures."""
-    from scipy.ndimage import maximum_filter
-
-    from opm_processing.imageprocessing.opmpsf import integrate_camera_pixels
-    from tests.simulation.camera import digitize
-    from tests.simulation.scenes import acquisition_shape, prepare_scene
+    from opm_processing.imageprocessing.opmpsf import (
+        camera_grid_center,
+        get_skewed_coords,
+        integrate_camera_pixels,
+    )
+    from tests.simulation.scenes import acquisition_shape
 
     config = simulation_parameters
+    kind, profile, budget = request.param
     microscope = replace(
         microscope_parameters, scan_step_um=config["microscope"]["scan_step_um"]
     )
-    specimen = config["specimens"][request.param]
-    mosaic = config["pipeline_mosaic"]
-    if request.param == "line-pairs":
-        z, _, x = specimen["half_extent_zyx_um"]
-        specimen = {
-            "half_extent_zyx_um": (z, mosaic["half_extent_zyx_um"][1], x),
-            "features": dict(specimen["features"], length_um=mosaic["line_length_um"]),
-        }
-    scene = prepare_scene(request.param, microscope, parameters=specimen)
+    scene = replace(
+        independent_photon_scene_factory(kind, large=True), microscope=microscope
+    )
     native = acquisition_shape(scene)
     shape = (
-        max(native[0], round(mosaic["scan_extent_um"] / microscope.scan_step_um) + 1),
-        *native[1:],
-    )
-    expectation = forward_model(
-        scene.density,
-        Acquisition(
-            scene.axes, shape, camera_photon_budget=(100, 0), output="expectation"
+        max(
+            native[0],
+            round(config["large_scene"]["scan_extent_um"] / microscope.scan_step_um)
+            + 1,
         ),
-        microscope,
+        max(native[1], config["large_scene"]["minimum_camera_rows"]),
+        native[2],
     )
-    psf, _ = camera_psf(microscope)
+    observation = simulated_camera(
+        shape,
+        kind=kind,
+        large=True,
+        illumination_profile=profile,
+        step=microscope.scan_step_um,
+        conversion=microscope.camera.electrons_per_adu,
+        budget=tuple(config["photon_budgets"][budget]),
+        seed=config["camera_seed"],
+    )
+    expectation, raw = observation.expectation, observation.raw
     source = (
         integrate_camera_pixels(
             scene.density,
@@ -802,8 +840,29 @@ def noisy_extended_scene(request, microscope_parameters, simulation_parameters):
         )
         > 0
     )
-    dark = ~maximum_filter(source, size=psf.shape, mode="constant", cval=False)
-    raw = digitize(expectation, microscope.camera, seed=config["camera_seed"])
-    for array in (expectation, psf, raw, source, dark):
+    theta = np.deg2rad(microscope.angle_deg)
+    x, y, z = get_skewed_coords(
+        shape, microscope.pixel_size_um, microscope.scan_step_um, theta
+    )
+    center = camera_grid_center(
+        shape,
+        microscope.pixel_size_um,
+        microscope.scan_step_um,
+        microscope.angle_deg,
+    )
+    dark = np.zeros(shape, bool)
+    for coordinate, gt_axis, psf_axis, half_footprint in zip(
+        (z - center[0], y - center[1], x - center[2]),
+        scene.axes,
+        scene.psf_axes,
+        microscope.pixel_size_um / 2 * np.array((np.sin(theta), np.cos(theta), 1)),
+        strict=True,
+    ):
+        dark |= (coordinate + half_footprint < gt_axis[0] + psf_axis[0]) | (
+            coordinate - half_footprint > gt_axis[-1] + psf_axis[-1]
+        )
+    assert dark.any()
+    np.testing.assert_array_equal(expectation[dark], 0)
+    for array in (expectation, raw, source, dark):
         array.setflags(write=False)
-    return microscope, expectation, psf, raw, source, dark
+    return microscope, expectation, raw, source, dark
