@@ -42,6 +42,7 @@ import numpy as np
 import psutil
 import tensorstore as ts
 from numba import njit
+from scipy.cluster.hierarchy import DisjointSet
 from tqdm import tqdm
 from yaozarrs.write.v05 import prepare_image
 
@@ -1160,27 +1161,15 @@ def _connected_tile_components(
     list of list of int
         Components in first-tile order, each with its first tile as anchor.
     """
-    adjacency = {index: set() for index in tile_indices}
+    connected = DisjointSet(tile_indices)
+    order = {node: index for index, node in enumerate(connected)}
     for left, right in pairs:
-        if left in adjacency and right in adjacency:
-            adjacency[left].add(right)
-            adjacency[right].add(left)
-    components = []
-    visited = set()
-    for start in adjacency:
-        if start in visited:
-            continue
-        component = []
-        frontier = [start]
-        visited.add(start)
-        while frontier:
-            current = frontier.pop()
-            component.append(current)
-            unseen = adjacency[current] - visited
-            visited.update(unseen)
-            frontier.extend(unseen)
-        components.append(component)
-    return components
+        if left in connected and right in connected:
+            connected.merge(left, right)
+    components = [
+        sorted(component, key=order.__getitem__) for component in connected.subsets()
+    ]
+    return sorted(components, key=lambda component: order[component[0]])
 
 
 def _select_nearest_registration_pairs(
@@ -1237,36 +1226,13 @@ def _select_nearest_registration_pairs(
     for component, component_edges in edges_by_component.items():
         component_edges.sort()
         component_nodes = components[component]
-        local_parent = {node: node for node in component_nodes}
-
-        def local_find(index: int) -> int:
-            """Find a tile representative within the current overlap component.
-
-            This disjoint-set helper is consumed before the component loop advances.
-
-            Parameters
-            ----------
-            index : int
-                Tile or registration-link index used by this calculation.
-
-            Returns
-            -------
-            int
-                Representative tile index within the overlap component.
-            """
-            while local_parent[index] != index:  # noqa: B023
-                local_parent[index] = local_parent[local_parent[index]]  # noqa: B023
-                index = local_parent[index]  # noqa: B023
-            return index
+        connected = DisjointSet(component_nodes)
 
         merges_needed = len(component_nodes) - 1
         merges = 0
         cutoff = component_edges[-1][0]
         for distance, i, j in component_edges:
-            i_root = local_find(i)
-            j_root = local_find(j)
-            if i_root != j_root:
-                local_parent[j_root] = i_root
+            if connected.merge(i, j):
                 merges += 1
             if merges == merges_needed:
                 cutoff = distance
@@ -3331,22 +3297,18 @@ class TileFusion:
             bool
                 True when removing the link preserves its tile component.
             """
-            adjacency = [set() for _ in range(n_tiles)]
-            for edge_index, link in enumerate(work):
-                if edge_index != index:
-                    adjacency[link["i"]].add(link["j"])
-                    adjacency[link["j"]].add(link["i"])
-            target = work[index]["j"]
-            visited = {work[index]["i"]}
-            frontier = list(visited)
-            while frontier:
-                node = frontier.pop()
-                if node == target:
-                    return True
-                unseen = adjacency[node] - visited
-                visited.update(unseen)
-                frontier.extend(unseen)
-            return False
+            source, target = work[index]["i"], work[index]["j"]
+            return any(
+                source in component and target in component
+                for component in _connected_tile_components(
+                    range(n_tiles),
+                    (
+                        (link["i"], link["j"])
+                        for edge_index, link in enumerate(work)
+                        if edge_index != index
+                    ),
+                )
+            )
 
         while outliers:
             removable = next(
