@@ -19,30 +19,47 @@ from opm_processing.imageprocessing.maxtilefusion import (
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("xy_step", [0.0, 0.3], ids=["depth-only", "integer-grid-xy"])
 def test_max_projection_depth_tiles_share_xy_footprint(
-    tmp_path, position_store_factory
+    tmp_path, position_store_factory, xy_step
 ) -> None:
-    """Depth tiles with fixed stage XY must fuse into a single tile footprint."""
+    """Preserve depth-only placement and exact integer-pixel stage footprints."""
     source = np.arange(64, dtype=np.uint16).reshape(1, 1, 1, 8, 8)
+    spacing = (0.23, 0.1, 0.1) if xy_step else (0.23, 0.115, 0.115)
     collection = position_store_factory(
         np.stack((source, source), axis=1),
         name="depth_phantom",
-        voxel_size_um=(0.23, 0.115, 0.115),
+        voxel_size_um=spacing,
     )
     fusion = MaxTileFusion(
         ts_dataset=open_position_collection(collection.path).arrays,
-        tile_positions=((3939.54, -7456.06, 4207.16), (3800.09, -7456.06, 4207.16)),
+        tile_positions=(
+            ((4, 0, 0), (0, -xy_step, xy_step))
+            if xy_step
+            else ((3939.54, -7456.06, 4207.16), (3800.09, -7456.06, 4207.16))
+        ),
         output_path=tmp_path / "depth_max_z_fused.ome.zarr",
-        pixel_size=(0.23, 0.115, 0.115),
+        pixel_size=spacing,
         opm_angle_deg=30.0,
         blend_pixels=(0, 0),
         chunk_size=4,
     )
     fusion.run()
 
-    np.testing.assert_array_equal(fusion.tile_positions[0], fusion.tile_positions[1])
     written = open_image_array(tmp_path / "depth_max_z_fused.ome.zarr")
-    np.testing.assert_array_equal(written.read().result(), source)
+    actual = written.read().result()
+    if xy_step:
+        assert actual.shape == (1, 1, 1, 16, 16)
+        assert np.unravel_index(np.argmax(actual), actual.shape)[-2:] == (10, 10)
+        np.testing.assert_array_equal(
+            actual[0, 0, 0, 8:11, 8:11], source[0, 0, 0, 5:, 5:]
+        )
+        assert not np.any(actual[..., 11:, :]) and not np.any(actual[..., 11:])
+    else:
+        np.testing.assert_array_equal(
+            fusion.tile_positions[0], fusion.tile_positions[1]
+        )
+        np.testing.assert_array_equal(actual, source)
 
 
 @pytest.mark.unit

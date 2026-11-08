@@ -529,8 +529,8 @@ class MaxTileFusion:
         )
 
         fused_shape_unpadded = (
-            int((max_y - min_y) / self.pixel_size[0]),
-            int((max_x - min_x) / self.pixel_size[1]),
+            int(np.ceil((max_y - min_y) / self.pixel_size[0] - 1e-9)),
+            int(np.ceil((max_x - min_x) / self.pixel_size[1] - 1e-9)),
         )
 
         pad_y = (
@@ -767,8 +767,8 @@ class MaxTileFusion:
         fused_height, fused_width = self.fused_shape
         tile_height, tile_width = self.tile_shape
         for tile_idx, (y, x) in enumerate(self.tile_positions):
-            y_start = int((y - self.offset[0]) / self.pixel_size[0])
-            x_start = int((x - self.offset[1]) / self.pixel_size[1])
+            y_start = int(np.round((y - self.offset[0]) / self.pixel_size[0]))
+            x_start = int(np.round((x - self.offset[1]) / self.pixel_size[1]))
             y_end = y_start + tile_height
             x_end = x_start + tile_width
             tile_bounds.append((y_start, y_end, x_start, x_end))
