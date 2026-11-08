@@ -56,7 +56,6 @@ class SamplingAccuracy:
         return (
             self.inside_envelope
             and np.isfinite(self.deviance)
-            and np.isfinite(self.deviance_bound)
             and self.deviance <= self.deviance_bound
             and self.flux_lower <= self.flux <= self.flux_upper
         )

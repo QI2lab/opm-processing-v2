@@ -127,7 +127,16 @@ def test_directional_rayleigh_measurement_matches_airy_first_minimum():
 
 
 @pytest.mark.parametrize(
-    "artifact", ["correct", "gain", "dim", "stripes", "zero", "zero-unbounded"]
+    "artifact",
+    [
+        "correct",
+        "correct-zero-bound",
+        "gain",
+        "dim",
+        "stripes",
+        "zero",
+        "zero-unbounded",
+    ],
 )
 def test_camera_sampling_bounds_detect_photon_and_spatial_errors(
     camera_sampling_case, artifact
@@ -156,6 +165,8 @@ def test_camera_sampling_bounds_detect_photon_and_spatial_errors(
         case.raw, camera.offset_adu, camera.electrons_per_adu
     ).astype(np.float64)
     original_flux = prediction.sum(dtype=np.float64)
+    if artifact == "correct-zero-bound":
+        envelope = SamplingEnvelope(np.zeros_like(expected), envelope.upper)
     if artifact == "gain":
         prediction *= 1.2
     elif artifact == "dim":
@@ -172,19 +183,20 @@ def test_camera_sampling_bounds_detect_photon_and_spatial_errors(
     measured = camera_sampling_accuracy(
         prediction, expected, envelope, np.ones(expected.shape, bool)
     )
-    assert measured.accepted == (artifact == "correct"), measured
+    correct = artifact in ("correct", "correct-zero-bound")
+    assert measured.accepted == correct, measured
     # The inverse-solver target uses this same independently observed optical
     # phantom. Its likelihood and calibrated-noise scores must distinguish the
     # same absolute gain and spatial errors without fitting a reconstruction.
     inverse_accuracy = camera_noise_accuracy(
         prediction, expected, camera, np.ones(expected.shape, bool)
     )
-    assert inverse_accuracy.accepted == (artifact == "correct"), inverse_accuracy
+    assert inverse_accuracy.accepted == correct, inverse_accuracy
     flux_accuracy = [
         camera_flux_accuracy(prediction, expected, camera, aperture)
         for aperture in camera_partition_apertures(expected.shape)
     ]
-    assert all(flux_accuracy) == (artifact == "correct")
+    assert all(flux_accuracy) == correct
     if artifact == "stripes":
         assert measured.flux_lower <= measured.flux <= measured.flux_upper
         assert not measured.inside_envelope
