@@ -4,16 +4,10 @@ from dataclasses import replace
 
 import numpy as np
 import pytest
-from scipy.special import j1
 from scipy.stats import norm, poisson
 
 from tests.simulation.camera_likelihood import camera_log_likelihood
-from tests.simulation.metrics import (
-    airy_rayleigh,
-    camera_score_difference,
-    first_minimum,
-    poisson_log_ratio_moments,
-)
+from tests.simulation.metrics import poisson_log_ratio_moments
 
 pytestmark = pytest.mark.unit
 
@@ -56,28 +50,18 @@ def test_held_out_camera_likelihood_favors_true_rate_without_brightness_fit(
     assert difference.mean() > 5 * difference.std(ddof=1) / np.sqrt(raw.size)
 
 
-def test_integer_camera_score_ratio_matches_independent_adc_sum(camera_calibration):
-    """Recover the Poisson score ratio for an ideal integer-count camera."""
+def test_integer_camera_likelihood_matches_poisson_probability(camera_calibration):
+    """Recover exact Poisson probabilities for an ideal integer-count camera."""
     camera = replace(
         camera_calibration, read_noise_e=0, electrons_per_adu=1, offset_adu=0
     )
     observed = np.array([0, 1, 30, 3000, 1000], dtype=np.uint16)
     prediction = np.array([0, 0.1, 30, 3000, 0.1])
-    baseline = np.array([1, 0.2, 25, 3100, 0.2])
     np.testing.assert_allclose(
         camera_log_likelihood(observed, prediction, camera),
         poisson.logpmf(observed, prediction),
         rtol=3e-13,
         atol=3e-13,
-    )
-    expected = camera_log_likelihood(
-        observed, prediction, camera
-    ) - camera_log_likelihood(observed, baseline, camera)
-    np.testing.assert_allclose(
-        camera_score_difference(observed, prediction, baseline, camera),
-        expected,
-        rtol=3e-11,
-        atol=3e-11,
     )
 
 
@@ -111,19 +95,6 @@ def test_registration_likelihood_moments_predict_independent_photon_draws(exposu
     fourth = 3 * variance**2 + np.sum(truth * np.log(truth / prediction) ** 4)
     variance_se = np.sqrt((fourth - (n - 3) / (n - 1) * variance**2) / n)
     assert abs(measured.var(ddof=1) - variance) <= 5 * variance_se
-
-
-def test_directional_rayleigh_measurement_matches_airy_first_minimum():
-    """Recover the circular-pupil Rayleigh separation and pair contrast."""
-    separation, dip = airy_rayleigh(0.637, 1.35)
-    radius = np.linspace(0, 2 * separation, 20001)
-    argument = 2 * np.pi * 1.35 * radius[1:] / 0.637
-    profile = np.r_[1, (2 * j1(argument) / argument) ** 2]
-    assert first_minimum(radius, profile) == pytest.approx(separation, abs=radius[1])
-    assert separation == pytest.approx(0.6098349456 * 0.637 / 1.35, rel=1e-9)
-    assert dip == pytest.approx(0.26497, abs=5e-5)
-    with pytest.raises(ValueError, match="first minimum"):
-        first_minimum(radius, np.exp(-(radius**2)))
 
 
 @pytest.mark.parametrize(

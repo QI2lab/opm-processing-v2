@@ -657,31 +657,6 @@ def discrete_optical_case(factor, nonuniform):
 
 
 @pytest.fixture
-def point_profile_case(request, microscope_parameters):
-    """Provide prescribed emitters and independent expectations on a shared grid."""
-    pattern, offset, separation = request.param
-    center = np.array((8.0, 8.0, 8.0))
-    offset = np.asarray(offset)
-    volume = np.full((17, 17, 17), float(pattern == "flat"))
-    if pattern == "pair":
-        volume[tuple((center - offset).astype(int))] = 100
-        volume[tuple((center + offset).astype(int))] = 200
-    elif pattern == "adjacent":
-        center[2] += 0.5
-        volume[8, 8, 8:10] = 100
-    else:
-        volume[8, 8, 8] = 1
-    return SimpleNamespace(
-        volume=volume,
-        center=center,
-        offset=offset,
-        separation=separation,
-        microscope=microscope_parameters,
-        pattern=pattern,
-    )
-
-
-@pytest.fixture
 def production_psf_parameters(microscope_parameters):
     """Provide explicit optical support and taper calibration for generated kernels."""
     microscope = microscope_parameters
