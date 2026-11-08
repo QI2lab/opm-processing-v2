@@ -14,10 +14,6 @@ from scipy.special import kl_div
 
 from opm_processing.imageprocessing.camera import camera_correct
 from tests.simulation.camera import digitize
-from tests.simulation.metrics import (
-    camera_score_difference,
-    two_point_profile,
-)
 
 pytestmark = pytest.mark.unit
 
@@ -128,38 +124,6 @@ def test_gc_checkpoint_continues_same_optical_reconstruction(
     assert steps == list(range(1, budget + 1))
     np.testing.assert_array_equal(resumed, uninterrupted[state.retained_scan])
     assert state.estimate is state.rng is state.rng_buffers is None
-
-
-def test_generated_psf_camera_reconstruction(
-    cupy_gpu, production_point_acquisition, production_forward_predictions
-):
-    """Apply production GC using the same PSF as the full camera simulation."""
-    from opm_processing.imageprocessing.rlgc import rlgc
-
-    case = production_point_acquisition
-    expected = case.expectations[-1]
-    camera = case.microscope.camera
-    calibrated = camera_correct(
-        digitize(expected, camera, seed=42), camera.offset_adu, camera.electrons_per_adu
-    )
-    recovered = rlgc(
-        calibrated,
-        case.kernel,
-        read_noise=camera.read_noise_e,
-        boundary="zero",
-        rng_seed=42,
-    )
-    assert np.isfinite(recovered).all() and recovered.min() >= 0
-    measured = production_forward_predictions[-1]
-    prediction, baseline = measured["prediction"], measured["input_prediction"]
-    assert kl_div(expected, prediction).sum() < kl_div(expected, baseline).sum()
-    score = camera_score_difference(
-        digitize(expected, camera, seed=43),
-        prediction,
-        baseline,
-        camera,
-    )
-    assert score.sum() > 0
 
 
 @pytest.mark.parametrize("array_backend", ["host", "gpu"])
@@ -338,84 +302,6 @@ def test_gc_stopping_uses_prescribed_fraction_and_change_limits(
     assert fraction == accepted / 1000
     assert delta == pytest.approx(abs(change) / max(peak, 1e-12), rel=2e-15)
     assert actual == reason
-
-
-@pytest.mark.parametrize("factor", (None, 3, 4), ids=("native", "sparse3", "sparse4"))
-@pytest.mark.parametrize("camera_mode", (False, True), ids=("ideal", "camera-3000"))
-def test_native_gc_directional_rayleigh_pair(
-    cupy_gpu,
-    rayleigh_pair,
-    optical_setup,
-    factor,
-    camera_mode,
-    camera_calibration,
-    ideal_photon_camera,
-    production_forward_predictions,
-):
-    """Resolve noisy pairs placed at the directional optical first-minimum spacing."""
-    solver = importlib.import_module("opm_processing.imageprocessing.rlgc")
-    case = rayleigh_pair
-    psf, microscope = optical_setup.psf, optical_setup.microscope
-    expectation = case.expectation
-    if camera_mode:
-        expectation = np.asarray(expectation, dtype=np.float64)
-        expectation = expectation * (3000 / float(expectation.max()))
-        assert expectation.max() == pytest.approx(3000, rel=2e-15)
-        camera = camera_calibration
-        observed = digitize(expectation, camera, seed=31)
-        calibrated = camera_correct(
-            observed, camera.offset_adu, camera.electrons_per_adu
-        )
-    else:
-        observed = digitize(expectation, ideal_photon_camera, seed=31).astype(
-            np.float32
-        )
-        calibrated = observed
-    recovered = solver.rlgc(
-        calibrated if factor is None else calibrated[::factor],
-        psf,
-        scan_upsample_factor=1 if factor is None else factor,
-        boundary="reflect" if factor is None else "zero",
-        read_noise=camera.read_noise_e if camera_mode else 0,
-    )
-    prediction = production_forward_predictions[-1]
-    baseline = prediction["input_prediction"]
-    if baseline is None:
-        # Sparse solver progress uses its actual initial prediction; no
-        # test-side interpolation or optical projector supplies a baseline.
-        baseline = prediction["initial_prediction"]
-    expected = expectation[:: factor or 1]
-    center = (np.array(observed.shape) - 1) / 2
-    measured = two_point_profile(recovered, center, case.offset, microscope)
-    metrics = {
-        "axis": case.axis,
-        "scan_factor": factor,
-        "rayleigh_separation_um": case.separation,
-        "sampled_rayleigh_dip": case.acquisition_dip,
-        "measured_dip": measured["valley_depth"],
-        "measured_positions_um": measured["peak_positions_um"],
-        "predictive_deviance": 2 * kl_div(expected, prediction["prediction"]).sum(),
-        "baseline_deviance": 2 * kl_div(expected, baseline).sum(),
-    }
-    assert np.isfinite(recovered).all() and recovered.min() >= 0
-    assert metrics["predictive_deviance"] < metrics["baseline_deviance"], metrics
-    # Sparse scans need not preserve the information required by the Rayleigh
-    # pair. Report their measured dip rather than assigning a fictitious limit.
-    if factor is None:
-        assert measured["peak_positions_um"] is not None, metrics
-        # Rayleigh fixes source separation through the single-point first minimum.
-        # It does not require a noisy reconstruction's dip to exceed the noiseless
-        # acquisition's dip. Peak positions and likelihood test the recovered pair.
-        # Profile interpolation cannot establish positions more finely than the
-        # acquisition-grid projection along this direction.
-        interval = case.separation / (2 * max(abs(case.offset)))
-        np.testing.assert_allclose(
-            measured["peak_positions_um"],
-            [-case.separation / 2, case.separation / 2],
-            rtol=0,
-            atol=interval,
-            err_msg=str(metrics),
-        )
 
 
 @pytest.mark.parametrize("factor", [1, 3, 4])

@@ -538,12 +538,12 @@ def pipeline_optical_data(microscope_parameters, simulation_parameters):
     """
 
     @lru_cache(maxsize=4)
-    def dosed_object(illumination, mosaic, scan_extent_factor):
+    def dosed_object(illumination, mosaic, scan_extent_factor, kind):
         """Set exposure once, before querying coarse or refined sensor grids."""
         reference_step = simulation_parameters["microscope"]["scan_step_um"]
         microscope = replace(microscope_parameters, scan_step_um=reference_step)
         settings = simulation_parameters["pipeline_mosaic" if mosaic else "pipeline"]
-        kind = "line-pairs" if mosaic else "points"
+        kind = kind or ("line-pairs" if mosaic else "points")
         specimen = simulation_parameters["specimens"][kind]
         if mosaic:
             specimen = {
@@ -583,10 +583,12 @@ def pipeline_optical_data(microscope_parameters, simulation_parameters):
         return scene, dose, source
 
     @lru_cache(maxsize=6)
-    def create(step, illumination=False, *, mosaic=False, scan_extent_factor=1):
+    def create(
+        step, illumination=False, *, mosaic=False, scan_extent_factor=1, kind=None
+    ):
         """Sample one unchanged physical emission field at the requested scan pitch."""
         scene, dose, source_density = dosed_object(
-            illumination, mosaic, scan_extent_factor
+            illumination, mosaic, scan_extent_factor, kind
         )
         microscope = replace(scene.microscope, scan_step_um=step)
         settings = simulation_parameters["pipeline_mosaic" if mosaic else "pipeline"]
@@ -677,7 +679,9 @@ def pipeline_case(
     native TensorStore storage in pytest temporary directories.
     """
     mode, illumination, step, crop = request.param
-    optical_data = pipeline_optical_data(step, illumination)
+    optical_data = pipeline_optical_data(
+        step, illumination, kind="line-pairs" if deconvolve else None
+    )
     microscope, expectation = (
         optical_data.microscope,
         optical_data.expectation,

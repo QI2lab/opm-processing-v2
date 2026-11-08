@@ -8,7 +8,6 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from scipy.interpolate import RegularGridInterpolator
 
 from opm_processing.imageprocessing.opmpsf import centered_sensor_axes
 from opm_processing.imageprocessing.opmtools import (
@@ -22,7 +21,7 @@ from tests.simulation.forward_model import (
     emission_psf,
     forward_model,
 )
-from tests.simulation.objects import centered_axis, deposit_point
+from tests.simulation.objects import deposit_point
 from tests.simulation.scenes import OpticalScene, freeze_metadata
 
 
@@ -44,17 +43,6 @@ class OpticalSetup:
     psf: np.ndarray
     axes: tuple[np.ndarray, ...]
     irradiance: np.ndarray
-
-
-@dataclass(frozen=True)
-class RayleighObservations:
-    """Known point-pair separation and immutable sampled diffraction response."""
-
-    axis: str
-    separation: float
-    acquisition_dip: float
-    offset: np.ndarray
-    expectation: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -132,6 +120,7 @@ def simulated_camera(
     def optical_data(
         shape,
         *,
+        kind="points",
         step=0.4,
         conversion=0.25,
         geometry="oblique",
@@ -139,7 +128,7 @@ def simulated_camera(
         budget=None,
     ):
         """Reuse immutable optical formation independently of detector noise."""
-        scene = independent_photon_scene_factory()
+        scene = independent_photon_scene_factory(kind)
         microscope = replace(
             microscope_parameters,
             scan_step_um=step,
@@ -169,6 +158,7 @@ def simulated_camera(
     def render(
         shape,
         *,
+        kind="points",
         step=0.4,
         conversion=0.25,
         geometry="oblique",
@@ -179,6 +169,7 @@ def simulated_camera(
         """Digitize the shared optical means with the requested detector seed."""
         scene, microscope, expectation = optical_data(
             shape,
+            kind=kind,
             step=step,
             conversion=conversion,
             geometry=geometry,
@@ -284,77 +275,6 @@ def optical_setup(microscope_parameters):
     )
 
 
-@pytest.fixture(scope="session", params=["x", "y", "z"])
-def rayleigh_pair(request, optical_setup):
-    """Direction-specific Rayleigh pair using production optical sampling.
-
-    Fine optical samples locate the diffraction PSF's first minimum. The target
-    contrast is measured from the noise-free forward acquisition on the same
-    grid and interpolated profile as the reconstruction. A continuous optical
-    profile is not a contrast threshold for discrete camera samples.
-    The two sources are placed at that physical separation, without snapping
-    their positions to acquisition voxels or creating reconstruction-grid delta PSFs.
-    The common detector field contains the full PSF response of every pair;
-    its scan endpoints also coincide for the tested sparse acquisitions.
-    """
-    from tests.simulation.metrics import first_minimum, two_point_profile
-
-    axis = request.param
-    index = "xyz".index(axis)
-    directions = np.eye(3)
-    direction = directions[index]
-    radius = np.arange(0, 1.8001, 0.005)
-    field = RegularGridInterpolator(
-        optical_setup.axes, optical_setup.irradiance, bounds_error=False, fill_value=0
-    )
-    separations = np.array(
-        [
-            first_minimum(radius, field((radius[:, None] * d)[:, ::-1]))
-            for d in directions
-        ]
-    )
-    separation = separations[index]
-    microscope = optical_setup.microscope
-    theta = np.deg2rad(microscope.angle_deg)
-    xyz_offsets = directions * separations[:, None] / 2
-    offsets = np.column_stack(
-        (
-            (xyz_offsets[:, 1] - xyz_offsets[:, 2] / np.tan(theta))
-            / microscope.scan_step_um,
-            xyz_offsets[:, 2] / (microscope.pixel_size_um * np.sin(theta)),
-            xyz_offsets[:, 0] / microscope.pixel_size_um,
-        )
-    )
-    # Detector half-width >= PSF half-width + maximum source displacement.
-    shape = (
-        2
-        * np.ceil(
-            (np.array(optical_setup.psf.shape) - 1) / 2
-            + np.max(np.abs(offsets), axis=0)
-        ).astype(int)
-        + 1
-    )
-    scan_multiple = np.lcm(3, 4)
-    shape[0] = ((shape[0] - 1 + scan_multiple - 1) // scan_multiple) * scan_multiple + 1
-    offset = offsets[index]
-    axes = tuple(centered_axis(e, 0.04) for e in (4.0, 3.0, 3.0))
-    density = np.zeros(tuple(map(len, axes)), np.float32)
-    for sign in (-1, 1):
-        deposit_point(density, axes, direction * sign * separation / 2, 100000)
-    expectation = forward_model(
-        density, Acquisition(axes, tuple(shape), output="expectation"), microscope
-    )
-    return RayleighObservations(
-        axis=axis,
-        separation=separation,
-        acquisition_dip=two_point_profile(
-            expectation, (np.array(expectation.shape) - 1) / 2, offset, microscope
-        )["valley_depth"],
-        offset=freeze_metadata(offset),
-        expectation=freeze_metadata(expectation),
-    )
-
-
 @pytest.fixture(scope="session")
 def ideal_photon_camera(camera_calibration):
     """Use the shared camera digitizer for ideal, unsigned photon observations."""
@@ -408,84 +328,6 @@ def measured_psf_calibration(tmp_path, psf_format):
     )
     write(kernel)
     return SimpleNamespace(path=path, kernel=kernel, write=write)
-
-
-@pytest.fixture
-def planar_point_model(optical_setup):
-    """Return two known emitters and the normalized central YX PSF used to blur them."""
-    from scipy import ndimage
-
-    central = optical_setup.psf[optical_setup.psf.shape[0] // 2].copy()
-    central /= central.sum()
-    psf = np.stack((np.ones_like(central), central * 7, np.ones_like(central) * 100))
-    density = np.zeros((3, 41, 43), np.float32)
-    axes = tuple(np.arange(n, dtype=float) for n in density.shape)
-    deposit_point(density, axes, (13, 12, 1), 2000)
-    deposit_point(density, axes, (30, 28, 1), 3000)
-    truth = density[1]
-    points = ((12, 13), (28, 30))
-    coordinates = np.indices(truth.shape)
-    distances = np.asarray(
-        [
-            sum(
-                (axis - center) ** 2
-                for axis, center in zip(coordinates, point, strict=True)
-            )
-            for point in points
-        ]
-    )
-    # Fixed Voronoi half-fields isolate both known emitters without choosing
-    # regions from reconstructed peaks or intensity thresholds.
-    point_fields = tuple(np.argmin(distances, axis=0) == index for index in range(2))
-    return SimpleNamespace(
-        truth=truth,
-        central=central,
-        psf=psf,
-        points=points,
-        point_fields=point_fields,
-        apertures=(np.ones(truth.shape, bool), *point_fields),
-        expectation=ndimage.convolve(truth, central, mode="reflect") + 0.25,
-    )
-
-
-@pytest.fixture
-def point_response_model(optical_setup):
-    """Share known point counts and a finite, sampled physical response kernel.
-
-    This discrete detector-operator unit conditions the production optical PSF
-    on its declared five-by-seven-by-seven support before normalizing mass.
-    Full optical acquisition accuracy is exercised by the forward-model cases.
-    """
-    from scipy import ndimage
-
-    radii = (2, 3, 3)
-    center = np.array(optical_setup.psf.shape) // 2
-    selection = tuple(
-        slice(c - r, c + r + 1) for c, r in zip(center, radii, strict=True)
-    )
-    psf = optical_setup.psf[selection].copy()
-    psf /= psf.sum()
-    truth = np.zeros((9, 35, 37), np.float32)
-    axes = tuple(np.arange(n, dtype=float) for n in truth.shape)
-    points = ((3, 10, 10), (6, 25, 27))
-    for point, count in zip(points, (20000, 30000), strict=True):
-        deposit_point(truth, axes, point[::-1], count)
-    response = np.broadcast_to(np.linspace(0.25, 2, 37, dtype=np.float32), (35, 37))
-    expectation = response * (ndimage.convolve(truth, psf, mode="reflect") + 0.25)
-    apertures = [np.ones(truth.shape, bool)]
-    for point in points:
-        aperture = np.zeros(truth.shape, bool)
-        aperture[
-            tuple(slice(c - r, c + r + 1) for c, r in zip(point, radii, strict=True))
-        ] = True
-        apertures.append(aperture)
-    return SimpleNamespace(
-        psf=psf,
-        response=response,
-        expectation=expectation,
-        points=points,
-        apertures=tuple(apertures),
-    )
 
 
 @pytest.fixture

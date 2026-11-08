@@ -70,6 +70,10 @@ initialization and random halves; default tiled RLGC continues them to the lates
 first-local-KL accepted iteration without replay. Test real allocation fallback
 with CUDA memory-pool limits, not fabricated out-of-memory exceptions.
 
+RLGC reconstruction quality and stopping evaluations use the shared noisy
+line-pair and sphere scenes, with native and sparse scan sampling in whole-volume
+and tiled layouts.
+
 Extend existing acquisition workflows for interruption/resume, moves and copies,
 separate raw/output directories, cached registration, numerical projections and
 ROI/TIFF export. Preserve metadata and journals; assert current paths, pixels,

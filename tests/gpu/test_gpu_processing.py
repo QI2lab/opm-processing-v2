@@ -15,7 +15,6 @@ import importlib
 import numpy as np
 import pytest
 from scipy import ndimage
-from scipy.special import kl_div
 from scipy.stats import entropy
 
 from tests.registration import (
@@ -24,8 +23,6 @@ from tests.registration import (
 from tests.registration import (
     test_orthogonal_camera_pairs_recover_known_stage_errors as test_orthogonal_camera_pairs_recover_known_stage_errors,
 )
-from tests.simulation.camera import digitize
-from tests.simulation.metrics import camera_flux_accuracy
 
 pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("cupy_gpu")]
 
@@ -171,52 +168,6 @@ def test_rlgc_empty_image_remains_empty(cupy_gpu, crop_scan, camera_value, monke
     assert len(cleanups) == 1
     pool = cupy_gpu.get_default_memory_pool()
     assert pool.total_bytes() == pool.used_bytes()
-
-
-@pytest.mark.parametrize("singleton_z", [False, True])
-def test_rlgc_2d_recovers_points_using_central_psf(
-    cupy_gpu,
-    planar_point_model,
-    ideal_photon_camera,
-    singleton_z,
-    production_forward_predictions,
-):
-    """Run the real wrapper and solver against independently blurred YX truth."""
-    rlgc = importlib.import_module("opm_processing.imageprocessing.rlgc")
-    case = planar_point_model
-    truth, skewed_psf = case.truth, case.psf
-    observed = digitize(
-        case.expectation,
-        ideal_photon_camera,
-        seed=31,
-    ).astype(np.float32)
-    if singleton_z:
-        observed = observed[None]
-        truth = truth[None]
-    restored = rlgc.rlgc(observed, skewed_psf, limit=0.02, max_delta=0.005)
-    assert restored.shape == truth.shape
-    assert restored.dtype == np.float32
-    expectation = case.expectation[None] if singleton_z else case.expectation
-    measured = production_forward_predictions[-1]
-    assert (
-        kl_div(expectation, measured["prediction"]).sum()
-        < kl_div(expectation, measured["input_prediction"]).sum()
-    )
-    for aperture in case.apertures:
-        assert camera_flux_accuracy(
-            measured["prediction"], expectation, ideal_photon_camera, aperture
-        )
-    np.testing.assert_array_equal(
-        np.unravel_index(np.argmax(restored), restored.shape),
-        np.unravel_index(np.argmax(truth), truth.shape),
-    )
-    plane = restored[0] if singleton_z else restored
-    for point, field in zip(case.points, case.point_fields, strict=True):
-        candidates = np.where(field, plane, -np.inf)
-        peak = np.unravel_index(np.argmax(candidates), plane.shape)
-        # Localize both original emitters to one output sample, without a
-        # peak-dependent search window or fitted amplitude.
-        np.testing.assert_allclose(peak, point, rtol=0, atol=1)
 
 
 @pytest.mark.parametrize("scale", (0.01, 1, 1000))
