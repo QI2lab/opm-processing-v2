@@ -24,29 +24,10 @@ def _patches(
     """Sample new phase RGBA on the same global native pixel centers."""
     patches = []
     for pupil in raster._pupils:
-        top, bottom, left, right = pupil["bounds"]
-        ya, yb = max(y0, math.ceil(top - 0.5)), min(y1, math.ceil(bottom - 0.5))
-        xa, xb = max(x0, math.ceil(left - 0.5)), min(x1, math.ceil(right - 0.5))
-        if ya >= yb or xa >= xb:
+        sampled = raster._pupil_patch(pupil, y0, y1, x0, x1)
+        if sampled is None:
             continue
-        source = pupil["rgba"]
-        if source.dtype != np.uint8 or source.ndim != 3 or source.shape[-1] != 4:
-            raise ValueError("Pupil replacement requires uint8 RGBA phase patches")
-        rows = np.clip(
-            ((np.arange(ya, yb) + 0.5 - top) / (bottom - top) * source.shape[0]).astype(
-                int
-            ),
-            0,
-            source.shape[0] - 1,
-        )
-        columns = np.clip(
-            (
-                (np.arange(xa, xb) + 0.5 - left) / (right - left) * source.shape[1]
-            ).astype(int),
-            0,
-            source.shape[1] - 1,
-        )
-        patch = source[source.shape[0] - 1 - rows[:, None], columns[None, :]]
+        (ya, yb, xa, xb), patch = sampled
         alpha = patch[..., 3]
         if np.any((alpha != 0) & (alpha != 255)):
             raise ValueError(

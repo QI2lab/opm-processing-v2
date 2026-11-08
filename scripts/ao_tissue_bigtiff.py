@@ -236,6 +236,36 @@ class NativeTissueRaster:
             np.uint8
         )
 
+    @staticmethod
+    def _pupil_patch(
+        pupil: dict[str, Any], y0: int, y1: int, x0: int, x1: int
+    ) -> tuple[tuple[int, int, int, int], np.ndarray] | None:
+        """Sample a pupil on global native pixel centers, retaining lower origin."""
+        top, bottom, left, right = pupil["bounds"]
+        ya, yb = max(y0, math.ceil(top - 0.5)), min(y1, math.ceil(bottom - 0.5))
+        xa, xb = max(x0, math.ceil(left - 0.5)), min(x1, math.ceil(right - 0.5))
+        if ya >= yb or xa >= xb:
+            return None
+        source = pupil["rgba"]
+        if source.dtype != np.uint8 or source.ndim != 3 or source.shape[-1] != 4:
+            raise ValueError("Pupil sampling requires uint8 RGBA phase patches")
+        rows = np.clip(
+            ((np.arange(ya, yb) + 0.5 - top) / (bottom - top) * source.shape[0]).astype(
+                int
+            ),
+            0,
+            source.shape[0] - 1,
+        )
+        columns = np.clip(
+            (
+                (np.arange(xa, xb) + 0.5 - left) / (right - left) * source.shape[1]
+            ).astype(int),
+            0,
+            source.shape[1] - 1,
+        )
+        patch = source[source.shape[0] - 1 - rows[:, None], columns[None, :]]
+        return (ya, yb, xa, xb), patch
+
     def render_tile(self, y0: int, y1: int, x0: int, x1: int) -> np.ndarray:
         """Render an arbitrary half-open native pixel rectangle as RGB uint8."""
         if not (0 <= y0 < y1 <= self.shape_yx[0] and 0 <= x0 < x1 <= self.shape_yx[1]):
@@ -278,30 +308,9 @@ class NativeTissueRaster:
                     * self.grid_alpha,
                 )
         for pupil in self._pupils:
-            top, bottom, left, right = pupil["bounds"]
-            ya, yb = max(y0, math.ceil(top - 0.5)), min(y1, math.ceil(bottom - 0.5))
-            xa, xb = max(x0, math.ceil(left - 0.5)), min(x1, math.ceil(right - 0.5))
-            if ya < yb and xa < xb:
-                source = pupil["rgba"]
-                rows = np.clip(
-                    (
-                        (np.arange(ya, yb) + 0.5 - top)
-                        / (bottom - top)
-                        * source.shape[0]
-                    ).astype(int),
-                    0,
-                    source.shape[0] - 1,
-                )
-                cols = np.clip(
-                    (
-                        (np.arange(xa, xb) + 0.5 - left)
-                        / (right - left)
-                        * source.shape[1]
-                    ).astype(int),
-                    0,
-                    source.shape[1] - 1,
-                )
-                patch = source[source.shape[0] - 1 - rows[:, None], cols[None, :]]
+            sampled = self._pupil_patch(pupil, y0, y1, x0, x1)
+            if sampled is not None:
+                (ya, yb, xa, xb), patch = sampled
                 self._blend(
                     result[ya - y0 : yb - y0, xa - x0 : xb - x0],
                     patch[..., :3],
