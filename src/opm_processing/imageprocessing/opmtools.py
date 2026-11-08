@@ -41,6 +41,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 from numba import njit, prange
+from ryomen import Slicer
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -600,23 +601,23 @@ def orthogonal_deskew(
     else:
         out = (np.zeros if zero_initialized else np.empty)(shape, np.float32)
     target = out[::-1] if reverse_deskewed_z else out
-    for z in range(0, shape[0], tile_shape[0]):
-        for y in range(0, shape[1], tile_shape[1]):
-            for x in range(0, shape[2], tile_shape[2]):
-                interpolate_rows(
-                    data,
-                    target[
-                        z : z + tile_shape[0],
-                        y : y + tile_shape[1],
-                        x : x + tile_shape[2],
-                    ],
-                    final_ny,
-                    final_nz,
-                    theta,
-                    distance,
-                    pixel_size,
-                    downsample_factor,
-                    zero_initialized,
-                    (z, y, x),
-                )
+    for tile, source, destination in Slicer(
+        target, crop_size=tile_shape, overlap=(0, 0, 0), pad=False
+    ):
+        # Ryomen shifts a final crop backward instead of shortening it. Every
+        # crop therefore uses its actual global origin, including repeated
+        # boundary samples, and receives explicit writes before placement.
+        interpolate_rows(
+            data,
+            tile,
+            final_ny,
+            final_nz,
+            theta,
+            distance,
+            pixel_size,
+            downsample_factor,
+            False,
+            tuple(axis.start for axis in destination[-3:]),
+        )
+        target[destination] = tile[source]
     return out
