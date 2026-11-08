@@ -47,7 +47,7 @@ class AOOptimizationResult:
 
     @cached_property
     def optimal_coefficients(self) -> np.ndarray:
-        """Return one coefficient vector after each recorded modal update."""
+        """Return saved coefficient vectors after iterations or modal updates."""
         values = np.asarray(self._array("optimal_coeffs"), dtype=float)
         if (
             values.ndim != 2
@@ -67,10 +67,11 @@ class AOOptimizationResult:
         if iterations < 1 or not isinstance(modes, (list, tuple)):
             raise ValueError("Saved AO optimization dimensions are invalid")
         expected = iterations * len(modes)
-        if self.optimal_coefficients.shape[0] != expected:
+        completed = self.optimal_coefficients.shape[0]
+        if completed != expected and (not modes or completed != iterations):
             raise ValueError(
-                "Saved AO history does not contain every recorded modal update"
+                "Saved AO history must contain every iteration or every modal update"
             )
-        if not expected:
+        if not completed:
             return self.starting_coefficients.copy()
         return self.optimal_coefficients[-1].copy()

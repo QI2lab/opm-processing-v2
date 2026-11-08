@@ -29,22 +29,21 @@ def load_cached_geometry(output: Path, manifest: dict[str, Any]) -> Any:
     """Reconstruct the exact renderer inputs without reading fused-volume pixels."""
     view = manifest["tissue_overlay"]
     provenance = view["geometry"]
-    composite = provenance["tissue_composite"]
-    channels = [int(channel) for channel in composite["channels"]]
+    composite = provenance.get("tissue_composite")
+    channels = (
+        [int(channel) for channel in composite["channels"]]
+        if composite
+        else [int(provenance["channel"])]
+    )
     pages = {int(page["depth_index"]): page for page in view["pages"]}
     if len(pages) != len(view["pages"]) or not pages:
         raise ValueError("Expected distinct completed viewing-copy layers")
-    colors = {int(c): tuple(color) for c, color in composite["colors_rgb8"].items()}
-    limits = {
-        int(c): {int(d): tuple(value) for d, value in layers.items()}
-        for c, layers in composite["display_limits_by_channel_depth"].items()
-    }
     images = {}
     common_canvas = None
     for channel in channels:
         directory = output / (
             "projection_cache"
-            if channel == 1
+            if not composite or channel == 1
             else f"projection_cache_channel_{channel}"
         )
         cache_path = directory / "layer_projection_cache.json"
@@ -70,13 +69,20 @@ def load_cached_geometry(output: Path, manifest: dict[str, Any]) -> Any:
         images[channel] = {}
         for depth, page in pages.items():
             roi = page["projection_roi"]
+            if composite:
+                recorded_path = roi["projection_cache_by_channel"][str(channel)]
+                fingerprint = roi["projection_cache_fingerprint_by_channel"][
+                    str(channel)
+                ]
+                image_hash = roi["mip_sha256_by_channel"][str(channel)]
+            else:
+                recorded_path = roi["projection_cache"]
+                fingerprint = roi["projection_cache_fingerprint"]
+                image_hash = roi["mip_sha256"]
             if (
-                Path(roi["projection_cache_by_channel"][str(channel)]).resolve()
-                != cache_path.resolve()
-                or roi["projection_cache_fingerprint_by_channel"][str(channel)]
-                != cache["fingerprint"]
-                or roi["mip_sha256_by_channel"][str(channel)]
-                != cache["mip_sha256_by_depth"][str(depth)]
+                Path(recorded_path).resolve() != cache_path.resolve()
+                or fingerprint != cache["fingerprint"]
+                or image_hash != cache["mip_sha256_by_depth"][str(depth)]
             ):
                 raise ValueError(
                     "Viewing-copy provenance differs from its native cache"
@@ -95,8 +101,21 @@ def load_cached_geometry(output: Path, manifest: dict[str, Any]) -> Any:
                 raise ValueError("Native projection cache layout or size is invalid")
             images[channel][depth] = image
     if common_canvas is None:
-        raise ValueError("No completed composite channels selected")
-    native_images = make_composite_layers(images, colors, limits)
+        raise ValueError("No completed tissue channels selected")
+    if composite:
+        colors = {int(c): tuple(color) for c, color in composite["colors_rgb8"].items()}
+        limits = {
+            int(c): {int(d): tuple(value) for d, value in layers.items()}
+            for c, layers in composite["display_limits_by_channel_depth"].items()
+        }
+        native_images = make_composite_layers(images, colors, limits)
+        display_limits = dict.fromkeys(native_images, (0, 255))
+    else:
+        native_images = images[channels[0]]
+        display_limits = {
+            int(depth): tuple(values)
+            for depth, values in provenance["native_display_limits_by_depth"].items()
+        }
     return SimpleNamespace(
         shape_yx=common_canvas[0],
         origin_yx_um=common_canvas[1],
@@ -113,7 +132,7 @@ def load_cached_geometry(output: Path, manifest: dict[str, Any]) -> Any:
             depth: page["planned_grid"] for depth, page in pages.items()
         },
         images_by_depth=native_images,
-        display_limits_by_depth=dict.fromkeys(native_images, (0, 255)),
+        display_limits_by_depth=display_limits,
         layer_projection_rois_by_depth={
             depth: page["projection_roi"] for depth, page in pages.items()
         },

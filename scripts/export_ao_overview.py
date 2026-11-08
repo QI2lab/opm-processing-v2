@@ -219,6 +219,10 @@ def main() -> None:
             )
         args.native_bigtiff = True
     if args.native_bigtiff:
+        if not args.planned_grid:
+            parser.error(
+                "Native BigTIFF exports require --planned-grid, including --composite-channels"
+            )
         args.local_z_projection = True
     if args.local_z_projection:
         args.full_resolution = True
@@ -524,7 +528,9 @@ def main() -> None:
                 output / "native",
                 timepoint=args.timepoint,
                 pupil_diameter_um=args.pupil_diameter_um,
-                scale_bar_um=args.scale_bar_um or 200,
+                scale_bar_um=manifest["tissue_overlay"]["pages"][0]["scale_bar"][
+                    "length_um"
+                ],
             )
         else:
             manifest["tissue_overlay"] = write_tissue_overlay(

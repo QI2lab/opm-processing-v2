@@ -447,44 +447,21 @@ def _open_projection_cache(
                     image.flush()
         else:
             try:
-                with image_path.open("rb") as stream:
-                    version = np.lib.format.read_magic(stream)
-                    if version == (1, 0):
-                        saved_shape, fortran, saved_dtype = (
-                            np.lib.format.read_array_header_1_0(stream)
-                        )
-                    elif version == (2, 0):
-                        saved_shape, fortran, saved_dtype = (
-                            np.lib.format.read_array_header_2_0(stream)
-                        )
-                    else:
-                        raise ValueError("Unsupported native cache array format")
-                    expected_bytes = (
-                        stream.tell() + math.prod(shape_yx) * dtype.itemsize
-                    )
+                image = np.lib.format.open_memmap(image_path, mode="r")
                 if (
-                    saved_shape != shape_yx
-                    or saved_dtype != dtype
-                    or fortran
-                    or image_path.stat().st_size != expected_bytes
+                    image.shape != shape_yx
+                    or image.dtype != dtype
+                    or not image.flags.c_contiguous
+                    or image_path.stat().st_size != image.offset + image.nbytes
                 ):
                     raise ValueError(
                         "Projection cache image shape, dtype, or size is invalid"
                     )
-                image = np.load(image_path, mmap_mode="r+", allow_pickle=False)
+                image = np.lib.format.open_memmap(image_path, mode="r+")
             except (OSError, ValueError) as error:
                 raise ValueError(
                     f"Projection cache image is invalid: {image_path}"
                 ) from error
-            if (
-                image.shape != shape_yx
-                or image.dtype != dtype
-                or not image.flags.c_contiguous
-                or image_path.stat().st_size != image.offset + image.nbytes
-            ):
-                raise ValueError(
-                    f"Projection cache image shape, dtype, or size is invalid: {image_path}"
-                )
         images[depth] = image
     if initialize:
         _flush_cache_arrays(images, paths)
