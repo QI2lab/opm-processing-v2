@@ -4214,7 +4214,7 @@ class TileFusion:
         concurrent_buffers = max(
             1, int(self._max_workers) + int(self.max_in_flight_writes)
         )
-        bytes_per_voxel = max(16, 12 * int(self.channels) + 4)
+        bytes_per_voxel = max(16, 16 * int(self.channels))
         bytes_per_z_plane = int(self.chunk_y) * int(self.chunk_x) * bytes_per_voxel
         max_z = max(
             output_chunk_z,
@@ -4255,9 +4255,9 @@ class TileFusion:
         )
         per_block_budget = max(1, budget // concurrent_buffers)
 
-        # A mixed block holds uint16 source/output arrays plus float32 overlap
-        # accumulators. Budget per concurrently rendered block, including channels.
-        bytes_per_voxel = max(16, 12 * int(self.channels) + 4)
+        # One source, output, accumulation and per-channel weights can all be
+        # float32. TensorStore's source cache has its own separate limit.
+        bytes_per_voxel = max(16, 16 * int(self.channels))
         max_xy_pixels = max(
             1,
             per_block_budget // (max(1, z_depth) * bytes_per_voxel),
@@ -4349,21 +4349,6 @@ class TileFusion:
             )
             return selection, direct, 1, 0
 
-        source_blocks: dict[int, tuple[tuple[int, int, int], np.ndarray]] = {}
-        for p, (oz, oy, ox) in contributors:
-            tile_shape = tile_shapes[p]
-            tz0, tz1 = max(z0, oz), min(z1, oz + tile_shape[0])
-            ty0, ty1 = max(y0, oy), min(y1, oy + tile_shape[1])
-            tx0, tx1 = max(x0, ox), min(x1, ox + tile_shape[2])
-            source = self._read_tile_volume(
-                p,
-                slice(None),
-                slice(tz0 - oz, tz1 - oz),
-                slice(ty0 - oy, ty1 - oy),
-                slice(tx0 - ox, tx1 - ox),
-                dtype=None,
-            )
-            source_blocks[p] = ((tz0, ty0, tx0), source)
         depth_gains = getattr(self, "_depth_intensity_gains", None)
 
         output = np.zeros(
@@ -4381,22 +4366,25 @@ class TileFusion:
                 slice(rx0 - x0, rx1 - x0),
             )
             if len(region_contributors) == 1:
-                p, (oz, oy, _ox) = region_contributors[0]
-                (sz0, sy0, sx0), source = source_blocks[p]
+                p, (oz, oy, ox) = region_contributors[0]
+                source = self._read_tile_volume(
+                    p,
+                    slice(None),
+                    slice(rz0 - oz, rz1 - oz),
+                    slice(ry0 - oy, ry1 - oy),
+                    slice(rx0 - ox, rx1 - ox),
+                    dtype=None,
+                )
                 output[output_selection] = self._cast_fusion_values(
                     self._scale_depth_source(
                         p,
-                        source[
-                            :,
-                            rz0 - sz0 : rz1 - sz0,
-                            ry0 - sy0 : ry1 - sy0,
-                            rx0 - sx0 : rx1 - sx0,
-                        ],
+                        source,
                         coverage_zy=tile_supports[p][
                             rz0 - oz : rz1 - oz, ry0 - oy : ry1 - oy
                         ],
                     )
                 )
+                del source
                 direct_regions += 1
                 continue
 
@@ -4427,10 +4415,17 @@ class TileFusion:
             for (p, (oz, oy, ox)), present in zip(
                 region_contributors, channel_flags, strict=True
             ):
-                (sz0, sy0, sx0), source = source_blocks[p]
                 local_z = slice(rz0 - oz, rz1 - oz)
                 local_y = slice(ry0 - oy, ry1 - oy)
                 local_x = slice(rx0 - ox, rx1 - ox)
+                source = self._read_tile_volume(
+                    p,
+                    slice(None),
+                    local_z,
+                    local_y,
+                    local_x,
+                    dtype=None,
+                )
                 tile_support = tile_supports[p]
                 tile_profiles = getattr(self, "_tile_profiles", None)
                 if tile_profiles is None:
@@ -4451,15 +4446,16 @@ class TileFusion:
                     0,
                     0,
                     0,
-                    rz0 - sz0,
-                    ry0 - sy0,
-                    rx0 - sx0,
+                    0,
+                    0,
+                    0,
                     (
                         None
                         if depth_gains is None or np.all(depth_gains[p] == 1)
                         else depth_gains[p]
                     ),
                 )
+                del source
 
             region_output = output[output_selection]
             if output.dtype == np.dtype(np.float32):
@@ -4467,6 +4463,7 @@ class TileFusion:
                 region_output[:] = fused
             else:
                 _normalize_block(fused, weight, output, rz0 - z0, ry0 - y0, rx0 - x0)
+            del fused, weight
             for channel_index in range(int(self.channels)):
                 active_tiles = [
                     tile_index
@@ -4481,25 +4478,28 @@ class TileFusion:
                 if len(active_tiles) != 1:
                     continue
                 tile_index = active_tiles[0]
-                oz, oy, _ox = next(
+                oz, oy, ox = next(
                     offset for p, offset in region_contributors if p == tile_index
                 )
-                (sz0, sy0, sx0), source = source_blocks[tile_index]
+                source = self._read_tile_volume(
+                    tile_index,
+                    slice(channel_index, channel_index + 1),
+                    slice(rz0 - oz, rz1 - oz),
+                    slice(ry0 - oy, ry1 - oy),
+                    slice(rx0 - ox, rx1 - ox),
+                    dtype=None,
+                )[0]
                 region_output[channel_index] = self._cast_fusion_values(
                     self._scale_depth_source(
                         tile_index,
-                        source[
-                            channel_index,
-                            rz0 - sz0 : rz1 - sz0,
-                            ry0 - sy0 : ry1 - sy0,
-                            rx0 - sx0 : rx1 - sx0,
-                        ],
+                        source,
                         channel_index,
                         tile_supports[tile_index][
                             rz0 - oz : rz1 - oz, ry0 - oy : ry1 - oy
                         ],
                     )
                 )
+                del source
             blended_regions += 1
 
         selection = (
