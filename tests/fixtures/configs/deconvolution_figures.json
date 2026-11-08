@@ -128,10 +128,8 @@
     }
   },
   "kinds": [
-    "points",
     "line-pairs",
-    "sphere",
-    "siemens-star"
+    "sphere"
   ],
   "illumination_profiles": [
     "uniform",
@@ -191,7 +189,6 @@
     "dpi": 190,
     "font_family": "Arial",
     "best_view": {
-      "points": "XZ",
       "line-pairs": "XZ",
       "sphere": "XZ",
       "siemens-star": "XY"

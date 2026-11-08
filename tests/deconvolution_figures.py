@@ -632,67 +632,6 @@ def save(fig: plt.Figure, stem: str, pdf: PdfPages) -> None:
     print("FIGURE", stem, flush=True)
 
 
-def points_figure(profile: str, factor: int) -> plt.Figure:
-    """Compare point reconstructions in the laboratory XZ view."""
-    fig, axes = plt.subplots(len(LEVELS), 4, figsize=(12.5, 11.4), squeeze=False)
-    fig.subplots_adjust(
-        left=0.065, right=0.985, bottom=0.105, top=0.89, wspace=0.035, hspace=0.10
-    )
-    fig.suptitle(
-        "Points · " + condition(profile, factor), fontsize=16, fontweight="bold", y=0.98
-    )
-    fig.text(
-        0.065,
-        0.935,
-        f"XZ maximum-intensity projections · {P.pixel_size_um:g} µm camera pixels · {P.angle_deg:g}° OPM",
-        fontsize=12,
-    )
-    for row, photons in enumerate(LEVELS):
-        folder = ROOT / f"photons_{photons}/{profile}_points_f{factor}"
-        data = load(folder / "views.npz")
-        info = json.loads((folder / "views.json").read_text())
-        for column, method in enumerate(METHODS):
-            iteration = {
-                "rl_best": info["best_iteration"],
-                "rl_end": RL_ITERATIONS,
-                "gc": info["gc_iteration"],
-            }.get(method)
-            image_panel(
-                axes[row, column],
-                data[method + "_XZ"],
-                data["gt_XZ"],
-                physical_extent(data, "XZ"),
-                method,
-                iteration,
-                {
-                    "figure": f"points_{profile}_f{factor}",
-                    "photons": photons,
-                    "view": "XZ",
-                },
-            )
-        axes[row, 0].text(
-            -0.07,
-            0.5,
-            f"{photons:,}/{BACKGROUND[photons]} photons",
-            rotation=90,
-            ha="right",
-            va="center",
-            fontsize=11,
-            transform=axes[row, 0].transAxes,
-        )
-    fig.text(
-        0.065,
-        0.025,
-        "Rows: source/background incident photons per camera pixel before QE. Shared GT display scale within each row.\n"
-        "Zero-background conditions retain source shot noise and camera read noise.\n"
-        f"RL best: highest recorded XZ PSNR through I={RL_ITERATIONS:,}. RLGC: read-noise compensation ({READ_NOISE:g} RMS), KL enabled.\n"
-        "No reconstruction intensity fitting.",
-        fontsize=9,
-        linespacing=1.4,
-    )
-    return fig
-
-
 def main() -> None:
     """Generate or render the explicitly configured comparison series."""
     global \
@@ -762,7 +701,6 @@ def main() -> None:
         ("line_cuts", "line-pairs"),
         ("sphere_orthogonal", "sphere"),
         ("siemens_star", "siemens-star"),
-        ("points", "points"),
     ):
         if kind not in CONFIG["kinds"]:
             continue
@@ -784,12 +722,6 @@ def main() -> None:
                         )
                 elif kind == "siemens-star":
                     save(star_figure(profile, factor), f"star_{profile}_f{factor}", pdf)
-                else:
-                    save(
-                        points_figure(profile, factor),
-                        f"points_{profile}_f{factor}",
-                        pdf,
-                    )
     with (OUT / "psnr_labels.csv").open("w", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=list(LABELS[0]))
         writer.writeheader()
@@ -800,12 +732,12 @@ def main() -> None:
         "<h1>Deconvolution comparisons</h1>"
         + "".join(
             f'<p><a href="{name}.pdf">{label}</a></p>'
-            for name, label in [
-                ("line_cuts", "Line cuts"),
-                ("sphere_orthogonal", "Sphere XY/XZ/YZ"),
-                ("siemens_star", "Siemens star"),
-                ("points", "Points"),
+            for name, label, kind in [
+                ("line_cuts", "Line cuts", "line-pairs"),
+                ("sphere_orthogonal", "Sphere XY/XZ/YZ", "sphere"),
+                ("siemens_star", "Siemens star", "siemens-star"),
             ]
+            if kind in CONFIG["kinds"]
         )
     )
     print("COMPLETE", len(LABELS), "PSNR labels", flush=True)
