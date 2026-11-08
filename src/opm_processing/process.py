@@ -1604,6 +1604,7 @@ def process_skewed(
     )
     if deconvolve:
         from opm_processing.imageprocessing.rlgc import (
+            RLGC_SOLVER_REVISION,
             RlgcChunkState,
             rlgc,
         )
@@ -1836,6 +1837,7 @@ def process_skewed(
             None
             if not deconvolve
             else {
+                "solver_revision": RLGC_SOLVER_REVISION,
                 "read_noise": decon_read_noise,
                 "crop_scan": decon_crop_scan,
                 "fallback_step_scan": decon_fallback_step_scan,
@@ -2603,6 +2605,7 @@ def process_projection(
     overwrite = not resume
     if deconvolve:
         from opm_processing.imageprocessing.rlgc import (
+            RLGC_SOLVER_REVISION,
             rlgc,
         )
 
@@ -2714,6 +2717,7 @@ def process_projection(
             None
             if not deconvolve
             else {
+                "solver_revision": RLGC_SOLVER_REVISION,
                 "read_noise": decon_read_noise,
                 "eager": bool(eager_deconvolution),
                 "psf_parameters": None
