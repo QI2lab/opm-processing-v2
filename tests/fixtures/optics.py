@@ -480,7 +480,6 @@ def point_response_model(optical_setup):
         ] = True
         apertures.append(aperture)
     return SimpleNamespace(
-        truth=truth,
         psf=psf,
         response=response,
         expectation=expectation,
@@ -899,23 +898,70 @@ def production_point_acquisition(
         for n, size in zip(kernel.shape, shape, strict=True)
     )
     kernel = kernel[region]
-    scan, row, column = np.meshgrid(
-        *((np.arange(size) - (size - 1) / 2) for size in shape), indexing="ij"
-    )
-    angle = np.deg2rad(microscope.angle_deg)
-    pixel = microscope.pixel_size_um
-    distance = np.sqrt(
-        (row * pixel * np.sin(angle)) ** 2
-        + (scan * step + row * pixel * np.cos(angle)) ** 2
-        + (column * pixel) ** 2
-    )
-    radius = 0.61 * microscope.wavelength_um / microscope.numerical_aperture
     return SimpleNamespace(
         microscope=microscope,
         expectations=freeze_metadata(expectations),
         kernels=freeze_metadata(kernels),
         kernel=freeze_metadata(kernel / kernel.sum()),
-        apertures=freeze_metadata(
-            (np.ones(shape, bool), distance <= radius, distance >= 2 * radius)
-        ),
     )
+
+
+@pytest.fixture(scope="session", params=("line-pairs", "sphere"))
+def noisy_extended_scene(request, microscope_parameters, simulation_parameters):
+    """Observe fixed extended emitters with calibrated noisy camera exposures."""
+    from scipy.ndimage import maximum_filter
+
+    from opm_processing.imageprocessing.opmpsf import integrate_camera_pixels
+    from tests.simulation.camera import digitize
+    from tests.simulation.scenes import acquisition_shape, prepare_scene
+
+    config = simulation_parameters
+    microscope = replace(
+        microscope_parameters, scan_step_um=config["microscope"]["scan_step_um"]
+    )
+    specimen = config["specimens"][request.param]
+    mosaic = config["pipeline_mosaic"]
+    if request.param == "line-pairs":
+        z, _, x = specimen["half_extent_zyx_um"]
+        specimen = {
+            "half_extent_zyx_um": (z, mosaic["half_extent_zyx_um"][1], x),
+            "features": dict(specimen["features"], length_um=mosaic["line_length_um"]),
+        }
+    scene = prepare_scene(request.param, microscope, parameters=specimen)
+    native = acquisition_shape(scene)
+    shape = (
+        max(native[0], round(mosaic["scan_extent_um"] / microscope.scan_step_um) + 1),
+        *native[1:],
+    )
+    expectation = forward_model(
+        scene.density,
+        Acquisition(
+            scene.axes, shape, camera_photon_budget=(100, 0), output="expectation"
+        ),
+        microscope,
+    )
+    psf, _ = camera_psf(microscope)
+    source = (
+        integrate_camera_pixels(
+            scene.density,
+            scene.axes,
+            centered_sensor_axes(
+                shape,
+                (
+                    microscope.scan_step_um,
+                    microscope.pixel_size_um,
+                    microscope.pixel_size_um,
+                ),
+            ),
+            pixel_size_um=microscope.pixel_size_um,
+            theta_deg=microscope.angle_deg,
+            samples=microscope.pixel_samples,
+            area_integral=False,
+        )
+        > 0
+    )
+    dark = ~maximum_filter(source, size=psf.shape, mode="constant", cval=False)
+    raw = digitize(expectation, microscope.camera, seed=config["camera_seed"])
+    for array in (expectation, psf, raw, source, dark):
+        array.setflags(write=False)
+    return microscope, expectation, psf, raw, source, dark
