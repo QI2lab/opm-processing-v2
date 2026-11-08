@@ -105,11 +105,9 @@ def processing_state_path(output_root: Path, acquisition_stem: str) -> Path:
 def processing_state_image_attributes(
     state_path: Path, image_path: Path
 ) -> dict[str, Any]:
-    """Link an external fused image to its journal without copying registration."""
+    """Link a fused image to its journal without copying registration."""
     state_path = Path(state_path).expanduser().resolve()
     image_path = Path(image_path).expanduser().resolve()
-    if state_path.parent == image_path.parent:
-        return {}
     return {
         "opm_processing": {
             "processing_state": _source_record(state_path, image_path),

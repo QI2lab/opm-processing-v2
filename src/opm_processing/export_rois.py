@@ -200,17 +200,31 @@ def select_rois(
     import napari
 
     root = open_group(source)
-    if isinstance(root.ome_metadata(), v05.Bf2Raw):
+    metadata = root.ome_metadata()
+    if isinstance(metadata, v05.Bf2Raw):
         series = root["OME"].ome_metadata().series
         if len(series) != 1:
             raise ValueError("ROI viewing requires a fused or single-position preview")
     viewer = napari.Viewer()
     layers = viewer.open(str(source), plugin="napari-ome-zarr")
     reference = layers[0]
-    if isinstance(root.ome_metadata(), v05.Bf2Raw):
+    if isinstance(metadata, v05.Bf2Raw):
         placement = projection_tile_footprints(source)[0]["origin_zyx_um"]
         for layer in layers:
             layer.translate = (*layer.translate[:-3], *placement)
+    elif isinstance(metadata, v05.Image):
+        multiscale = metadata.multiscales[0]
+        translation = multiscale.datasets[0].translation_transform
+        if translation is not None:
+            placement = tuple(
+                value
+                for axis, value in zip(
+                    multiscale.axes, translation.translation, strict=True
+                )
+                if axis.type != "channel"
+            )
+            for layer in layers:
+                layer.translate = placement
     configure_roi_projection(viewer, layers)
     # Each ROI spans all Z and timepoints. A 2D overlay also avoids napari's
     # integer shape-slice keys hiding rectangles at fractional world Z values.
