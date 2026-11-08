@@ -220,17 +220,25 @@ def test_progress_groups_preserve_every_pending_volume(order):
 
 
 @pytest.mark.parametrize("zero", [False, True])
-def test_position_pyramid_queue_writes_all_levels(position_store_factory, zero):
+@pytest.mark.parametrize("method", ["stride", "block_mean"])
+@pytest.mark.parametrize("dtype", [np.uint16, np.float32])
+def test_position_pyramid_queue_writes_all_levels(
+    position_store_factory, zero, method, dtype
+):
     """Retain intensity or an explicit zero across every queued image pyramid."""
+    from skimage.measure import block_reduce
+
     from opm_processing.process import queue_position_pyramid_writes
 
-    source = np.arange(3 * 8 * 10, dtype=np.float32).reshape(3, 8, 10)
+    source = np.arange(3 * 9 * 518, dtype=np.float32).reshape(3, 9, 518) / 4 + 0.375
+    base = source.astype(dtype)
     collection = position_store_factory(
-        np.zeros((1, 1, 1, *source.shape), np.float32),
+        np.zeros((1, 1, 1, *source.shape), dtype),
         multiscale_factors_yx=(2, 4),
+        multiscale_downsample=method,
     )
     writes = queue_position_pyramid_writes(
-        collection, 0, 0, 0, np.float32(0) if zero else source
+        collection, 0, 0, 0, dtype(0) if zero else source
     )
     for future in writes:
         future.result()
@@ -238,9 +246,16 @@ def test_position_pyramid_queue_writes_all_levels(position_store_factory, zero):
     for factor, arrays in zip(
         collection.multiscale_factors_yx, collection.multiscale_arrays, strict=True
     ):
+        expected = base[..., ::factor, ::factor]
+        if method == "block_mean" and factor > 1:
+            complete = base[..., : 9 // factor * factor, : 518 // factor * factor]
+            expected = block_reduce(complete, (1, factor, factor), func=np.mean)
+            if dtype == np.uint16:
+                expected = np.rint(expected)
+            expected = expected.astype(dtype)
         np.testing.assert_array_equal(
             arrays[0][0, 0].read().result(),
-            0 if zero else source[..., ::factor, ::factor],
+            0 if zero else expected,
         )
 
 

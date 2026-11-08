@@ -44,7 +44,7 @@ def test_roi_resumes_at_last_durable_channel(
         """Inject a partial write failure before the channel checkpoint."""
         if key == stop_key:
             # Leave a partial channel and fail the write future before checkpointing.
-            target[0].write(value[0]).result()
+            run.process.write_processed_channel(target[:1], value[:1])
             readonly = ts.open(target.spec(), read=True, write=False).result()
             return real_write(readonly, value, state, path, key, **kwargs)
         return real_write(target, value, state, path, key, **kwargs)

@@ -12,14 +12,17 @@ import multiprocessing as mp
 import sys
 import time
 import traceback
+from collections import deque
 from contextlib import ExitStack
 from functools import partial
 from multiprocessing.connection import wait as wait_for_worker
 from pathlib import Path
+from tempfile import TemporaryFile
 from typing import TYPE_CHECKING, Annotated, Any
 
 import numpy as np
 import typer
+from ryomen import Slicer
 from tifffile import TiffFile, TiffWriter, imread
 from tqdm import tqdm
 from yaozarrs import open_group, v05
@@ -86,6 +89,7 @@ app.pretty_exceptions_enable = False
 
 # Reject cached fields made before depth estimates shared one maximum field.
 FLATFIELD_SOFTWARE = "opm-processing/basicpy-stage-z-max-camera-contract-v12"
+PROCESSING_TILE_SHAPE = (16, 256, 256)
 
 
 def progress_tile_groups(
@@ -340,6 +344,49 @@ def format_processed_output(data: np.ndarray, save_float32: bool) -> np.ndarray:
     return np.clip(data, 0, np.iinfo(np.uint16).max).astype(np.uint16)
 
 
+def write_processed_channel(target: Any, value: np.ndarray | np.generic) -> bool:
+    """Convert and write one channel in bounded tiles sized from storage chunks.
+
+    Parameters
+    ----------
+    target : Any
+        Writable ZYX TensorStore selection for one output channel.
+    value : numpy.ndarray or numpy.generic
+        Float32 image or scalar fill. A memory-mapped image remains disk-backed.
+
+    Returns
+    -------
+    bool
+        Whether any persisted output sample is nonzero. At most two converted
+        tiles are queued, and all writes finish before the source is released.
+    """
+    if np.ndim(value) == 0:
+        target.write(value).result()
+        return bool(value)
+    tile_shape = tuple(
+        min(int(chunk), limit)
+        for chunk, limit in zip(
+            target.chunk_layout.write_chunk.shape, PROCESSING_TILE_SHAPE, strict=True
+        )
+    )
+    save_float32 = np.dtype(target.dtype.numpy_dtype) == np.dtype(np.float32)
+    pending = deque()
+    has_signal = False
+    try:
+        for tile, source, destination in Slicer(
+            value, crop_size=tile_shape, overlap=(0, 0, 0), pad=False
+        ):
+            formatted = format_processed_output(tile[source], save_float32)
+            has_signal |= bool(np.any(formatted))
+            pending.append(target[destination].write(formatted))
+            if len(pending) >= 2:
+                pending.popleft().result()
+    finally:
+        for future in pending:
+            future.result()
+    return has_signal
+
+
 def write_checkpointed_roi_channel(
     target: Any,
     value: np.ndarray | np.generic,
@@ -348,7 +395,7 @@ def write_checkpointed_roi_channel(
     channel_key: tuple[int, int, int],
     *,
     is_zero: bool,
-) -> None:
+) -> bool:
     """Finish a cropped channel write before recording it as resumable.
 
     Parameters
@@ -368,11 +415,13 @@ def write_checkpointed_roi_channel(
 
     Returns
     -------
-    None
-        The channel is checkpointed only after its write finishes successfully.
+    bool
+        Whether the channel contains nonzero persisted values. Its checkpoint
+        is recorded only after every bounded output write finishes successfully.
     """
-    target.write(value).result()
-    state.complete_channel(output_path, *channel_key, is_zero=is_zero)
+    has_signal = write_processed_channel(target, value)
+    state.complete_channel(output_path, *channel_key, is_zero=is_zero or not has_signal)
+    return has_signal
 
 
 def queue_position_pyramid_writes(
@@ -403,19 +452,68 @@ def queue_position_pyramid_writes(
         Write futures that the caller must finish before checkpointing the tile.
     """
     writes = []
-    for factor, level_arrays in zip(
-        collection.multiscale_factors_yx, collection.multiscale_arrays, strict=False
-    ):
-        value = (
-            level_zero
-            if factor == 1 or np.ndim(level_zero) == 0
-            else downsample_yx(
-                np.asarray(level_zero),
-                factor,
-                collection.multiscale_downsample,
-            )
-        )
-        writes.append(level_arrays[position][timepoint, channel].write(value))
+    pending = deque()
+    try:
+        for factor, level_arrays in zip(
+            collection.multiscale_factors_yx, collection.multiscale_arrays, strict=False
+        ):
+            target = level_arrays[position][timepoint, channel]
+            if np.ndim(level_zero) == 0:
+                future = target.write(level_zero)
+                pending.append(future)
+            else:
+                save_float32 = np.dtype(target.dtype.numpy_dtype) == np.dtype(
+                    np.float32
+                )
+                # Strides remain views. Block means must retain the original
+                # base-dtype rounding while bounding their fine-grid input.
+                reduction = (
+                    factor if collection.multiscale_downsample == "block_mean" else 1
+                )
+                tile_shape = tuple(
+                    max(1, min(int(chunk), limit // scale))
+                    for chunk, limit, scale in zip(
+                        target.chunk_layout.write_chunk.shape,
+                        PROCESSING_TILE_SHAPE,
+                        (1, reduction, reduction),
+                        strict=True,
+                    )
+                )
+                layout = level_zero[
+                    ...,
+                    : target.shape[-2] * factor : factor,
+                    : target.shape[-1] * factor : factor,
+                ]
+                for _tile, _source, destination in Slicer(
+                    layout, crop_size=tile_shape, overlap=(0, 0, 0), pad=False
+                ):
+                    selection = (
+                        *destination[:-2],
+                        *(
+                            slice(axis.start * factor, axis.stop * factor)
+                            for axis in destination[-2:]
+                        ),
+                    )
+                    value = np.asarray(level_zero[selection])
+                    if collection.multiscale_downsample == "block_mean":
+                        value = format_processed_output(value, save_float32)
+                    value = downsample_yx(
+                        value, factor, collection.multiscale_downsample
+                    )
+                    future = target[destination].write(
+                        format_processed_output(value, save_float32)
+                    )
+                    pending.append(future)
+                    if len(pending) >= 2:
+                        pending.popleft().result()
+            writes.append(future)
+            if len(pending) >= 2:
+                pending.popleft().result()
+    finally:
+        # Source views can borrow a mapped MIP. Finish their copies before
+        # returning to the caller's ExitStack, retaining two concurrent writes.
+        for future in pending:
+            future.result()
     return writes
 
 
@@ -1748,7 +1846,6 @@ def process_skewed(
         deskewed_shape[1],
         deskewed_shape[2],
     ]
-    deskewed: np.ndarray | None = None
 
     if illumination_path is not None:
         flatfield_path = Path(illumination_path).expanduser().resolve()
@@ -1955,11 +2052,6 @@ def process_skewed(
             deskewed_shape[2],
         ]
 
-        # create array to hold one maximum projection deskewed volume
-        max_z_deskewed = np.zeros(
-            (1, deskewed_shape[1], deskewed_shape[2]), dtype=np.float32
-        )
-
         if not (deconvolve):
             max_z_output_path = output_dir / Path(
                 acquisition_stem(root_path) + "_max_z_deskewed.ome.zarr"
@@ -2137,7 +2229,6 @@ def process_skewed(
             acquisition.acquisition_order,
         )
 
-    wrote_tile = False
     zero_channels = processing_state.zero_channels(output_path)
     completed_channels = (
         processing_state.completed_channels(output_path)
@@ -2157,7 +2248,6 @@ def process_skewed(
                     continue
                 roi_series_index, roi_plan = plan_entry
                 skewed_roi = roi_plan["skewed_bounds"]
-            wrote_tile = True
             tile_completed_channels = {
                 channel
                 for time, position, channel in completed_channels
@@ -2354,70 +2444,133 @@ def process_skewed(
                 else:
                     stop = -flyback_crop if flyback_crop is not None else None
                     deskew_input = camera_corrected_data[excess_scan_positions:stop]
-                deskewed = orthogonal_deskew(
-                    deskew_input,
+                target = (
+                    ts_store[pos_idx][t_idx, chan_idx]
+                    if roi_series_index is None
+                    else ts_store[roi_series_index][0, chan_idx]
+                )
+                tile_shape = tuple(
+                    min(int(chunk), limit)
+                    for chunk, limit in zip(
+                        target.chunk_layout.write_chunk.shape,
+                        PROCESSING_TILE_SHAPE,
+                        strict=True,
+                    )
+                )
+                full_shape, *_ = deskew_shape_estimator(
+                    deskew_input.shape,
                     theta=opm_tilt_deg,
                     distance=reconstruction_step_um,
                     pixel_size=pixel_size_um,
+                    crop_after_deskew=False,
                     downsample_factor=z_downsample_level,
                 )
-
-                if roi_plan is not None:
-                    crop_y0, crop_y1, crop_x0, crop_x1 = (
-                        int(value) for value in roi_plan["deskew_crop_yx"]
-                    )
-                    deskewed = deskewed[
-                        :,
-                        crop_y0:crop_y1,
-                        crop_x0:crop_x1,
-                    ]
-                elif crop_after_deskew:
-                    cropped_ny = deskewed_shape[1] - _pad_y
-                    deskewed = deskewed[:, crop_y : crop_y + cropped_ny, :]
-                    if _pad_y:
-                        deskewed = np.pad(deskewed, ((0, 0), (0, _pad_y), (0, 0)))
-
-                if max_projection:
-                    max_z_deskewed = np.max(deskewed, axis=0, keepdims=True)
-                    # create future objects for async data writing
-                    ts_max_writes.extend(
-                        queue_position_pyramid_writes(
-                            max_z_collection,
-                            pos_idx,
-                            t_idx,
-                            chan_idx,
-                            format_processed_output(
-                                max_z_deskewed,
-                                save_float32,
-                            ),
+                with ExitStack() as output_buffers:
+                    deskew_buffer = None
+                    if (
+                        math.prod(full_shape) * np.dtype(np.float32).itemsize
+                        > 128 * 1024**2
+                    ):
+                        backing = output_buffers.enter_context(
+                            TemporaryFile(dir=output_dir)
                         )
+                        deskew_buffer = np.memmap(
+                            backing,
+                            mode="w+",
+                            dtype=np.float32,
+                            shape=tuple(full_shape),
+                        )
+                        output_buffers.callback(deskew_buffer._mmap.close)
+                    deskewed = orthogonal_deskew(
+                        deskew_input,
+                        theta=opm_tilt_deg,
+                        distance=reconstruction_step_um,
+                        pixel_size=pixel_size_um,
+                        downsample_factor=z_downsample_level,
+                        tile_shape=tile_shape,
+                        out=deskew_buffer,
                     )
 
-                # create future objects for async data writing
-                formatted = format_processed_output(deskewed, save_float32)
-                if not np.any(formatted):
-                    zero_channels.add((int(t_idx), int(pos_idx), int(chan_idx)))
-                if roi_series_index is None:
-                    ts_writes.append(
-                        ts_store[pos_idx][t_idx, chan_idx].write(formatted)
-                    )
-                else:
-                    write_checkpointed_roi_channel(
-                        ts_store[roi_series_index][0, chan_idx],
-                        formatted,
-                        processing_state,
-                        output_path,
-                        channel_key,
-                        is_zero=channel_key in zero_channels,
-                    )
-                    # ROI writes are durable here. Cropped views otherwise keep
-                    # the previous full reconstruction/deskew alive throughout
-                    # the next channel's deconvolution.
-                    del raw_data, camera_calibrated_data, camera_corrected_data
-                    del deskew_input, formatted
-                    deskewed = None
-                    if deconvolve:
-                        del decon_input, deconvolved_data
+                    if roi_plan is not None:
+                        crop_y0, crop_y1, crop_x0, crop_x1 = (
+                            int(value) for value in roi_plan["deskew_crop_yx"]
+                        )
+                        deskewed = deskewed[
+                            :,
+                            crop_y0:crop_y1,
+                            crop_x0:crop_x1,
+                        ]
+                    elif crop_after_deskew:
+                        cropped_ny = deskewed_shape[1] - _pad_y
+                        deskewed = deskewed[:, crop_y : crop_y + cropped_ny, :]
+
+                    if max_projection:
+                        projection_shape = (
+                            1,
+                            deskewed.shape[1]
+                            + (_pad_y if roi_plan is None and crop_after_deskew else 0),
+                            deskewed.shape[2],
+                        )
+                        if (
+                            math.prod(projection_shape) * np.dtype(np.float32).itemsize
+                            > 128 * 1024**2
+                        ):
+                            projection_file = output_buffers.enter_context(
+                                TemporaryFile(dir=output_dir)
+                            )
+                            max_z_deskewed = np.memmap(
+                                projection_file,
+                                mode="w+",
+                                dtype=np.float32,
+                                shape=projection_shape,
+                            )
+                            output_buffers.callback(max_z_deskewed._mmap.close)
+                        else:
+                            max_z_deskewed = np.empty(projection_shape, np.float32)
+                        np.max(
+                            deskewed,
+                            axis=0,
+                            keepdims=True,
+                            out=max_z_deskewed[:, : deskewed.shape[1]],
+                        )
+                        max_z_deskewed[:, deskewed.shape[1] :] = 0
+                        ts_max_writes.extend(
+                            queue_position_pyramid_writes(
+                                max_z_collection,
+                                pos_idx,
+                                t_idx,
+                                chan_idx,
+                                max_z_deskewed,
+                            )
+                        )
+
+                    if roi_series_index is None:
+                        has_signal = write_processed_channel(
+                            target[:, : deskewed.shape[1], :], deskewed
+                        )
+                        if deskewed.shape[1] < target.shape[1]:
+                            target[:, deskewed.shape[1] :, :].write(
+                                output_dtype.type(0)
+                            ).result()
+                    else:
+                        has_signal = write_checkpointed_roi_channel(
+                            target,
+                            deskewed,
+                            processing_state,
+                            output_path,
+                            channel_key,
+                            is_zero=channel_key in zero_channels,
+                        )
+                    if not has_signal:
+                        zero_channels.add(channel_key)
+
+                # Output writes are durable before releasing a mapped buffer or
+                # retaining another channel's calibration and reconstruction.
+                del raw_data, camera_calibrated_data, camera_corrected_data
+                del deskew_input, deskew_buffer
+                deskewed = None
+                if deconvolve:
+                    del decon_input, deconvolved_data
             for ts_write in ts_writes:
                 ts_write.result()
             if max_projection:
@@ -2437,10 +2590,6 @@ def process_skewed(
             if max_projection:
                 processing_state.complete_tile(max_z_output_path, t_idx, pos_idx)
 
-    if wrote_tile and deskewed is not None:
-        del deskewed
-        if max_projection:
-            del max_z_deskewed
     del ts_store
     if create_fused_max_projection:
         if deconvolve:
