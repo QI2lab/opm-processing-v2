@@ -9,7 +9,7 @@ from opm_processing.dataio.position_collection import (
     open_image_array,
     open_position_collection,
 )
-from opm_processing.imageprocessing.opmtools import get_skewed_coords
+from opm_processing.imageprocessing.opmpsf import get_skewed_coords
 from opm_processing.imageprocessing.tilefusion import TileFusion
 from opm_processing.process import process
 from tests.simulation.camera_likelihood import (
@@ -43,6 +43,7 @@ def test_physical_stage_z_translation_preserves_registered_xy(
     process(
         root_path=path,
         deconvolve=False,
+        save_float32=True,
         crop_after_deskew=crop,
         **processing_options,
     )

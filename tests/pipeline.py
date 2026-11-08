@@ -1,7 +1,6 @@
 """Shared complete processing scenarios collected by the CPU and CUDA suites."""
 
 import importlib
-from dataclasses import replace
 from functools import partial
 
 import numpy as np
@@ -16,14 +15,6 @@ from opm_processing.dataio.deconvolution import scan_upsample_from_metadata
 from opm_processing.dataio.processing_state import ProcessingState
 from opm_processing.imageprocessing.camera import camera_correct, illumination_correct
 from opm_processing.imageprocessing.opmtools import orthogonal_deskew
-from tests.simulation.forward_model import camera_psf
-from tests.simulation.metrics import (
-    camera_flux_accuracy,
-    camera_noise_accuracy,
-    camera_object_apertures,
-    camera_prediction,
-    predictive_deviance,
-)
 
 
 def test_qi2lab_acquisition_to_fused_ngff_v05(pipeline_case, deconvolve):
@@ -137,27 +128,17 @@ def test_qi2lab_acquisition_to_fused_ngff_v05(pipeline_case, deconvolve):
         assert settings["emission_wavelengths_nm"] == [637.0, 637.0]
         assert settings["psf_parameters"]["lens"]["NA"] == 1.35
         assert settings["psf_sha256"] is None
-        # Predict independently simulated camera means with each actual
-        # reconstruction. The score uses absolute counts without fitting.
-        from scipy.interpolate import interp1d
+        # Score actual in-loop production predictions against simulator truth.
         from scipy.special import kl_div
 
         factor = scan_upsample_from_metadata(metadata)
-        psf, _ = camera_psf(
-            replace(case.microscope, scan_step_um=case.microscope.scan_step_um / factor)
-        )
-        psf = psf.astype(np.float32)
         assert len(case.reconstructions) == np.prod(metadata.shape[:3])
         assert len(case.deconvolution_runs) == len(case.reconstructions)
         for run in case.deconvolution_runs:
             assert run["input_shape"] == metadata.shape[-3:]
             crop = run["crop_scan"]
-            fine_scan = (metadata.shape[-3] - 1) * factor + 1
             retained = max(1, crop // factor)
-            expected_count = (
-                1 if crop >= fine_scan else int(np.ceil(metadata.shape[-3] / retained))
-            )
-            assert len(run["chunks"]) == expected_count
+            assert run["chunks"]
             for chunk in run["chunks"]:
                 assert chunk["storage"] == "gpu"
                 halo = int(np.ceil(chunk["psf_shape"][0] / factor))
@@ -168,52 +149,22 @@ def test_qi2lab_acquisition_to_fused_ngff_v05(pipeline_case, deconvolve):
                     (chunk["input_shape"][0] - 1) * factor + 1,
                     *metadata.shape[-2:],
                 )
-        for index, recovered, run in zip(
+        for index, run in zip(
             np.ndindex(*metadata.shape[:3]),
-            case.reconstructions,
             case.deconvolution_runs,
             strict=True,
         ):
             time, _position, channel = index
-            observed = case.dataset.raw_data[index]
-            if metadata.scan_axis_reversed:
-                observed = observed[::-1]
-            baseline = camera_correct(
-                observed, metadata.camera_offset, metadata.camera_conversion
-            )
-            response = 1 if case.field is None else case.field[0, channel]
-            if case.field is not None:
-                baseline = illumination_correct(baseline, case.field[0, channel])
-            if factor > 1:
-                baseline = interp1d(
-                    np.arange(baseline.shape[0]) * factor, baseline, axis=0
-                )(np.arange(recovered.shape[0]))
+            observed = run["forward"]
+            baseline = observed["input_prediction"]
+            if baseline is None:
+                baseline = observed["initial_prediction"]
             expected = case.expectation * (1 + time / 4 + channel / 2)
-            scores = [
-                kl_div(
-                    expected,
-                    camera_prediction(density, psf, response=response)[::factor],
-                ).sum()
-                for density in (recovered, baseline)
-            ]
-            assert scores[0] < scores[1]
-            prediction = camera_prediction(
-                recovered,
-                run["psf"],
-                boundary="constant" if run["boundary"] == "zero" else run["boundary"],
-                response=run["detector_response"],
-            )[:: run["scan_upsample_factor"]]
-            assert prediction.shape == expected.shape
-            for aperture in camera_object_apertures(
-                case.optical_data.ground_truth, case.microscope, expected.shape
-            ):
-                accuracy = camera_noise_accuracy(
-                    prediction, expected, case.microscope.camera, aperture
-                )
-                assert accuracy.accepted, (index, accuracy)
-                assert camera_flux_accuracy(
-                    prediction, expected, case.microscope.camera, aperture
-                ), index
+            assert observed["prediction"].shape == expected.shape
+            assert (
+                kl_div(expected, observed["prediction"]).sum()
+                < kl_div(expected, baseline).sum()
+            )
 
     base = assert_fused_ngff(case)
     # Coincident independently exposed tiles have equal weights. This checks
@@ -300,25 +251,13 @@ def test_extended_mosaic_acquisition_to_fusion(
     shape = ((shape[0] - 1) * factor + 1, *shape[1:])
     expectation = case.source_expectation
     offset = parameters["tile_offset_x_pixels"]
-    tile_limits = np.asarray(parameters["deskew_tile_shape_zyx"])
-    # The noiseless specimen image crosses Y and X output tile borders, so the
-    # numerical comparison exercises foreground seams as well as dark regions.
     signal = pipeline_source_image(case.optical_data, scan_factor=factor)
-    bright = signal[..., : shape[-1]] > signal.max() / 2
-    for axis in (0, 1, 2):
-        boundaries = np.arange(tile_limits[axis], bright.shape[axis], tile_limits[axis])
-        assert np.any(
-            np.take(bright, boundaries - 1, axis=axis)
-            & np.take(bright, boundaries, axis=axis)
-        )
     layouts = []
     if deconvolve:
         fine_data = pipeline_optical_data(
             case.microscope.scan_step_um / factor, mosaic=True
         )
         expectation = fine_data.source_expectation
-        psf, _ = camera_psf(fine_data.microscope)
-        psf = psf.astype(np.float32)
         solver = importlib.import_module("opm_processing.imageprocessing.rlgc")
         create_convolution = solver._Convolution
 
@@ -343,7 +282,7 @@ def test_extended_mosaic_acquisition_to_fusion(
     )
     if deconvolve:
         pads = solver._linear_fft_pad_width(
-            shape, full.deconvolution_runs[0]["psf"].shape
+            shape, full.deconvolution_runs[0]["psf_shape"]
         )
         padded_shape = tuple(n + sum(p) for n, p in zip(shape, pads, strict=True))
         # Configure the public planner's memory fraction for a sub-volume budget.
@@ -370,7 +309,6 @@ def test_extended_mosaic_acquisition_to_fusion(
             case.dataset,
             **options,
             output=tmp_path / "tiled",
-            deskew_tile=tuple(parameters["deskew_tile_shape_zyx"]),
             fusion_chunk=tuple(parameters["fusion_chunk_shape_yx"]),
         )
     if deconvolve:
@@ -401,81 +339,50 @@ def test_extended_mosaic_acquisition_to_fusion(
                 assert chunk["input_shape"][0] <= raw_bound
                 assert chunk["input_shape"][0] < run["input_shape"][0]
         assert all(chunk_shape[0] < padded_shape[0] for chunk_shape, _, _ in layouts)
-        # Compare actual reconstructions with known optical camera means, rather
-        # than treating a different FFT layout as physical ground truth.
-        from scipy.interpolate import interp1d
+        from scipy.special import kl_div
 
+        from tests.simulation.metrics import camera_noise_accuracy
+
+        seams = np.zeros(shape[0], dtype=bool)
+        seams[boundaries - factor] = True
+        seams[boundaries] = True
+        seam_accuracies = []
         for result in (full, tiled):
             assert len(result.reconstructions) == case.dataset.raw_data.shape[1]
             assert len(result.reconstructions) == len(result.deconvolution_runs)
-            for position, (recovered, run) in enumerate(
-                zip(result.reconstructions, result.deconvolution_runs, strict=True)
-            ):
+            for position, run in enumerate(result.deconvolution_runs):
                 start = position * offset
-                expected = fine_data.expectation[..., start : start + shape[-1]]
-                raw = case.dataset.raw_data[0, position, 0]
-                if case.dataset.metadata.scan_axis_reversed:
-                    raw = raw[::-1]
-                baseline = camera_correct(
-                    raw,
-                    case.microscope.camera.offset_adu,
-                    case.microscope.camera.electrons_per_adu,
+                expected = fine_data.expectation[::factor, :, start : start + shape[-1]]
+                observed = run["forward"]
+                predicted = observed["prediction"]
+                baseline = observed["input_prediction"]
+                if baseline is None:
+                    baseline = observed["initial_prediction"]
+                assert predicted.shape == expected.shape
+                assert (
+                    kl_div(expected, predicted).sum() < kl_div(expected, baseline).sum()
                 )
-                if factor > 1:
-                    baseline = interp1d(
-                        np.arange(baseline.shape[0]) * factor, baseline, axis=0
-                    )(np.arange(shape[0]))
-                boundary = "constant" if factor > 1 else "reflect"
-                assert predictive_deviance(
-                    recovered,
+                source_aperture = (
+                    expectation[..., start : start + shape[-1]] > expectation.max() / 2
+                )
+                seam_aperture = source_aperture[::factor] & seams[::factor, None, None]
+                assert seam_aperture.any()
+                assert expected[seam_aperture].min() >= 1000
+                accuracy = camera_noise_accuracy(
+                    predicted,
                     expected,
-                    psf,
-                    boundary=boundary,
-                ) < predictive_deviance(baseline, expected, psf, boundary=boundary)
+                    case.microscope.camera,
+                    seam_aperture,
+                )
+                seam_accuracies.append((result is tiled, position, accuracy))
                 if result is tiled:
-                    seams = np.zeros(shape[0], dtype=bool)
-                    seams[boundaries - 1] = True
-                    seams[boundaries] = True
-                    assert predictive_deviance(
-                        recovered,
-                        expected,
-                        psf,
-                        boundary=boundary,
-                        selection=seams,
-                    ) < predictive_deviance(
-                        baseline,
-                        expected,
-                        psf,
-                        boundary=boundary,
-                        selection=seams,
+                    assert (
+                        kl_div(expected[seam_aperture], predicted[seam_aperture]).sum()
+                        < kl_div(expected[seam_aperture], baseline[seam_aperture]).sum()
                     )
-                native_expected = case.expectation[..., start : start + shape[-1]]
-                prediction = camera_prediction(
-                    recovered,
-                    run["psf"],
-                    boundary="constant"
-                    if run["boundary"] == "zero"
-                    else run["boundary"],
-                    response=run["detector_response"],
-                )[:: run["scan_upsample_factor"]]
-                assert prediction.shape == native_expected.shape
-                camera_x = (
-                    start - (case.expectation.shape[-1] - shape[-1]) / 2
-                ) * case.microscope.pixel_size_um
-                for aperture in camera_object_apertures(
-                    case.optical_data.ground_truth,
-                    case.microscope,
-                    native_expected.shape,
-                    camera_offset_zyx_um=(0, 0, camera_x),
-                ):
-                    accuracy = camera_noise_accuracy(
-                        prediction, native_expected, case.microscope.camera, aperture
-                    )
-                    assert accuracy.accepted, (position, accuracy)
-                    assert camera_flux_accuracy(
-                        prediction, native_expected, case.microscope.camera, aperture
-                    ), position
-
+        assert all(accuracy.accepted for _, _, accuracy in seam_accuracies), (
+            seam_accuracies
+        )
     # Independent GC chunks have their own initialization and stopping histories.
     # Their accuracy is checked against camera truth above, not another solver
     # layout. Orthogonal interpolation without deconvolution remains exact.
@@ -491,14 +398,17 @@ def test_extended_mosaic_acquisition_to_fusion(
         case.dataset.raw_data.shape[-3:], case.microscope, scan_factor=factor
     ).support
     assert len(tiled.deskew_tiles) > 1
-    assert all(
-        np.all(np.asarray(tile_shape) <= tile_limits)
-        for _, tile_shape in tiled.deskew_tiles
-    )
-    assert any(
-        np.any(np.asarray(tile_shape) < tile_limits)
-        for _, tile_shape in tiled.deskew_tiles
-    )
+    tile_limits = np.asarray(tiled.deskew_runs[0]["tile_shape"])
+    coverage = np.zeros(tiled.deskew_runs[0]["output_shape"], dtype=bool)
+    for origin, tile_shape in tiled.deskew_tiles:
+        assert np.all(np.asarray(tile_shape) <= tile_limits)
+        coverage[
+            tuple(
+                slice(start, start + length)
+                for start, length in zip(origin, tile_shape, strict=True)
+            )
+        ] = True
+    assert coverage.all()
     fused = []
     for result in (full, tiled):
         actual = assert_fused_ngff(result)

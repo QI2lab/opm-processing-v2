@@ -2,7 +2,7 @@
 
 import importlib
 from dataclasses import dataclass, replace
-from functools import lru_cache, partial
+from functools import lru_cache
 from types import SimpleNamespace
 
 import numpy as np
@@ -235,19 +235,21 @@ def pipeline_camera_accuracy(pipeline_geometry):
 
 
 @pytest.fixture
-def pipeline_runner(monkeypatch, processing_options, invoke_cli):
+def pipeline_runner(
+    monkeypatch, processing_options, invoke_cli, production_forward_predictions
+):
     """Run real processing and fusion with shared storage and worker boundaries.
 
     Returns
     -------
     callable
         Process a raw acquisition into an independently selected output directory,
-        optionally configuring deskew output tiles, RLGC and fusion block sizes.
+        optionally configuring RLGC and fusion block sizes. Deskew uses the
+        normal production tile planner.
     """
     from opm_processing.dataio.acquisition import acquisition_stem
     from opm_processing.dataio.position_collection import open_position_collection
     from opm_processing.imageprocessing import opmtools
-    from opm_processing.imageprocessing.opmtools import orthogonal_deskew
 
     module = importlib.import_module("opm_processing.process")
     fuse = importlib.import_module("opm_processing.fuse")
@@ -259,7 +261,6 @@ def pipeline_runner(monkeypatch, processing_options, invoke_cli):
         illumination=False,
         crop_scan=None,
         output=None,
-        deskew_tile=None,
         fusion_chunk=(16, 16),
         blend=(0, 0, 0),
     ):
@@ -277,6 +278,7 @@ def pipeline_runner(monkeypatch, processing_options, invoke_cli):
                 decon_verbose=0,
             )
         deskew_tiles = set()
+        deskew_runs = []
         reconstructions = []
         deconvolution_runs = []
         chunks = []
@@ -304,42 +306,40 @@ def pipeline_runner(monkeypatch, processing_options, invoke_cli):
                     before = len(chunks)
                     result = reconstruct(*args, **kwargs)
                     reconstructions.append(result.copy())
-                    kernel = np.array(args[1], dtype=np.float64, copy=True)
-                    if kwargs.get("normalize_psf", True):
-                        kernel /= kernel.sum(dtype=np.float64)
                     deconvolution_runs.append(
                         {
                             "input_shape": args[0].shape,
                             "crop_scan": kwargs.get("crop_scan"),
                             "chunks": chunks[before:],
-                            "psf": kernel,
-                            "boundary": kwargs.get("boundary", "reflect"),
-                            "scan_upsample_factor": kwargs.get(
-                                "scan_upsample_factor", 1
-                            ),
-                            "detector_response": np.asarray(
-                                kwargs.get("detector_response", 1)
-                            ).copy(),
+                            "psf_shape": args[1].shape,
+                            "forward": production_forward_predictions[-1],
                         }
                     )
                     return result
 
                 execution.setattr(solver, "rlgc", observe_reconstruction)
                 execution.setattr(solver, "_rlgc_once", observe_chunk)
-            if deskew_tile is not None:
-                interpolate = opmtools.interpolate_rows
+            interpolate = opmtools.interpolate_rows
+            deskew = module.orthogonal_deskew
 
-                def record_tile(*args):
-                    """Record executed global output tiles and run the real kernel."""
-                    deskew_tiles.add((args[-1], args[1].shape))
-                    return interpolate(*args)
+            def record_tile(*args):
+                """Record actual global output tiles while running the real kernel."""
+                deskew_tiles.add((args[-1], args[1].shape))
+                return interpolate(*args)
 
-                execution.setattr(opmtools, "interpolate_rows", record_tile)
-                execution.setattr(
-                    module,
-                    "orthogonal_deskew",
-                    partial(orthogonal_deskew, tile_shape=deskew_tile),
+            def observe_deskew(*args, **kwargs):
+                """Observe the production planner without replacing its choices."""
+                result = deskew(*args, **kwargs)
+                deskew_runs.append(
+                    {
+                        "output_shape": result.shape,
+                        "tile_shape": kwargs["tile_shape"],
+                    }
                 )
+                return result
+
+            execution.setattr(opmtools, "interpolate_rows", record_tile)
+            execution.setattr(module, "orthogonal_deskew", observe_deskew)
             invoke_cli("process", dataset.path, **options)
         directory = dataset.path.parent if output is None else output
         stem = acquisition_stem(dataset.path)
@@ -387,6 +387,7 @@ def pipeline_runner(monkeypatch, processing_options, invoke_cli):
             collection=open_position_collection(processed),
             output=directory / f"{stem}_fused.ome.zarr",
             deskew_tiles=deskew_tiles,
+            deskew_runs=deskew_runs,
             reconstructions=reconstructions,
             deconvolution_runs=deconvolution_runs,
         )
@@ -797,6 +798,7 @@ def mosaic_acquisition(
             (2.3, -4.6, 1.15),
             (2.3, -4.6 + scan_encoder_error_um, 1.15 + (offset + 1) * pixel),
         ),
+        camera_read_noise_e=microscope.camera.read_noise_e,
     )
     return SimpleNamespace(
         dataset=dataset,

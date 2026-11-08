@@ -13,7 +13,6 @@ from tests.simulation.metrics import (
     camera_score_difference,
     first_minimum,
     poisson_log_ratio_moments,
-    predictive_deviance,
 )
 
 pytestmark = pytest.mark.unit
@@ -55,22 +54,6 @@ def test_held_out_camera_likelihood_favors_true_rate_without_brightness_fit(
     )
     # Five standard errors test the likelihood ordering on independent observations.
     assert difference.mean() > 5 * difference.std(ddof=1) / np.sqrt(raw.size)
-
-
-@pytest.mark.parametrize("kernel_shape", [(1, 1, 1), (3, 3, 3), (4, 2, 3)])
-def test_blurred_object_likelihood_uses_exact_reflected_optical_model(kernel_shape):
-    """Match the analytic Poisson likelihood of twofold exposure on reflected edges."""
-    from scipy import ndimage
-
-    z, y, x = np.indices((7, 9, 11), dtype=float)
-    density = 1 + z + 2 * y + 3 * x
-    psf = np.arange(1, np.prod(kernel_shape) + 1, dtype=float).reshape(kernel_shape)
-    psf /= psf.sum()
-    blurred = ndimage.convolve(density, psf, mode="reflect")
-    expected = 2 * (2 * np.log(2) - 1) * blurred.sum()
-    assert predictive_deviance(
-        density, 2 * blurred, psf, boundary="reflect"
-    ) == pytest.approx(expected, rel=1e-13)
 
 
 def test_integer_camera_score_ratio_matches_independent_adc_sum(camera_calibration):

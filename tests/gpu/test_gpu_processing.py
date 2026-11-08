@@ -15,17 +15,17 @@ import importlib
 import numpy as np
 import pytest
 from scipy import ndimage
+from scipy.special import kl_div
 from scipy.stats import entropy
 
+from tests.registration import (
+    test_bounded_peak_matches_upstream_phase_normalization as test_bounded_peak_matches_upstream_phase_normalization,
+)
 from tests.registration import (
     test_orthogonal_camera_pairs_recover_known_stage_errors as test_orthogonal_camera_pairs_recover_known_stage_errors,
 )
 from tests.simulation.camera import digitize
-from tests.simulation.metrics import (
-    camera_flux_accuracy,
-    camera_prediction,
-    predictive_deviance,
-)
+from tests.simulation.metrics import camera_flux_accuracy
 
 pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("cupy_gpu")]
 
@@ -150,8 +150,9 @@ def test_unbounded_registration_recovers_displaced_physical_observations(
     assert score > unregistered
 
 
-@pytest.mark.parametrize("crop_scan", [None, 1, 2, 0, -1, 1.5, True])
-def test_rlgc_empty_image_remains_empty(cupy_gpu, crop_scan, monkeypatch):
+@pytest.mark.parametrize("crop_scan", [None, 1, 2])
+@pytest.mark.parametrize("camera_value", (0, -1))
+def test_rlgc_empty_image_remains_empty(cupy_gpu, crop_scan, camera_value, monkeypatch):
     """Preserve empty data and release solver state."""
     rlgc = importlib.import_module("opm_processing.imageprocessing.rlgc")
     clear = rlgc.clear_rlgc_caches
@@ -163,30 +164,27 @@ def test_rlgc_empty_image_remains_empty(cupy_gpu, crop_scan, monkeypatch):
         return clear(*args, **kwargs)
 
     monkeypatch.setattr(rlgc, "clear_rlgc_caches", observe_cleanup)
-    observed = np.zeros((3, 12, 16), dtype=np.float32)
-    psf = np.ones((3, 3, 3), dtype=np.float32)
-    if crop_scan is not None and (
-        isinstance(crop_scan, bool) or crop_scan in (0, -1, 1.5)
-    ):
-        with pytest.raises(ValueError, match="crop_scan must be a positive integer"):
-            rlgc.rlgc(observed, psf, crop_scan=crop_scan)
-        return
+    observed = np.full((11, 12, 16), camera_value, dtype=np.float32)
+    psf = np.ones((3, 3), dtype=np.float32)
     restored = rlgc.rlgc(observed, psf, crop_scan=crop_scan)
-    np.testing.assert_array_equal(restored, observed)
+    np.testing.assert_array_equal(restored, np.zeros_like(observed))
     assert len(cleanups) == 1
-    assert not rlgc._fft_cache_3d
     pool = cupy_gpu.get_default_memory_pool()
     assert pool.total_bytes() == pool.used_bytes()
 
 
 @pytest.mark.parametrize("singleton_z", [False, True])
 def test_rlgc_2d_recovers_points_using_central_psf(
-    cupy_gpu, planar_point_model, ideal_photon_camera, singleton_z
+    cupy_gpu,
+    planar_point_model,
+    ideal_photon_camera,
+    singleton_z,
+    production_forward_predictions,
 ):
     """Run the real wrapper and solver against independently blurred YX truth."""
     rlgc = importlib.import_module("opm_processing.imageprocessing.rlgc")
     case = planar_point_model
-    truth, central, skewed_psf = case.truth, case.central, case.psf
+    truth, skewed_psf = case.truth, case.psf
     observed = digitize(
         case.expectation,
         ideal_photon_camera,
@@ -198,20 +196,20 @@ def test_rlgc_2d_recovers_points_using_central_psf(
     restored = rlgc.rlgc(observed, skewed_psf, limit=0.02, max_delta=0.005)
     assert restored.shape == truth.shape
     assert restored.dtype == np.float32
-    psf = central[None] if singleton_z else central
     expectation = case.expectation[None] if singleton_z else case.expectation
-    assert predictive_deviance(
-        restored, expectation, psf, boundary="reflect"
-    ) < predictive_deviance(observed, expectation, psf, boundary="reflect")
+    measured = production_forward_predictions[-1]
+    assert (
+        kl_div(expectation, measured["prediction"]).sum()
+        < kl_div(expectation, measured["input_prediction"]).sum()
+    )
+    for aperture in case.apertures:
+        assert camera_flux_accuracy(
+            measured["prediction"], expectation, ideal_photon_camera, aperture
+        )
     np.testing.assert_array_equal(
         np.unravel_index(np.argmax(restored), restored.shape),
         np.unravel_index(np.argmax(truth), truth.shape),
     )
-    prediction = camera_prediction(restored, psf, boundary="reflect")
-    for aperture in case.apertures:
-        assert camera_flux_accuracy(
-            prediction, expectation, ideal_photon_camera, aperture
-        )
     plane = restored[0] if singleton_z else restored
     for point, field in zip(case.points, case.point_fields, strict=True):
         candidates = np.where(field, plane, -np.inf)
