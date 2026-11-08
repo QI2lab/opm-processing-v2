@@ -365,7 +365,6 @@ def test_tiled_gc_recovers_noisy_extended_objects_without_rl_noise(
 
     from opm_processing.imageprocessing.rlgc import rlgc
     from tests.simulation.forward_model import camera_psf
-    from tests.simulation.metrics import camera_flux_accuracy
 
     microscope, expectation, raw, source, dark = noisy_extended_scene
     psf, _ = camera_psf(microscope)
@@ -502,10 +501,6 @@ def test_tiled_gc_recovers_noisy_extended_objects_without_rl_noise(
             np.sqrt(np.mean((actual - true) ** 2, dtype=np.float64)),
         )
         assert gc_error < baseline_error, (name, gc_error, baseline_error)
-    logger.info(
-        "acquired_source_flux_6sigma=%s",
-        camera_flux_accuracy(predicted, expectation[::factor], camera, aperture),
-    )
     for phase in range(factor):
         aperture = source[phase::factor]
         assert aperture.any()

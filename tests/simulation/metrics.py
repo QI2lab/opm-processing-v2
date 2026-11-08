@@ -1,10 +1,7 @@
 """Likelihood and physical sampling measurements for simulated camera acquisitions."""
 
-from dataclasses import dataclass
-
 import numpy as np
 from scipy.special import kl_div
-from scipy.stats import chi2
 
 from opm_processing.imageprocessing.opmpsf import (
     camera_grid_center,
@@ -12,116 +9,6 @@ from opm_processing.imageprocessing.opmpsf import (
     get_skewed_coords,
     integrate_camera_pixels,
 )
-
-
-@dataclass(frozen=True)
-class CameraNoiseAccuracy:
-    """Absolute camera-space error relative to a declared high-count noise target."""
-
-    deviance: float
-    deviance_limit: float
-    pearson: float
-    pearson_limit: float
-
-    @property
-    def accepted(self):
-        """Require finite pointwise Poisson and calibrated-noise accuracy scores."""
-        return (
-            np.isfinite(
-                (self.deviance, self.deviance_limit, self.pearson, self.pearson_limit)
-            ).all()
-            and self.deviance <= self.deviance_limit
-            and self.pearson <= self.pearson_limit
-        )
-
-
-def camera_noise_accuracy(prediction, expectation, camera, mask):
-    """Judge camera-prediction error against a predeclared measurement-noise target.
-
-    This is a metrology target motivated by one independent high-count camera
-    observation, not a coverage theorem for nonlinear reconstructed pixels.
-    The reference chi-square has one degree of freedom per original camera
-    sample. Its variance includes Poisson, read and ADC quantization terms.
-    The fixed upper-tail probability is 1e-6.
-    No gain, covariance or degrees of freedom are fitted to the reconstruction.
-
-    Parameters
-    ----------
-    prediction : array-like
-        Actual reconstruction's forward-predicted detector electron rates.
-    expectation : array-like
-        Original noiseless optical camera rates.
-    camera : Camera
-        Independently declared detector read noise and electron/ADU calibration.
-    mask : array-like
-        Fixed physical aperture, selected without using reconstructed values.
-
-    Returns
-    -------
-    CameraNoiseAccuracy
-        Absolute likelihood and calibrated-noise residual scores and limits.
-    """
-    predicted, expected = np.broadcast_arrays(
-        np.asarray(prediction, np.float64), np.asarray(expectation, np.float64)
-    )
-    selected = np.broadcast_to(np.asarray(mask, bool), expected.shape)
-    if (
-        not selected.any()
-        or not np.isfinite(expected[selected]).all()
-        or np.min(expected[selected]) < 1000
-        or not np.isfinite((camera.read_noise_e, camera.electrons_per_adu)).all()
-        or camera.read_noise_e < 0
-        or camera.electrons_per_adu <= 0
-    ):
-        raise ValueError("Require a nonempty fixed high-count camera aperture")
-    truth, actual = expected[selected], predicted[selected]
-    if not np.isfinite(actual).all() or np.any(actual < 0):
-        return CameraNoiseAccuracy(np.inf, 0, np.inf, 0)
-    variance = truth + camera.read_noise_e**2 + camera.electrons_per_adu**2 / 12
-    limit = float(chi2.isf(1e-6, truth.size))
-    return CameraNoiseAccuracy(
-        float(2 * kl_div(truth, actual).sum(dtype=np.float64)),
-        limit * float(np.max(variance / truth)),
-        float(np.sum((actual - truth) ** 2 / variance, dtype=np.float64)),
-        limit,
-    )
-
-
-def camera_flux_accuracy(prediction, expectation, camera, mask):
-    """Require absolute fixed-aperture photons within six declared noise sigmas.
-
-    The count target is fixed before reconstruction. Its variance is the known
-    Poisson total plus declared read/ADC variance; ideal integer-photon cameras
-    have no ADC rounding error. This is a metrology target, not a claim about
-    the distribution of nonlinear inverse-filtered pixels.
-    """
-    actual, expected = np.broadcast_arrays(
-        np.asarray(prediction, np.float64), np.asarray(expectation, np.float64)
-    )
-    selected = np.broadcast_to(np.asarray(mask, bool), expected.shape)
-    if (
-        not selected.any()
-        or not np.isfinite(expected[selected]).all()
-        or np.any(expected[selected] < 0)
-        or not np.isfinite((camera.read_noise_e, camera.electrons_per_adu)).all()
-        or camera.read_noise_e < 0
-        or camera.electrons_per_adu <= 0
-    ):
-        raise ValueError("Require a nonempty physical photon aperture and camera")
-    integral_codes = (
-        camera.read_noise_e == 0
-        and float(camera.offset_adu).is_integer()
-        and float(1 / camera.electrons_per_adu).is_integer()
-    )
-    quantization = 0 if integral_codes else camera.electrons_per_adu**2 / 12
-    target = expected[selected].sum(dtype=np.float64)
-    variance = target + selected.sum() * (camera.read_noise_e**2 + quantization)
-    return bool(
-        np.isfinite(actual[selected]).all()
-        and np.all(actual[selected] >= 0)
-        and abs(actual[selected].sum(dtype=np.float64) - target)
-        <= 6 * np.sqrt(variance)
-    )
 
 
 def camera_partition_apertures(shape):

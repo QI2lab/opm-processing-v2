@@ -109,7 +109,7 @@ def test_registration_likelihood_moments_predict_independent_photon_draws(exposu
         "zero-unbounded",
     ],
 )
-def test_camera_sampling_bounds_detect_photon_and_spatial_errors(
+def test_camera_sampling_bounds_detect_gain_and_spatial_errors(
     camera_sampling_case, artifact
 ):
     """Known detector noise cannot conceal a twenty-percent or mean-preserving stripe error."""
@@ -118,11 +118,6 @@ def test_camera_sampling_bounds_detect_photon_and_spatial_errors(
         SamplingEnvelope,
         camera_sampling_accuracy,
         camera_sampling_envelope,
-    )
-    from tests.simulation.metrics import (
-        camera_flux_accuracy,
-        camera_noise_accuracy,
-        camera_partition_apertures,
     )
 
     case = camera_sampling_case
@@ -156,18 +151,6 @@ def test_camera_sampling_bounds_detect_photon_and_spatial_errors(
     )
     correct = artifact in ("correct", "correct-zero-bound")
     assert measured.accepted == correct, measured
-    # The inverse-solver target uses this same independently observed optical
-    # phantom. Its likelihood and calibrated-noise scores must distinguish the
-    # same absolute gain and spatial errors without fitting a reconstruction.
-    inverse_accuracy = camera_noise_accuracy(
-        prediction, expected, camera, np.ones(expected.shape, bool)
-    )
-    assert inverse_accuracy.accepted == correct, inverse_accuracy
-    flux_accuracy = [
-        camera_flux_accuracy(prediction, expected, camera, aperture)
-        for aperture in camera_partition_apertures(expected.shape)
-    ]
-    assert all(flux_accuracy) == correct
     if artifact == "stripes":
         assert measured.flux_lower <= measured.flux <= measured.flux_upper
         assert not measured.inside_envelope

@@ -392,9 +392,6 @@ def live_wait_case(
         raw=raw,
         scene=scene,
         sample_timepoint=sample_timepoint,
-        calibration_photons=ensemble.calibration_photons
-        if kind == "estimate"
-        else None,
         destination=destination,
         sleeps=sleeps,
         field_path=field_path if kind == "cached" else destination / field_path.name,

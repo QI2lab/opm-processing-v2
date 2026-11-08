@@ -223,7 +223,6 @@ def illumination_calibration_ensemble(roi_camera_scene, uniform_optical_calibrat
     return SimpleNamespace(
         scene=scene,
         raw=np.concatenate((calibration_raw[None, None, None], scene.pixels)),
-        calibration_photons=2000 * microscope.quantum_efficiency,
         sample_timepoint=1,
     )
 

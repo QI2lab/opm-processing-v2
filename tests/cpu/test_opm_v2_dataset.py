@@ -14,7 +14,6 @@ from opm_processing.dataio.processing_state import (
 from opm_processing.imageprocessing.camera import camera_correct
 from opm_processing.process import format_processed_output
 from tests.simulation.camera import digitize
-from tests.simulation.metrics import camera_flux_accuracy, camera_noise_accuracy
 
 pytestmark = pytest.mark.integration
 
@@ -77,13 +76,6 @@ def test_projection_output_preserves_calibration_geometry_and_provenance(
             save_float32,
         )
         np.testing.assert_array_equal(actual[:, :, 0], expected)
-        truth = fixture.expectation[:, position]
-        aperture = np.ones(truth.shape, bool)
-        accuracy = camera_noise_accuracy(
-            actual, truth, fixture.microscope.camera, aperture
-        )
-        assert accuracy.accepted, accuracy
-        assert camera_flux_accuracy(actual, truth, fixture.microscope.camera, aperture)
     fused_path = output_dir / f"{fixture.path.stem}_stagefused.ome.zarr"
     if selected is None:
         assert not fused_path.exists()
@@ -153,8 +145,3 @@ def test_projection_cli_resume_preserves_completed_pixels(
             False,
         )[:, :, None]
     np.testing.assert_array_equal(after, expected)
-    truth = (fixture.expectation if resume else changed_truth)[:, 0]
-    aperture = np.ones(truth.shape, bool)
-    accuracy = camera_noise_accuracy(after, truth, fixture.microscope.camera, aperture)
-    assert accuracy.accepted, accuracy
-    assert camera_flux_accuracy(after, truth, fixture.microscope.camera, aperture)

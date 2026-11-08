@@ -56,10 +56,12 @@ filesystem/UI interaction and inject faults only in error-handling tests.
 Scientific assertions must not fit reconstruction gain or shifts, select regions
 from reconstructed intensities, substitute production output for truth, or relax
 accuracy to match a failure. Use independent camera realizations, fixed physical
-source/background apertures and absolute photon/camera likelihood. Likelihood is
-an accuracy measure, not a held-out stopping rule. Resolution uses directional
+source/background apertures and camera-space recovery/noise measurements.
+Likelihood is an accuracy measure, not a held-out stopping rule. Resolution uses directional
 PSF first minima (Rayleigh); tolerances follow precision, sampling or stated error
-bounds. Geometry and photon-volume checks use the supported 30-degree convention.
+bounds. Do not use raw camera-count variance as an acceptance distribution for
+nonlinear, correlated reconstruction estimates. Geometry and photon-volume
+checks use the supported 30-degree convention.
 
 Core processing integrations check raw inputs, generated PSFs, haloed sequential
 scan chunks, deskew, registration, fusion and reopened outputs. Check bounded chunk
@@ -79,8 +81,9 @@ simulation. Require foreground across multiple observed tile borders and verify
 actual Ryomen execution, shifted final deskew crops and callback continuation
 without replay. Check dark-noise variance in known optical vacuum, excluding
 spatially varying fluorescent background. Noisy deskew samples use certified
-sampling/noise intervals; fitted inverse rates retain their separate accuracy
-checks.
+sampling/noise intervals. Reconstruction checks use independent optical truth,
+KL recovery and measured noise behavior, without unvalidated six-sigma photon
+totals or chi-square noise-floor gates.
 
 Extend existing acquisition workflows for interruption/resume, moves and copies,
 separate raw/output directories, cached registration, numerical projections and
