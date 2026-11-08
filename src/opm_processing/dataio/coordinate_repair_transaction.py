@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from datetime import UTC, datetime
@@ -55,7 +56,9 @@ def _dependencies(plan: dict[str, Any], roots: dict[str, Path]) -> None:
     if not isinstance(dependencies, list):
         raise ValueError("Repair plan lacks validated input dependencies")
     for dependency in dependencies:
-        if base._sha(_path(roots, dependency).read_bytes()) != dependency["sha256"]:
+        with _path(roots, dependency).open("rb") as stream:
+            fingerprint = hashlib.file_digest(stream, "sha256").hexdigest()
+        if fingerprint != dependency["sha256"]:
             raise ValueError(
                 "Repair input dependency changed; no files changed. Generate a fresh plan."
             )

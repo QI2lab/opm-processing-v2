@@ -203,10 +203,12 @@ def plan_stage_coordinate_repair(
         )
         if path.is_file()
     ]
-    dependency_hashes = {
-        str(path.relative_to(directory)): _sha(path.read_bytes())
-        for path in source_dependencies
-    }
+    dependency_hashes = {}
+    for path in source_dependencies:
+        with path.open("rb") as stream:
+            dependency_hashes[str(path.relative_to(directory))] = hashlib.file_digest(
+                stream, "sha256"
+            ).hexdigest()
     acquisition = inspect_acquisition(source)
     stem = acquisition_stem(source)
     if source.parent != directory:
@@ -466,15 +468,18 @@ def plan_stage_coordinate_repair(
     ]
     for path in dependencies:
         if path.is_file():
-            dependency_hashes[str(path.relative_to(directory))] = _sha(
-                path.read_bytes()
-            )
+            with path.open("rb") as stream:
+                dependency_hashes[str(path.relative_to(directory))] = (
+                    hashlib.file_digest(stream, "sha256").hexdigest()
+                )
     base_plan["read_dependencies"] = [
         {"path": relative, "sha256": fingerprint}
         for relative, fingerprint in sorted(dependency_hashes.items())
     ]
     for record in base_plan["read_dependencies"]:
-        if _sha(_inside(directory, record["path"]).read_bytes()) != record["sha256"]:
+        with _inside(directory, record["path"]).open("rb") as stream:
+            fingerprint = hashlib.file_digest(stream, "sha256").hexdigest()
+        if fingerprint != record["sha256"]:
             raise ValueError(
                 "Repair inputs changed during planning; retry after acquisition is idle"
             )
@@ -554,7 +559,9 @@ def apply_stage_coordinate_repair(plan: dict[str, Any]) -> dict[str, Any]:
             "Repair preimage mismatch; no files changed. Generate a fresh plan."
         )
     for dependency in plan.get("read_dependencies", []):
-        if _sha(_inside(root, dependency["path"]).read_bytes()) != dependency["sha256"]:
+        with _inside(root, dependency["path"]).open("rb") as stream:
+            fingerprint = hashlib.file_digest(stream, "sha256").hexdigest()
+        if fingerprint != dependency["sha256"]:
             raise ValueError(
                 "Repair input dependency changed; no files changed. Generate a fresh plan."
             )
@@ -588,6 +595,15 @@ def apply_stage_coordinate_repair(plan: dict[str, Any]) -> dict[str, Any]:
         os.fsync(stream.fileno())
     if manifest_path.read_bytes() != manifest_content:
         raise RuntimeError("Repair backup manifest verification failed")
+    # Backups may take time. Reject changed source geometry before replacing
+    # the first target, as the split-root repair transaction does.
+    for dependency in plan["read_dependencies"]:
+        with _inside(root, dependency["path"]).open("rb") as stream:
+            fingerprint = hashlib.file_digest(stream, "sha256").hexdigest()
+        if fingerprint != dependency["sha256"]:
+            raise ValueError(
+                "Repair input dependency changed; no files changed. Generate a fresh plan."
+            )
     completed: list[int] = []
     try:
         for index, (path, record) in enumerate(zip(paths, records, strict=True)):
@@ -603,11 +619,14 @@ def apply_stage_coordinate_repair(plan: dict[str, Any]) -> dict[str, Any]:
     except BaseException as error:
         conflicts = []
         for index in reversed(completed):
-            current = _sha(paths[index].read_bytes())
-            if current == records[index]["after_sha256"]:
-                _atomic_write(paths[index], originals[index])
-            elif current != records[index]["before_sha256"]:
-                conflicts.append(str(paths[index]))
+            try:
+                current = _sha(paths[index].read_bytes())
+                if current == records[index]["after_sha256"]:
+                    _atomic_write(paths[index], originals[index])
+                elif current != records[index]["before_sha256"]:
+                    conflicts.append(str(paths[index]))
+            except BaseException as recovery_error:
+                conflicts.append(f"{paths[index]}: {recovery_error!r}")
         if conflicts:
             raise RuntimeError(
                 f"Concurrent metadata changes prevented complete rollback; backups: {backup}; conflicts: {conflicts}"
