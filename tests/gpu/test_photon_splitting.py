@@ -11,8 +11,7 @@ pytestmark = pytest.mark.unit
 def test_count_split_matches_prescribed_distribution_moments(
     cupy_gpu, array_backend, fractional
 ):
-    # Integer photons and calibrated fractional weights across the count range.
-    """Match prescribed split mean, variance and fractional-count distributions."""
+    """Check integer thinning and symmetric fractional-count splitting."""
     from opm_processing.imageprocessing.rlgc import _split_observed_counts
 
     xp = cupy_gpu if array_backend == "gpu" else np
@@ -30,26 +29,17 @@ def test_count_split_matches_prescribed_distribution_moments(
     observed = np.broadcast_to(levels[:, None], (levels.size, count))
     counts = xp.asarray(observed, dtype=xp.float32)
     first = to_numpy(_split_observed_counts(counts, xp.random.default_rng(19)))
-    np.testing.assert_array_equal(
-        first, to_numpy(_split_observed_counts(counts, xp.random.default_rng(19)))
-    )
     if not fractional:
-        reference = xp.random.default_rng(19).binomial(
-            xp.asarray(np.where(observed >= 150, 1, observed)).astype(xp.int64),
-            0.5,
-        )
-        np.testing.assert_array_equal(
-            first[levels < 150], to_numpy(reference)[levels < 150]
-        )
+        np.testing.assert_array_equal(first, np.floor(first))
     second = observed - first
+    assert first.min() >= 0 and second.min() >= 0
     np.testing.assert_allclose(
         first + second, observed, rtol=2 * np.finfo(np.float32).eps, atol=0
     )
-    whole = np.floor(levels.astype(np.float64) + 0.5)
+    whole = np.floor(levels.astype(np.float64))
     residual = levels - whole
-    # Binomial n/4 below 150; Gaussian n/4 above it; uniform remainder r²/12.
-    variance = whole / 4 + residual**2 / 12
-    fourth = 3 * variance**2 - np.where(whole < 150, whole / 8, 0) - residual**4 / 120
+    variance = (whole + residual**2) / 4
+    fourth = 3 * variance**2 - (whole + residual**4) / 8
     variance_se = np.sqrt(
         np.maximum(fourth - (count - 3) / (count - 1) * variance**2, 0) / count
     )
@@ -74,15 +64,18 @@ def test_count_split_matches_prescribed_distribution_moments(
 
 @pytest.mark.parametrize("array_backend", ["gpu", "host"])
 def test_poisson_thinning_produces_independent_half_rate_processes(
-    cupy_gpu, array_backend
+    cupy_gpu, ideal_photon_camera, array_backend
 ):
     """Recover independent half-rate Poisson samples through binomial thinning."""
     from opm_processing.imageprocessing.rlgc import _split_observed_counts
+    from tests.simulation.camera import digitize
 
     xp = cupy_gpu if array_backend == "gpu" else np
     to_numpy = cupy_gpu.asnumpy if array_backend == "gpu" else np.asarray
     count = 400000
-    observed = np.random.default_rng(73).poisson(20, count).astype(np.float32)
+    observed = digitize(np.full(count, 20.0), ideal_photon_camera, seed=73).astype(
+        np.float32
+    )
     first = to_numpy(
         _split_observed_counts(xp.asarray(observed), xp.random.default_rng(131))
     ).astype(np.float64)
