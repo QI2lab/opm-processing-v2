@@ -65,8 +65,9 @@ Core processing integrations check raw inputs, generated PSFs, haloed sequential
 scan chunks, deskew, registration, fusion and reopened outputs. Check bounded chunk
 state and partial last tiles where those behaviors are under test. Sources must
 cross multiple real tile borders with foreground on both sides. Comparing two
-processing layouts alone is not scientific accuracy. Independent chunks have
-their own initialization and stopping histories. Test real allocation fallback
+processing layouts alone is not scientific accuracy. Scan chunks have their own
+initialization and random halves; default tiled RLGC continues them to the latest
+first-local-KL accepted iteration without replay. Test real allocation fallback
 with CUDA memory-pool limits, not fabricated out-of-memory exceptions.
 
 Extend existing acquisition workflows for interruption/resume, moves and copies,
