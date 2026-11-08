@@ -43,7 +43,6 @@ else:
 def relative_regions(
     manifest: dict[str, Any],
     saved: list[Region],
-    reader: Any,
     *,
     include_starting: bool = False,
 ) -> tuple[list[Region], dict[str, Any], list[dict[str, Any]]]:
@@ -105,7 +104,7 @@ def relative_regions(
         previous_final[region.index] = final.copy()
         coefficients = final if include_starting else change
         pupil = np.ma.asarray(
-            reader.phase_from_modal_coeff(
+            phase_from_modal_coeff(
                 coefficients,
                 mode_indices=np.arange(1, coefficients.size + 1),
                 samples=512,
@@ -192,9 +191,8 @@ def export_relative(
     saved = load_saved_regions(original)
     # The historical reader remains the unchanged data loader. New phase maps
     # use the modal basis independently checked against offline WaveKit.
-    phase_reader = SimpleNamespace(phase_from_modal_coeff=phase_from_modal_coeff)
     regions, phase_reference, plotted_records = relative_regions(
-        original, saved, phase_reader, include_starting=include_starting
+        original, saved, include_starting=include_starting
     )
     phase_path = Path(__file__).with_name("ao_wavekit_phase.py")
     phase_reference["reconstruction"] = {

@@ -8,10 +8,10 @@ function does not reconstruct measured mirror shape or residual sample phase.
 
 from __future__ import annotations
 
-from math import factorial
 from typing import TYPE_CHECKING
 
 import numpy as np
+from prysm.polynomials.zernike import zernike_nm
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -55,35 +55,6 @@ WAVEKIT_MODE_NM: tuple[tuple[int, int], ...] = (
     (8, 2),
     (8, -2),
 )
-
-
-def _zernike_nm(
-    n: int,
-    m: int,
-    radius: np.ndarray,
-    theta: np.ndarray,
-    *,
-    norm: bool,
-) -> np.ndarray:
-    """Evaluate a real circular Zernike polynomial with optional RMS scaling."""
-    absolute_m = abs(m)
-    radial = np.zeros_like(radius, dtype=float)
-    for k in range((n - absolute_m) // 2 + 1):
-        coefficient = (
-            (-1) ** k
-            * factorial(n - k)
-            / (
-                factorial(k)
-                * factorial((n + absolute_m) // 2 - k)
-                * factorial((n - absolute_m) // 2 - k)
-            )
-        )
-        radial += coefficient * radius ** (n - 2 * k)
-    angular = np.cos(absolute_m * theta) if m > 0 else np.sin(absolute_m * theta)
-    if m == 0:
-        angular = 1.0
-    scale = np.sqrt(n + 1) if m == 0 else np.sqrt(2 * (n + 1))
-    return (scale if norm else 1.0) * radial * angular
 
 
 def phase_from_modal_coeff(
@@ -134,7 +105,7 @@ def phase_from_modal_coeff(
     for coefficient, index in zip(coefficients, indices, strict=True):
         if coefficient:
             n, m = WAVEKIT_MODE_NM[index - 1]
-            values += coefficient * _zernike_nm(
+            values += coefficient * zernike_nm(
                 n, m, np.minimum(radius, 1), theta, norm=norm
             )
     pupil = np.ma.array(values, mask=radius > 1)

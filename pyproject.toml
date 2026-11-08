@@ -55,6 +55,7 @@ processing = [
     "napari-ome-zarr>=0.9.0",
     "napari-plugin-engine",
     "numba",
+    "prysm>=0.21.1,<0.22",
     "psutil",
     "psfmodels",
     "pyyaml",
