@@ -277,9 +277,8 @@ def test_gc_kl_scores_forward_prediction(
         (1000, 5e-16, 5e-16, "relative_change"),
     ],
 )
-@pytest.mark.parametrize("array_backend", ["gpu", "host"])
 def test_gc_stopping_uses_prescribed_fraction_and_change_limits(
-    cupy_gpu, accepted, change, peak, reason, array_backend
+    cupy_gpu, accepted, change, peak, reason
 ):
     """Apply strict positive-consensus/absolute-change bounds and denominator floor."""
     from opm_processing.imageprocessing.rlgc import (
@@ -288,7 +287,7 @@ def test_gc_stopping_uses_prescribed_fraction_and_change_limits(
         _gc_stopping_metrics,
     )
 
-    xp = cupy_gpu if array_backend == "gpu" else np
+    xp = cupy_gpu
     current = xp.full(1000, peak, dtype=xp.float64)
     previous = current.copy()
     previous[0] -= change

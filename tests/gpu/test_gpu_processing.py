@@ -149,8 +149,7 @@ def test_exact_signal_registration_recovers_known_3d_translation(
         pytest.fail("cuCIM is unavailable; install the project's gpu extra")
 
     tilefusion = importlib.import_module("opm_processing.imageprocessing.tilefusion")
-    if not tilefusion.USING_GPU or tilefusion.xp is not cp:
-        pytest.fail("TileFusion silently selected its CPU registration backend")
+    assert tilefusion.USING_GPU and tilefusion.xp is cp
 
     fixed = aperiodic_registration_object((11, 39, 43), seed=22).astype(np.float32)
     applied_shift = np.array(applied_shift, dtype=np.float32)
