@@ -105,6 +105,8 @@ def test_processing_propagates_hardware_cadence(
         volume.spatial_origins_zyx_um[0],
         volume.voxel_size_um,
     )
+    planes = calibrated_mirror_timelapse.truth.pixels.shape[-3]
+    volume_period = planes * 0.005
     for name in (
         "single_mirror_deskewed.ome.zarr",
         "single_mirror_max_z_deskewed.ome.zarr",
@@ -116,11 +118,11 @@ def test_processing_propagates_hardware_cadence(
             np.testing.assert_array_equal(
                 result.arrays[0].read().result(), np.max(pixels, axis=2, keepdims=True)
             )
-        assert result.time_interval_s == pytest.approx(0.020)
+        assert result.time_interval_s == pytest.approx(volume_period)
         timing = result.attributes["opm_processing"]["timing"]
-        assert timing["n_acquired_planes"] == 4
+        assert timing["n_acquired_planes"] == planes
         assert timing["dt_plane_s"] == 0.005
-        assert timing["dt_volume_s"] == 0.020
+        assert timing["dt_volume_s"] == volume_period
         assert timing["source"] == "recorded camera exposure_time; rounded to 0.01 ms"
 
 
