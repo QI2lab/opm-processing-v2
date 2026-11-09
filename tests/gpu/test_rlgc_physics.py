@@ -127,57 +127,59 @@ def test_gc_checkpoint_continues_same_optical_reconstruction(
     assert state.estimate is state.rng is state.rng_buffers is None
 
 
-@pytest.mark.parametrize("array_backend", ["host", "gpu"])
-def test_consensus_uses_additive_object_changes(cupy_gpu, array_backend):
+def test_consensus_uses_additive_object_changes(cupy_gpu, monkeypatch):
     """Paper Eqs. (4)–(5): weight before smoothing and freeze zero consensus."""
     solver = importlib.import_module("opm_processing.imageprocessing.rlgc")
-    xp = np if array_backend == "host" else cupy_gpu
-    observed = xp.asarray([[[3, 101, 101]]], dtype=xp.float32)
+    cp = cupy_gpu
+    # A delta PSF makes the real optical operators identities. Power-of-two
+    # dimensions and initial values keep their FFT input ratios exactly binary.
+    observed = cp.asarray([[[3, 1, 101, 1]]], dtype=cp.float32)
     first, second = solver._split_calibrated_counts(
-        observed, xp.random.default_rng(42), np.float32(0)
+        observed, cp.random.default_rng(42), np.float32(0)
     )
     # Identity optics make each additive half-step exactly 2*half - x.
     # Odd counts ensure unequal halves. Choose x between, on, and below the
     # two half-step targets to exercise negative, zero and positive consensus.
-    initial = observed.copy()
-    initial[..., 1] = 2 * first[..., 1]
-    initial[..., 2] = xp.minimum(first[..., 2], second[..., 2])
+    initial = cp.asarray([[[4, 2, 4, 1]]], dtype=cp.float32)
     assert float(initial.min()) > 0
     expected_product = (2 * first - initial) * (2 * second - initial)
     assert float(expected_product[..., 0].item()) < 0
     assert float(expected_product[..., 1].item()) == 0
     assert float(expected_product[..., 2].item()) > 0
 
-    def smooth(product, sensitivity):
-        np.testing.assert_allclose(
-            cupy_gpu.asnumpy(product), cupy_gpu.asnumpy(expected_product), rtol=2e-6
-        )
-        return product
+    iterate, calls = solver._iterate_rlgc, 0
 
-    actual = solver._iterate_rlgc(
-        observed,
-        observed.shape,
-        xp.copy,
-        xp.copy,
-        smooth,
-        np.s_[:, :, :],
-        gradient_consensus=True,
+    def observe_iterations(observed, shape, forward, adjoint, smooth, *args, **kwargs):
+        """Check the actual additive product before production optical smoothing."""
+
+        def observe_smoothing(product, sensitivity):
+            nonlocal calls
+            calls += 1
+            assert cp.get_array_module(product) is cp
+            np.testing.assert_allclose(
+                cp.asnumpy(product), cp.asnumpy(expected_product), rtol=2e-6
+            )
+            return smooth(product, sensitivity)
+
+        return iterate(
+            observed, shape, forward, adjoint, observe_smoothing, *args, **kwargs
+        )
+
+    monkeypatch.setattr(solver, "_iterate_rlgc", observe_iterations)
+    actual = solver.rlgc(
+        cp.asnumpy(observed),
+        np.ones((1, 1, 1), np.float32),
+        initial_estimate=cp.asnumpy(initial),
         max_iterations=1,
         limit=0,
         max_delta=0,
         rng_seed=42,
         use_kl=False,
-        read_noise=0,
-        initial_estimate=initial,
-        logger=None,
-        log_prefix="",
-        callback=None,
     )
+    assert calls == 1
     expected = initial.copy()
     expected[..., 2] = observed[..., 2]
-    np.testing.assert_allclose(
-        cupy_gpu.asnumpy(actual), cupy_gpu.asnumpy(expected), rtol=2e-6
-    )
+    np.testing.assert_allclose(actual, cp.asnumpy(expected), rtol=2e-6)
 
 
 @pytest.mark.parametrize("storage", ["host", "gpu"])
