@@ -9,11 +9,11 @@ from tests.pipeline import (
 pytestmark = [
     pytest.mark.integration,
     pytest.mark.usefixtures("cupy_gpu"),
-    pytest.mark.parametrize("deconvolve", [True]),
+    pytest.mark.parametrize("deconvolve", [False, True]),
     pytest.mark.parametrize(
         "noisy_extended_scene",
         [
-            (kind, "uniform", 1, layout)
+            (kind, "uniform", 1, layout, True)
             for kind in ("line-pairs", "sphere")
             for layout in ("whole", "tiled")
         ],

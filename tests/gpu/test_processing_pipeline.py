@@ -1,4 +1,4 @@
-"""Run the shared full pipeline with real full-volume and tiled CUDA RLGC."""
+"""Real deskew/registration pipelines, with and without full or tiled CUDA RLGC."""
 
 import pytest
 
@@ -9,24 +9,19 @@ from tests.pipeline import (
 pytestmark = [
     pytest.mark.integration,
     pytest.mark.usefixtures("cupy_gpu"),
-    pytest.mark.parametrize("deconvolve", [True]),
     pytest.mark.parametrize(
-        "pipeline_case",
+        ("pipeline_case", "deconvolve"),
         [
-            (mode, illumination, step, crop)
-            for mode in ("stage", "mirror")
-            for step in (0.4, 1.2)
-            for illumination, crop in ((False, None), (True, 39))
-        ],
-        indirect=True,
-        ids=[
-            f"{mode}-{step}um-{method}"
-            for mode in ("stage", "mirror")
-            for step in (0.4, 1.2)
-            for method in (
-                "full-generated-psf",
-                "tiled-generated-psf-estimated-taper",
+            pytest.param(
+                (mode, illumination, step, 39 if deconvolve and illumination else None),
+                deconvolve,
+                id=f"{deconvolve}-{mode}-{step}um-{'estimated-taper' if illumination else 'uniform'}",
             )
+            for deconvolve in (False, True)
+            for mode in ("stage", "mirror")
+            for step in (0.4, 1.2)
+            for illumination in (False, True)
         ],
+        indirect=["pipeline_case"],
     ),
 ]

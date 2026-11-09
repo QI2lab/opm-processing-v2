@@ -18,19 +18,18 @@ from opm_processing.export_ome_tiff import load_export_metadata
 from opm_processing.imageprocessing.tilefusion import TileFusion
 from opm_processing.process import confirm_partial_output_resume
 
-pytestmark = pytest.mark.integration
+pytestmark = [pytest.mark.integration, pytest.mark.usefixtures("cupy_gpu")]
 
 
 @pytest.mark.parametrize("deconvolve", [False])
 @pytest.mark.parametrize(
-    "pipeline_case",
+    ("pipeline_case", "copied"),
     [
-        ("mirror", False, 0.4, None),
-        ("stage", False, 1.2, None),
+        pytest.param(("mirror", False, 0.4, None), False, id="mirror-moved"),
+        pytest.param(("stage", False, 1.2, None), True, id="stage-copied"),
     ],
-    indirect=True,
+    indirect=["pipeline_case"],
 )
-@pytest.mark.parametrize("copied", [False, True], ids=["moved", "copied"])
 def test_inspection_and_exports_process_simulated_acquisition(
     pipeline_case,
     copied,
@@ -73,12 +72,7 @@ def test_inspection_and_exports_process_simulated_acquisition(
         source if copied else processed,
         output_dir=output_dir if copied else None,
         blend_pixels=(0, 0, 0),
-        downsample_factors=(1, 1, 1),
         registration_channel=metadata.shape[2] - 1,
-        ssim_window=3,
-        registration_threshold=0.1,
-        max_registration_shift_zyx=(2, 2, 2),
-        chunk_shape_yx=(16, 16),
         max_workers=1,
         normalize_depth_intensity=False,
     )

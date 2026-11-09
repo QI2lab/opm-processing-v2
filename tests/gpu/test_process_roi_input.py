@@ -8,7 +8,7 @@ from opm_processing import process_roi as process_roi_module
 from opm_processing.dataio.acquisition import acquisition_stem
 from opm_processing.dataio.processing_state import ProcessingState
 
-pytestmark = pytest.mark.integration
+pytestmark = [pytest.mark.integration, pytest.mark.usefixtures("cupy_gpu")]
 
 
 @pytest.mark.parametrize("explicit_paths", (False, True))

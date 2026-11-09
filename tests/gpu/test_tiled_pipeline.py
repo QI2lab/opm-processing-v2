@@ -9,7 +9,7 @@ from tests.pipeline import (
 pytestmark = [
     pytest.mark.integration,
     pytest.mark.usefixtures("cupy_gpu"),
-    pytest.mark.parametrize("deconvolve", [True]),
+    pytest.mark.parametrize("deconvolve", [False, True]),
     pytest.mark.parametrize(
         "mosaic_acquisition",
         [
