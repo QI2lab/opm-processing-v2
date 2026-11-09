@@ -2223,8 +2223,8 @@ class TileFusion:
         """Register `g2` to `g1` and compute an SSIM score.
 
         Steps:
-        1) histogram-match g2 -> g1
-        2) phase cross-correlation to estimate subpixel shift
+        1) retain original intensities for phase cross-correlation
+        2) histogram-match g2 -> g1 for photometric SSIM scoring
         3) align g2 at that fractional estimate, excluding interpolation padding
         4) compute SSIM on common geometric support; thin depth overlaps
            without a complete 3D window use XY means of common valid planes
@@ -2425,7 +2425,9 @@ class TileFusion:
                 registration_axis,
             )
 
-        shift_apply = correlate(arr1, arr2)
+        # Nonlinear histogram matching can move fractional phase peaks. Keep
+        # geometric estimation on the original data and match only for SSIM.
+        shift_apply = correlate(arr1, unmodified_moving)
         if (
             shift_apply is not None
             and max_shift is not None
@@ -2434,7 +2436,7 @@ class TileFusion:
         ):
             shift_apply = _bounded_phase_correlation_peak(
                 arr1,
-                arr2,
+                unmodified_moving,
                 max_shift,
             )
 
@@ -2445,7 +2447,7 @@ class TileFusion:
                 raise ValueError("registration_axis is outside the patch rank")
             edge_shift = correlate(
                 sobel_filter(arr1, axis=axis),
-                sobel_filter(arr2, axis=axis),
+                sobel_filter(unmodified_moving, axis=axis),
             )
             edge_is_allowed = edge_shift is not None and (
                 max_shift is None or not bool(xp.any(xp.abs(edge_shift) > limits))
