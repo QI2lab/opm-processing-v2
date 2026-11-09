@@ -1,8 +1,8 @@
 """
 2D/3D tile fusion for qi2lab OPM data.
 
-This module implements GPU-optional (CuPy/cuCIM) and CPU (NumPy/SciPy/skimage)
-registration plus Numba-accelerated feather-weighted fusion of TPCZYX stacks.
+This module implements CuPy/cuCIM registration and Numba-accelerated
+feather-weighted CPU fusion of TPCZYX stacks.
 
 Pipeline summary
 ----------------
@@ -17,8 +17,7 @@ Pipeline summary
 Notes
 -----
 - The output store layout is (t, c, z, y, x).
-- If CuPy/cuCIM are available, registration downsampling and shift operations
-  use GPU; fusion is performed on CPU using Numba kernels.
+- Registration requires CuPy/cuCIM; fusion is performed on CPU using Numba kernels.
 """
 
 from __future__ import annotations
@@ -43,6 +42,7 @@ import psutil
 import tensorstore as ts
 from numba import njit
 from scipy.cluster.hierarchy import DisjointSet
+from skimage.measure import block_reduce as cpu_block_reduce
 from tqdm import tqdm
 from yaozarrs.write.v05 import prepare_image
 
@@ -82,7 +82,7 @@ if TYPE_CHECKING:
     from opm_processing.dataio.roi import PhysicalRoi
 
 # -----------------------------------------------------------------------------
-# Optional GPU stack (safe globals)
+# Optional imports keep CPU geometry and fusion usable without the CUDA stack.
 # -----------------------------------------------------------------------------
 USING_GPU = False
 GPU_IMPORT_ERROR: Exception | None = None
@@ -97,43 +97,7 @@ sobel_filter: Any
 shift_filter: Any
 minimum_filter: Any
 
-_ssim_cpu: Any | None = None
-
-xp: Any = np
-
-
-def _cpu_registration_backend() -> dict[str, Any]:
-    """Load the CPU operators used by registration's production fallback.
-
-    Returns
-    -------
-    dict of str to object
-        Backend flags, NumPy array operations and installed SciPy/skimage
-        operators. Each call returns a fresh set of module bindings.
-    """
-    from scipy import ndimage
-    from skimage.exposure import match_histograms
-    from skimage.measure import block_reduce
-    from skimage.metrics import structural_similarity
-    from skimage.registration import phase_cross_correlation
-    from skimage.registration._masked_phase_cross_correlation import (
-        cross_correlate_masked,
-    )
-
-    return {
-        "USING_GPU": False,
-        "cp": None,
-        "xp": np,
-        "ssim_cuda": None,
-        "_ssim_cpu": structural_similarity,
-        "match_histograms": match_histograms,
-        "block_reduce": block_reduce,
-        "phase_cross_correlation": phase_cross_correlation,
-        "masked_cross_correlation": cross_correlate_masked,
-        "sobel_filter": ndimage.sobel,
-        "shift_filter": ndimage.shift,
-        "minimum_filter": ndimage.minimum_filter,
-    }
+xp: Any | None = None
 
 
 preload_cuda_libraries()
@@ -162,11 +126,9 @@ try:
     shift_filter = _shift
     minimum_filter = _minimum_filter
     ssim_cuda = _ssim_gpu
-    USING_GPU = True
+    USING_GPU = cp.cuda.runtime.getDeviceCount() > 0
 except Exception as error:
-    # GPU stack unavailable; fall back to CPU.
     GPU_IMPORT_ERROR = error
-    globals().update(_cpu_registration_backend())
 
 
 def _default_fusion_workers() -> int:
@@ -202,7 +164,7 @@ def fusion_backend_status(
     workers = _default_fusion_workers() if max_workers is None else int(max_workers)
     return {
         "gpu_registration": USING_GPU,
-        "registration_backend": "cupy/cucim" if USING_GPU else "numpy/scikit-image",
+        "registration_backend": "cupy/cucim",
         "fusion_backend": "threaded-blocks/numba-cpu",
         "fusion_workers": workers,
         "gpu_error": None if GPU_IMPORT_ERROR is None else repr(GPU_IMPORT_ERROR),
@@ -320,7 +282,7 @@ def resolve_fusion_input(
 
 
 def _ssim(arr1: Any, arr2: Any, win_size: int, valid_mask: Any | None = None) -> float:
-    """Compute SSIM, routing to GPU kernel if available, else CPU skimage.
+    """Compute SSIM using cuCIM on the GPU.
 
     Parameters
     ----------
@@ -347,24 +309,13 @@ def _ssim(arr1: Any, arr2: Any, win_size: int, valid_mask: Any | None = None) ->
     data_range = float(xp.ptp(arr1 if valid_mask is None else arr1[valid_mask]))
     if data_range == 0.0:
         data_range = 1.0
-    if USING_GPU and ssim_cuda is not None:
-        result = ssim_cuda(
-            arr1,
-            arr2,
-            win_size=win_size,
-            data_range=data_range,
-            full=valid_mask is not None,
-        )
-    else:
-        if _ssim_cpu is None:
-            raise RuntimeError("CPU SSIM backend is unavailable.")
-        result = _ssim_cpu(
-            np.asarray(arr1),
-            np.asarray(arr2),
-            win_size=win_size,
-            data_range=data_range,
-            full=valid_mask is not None,
-        )
+    result = ssim_cuda(
+        arr1,
+        arr2,
+        win_size=win_size,
+        data_range=data_range,
+        full=valid_mask is not None,
+    )
     return float(result if valid_mask is None else xp.mean(result[1][eligible]))
 
 
@@ -2320,6 +2271,7 @@ class TileFusion:
         RuntimeError
             If a required backend function is unavailable.
         """
+        require_gpu_backend()
         arr1 = xp.asarray(g1, dtype=xp.float32)
         arr2 = xp.asarray(g2, dtype=xp.float32)
         masks = (
@@ -2382,7 +2334,7 @@ class TileFusion:
             return xp.asarray(shift, dtype=xp.float32)
 
         def correlate(fixed: Any, moving: Any) -> Any:
-            """Calculate phase correlation with the selected CPU or CUDA backend.
+            """Calculate phase correlation with the cuCIM CUDA backend.
 
             Parameters
             ----------
@@ -2400,8 +2352,8 @@ class TileFusion:
             # the intensity images contain useful features in other directions.
             if not bool(xp.any(fixed)) or not bool(xp.any(moving)):
                 return None
-            # CPU disambiguation can move identical, textureless crops to an
-            # equivalent peak. Preserve zero correction on both backends.
+            # Disambiguation can move identical, textureless crops to an
+            # equivalent peak. Preserve their zero correction.
             if bool(xp.array_equal(fixed, moving)):
                 return xp.zeros(fixed.ndim, dtype=xp.float32)
             result = measured_phase_shift(fixed, moving, resolve_alias=disambiguate)
@@ -2563,10 +2515,7 @@ class TileFusion:
         else:
             shift_ret = shift_apply
 
-        if USING_GPU and cp is not None:
-            out_shift = cp.asnumpy(shift_ret)
-        else:
-            out_shift = np.asarray(shift_ret)
+        out_shift = cp.asnumpy(shift_ret)
 
         return tuple(float(s) for s in out_shift), float(score)
 
@@ -2608,6 +2557,7 @@ class TileFusion:
         - Links never cross timepoints; i and j always belong to the same t.
         - For 2D data, dz is forced to 0 and overlap gating ignores z.
         """
+        require_gpu_backend()
         df_in = (
             self.downsample_factors
             if downsample_factors is None
@@ -2677,9 +2627,7 @@ class TileFusion:
             df_zyx_base = (1, df_zyx_base[1], df_zyx_base[2])
         available_host_bytes = int(psutil.virtual_memory().available)
         read_workers = min(4, max(1, self._max_workers))
-        device_buffers = (
-            _RegistrationDeviceBuffers(cp) if USING_GPU and cp is not None else None
-        )
+        device_buffers = _RegistrationDeviceBuffers(cp)
         n_pos = int(self.position_dim)
         tile_groups = getattr(
             self,
@@ -2948,12 +2896,8 @@ class TileFusion:
                         reduce_block = df_zyx_eff[1:]
                     else:
                         reduce_block = df_zyx_eff
-                    if device_buffers is not None:
-                        staged_i = device_buffers._stage_one(0, np.asarray(patch_i))
-                        staged_j = device_buffers._stage_one(1, np.asarray(patch_j))
-                    else:
-                        staged_i = xp.asarray(patch_i)
-                        staged_j = xp.asarray(patch_j)
+                    staged_i = device_buffers._stage_one(0, np.asarray(patch_i))
+                    staged_j = device_buffers._stage_one(1, np.asarray(patch_j))
                     g1 = block_reduce(
                         staged_i,
                         block_size=reduce_block,
@@ -3083,8 +3027,7 @@ class TileFusion:
                                     not lateral_allowed or alternative_score > score
                                 ):
                                     refined, score = alternative, alternative_score
-                        if USING_GPU and cp is not None:
-                            refined = cp.asnumpy(refined)
+                        refined = cp.asnumpy(refined)
                         refined = np.asarray(refined, dtype=np.float64)
                         refined[0] -= context_z
                         shift_ds = refined
@@ -4799,21 +4742,23 @@ class TileFusion:
                         ::relative_factor,  # noqa: B023
                     ]
                 else:
-                    arr = xp.asarray(slab)
-                    down_arr = block_reduce(
-                        arr,
-                        block_size=(
-                            z_factor,  # noqa: B023
-                            relative_factor,  # noqa: B023
-                            relative_factor,  # noqa: B023
-                        ),
-                        func=xp.mean,
+                    reduce_block = (
+                        z_factor,  # noqa: B023
+                        relative_factor,  # noqa: B023
+                        relative_factor,  # noqa: B023
                     )
-                    down = (
-                        cp.asnumpy(down_arr)
-                        if USING_GPU and cp is not None
-                        else np.asarray(down_arr)
-                    )
+                    if USING_GPU:
+                        down = cp.asnumpy(
+                            block_reduce(
+                                cp.asarray(slab),
+                                block_size=reduce_block,
+                                func=cp.mean,
+                            )
+                        )
+                    else:
+                        down = cpu_block_reduce(
+                            slab, block_size=reduce_block, func=np.mean
+                        )
                 out[  # noqa: B023
                     t,
                     c,

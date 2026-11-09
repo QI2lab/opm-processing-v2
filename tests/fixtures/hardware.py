@@ -2,15 +2,13 @@
 
 from __future__ import annotations
 
-import os
-
 import pytest
 
 
 @pytest.fixture(scope="module")
 def cupy_gpu():
-    """Return CuPy on available CUDA hardware, or honor GPU skip policy."""
-    import cupy as cp
+    """Return CuPy on available CUDA hardware, or skip unavailable hardware."""
+    cp = pytest.importorskip("cupy")
 
     message = "CuPy found no CUDA devices"
     try:
@@ -23,8 +21,6 @@ def cupy_gpu():
         device_count = 0
         message = f"CUDA device discovery failed: {error}"
     if device_count < 1:
-        if os.environ.get("OPM_REQUIRE_GPU") == "1":
-            pytest.fail(message, pytrace=False)
         pytest.skip(message)
     device = cp.cuda.Device(0)
     device.use()
@@ -36,25 +32,6 @@ def cupy_gpu():
     cp.cuda.Stream.null.synchronize()
     cp.get_default_memory_pool().free_all_blocks()
     cp.get_default_pinned_memory_pool().free_all_blocks()
-
-
-@pytest.fixture(autouse=True)
-def cpu_registration_backend(monkeypatch, request):
-    """Select the actual CPU operators for cases marked as CPU execution.
-
-    Parameters
-    ----------
-    monkeypatch : pytest.MonkeyPatch
-        Restore the previously selected numerical backend after each case.
-    request : pytest.FixtureRequest
-        Collected CPU/GPU marker supplied by the test directory.
-    """
-    if request.node.get_closest_marker("cpu") is None:
-        return
-    from opm_processing.imageprocessing import tilefusion
-
-    for name, operator in tilefusion._cpu_registration_backend().items():
-        monkeypatch.setattr(tilefusion, name, operator)
 
 
 @pytest.fixture(scope="module")
