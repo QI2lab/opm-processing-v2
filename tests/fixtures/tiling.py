@@ -344,7 +344,7 @@ def stage_placement_acquisition(
     independent_photon_scene_factory,
     crop,
 ):
-    """Image one fixed point through the shared physical oblique camera model."""
+    """Image structured lines and a fixed fiducial through physical stage motion."""
     from dataclasses import replace
 
     from opm_processing.dataio.acquisition import ChannelMetadata
@@ -368,13 +368,15 @@ def stage_placement_acquisition(
     )
     stage_z_values_um = -np.asarray((0, 6, 12)) * pixel_um
     microscope = replace(microscope_parameters, scan_step_um=step_um, angle_deg=angle)
-    scene = independent_photon_scene_factory()
-    density = np.zeros_like(scene.density)
+    scene = independent_photon_scene_factory(
+        "line-pairs", large=True, integration_scan_planes=scans
+    )
+    density = scene.density.copy()
     deposit_point(density, scene.axes, (0, 0, 0), 1.0)
     scene = replace(
         scene,
         density=density,
-        features={"centers_xyz_um": [[0.0, 0.0, 0.0]]},
+        features=dict(scene.features, centers_xyz_um=[[0.0, 0.0, 0.0]]),
         microscope=microscope,
     )
     scan_axis = np.arange(scans) * step_um

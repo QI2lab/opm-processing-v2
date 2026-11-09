@@ -89,19 +89,42 @@ def independent_photon_scene_factory(microscope_parameters, simulation_parameter
     from tests.simulation.scenes import prepare_scene
 
     @lru_cache(maxsize=2)
-    def build(kind="points", *, large=False):
+    def build(kind="points", *, large=False, integration_scan_planes=None):
         """Reuse physical scenes on the shared calibrated fine grid."""
         specimen = simulation_parameters["specimens"][kind]
         if large and kind == "line-pairs":
             z, _, x = specimen["half_extent_zyx_um"]
             length = simulation_parameters["large_scene"]["line_length_um"]
+            features = dict(specimen["features"])
+            if integration_scan_planes is not None:
+                integration = simulation_parameters["integration_line_pairs"]
+                z = max(
+                    z,
+                    simulation_parameters["specimens"]["points"]["half_extent_zyx_um"][
+                        0
+                    ],
+                )
+                if (
+                    integration_scan_planes
+                    == simulation_parameters["whole_scan_planes"]
+                ):
+                    # At feature Z=0, both endpoints and their full optical
+                    # support fit even the coarse camera's common scan range.
+                    length = integration["whole_line_length_um"]
+                # Two finite cylinders straddle actual X tile borders; scan
+                # subsampling cannot remove this independent border coverage.
+                x = integration["half_extent_x_um"]
+                features.update(
+                    pair_gap_um=integration["pair_gap_um"],
+                    offset_x_um=integration["offset_x_um"],
+                )
             specimen = {
                 "half_extent_zyx_um": (
                     z,
                     length / 2 + microscope_parameters.psf_half_extent_zyx_um[1],
                     x,
                 ),
-                "features": dict(specimen["features"], length_um=length),
+                "features": dict(features, length_um=length),
             }
         return prepare_scene(
             kind,
@@ -133,6 +156,7 @@ def simulated_camera(
         *,
         kind="points",
         large=False,
+        integration=False,
         illumination_profile="uniform",
         step=0.4,
         conversion=0.25,
@@ -141,7 +165,11 @@ def simulated_camera(
         budget=None,
     ):
         """Reuse immutable optical formation independently of detector noise."""
-        scene = independent_photon_scene_factory(kind, large=large)
+        scene = independent_photon_scene_factory(
+            kind,
+            large=large,
+            integration_scan_planes=shape[0] if integration else None,
+        )
         microscope = replace(
             microscope_parameters,
             scan_step_um=step,
@@ -176,6 +204,7 @@ def simulated_camera(
         *,
         kind="points",
         large=False,
+        integration=False,
         illumination_profile="uniform",
         step=0.4,
         conversion=0.25,
@@ -201,6 +230,7 @@ def simulated_camera(
                 shape,
                 kind=kind,
                 large=large,
+                integration=integration,
                 illumination_profile=illumination_profile,
                 step=native_step,
                 conversion=conversion,
@@ -219,6 +249,7 @@ def simulated_camera(
             shape,
             kind=kind,
             large=large,
+            integration=integration,
             illumination_profile=illumination_profile,
             step=step,
             conversion=conversion,
@@ -238,12 +269,15 @@ def simulated_camera(
 
 
 @pytest.fixture(scope="session")
-def physical_translation_pair(independent_photon_scene_factory, simulation_parameters):
-    """Observe an aperiodic object from displaced physical sensor coordinates.
+def cartesian_registration_pair(
+    independent_photon_scene_factory, simulation_parameters
+):
+    """Observe known emitters on registration's orthogonal Cartesian ZYX grid.
 
     Both acquisitions share one known emission dose and calibrated microscope.
     Independent detector realizations avoid matching a reused camera-noise field.
     """
+    from opm_processing.imageprocessing.camera import camera_correct
     from tests.simulation.camera import digitize
 
     @lru_cache(maxsize=4)
@@ -268,7 +302,7 @@ def physical_translation_pair(independent_photon_scene_factory, simulation_param
             Acquisition(
                 scene.axes,
                 shape,
-                geometry="oblique",
+                geometry="cartesian",
                 camera_photon_budget=(10000, 30),
                 output="object",
             ),
@@ -286,7 +320,7 @@ def physical_translation_pair(independent_photon_scene_factory, simulation_param
                     scene.axes,
                     shape,
                     sensor_axes=sensor_axes,
-                    geometry="oblique",
+                    geometry="cartesian",
                     output="expectation",
                 ),
                 microscope,
@@ -298,13 +332,22 @@ def physical_translation_pair(independent_photon_scene_factory, simulation_param
             freeze_metadata(-np.array(applied_shift)),
         )
 
-    def render(applied_shift):
-        """Draw independent detector samples for the prescribed translated pair."""
+    @lru_cache(maxsize=2)
+    def render(applied_shift, *, noise=True):
+        """Draw independent exposures and use production camera calibration."""
         camera, means, expected = optical_data(applied_shift)
-        images = [
-            digitize(mean, camera, seed=42 + index).astype(np.float32)
-            for index, mean in enumerate(means)
-        ]
+        images = []
+        for index, mean in enumerate(means):
+            observed = (
+                camera_correct(
+                    digitize(mean, camera, seed=42 + index),
+                    camera.offset_adu,
+                    camera.electrons_per_adu,
+                )
+                if noise
+                else mean.astype(np.float32)
+            )
+            images.append(observed)
         return (*freeze_metadata(images), expected)
 
     return render
@@ -793,7 +836,6 @@ def noisy_extended_scene(
     request,
     microscope_parameters,
     simulation_parameters,
-    independent_photon_scene_factory,
     simulated_camera,
 ):
     """Observe fixed extended emitters with calibrated noisy camera exposures."""
@@ -804,12 +846,10 @@ def noisy_extended_scene(
     )
 
     config = simulation_parameters
-    kind, profile, budget, layout = request.param
+    kind, profile, budget, layout = request.param[:4]
+    integration = len(request.param) > 4 and request.param[4]
     microscope = replace(
         microscope_parameters, scan_step_um=config["microscope"]["scan_step_um"]
-    )
-    scene = replace(
-        independent_photon_scene_factory(kind, large=True), microscope=microscope
     )
     shape = (
         config[f"{layout}_scan_planes"],
@@ -819,6 +859,7 @@ def noisy_extended_scene(
         shape,
         kind=kind,
         large=True,
+        integration=integration,
         illumination_profile=profile,
         step=microscope.scan_step_um,
         conversion=microscope.camera.electrons_per_adu,
@@ -826,6 +867,7 @@ def noisy_extended_scene(
         seed=config["camera_seed"],
     )
     expectation, raw = observation.expectation, observation.raw
+    scene = observation.ground_truth
     source = (
         integrate_camera_pixels(
             scene.density,

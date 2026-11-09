@@ -215,6 +215,12 @@
   "large_scene": {
     "line_length_um": 48.0
   },
+  "integration_line_pairs": {
+    "whole_line_length_um": 6.0,
+    "pair_gap_um": 4.776,
+    "offset_x_um": -0.69,
+    "half_extent_x_um": 15.6
+  },
   "pipeline": {
     "plane_period_s": 0.02
   }

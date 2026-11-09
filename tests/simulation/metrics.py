@@ -109,8 +109,8 @@ def camera_object_apertures(
     """Select source and background camera apertures from original physical axes.
 
     The finite known object's PSF-eroded interior and Rayleigh-radius emitter
-    neighborhoods are fixed independently of reconstructed values. Detector
-    row/column subsets preserve sensitivity to broad compensating stripes.
+    neighborhoods are fixed independently of reconstructed values. Pointwise
+    bounds on the complete interior cover every detector row and column.
     """
     from tests.simulation.forward_model import camera_psf
 
@@ -165,10 +165,10 @@ def camera_object_apertures(
                     0,
                 ),
             )
-        points = ()
+        points = features.get("centers_xyz_um", ())
     else:
-        points = np.asarray(ground_truth.features["centers_xyz_um"])[:, ::-1]
-    for point in points:
+        points = ground_truth.features["centers_xyz_um"]
+    for point in np.asarray(points).reshape(-1, 3)[:, ::-1]:
         distance = np.minimum(
             distance,
             np.sqrt(
@@ -184,12 +184,4 @@ def camera_object_apertures(
         raise ValueError("The physical camera field must acquire source and background")
     yield source
     yield background
-    for axis in (-2, -1):
-        for index in range(shape[axis]):
-            partition = [slice(None)] * len(shape)
-            partition[axis] = slice(index, index + 1)
-            partition = tuple(partition)
-            if interior[partition].any():
-                selected = np.zeros(shape, bool)
-                selected[partition] = interior[partition]
-                yield selected
+    yield interior

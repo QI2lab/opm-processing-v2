@@ -80,10 +80,7 @@ def uniform_camera_scene(uniform_detector_scene):
 @pytest.fixture
 def assert_uniform_photon_accuracy():
     """Bound positive CPU interpolation using the original phantom and camera noise."""
-    from tests.simulation.camera_likelihood import (
-        SamplingEnvelope,
-        camera_sampling_accuracy,
-    )
+    from tests.simulation.camera_likelihood import SamplingEnvelope
 
     def check(data, scene, *, position=0, channels=None):
         """Check calibrated absolute photons, spatial support and output precision."""
@@ -130,7 +127,6 @@ def assert_uniform_photon_accuracy():
                     field,
                 ).astype(np.float64)
                 residual = observed - truth
-                expected = float(truth.flat[0]) * support
                 operations = 64
                 error = operations * np.finfo(np.float32).eps
                 roundoff = error / (1 - error) * max(float(observed.max()), 1) * gain
@@ -142,10 +138,13 @@ def assert_uniform_photon_accuracy():
                     high + roundoff + quantum,
                 )
                 actual = data[time, channel]
-                result = camera_sampling_accuracy(
-                    actual, expected, envelope, support > 0
+                selected = support > 0
+                assert selected.any()
+                assert np.all(
+                    np.isfinite(actual[selected])
+                    & (actual[selected] >= envelope.lower[selected])
+                    & (actual[selected] <= envelope.upper[selected])
                 )
-                assert result.accepted, result
                 np.testing.assert_array_equal(actual[support == 0], 0)
 
     return check

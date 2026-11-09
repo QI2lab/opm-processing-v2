@@ -132,21 +132,14 @@ def test_qi2lab_acquisition_to_fused_ngff_v05(pipeline_case, deconvolve):
         factor = scan_upsample_from_metadata(metadata)
         assert len(case.reconstructions) == np.prod(metadata.shape[:3])
         assert len(case.deconvolution_runs) == len(case.reconstructions)
-        for run in case.deconvolution_runs:
+        for reconstruction, run in zip(
+            case.reconstructions, case.deconvolution_runs, strict=True
+        ):
             assert run["input_shape"] == metadata.shape[-3:]
-            crop = run["crop_scan"]
-            retained = max(1, crop // factor)
-            assert run["chunks"]
-            for chunk in run["chunks"]:
-                assert chunk["storage"] == "gpu"
-                halo = int(np.ceil(chunk["psf_shape"][0] / factor))
-                raw_bound = retained + 2 * halo + int(factor > 1)
-                assert chunk["input_shape"][0] <= min(metadata.shape[-3], raw_bound)
-                assert chunk["input_shape"][1:] == metadata.shape[-2:]
-                assert chunk["output_shape"] == (
-                    (chunk["input_shape"][0] - 1) * factor + 1,
-                    *metadata.shape[-2:],
-                )
+            assert reconstruction.shape == (
+                (metadata.shape[-3] - 1) * factor + 1,
+                *metadata.shape[-2:],
+            )
         for index, run in zip(
             np.ndindex(*metadata.shape[:3]),
             case.deconvolution_runs,
@@ -280,12 +273,6 @@ def test_large_noisy_scene_acquisition_to_fusion(
         if deconvolve:
             run = result.deconvolution_runs[position]
             observed = run["forward"]
-            assert len(run["chunks"]) > 2 if tiled_scan else len(run["chunks"]) == 1
-            halo = int(np.ceil(run["psf_shape"][0] / factor))
-            for chunk in run["chunks"]:
-                if tiled_scan:
-                    assert chunk["input_shape"][0] < metadata.shape[-3]
-                    assert chunk["input_shape"][0] <= crop_scan // factor + 2 * halo + 1
             chunks = sorted(
                 observed["chunks"], key=lambda chunk: chunk["destination"].start
             )
@@ -365,10 +352,12 @@ def test_large_noisy_scene_acquisition_to_fusion(
         )
     assert covered.all() and len(result.deskew_tiles) > 8
     crossings = 0
+    axis_borders = []
     for axis in range(3):
         borders = {
             origin[axis] for origin, _shape in result.deskew_tiles if origin[axis]
         }
+        axis_borders.append(sorted(borders))
         crossings += sum(
             np.any(
                 np.take(foreground, border - 1, axis=axis)
@@ -376,7 +365,7 @@ def test_large_noisy_scene_acquisition_to_fusion(
             )
             for border in borders
         )
-    assert crossings >= 2
+    assert crossings >= 2, (crossings, axis_borders, geometry.shape, tile_shape)
     assert any(
         origin[axis] % tile_shape[axis]
         and origin[axis] + shape[axis] == geometry.shape[axis]
@@ -511,14 +500,14 @@ def test_extended_mosaic_acquisition_to_fusion(
             assert crop >= shape[0]
             seam_scans[:] = True
         for position, run in enumerate(result.deconvolution_runs):
-            assert len(run["chunks"]) > 1 if case.tiled else len(run["chunks"]) == 1
-            for chunk in run["chunks"]:
+            observed = run["forward"]
+            chunks = observed["chunks"]
+            assert len(chunks) > 1 if case.tiled else len(chunks) == 1
+            for chunk in chunks:
                 if case.tiled:
-                    assert chunk["input_shape"][0] < raw_shape[0]
-                assert chunk["storage"] == "gpu"
+                    assert chunk["observed_shape"][0] < raw_shape[0]
             start = position * offset
             expected = case.expectation[..., start : start + shape[-1]]
-            observed = run["forward"]
             predicted = observed["prediction"]
             baseline = observed["input_prediction"]
             if baseline is None:

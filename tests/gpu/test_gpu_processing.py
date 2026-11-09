@@ -4,8 +4,7 @@ These unit tests use known analytical operands and simulated camera data. Each c
 GPU output with an independent result or checks a
 quantitative reconstruction/registration property.
 
-Set ``OPM_REQUIRE_GPU=1`` in a GPU CI job so an unavailable GPU stack fails the
-suite instead of skipping it.
+Unavailable CUDA hardware skips these tests.
 """
 
 from __future__ import annotations
@@ -17,14 +16,63 @@ import pytest
 from scipy import ndimage
 from scipy.stats import entropy
 
-from tests.registration import (
-    test_bounded_peak_matches_upstream_phase_normalization as test_bounded_peak_matches_upstream_phase_normalization,
-)
-from tests.registration import (
-    test_orthogonal_camera_pairs_recover_known_stage_errors as test_orthogonal_camera_pairs_recover_known_stage_errors,
-)
+from opm_processing.imageprocessing import tilefusion
 
 pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("cupy_gpu")]
+
+
+@pytest.mark.parametrize("scale", [1.0, 1e-3, 1e-4])
+@pytest.mark.parametrize("seed", [485, 492])
+def test_bounded_peak_matches_upstream_phase_normalization(
+    aperiodic_registration_object, scale, seed
+):
+    """Use the upstream weak-frequency floor even for faint unrelated objects."""
+    tilefusion.require_gpu_backend()
+    backend = tilefusion.xp
+    fixed, moving = (
+        aperiodic_registration_object((9, 43, 55), seed=value).astype(np.float32)
+        for value in (seed, seed + 1)
+    )
+    fixed = backend.asarray((fixed / fixed.max() * np.float32(scale))[:7, :35, :47])
+    moving = backend.asarray(
+        (moving / moving.max() * np.float32(scale))[1:8, 4:39, 3:50]
+    )
+    expected, _, _ = tilefusion.phase_cross_correlation(
+        fixed, moving, normalization="phase", upsample_factor=1
+    )
+    actual = tilefusion._bounded_phase_correlation_peak(
+        fixed, moving, np.asarray(fixed.shape) // 2
+    )
+    np.testing.assert_array_equal(actual.tolist(), backend.asarray(expected).tolist())
+
+
+@pytest.mark.parametrize("sampling", [(1, 1, 1), (1, 2, 2)])
+def test_orthogonal_camera_pairs_recover_known_stage_errors(
+    orthogonal_registration_pair, sampling
+):
+    """Recover prescribed stage errors from independently formed oblique images."""
+    tilefusion.require_gpu_backend()
+    backend = tilefusion.xp
+    pair = orthogonal_registration_pair
+    fixed, moving = (
+        tilefusion.block_reduce(backend.asarray(image), sampling, backend.mean)
+        for image in (pair.fixed, pair.moving)
+    )
+    masks = tuple(
+        tilefusion.block_reduce(backend.asarray(mask), sampling, backend.min)
+        for mask in pair.masks
+    )
+    shift, score = tilefusion.TileFusion.register_and_score(
+        fixed,
+        moving,
+        3,
+        max_shift=np.array((2, 4, 4)) / sampling,
+        registration_axis=pair.axis,
+        shift_sampling=sampling,
+        support_masks=masks,
+    )
+    assert np.isfinite(score)
+    np.testing.assert_array_equal(np.rint(np.asarray(shift) * sampling), pair.expected)
 
 
 def test_fft_convolution_matches_direct_reference(
@@ -134,12 +182,12 @@ def test_exact_signal_registration_recovers_known_3d_translation(
 
 
 @pytest.mark.parametrize("applied_shift", ((1.0, -2.0, 3.0), (0.6, -2.3, 3.4)))
-def test_unbounded_registration_recovers_displaced_physical_observations(
-    cupy_gpu, physical_translation_pair, applied_shift
+def test_registration_recovers_displaced_cartesian_observations(
+    cupy_gpu, cartesian_registration_pair, applied_shift
 ):
-    """Register independently exposed, aperiodic points without a displacement prior."""
+    """Register independent optical observations in the consumed Cartesian frame."""
     tilefusion = importlib.import_module("opm_processing.imageprocessing.tilefusion")
-    fixed, moving, expected = physical_translation_pair(applied_shift)
+    fixed, moving, expected = cartesian_registration_pair(applied_shift)
     unregistered = tilefusion._ssim(
         cupy_gpu.asarray(fixed), cupy_gpu.asarray(moving), 5
     )

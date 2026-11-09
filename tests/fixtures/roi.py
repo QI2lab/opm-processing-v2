@@ -244,7 +244,6 @@ def assert_roi_point_accuracy(assert_roi_point_locations):
     from opm_processing.process import format_processed_output
     from tests.simulation.camera_likelihood import (
         SamplingEnvelope,
-        camera_sampling_accuracy,
         camera_sampling_envelope,
         sampling_stencil_radii,
     )
@@ -260,10 +259,17 @@ def assert_roi_point_accuracy(assert_roi_point_locations):
         illumination=1.0,
         positions=None,
         fused=False,
+        required_point=None,
     ):
         """Check fixed original-object apertures including partly supported Z bins."""
         assert_roi_point_locations(
-            data, scene, origin, spacing, raw_origin=raw_origin, channels=channels
+            data,
+            scene,
+            origin,
+            spacing,
+            raw_origin=raw_origin,
+            channels=channels,
+            required_point=required_point,
         )
         microscope, camera = scene.microscope, scene.microscope.camera
         pixel, scan_step = microscope.pixel_size_um, microscope.scan_step_um
@@ -370,7 +376,6 @@ def assert_roi_point_accuracy(assert_roi_point_locations):
         selected_channels = range(data.shape[1]) if channels is None else channels
         for time in range(data.shape[0]):
             for channel in selected_channels:
-                means = scene.means[time, selected_positions, channel].mean(axis=0)
                 view_bounds = [
                     camera_sampling_envelope(
                         scene.means[time, position, channel],
@@ -388,24 +393,19 @@ def assert_roi_point_accuracy(assert_roi_point_locations):
                         np.testing.assert_array_equal(
                             scene.means[time, selected_positions, channel],
                             np.broadcast_to(
-                                means, (len(selected_positions), *native_shape)
+                                scene.means[time, selected_positions[0], channel],
+                                (len(selected_positions), *native_shape),
                             ),
                         )
                     sources = [
                         (
                             np.minimum.reduce([bound.lower for bound in view_bounds]),
                             np.maximum.reduce([bound.upper for bound in view_bounds]),
-                            means,
                         )
                     ]
                 else:
-                    sources = [
-                        (bound.lower, bound.upper, scene.means[time, position, channel])
-                        for position, bound in zip(
-                            selected_positions, view_bounds, strict=True
-                        )
-                    ]
-                processed = np.zeros((3, *output_shape), np.float32)
+                    sources = [(bound.lower, bound.upper) for bound in view_bounds]
+                processed = np.zeros((2, *output_shape), np.float32)
                 weight = np.zeros((1, *output_shape), np.float32)
                 for source in sources:
                     deskewed = np.zeros_like(processed)
@@ -430,7 +430,7 @@ def assert_roi_point_accuracy(assert_roi_point_locations):
                             processed,
                             weight,
                             deskewed,
-                            np.ones(3, bool),
+                            np.ones(2, bool),
                             coverage,
                             *profiles,
                             0,
@@ -441,7 +441,7 @@ def assert_roi_point_accuracy(assert_roi_point_locations):
                         processed[:] = deskewed
                 if fused:
                     _normalize_block(processed, weight, processed)
-                lower, upper, reference = processed
+                lower, upper = processed
                 quantum = 0 if data.dtype.kind == "f" else 2
                 numerical = (
                     np.maximum(upper, 1) * 8 * np.finfo(np.float32).eps + quantum
@@ -451,10 +451,13 @@ def assert_roi_point_accuracy(assert_roi_point_locations):
                 )
                 for aperture in apertures:
                     mask = (support > 0) & aperture[None]
-                    result = camera_sampling_accuracy(
-                        data[time, channel], reference, envelope, mask
+                    assert mask.any()
+                    actual = data[time, channel][mask]
+                    assert np.all(
+                        np.isfinite(actual)
+                        & (actual >= envelope.lower[mask])
+                        & (actual <= envelope.upper[mask])
                     )
-                    assert result.accepted, result
 
     return check
 
@@ -551,10 +554,20 @@ def assert_roi_point_locations():
         *,
         raw_origin=(0, 0, 0),
         channels=None,
+        required_point=None,
     ):
         """Measure actual stored values against fixed physical source locations."""
         origin, spacing = np.asarray(origin), np.asarray(spacing)
         expected = scene.centers_zyx_um + np.asarray(raw_origin)
+        halo = np.asarray(scene.microscope.psf_half_extent_zyx_um)
+        upper = origin + (np.asarray(data.shape[-3:]) - 1) * spacing
+        eligible = np.all(
+            (expected - halo >= origin) & (expected + halo <= upper), axis=1
+        )
+        if required_point is not None:
+            assert eligible[required_point], (
+                "Intended emitter's PSF is clipped by its ROI"
+            )
         split = expected[:, 2].mean()
         columns = origin[2] + np.arange(data.shape[-1]) * spacing[2]
         checked = 0
@@ -562,9 +575,7 @@ def assert_roi_point_locations():
             if channels is not None and channel not in channels:
                 continue
             for point, target in enumerate(expected):
-                if np.any(target[1:] < origin[1:]) or np.any(
-                    target[1:] >= origin[1:] + np.asarray(data.shape[-2:]) * spacing[1:]
-                ):
+                if not eligible[point]:
                     continue
                 checked += 1
                 # Each emitter has its own physical half-field. A peak search
@@ -596,6 +607,6 @@ def assert_roi_point_locations():
             for channel in selected_channels:
                 increasing = np.diff(expected_counts[:, channel]) > 0
                 assert np.all(np.diff(observed_counts[:, channel])[increasing] > 0)
-        assert checked, "ROI excludes every original optical emitter"
+        assert checked, "ROI contains no complete original optical emitter aperture"
 
     return check
