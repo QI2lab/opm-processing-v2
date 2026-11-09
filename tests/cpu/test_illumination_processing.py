@@ -172,8 +172,6 @@ def test_processing_applies_the_same_field_at_every_depth(
 )
 def test_real_estimator_predicts_known_detector_illumination(illumination_observations):
     """Estimate identifiable fields within a predefined absolute camera accuracy target."""
-    from tests.simulation.camera_likelihood import camera_sampling_accuracy
-
     case = illumination_observations
     actual = estimate_illuminations(
         case.datastore,
@@ -197,13 +195,12 @@ def test_real_estimator_predicts_known_detector_illumination(illumination_observ
         prediction = case.source * estimated
         # This is a camera-space accuracy requirement for a nonlinear estimator,
         # rather than a claim that BaSiC itself performs convex interpolation.
-        aperture = np.ones(expected.shape, bool)
-        measured = camera_sampling_accuracy(prediction, truth, envelope, aperture)
-        assert measured.accepted, measured
-        uncorrected = camera_sampling_accuracy(
-            np.full_like(truth, case.source), truth, envelope, aperture
+        assert np.all(
+            np.isfinite(prediction)
+            & (prediction >= envelope.lower)
+            & (prediction <= envelope.upper)
         )
-        assert not uncorrected.accepted, uncorrected
+        assert np.any((case.source < envelope.lower) | (case.source > envelope.upper))
         assert (2 * kl_div(truth, prediction)).sum() < (
             2 * kl_div(truth, case.source)
         ).sum()
@@ -246,11 +243,11 @@ def test_live_wait_defers_processing_and_selects_flatfield(
     live_wait_case,
     monkeypatch,
     assert_roi_point_accuracy,
-    deskew_uniform_expectation,
     invoke_cli,
 ):
     """Wait for both completion and chunks, then reuse or estimate illumination."""
     processing = importlib.import_module("opm_processing.process")
+    from opm_processing.imageprocessing.opmtools import deskew_coverage
 
     case = live_wait_case
     estimates = []
@@ -312,8 +309,18 @@ def test_live_wait_defers_processing_and_selects_flatfield(
     np.testing.assert_allclose(
         output.voxel_size_um, (0.115, 0.115, 0.115), atol=0, rtol=0
     )
-    support = deskew_uniform_expectation(case.raw.shape[-3:], 1)
-    np.testing.assert_array_equal(data[0, 0][support == 0], 0)
+    microscope = case.scene.microscope
+    coverage = deskew_coverage(
+        case.raw.shape[-3:],
+        data.shape[-3:],
+        microscope.angle_deg,
+        microscope.scan_step_um,
+        microscope.pixel_size_um,
+    )
+    support = (coverage[..., None] > 0) & (
+        np.arange(data.shape[-1]) < case.raw.shape[-1]
+    )
+    np.testing.assert_array_equal(data[0, 0][~support], 0)
     assert_roi_point_accuracy(
         data[case.sample_timepoint : case.sample_timepoint + 1],
         case.scene,

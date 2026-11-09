@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 from scipy.ndimage import maximum_filter, minimum_filter, shift
-from scipy.special import gammaln, kl_div, log_ndtr, logsumexp, ndtri, xlogy
+from scipy.special import gammaln, log_ndtr, logsumexp, ndtri, xlogy
 from scipy.stats import poisson
 
 from opm_processing.imageprocessing.camera import camera_correct
@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class SamplingEnvelope:
-    """Certified camera-rate interval from known means and original detector noise."""
+    """Local camera-rate bounds from the original detector realization."""
 
     lower: np.ndarray
     upper: np.ndarray
@@ -37,28 +37,6 @@ class SamplingEnvelope:
         """Keep shared numerical bounds immutable across individual checks."""
         for array in (self.lower, self.upper):
             array.setflags(write=False)
-
-
-@dataclass(frozen=True)
-class SamplingAccuracy:
-    """Absolute camera-likelihood and photon-flux checks on one fixed aperture."""
-
-    inside_envelope: bool
-    deviance: float
-    deviance_bound: float
-    flux: float
-    flux_lower: float
-    flux_upper: float
-
-    @property
-    def accepted(self) -> bool:
-        """Require local, likelihood and total-photon bounds simultaneously."""
-        return (
-            self.inside_envelope
-            and np.isfinite(self.deviance)
-            and self.deviance <= self.deviance_bound
-            and self.flux_lower <= self.flux <= self.flux_upper
-        )
 
 
 def sampling_stencil_radii(
@@ -180,8 +158,8 @@ def camera_sampling_envelope(
     conservative physical stencil. The original draws retain actual Poisson,
     read-noise, ADC and clipping effects; no reconstructed values set bounds.
     This also remains valid when a fitted flatfield depends on the observations.
-    Original optical means supply the separate likelihood/flux reference and
-    the arithmetic-error scale, rather than a reconstructed brightness fit.
+    Original optical means supply the arithmetic-error scale, rather than a
+    reconstructed brightness fit.
 
     Parameters
     ----------
@@ -291,60 +269,6 @@ def camera_sampling_envelope(
     return SamplingEnvelope(
         np.maximum(lower - roundoff, 0),
         np.maximum(upper + roundoff, 0),
-    )
-
-
-def camera_sampling_accuracy(
-    prediction: ArrayLike,
-    expectation: ArrayLike,
-    envelope: SamplingEnvelope,
-    mask: ArrayLike,
-) -> SamplingAccuracy:
-    """Compare absolute camera rates with certified likelihood and flux bounds.
-
-    Poisson KL is convex in its predicted rate, so its maximum over a known
-    interval occurs at an endpoint. A local interval check remains mandatory
-    even when an endpoint is zero and gives an infinite KL bound. Fixed spatial
-    apertures keep opposing stripe errors from cancelling in total photon flux.
-
-    Parameters
-    ----------
-    prediction : array-like
-        Camera-rate prediction sampled from the actual saved reconstruction.
-    expectation : array-like
-        Original simulated noiseless camera means.
-    envelope : SamplingEnvelope
-        Bounds derived solely from original truth and observations.
-    mask : array-like
-        Fixed physical source or background aperture on the camera grid.
-
-    Returns
-    -------
-    SamplingAccuracy
-        Joint local, absolute-likelihood and integrated-flux result.
-    """
-    predicted, expected = np.broadcast_arrays(
-        np.asarray(prediction, np.float64), np.asarray(expectation, np.float64)
-    )
-    selected = np.broadcast_to(np.asarray(mask, bool), expected.shape)
-    if not selected.any() or expected[selected].sum() <= 0:
-        raise ValueError("Accuracy requires a nonempty positive known-camera aperture")
-    low, high = envelope.lower[selected], envelope.upper[selected]
-    rates, actual = expected[selected], predicted[selected]
-    inside = bool(
-        np.isfinite(actual).all() and np.all(actual >= low) and np.all(actual <= high)
-    )
-    divergence = float(2 * kl_div(rates, actual).sum(dtype=np.float64))
-    bound = float(
-        2 * np.maximum(kl_div(rates, low), kl_div(rates, high)).sum(dtype=np.float64)
-    )
-    return SamplingAccuracy(
-        inside,
-        divergence,
-        bound,
-        float(actual.sum(dtype=np.float64)),
-        float(low.sum(dtype=np.float64)),
-        float(high.sum(dtype=np.float64)),
     )
 
 

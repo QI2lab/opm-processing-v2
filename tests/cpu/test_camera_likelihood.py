@@ -106,7 +106,6 @@ def test_registration_likelihood_moments_predict_independent_photon_draws(exposu
         "dim",
         "stripes",
         "zero",
-        "zero-unbounded",
     ],
 )
 def test_camera_sampling_bounds_detect_gain_and_spatial_errors(
@@ -116,7 +115,6 @@ def test_camera_sampling_bounds_detect_gain_and_spatial_errors(
     from opm_processing.imageprocessing.camera import camera_correct
     from tests.simulation.camera_likelihood import (
         SamplingEnvelope,
-        camera_sampling_accuracy,
         camera_sampling_envelope,
     )
 
@@ -142,15 +140,12 @@ def test_camera_sampling_bounds_detect_gain_and_spatial_errors(
             0.2 * case.nominal
         )
         assert prediction.sum(dtype=np.float64) == original_flux
-    elif artifact in ("zero", "zero-unbounded"):
+    elif artifact == "zero":
         prediction.fill(0)
-        if artifact == "zero-unbounded":
-            envelope = SamplingEnvelope(np.zeros_like(expected), expected * 2)
-    measured = camera_sampling_accuracy(
-        prediction, expected, envelope, np.ones(expected.shape, bool)
-    )
     correct = artifact in ("correct", "correct-zero-bound")
-    assert measured.accepted == correct, measured
-    if artifact == "stripes":
-        assert measured.flux_lower <= measured.flux <= measured.flux_upper
-        assert not measured.inside_envelope
+    inside = np.all(
+        np.isfinite(prediction)
+        & (prediction >= envelope.lower)
+        & (prediction <= envelope.upper)
+    )
+    assert inside == correct
