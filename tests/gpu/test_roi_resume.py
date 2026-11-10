@@ -98,7 +98,6 @@ def test_roi_resumes_at_last_durable_channel(
             run.truth,
             resumed.spatial_origins_zyx_um[index],
             resumed.voxel_size_um,
-            positions=(index + 1,),
         )
         for _, position, channel in saved:
             if position == index + 1:
@@ -131,7 +130,6 @@ def test_roi_processing_resumes_by_default(roi_run, resume, assert_roi_point_acc
             run.truth,
             collection.spatial_origins_zyx_um[index],
             collection.voxel_size_um,
-            positions=(index + 1,),
         )
     changed = copy(run.truth)
     changed.means = run.truth.means.copy()
@@ -161,7 +159,6 @@ def test_roi_processing_resumes_by_default(roi_run, resume, assert_roi_point_acc
             changed if resume is False else run.truth,
             collection.spatial_origins_zyx_um[index],
             collection.voxel_size_um,
-            positions=(index + 1,),
         )
 
 
@@ -214,8 +211,6 @@ def test_roi_command_fuses_selected_tiles_and_projects_pixels(
         run.truth,
         dataset.translation_transform.translation[-3:],
         dataset.scale_transform.scale[-3:],
-        positions=run.roi.position_indices,
-        fused=True,
     )
     # Projection is a separate numerical reduction, checked with NumPy after
     # the stored fused volume passes the original-object accuracy requirement.

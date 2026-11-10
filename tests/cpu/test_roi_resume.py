@@ -64,7 +64,6 @@ def test_empty_roi_channel_is_checkpointed_and_skipped(
             result.spatial_origins_zyx_um[index],
             result.voxel_size_um,
             channels=(1, 2) if index == 0 else None,
-            positions=(index + 1,),
         )
     assert ProcessingState.read(state_path).zero_channels(output) == {(0, 1, 0)}
 

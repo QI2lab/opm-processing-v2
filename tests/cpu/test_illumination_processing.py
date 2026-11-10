@@ -327,5 +327,4 @@ def test_live_wait_defers_processing_and_selects_flatfield(
         output.spatial_origins_zyx_um[0],
         output.voxel_size_um,
         raw_origin=(0, -span, 0),
-        illumination=field[0, 0] if case.kind != "pending-chunks" else 1.0,
     )

@@ -19,12 +19,9 @@ def test_roi_deconvolves_recorded_sampling(
     mosaic_acquisition,
     monkeypatch,
     invoke_cli,
-    assert_reconstruction_storage,
     production_forward_predictions,
 ):
     """Crop raw camera data with optical support before reconstructing the ROI."""
-    from dataclasses import replace
-
     import tifffile
     from typer.testing import CliRunner
     from yaozarrs import open_group
@@ -39,7 +36,12 @@ def test_roi_deconvolves_recorded_sampling(
         regenerate_fused_max_projection,
     )
     from opm_processing.imageprocessing.opmpsf import camera_grid_center
+    from opm_processing.imageprocessing.opmtools import (
+        deskew_shape_estimator,
+        interpolate_rows,
+    )
     from opm_processing.imageprocessing.tilefusion import TileFusion
+    from opm_processing.process import format_processed_output
 
     case = mosaic_acquisition
     invoke_cli(
@@ -291,7 +293,6 @@ def test_roi_deconvolves_recorded_sampling(
             x1 - x0,
         )
         np.testing.assert_array_equal(retained, recovered)
-    refined = replace(microscope, scan_step_um=microscope.scan_step_um / factor)
     cropped = open_position_collection(tiles)
     for position, (recovered, raw_crop, measured) in enumerate(
         zip(deconvolved, raw_crops, predictions, strict=True)
@@ -309,16 +310,46 @@ def test_roi_deconvolves_recorded_sampling(
             kl_div(expected_native, measured["prediction"]).sum()
             < kl_div(expected_native, baseline).sum()
         )
-        assert_reconstruction_storage(
-            cropped.arrays[position][0, 0].read().result(),
-            (recovered,),
-            cropped.spatial_origins_zyx_um[position],
-            cropped.voxel_size_um,
-            np.add(
-                saved_placements[0, position],
-                (0, start * microscope.scan_step_um, raw_crop[2] * pixel),
-            ),
-            refined,
+        volume = cropped.arrays[position][0, 0].read().result()
+        np.testing.assert_allclose(cropped.voxel_size_um, pixel, rtol=0, atol=0.0005)
+        raw_origin = np.add(
+            saved_placements[0, position],
+            (0, start * microscope.scan_step_um, raw_crop[2] * pixel),
+        )
+        offset = (
+            np.asarray(cropped.spatial_origins_zyx_um[position]) - raw_origin
+        ) / pixel
+        np.testing.assert_allclose(
+            offset, np.rint(offset), rtol=0, atol=0.0005 / pixel + 1e-12
+        )
+        output_origin = np.rint(offset).astype(int)
+        assert np.all(output_origin >= 0)
+        native_shape, *_ = deskew_shape_estimator(
+            recovered.shape,
+            microscope.angle_deg,
+            microscope.scan_step_um / factor,
+            pixel,
+            crop_after_deskew=False,
+            divisible_by=1,
+        )
+        expected = np.zeros(volume.shape, np.float32)
+        interpolate_rows(
+            recovered,
+            expected,
+            native_shape[1],
+            native_shape[0],
+            microscope.angle_deg,
+            microscope.scan_step_um / factor,
+            pixel,
+            1,
+            False,
+            tuple(output_origin),
+        )
+        np.testing.assert_allclose(
+            volume,
+            format_processed_output(expected, save_float32=volume.dtype.kind == "f"),
+            rtol=8 * np.finfo(np.float32).eps,
+            atol=0,
         )
     assert (
         configuration["configuration"]["deconvolution"].get("scan_upsample_factor", 1)
