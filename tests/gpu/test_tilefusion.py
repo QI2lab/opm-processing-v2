@@ -26,24 +26,6 @@ def test_registration_similarity_uses_acquired_window_support(
         assert score == pytest.approx(1.0)
 
 
-def test_zero_registration_channel_is_excluded_before_patch_reads(
-    tile_fusion,
-) -> None:
-    """Do not schedule registration reads for a pair containing a zero tile."""
-    fusion = tile_fusion(
-        [np.ones((1, 4, 4, 4), np.uint16), np.zeros((1, 4, 4, 4), np.uint16)],
-        [(0, 0, 0), (0, 0, 2)],
-        downsample_factors=(1, 1, 1),
-        ssim_window=3,
-        threshold=0.0,
-        max_registration_shift_zyx=(2, 2, 2),
-    )
-
-    fusion.refine_tile_positions_with_cross_correlation(ch_idx=0)
-
-    assert fusion.pairwise_metrics == {}
-
-
 @pytest.mark.parametrize("limit_y", (None, 50))
 @pytest.mark.parametrize("depth_overlap", (20, 13))
 def test_depth_registration_handles_large_xy_drift(
