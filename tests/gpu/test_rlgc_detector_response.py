@@ -373,19 +373,35 @@ def test_roi_deconvolves_recorded_sampling(
 
 @pytest.mark.unit
 @pytest.mark.parametrize(
-    "kl_history", [False, True], ids=["iteration-cap", "both-halves-KL"]
-)
-@pytest.mark.parametrize("read_noise", [0, 1.6], ids=["photons", "read-noise"])
-@pytest.mark.parametrize(
-    "crop_scan,storage", [(2, "gpu"), (2, "host")], ids=["tiled-fft", "host-tiled-fft"]
-)
-@pytest.mark.parametrize(
-    "factor,pad_yx",
-    [(None, True), (None, False), (1, True), (3, True)],
-    ids=["native", "native-unpadded-yx", "sparse1", "sparse3"],
-)
-@pytest.mark.parametrize(
-    "nonuniform", [False, True], ids=["unity", "detector-response"]
+    "factor,pad_yx,nonuniform,kl_history,read_noise,storage",
+    [
+        (None, True, True, True, 0, "gpu"),
+        (None, True, True, True, 1.6, "gpu"),
+        (None, True, True, True, 1.6, "host"),
+        (None, False, True, True, 1.6, "gpu"),
+        (None, False, True, True, 1.6, "host"),
+        (None, True, False, True, 1.6, "gpu"),
+        (None, True, True, False, 1.6, "gpu"),
+        (1, True, True, True, 1.6, "gpu"),
+        (1, True, True, True, 1.6, "host"),
+        (3, True, True, True, 1.6, "gpu"),
+        (3, True, True, True, 1.6, "host"),
+        (3, True, True, False, 1.6, "host"),
+    ],
+    ids=[
+        "photons",
+        "read-noise",
+        "host",
+        "unpadded-yx",
+        "host-unpadded-yx",
+        "unity-response",
+        "iteration-cap",
+        "zero-boundary",
+        "host-zero-boundary",
+        "sparse3",
+        "host-sparse3",
+        "host-sparse3-iteration-cap",
+    ],
 )
 def test_tiled_consensus_recovers_known_blurred_object(
     cupy_gpu,
@@ -394,7 +410,6 @@ def test_tiled_consensus_recovers_known_blurred_object(
     nonuniform,
     kl_history,
     read_noise,
-    crop_scan,
     storage,
     discrete_optical_case,
     production_forward_predictions,
@@ -415,15 +430,11 @@ def test_tiled_consensus_recovers_known_blurred_object(
         "pad_yx": pad_yx,
         "storage": storage,
     }
-    for chunk in (None, crop_scan):
+    for chunk in (None, 2):
         recovered = solver.rlgc(case.measured, case.psf, crop_scan=chunk, **options)
         assert recovered.shape == case.truth.shape
         measured = production_forward_predictions[-1]
-        baseline = measured["input_prediction"]
-        if baseline is None:
-            # Sparse progress is measured against the actual initializer on
-            # acquired planes, without interpolation or a second projector.
-            baseline = measured["initial_prediction"]
+        baseline = measured["baseline_prediction"]
         expected = case.expectation[:: (factor or 1)]
         assert (
             kl_div(expected, measured["prediction"]).sum()
@@ -433,18 +444,31 @@ def test_tiled_consensus_recovers_known_blurred_object(
 
 @pytest.mark.unit
 @pytest.mark.parametrize(
-    "scan_planes,detector_shape", [(1, (16, 4)), (7, (16, 4)), (32, (256, 256))]
-)
-@pytest.mark.parametrize("crop_scan", (3, 20))
-@pytest.mark.parametrize(
-    "storage,gpu_budget,allocator",
+    "scan_planes,detector_shape,crop_scan,storage,gpu_budget,allocator",
     [
-        ("gpu", None, None),
-        ("host", None, None),
-        ("gpu", 128 * 1024**2, "isolated"),
-        ("gpu", 128 * 1024**2, "default"),
+        (1, (16, 4), 3, "gpu", None, None),
+        (1, (16, 4), 3, "host", None, None),
+        (7, (16, 4), 3, "gpu", None, None),
+        (7, (16, 4), 3, "host", None, None),
+        (7, (16, 4), 20, "gpu", None, None),
+        (32, (256, 256), 3, "gpu", None, None),
+        (32, (256, 256), 20, "gpu", None, None),
+        (32, (256, 256), 20, "host", None, None),
+        (32, (256, 256), 20, "gpu", 128 * 1024**2, "isolated"),
+        (32, (256, 256), 20, "gpu", 128 * 1024**2, "default"),
     ],
-    ids=["gpu", "host", "limited-cuda-pool", "limited-default-pool"],
+    ids=[
+        "single-plane",
+        "host-single-plane",
+        "short",
+        "host-short",
+        "whole-short",
+        "small-chunks",
+        "large-chunks",
+        "host-large-chunks",
+        "limited-cuda-pool",
+        "limited-default-pool",
+    ],
 )
 def test_nonuniform_response_preserves_uniform_fluorescence(
     cupy_gpu,

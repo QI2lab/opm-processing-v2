@@ -43,17 +43,16 @@ def test_count_split_matches_prescribed_distribution_moments(
     variance_se = np.sqrt(
         np.maximum(fourth - (count - 3) / (count - 1) * variance**2, 0) / count
     )
-    for half in (first, second):
-        # Six standard errors of the independently specified count distribution,
-        # rather than a fixed percentage or empirical probability tolerance.
-        np.testing.assert_array_less(
-            np.abs(half.astype(np.float64).mean(axis=1) - levels / 2),
-            6 * np.sqrt(variance / count) + 1e-12,
-        )
-        np.testing.assert_array_less(
-            np.abs(half.astype(np.float64).var(axis=1, ddof=1) - variance),
-            6 * variance_se + 1e-12,
-        )
+    # Six standard errors of the independently specified count distribution.
+    # The complementary half's moments follow from their fixed sum above.
+    np.testing.assert_array_less(
+        np.abs(first.astype(np.float64).mean(axis=1) - levels / 2),
+        6 * np.sqrt(variance / count) + 1e-12,
+    )
+    np.testing.assert_array_less(
+        np.abs(first.astype(np.float64).var(axis=1, ddof=1) - variance),
+        6 * variance_se + 1e-12,
+    )
     probability = np.array([1, 4, 6, 4, 1]) / 16
     measured = np.bincount(np.floor(first[2]).astype(int), minlength=5) / count
     np.testing.assert_array_less(
