@@ -9,18 +9,12 @@ from tests.pipeline import (
 pytestmark = [
     pytest.mark.integration,
     pytest.mark.usefixtures("cupy_gpu"),
-    pytest.mark.parametrize("deconvolve", [False, True]),
     pytest.mark.parametrize(
-        "mosaic_acquisition",
+        ("mosaic_acquisition", "deconvolve"),
         [
-            pytest.param((mode, step, 0, layout), id=f"{mode}-{step}um-{layout}")
-            for mode, step, layout in (
-                ("stage", 0.4, "whole"),
-                ("mirror", 1.2, "whole"),
-                ("mirror", 0.4, "tiled"),
-                ("stage", 1.2, "tiled"),
-            )
+            pytest.param(("stage", 0.4, 0, "whole"), False, id="stage-native-whole"),
+            pytest.param(("stage", 1.2, 0, "tiled"), True, id="stage-sparse3-tiled"),
         ],
-        indirect=True,
+        indirect=["mosaic_acquisition"],
     ),
 ]

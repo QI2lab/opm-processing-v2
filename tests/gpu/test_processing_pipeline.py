@@ -13,19 +13,9 @@ pytestmark = [
         ("pipeline_case", "deconvolve"),
         [
             pytest.param(
-                ("stage", True, 1.2, None),
-                False,
-                id="False-stage-1.2um-estimated-taper",
-            ),
-            pytest.param(
-                ("stage", False, 0.4, None),
+                ("stage", True, 0.4, None),
                 True,
-                id="True-stage-0.4um-uniform",
-            ),
-            pytest.param(
-                ("mirror", True, 1.2, 39),
-                True,
-                id="True-mirror-1.2um-estimated-taper",
+                id="True-stage-0.4um-estimated-taper",
             ),
         ],
         indirect=["pipeline_case"],

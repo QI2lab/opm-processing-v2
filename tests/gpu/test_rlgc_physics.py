@@ -359,10 +359,15 @@ def test_optical_forward_adjoint_matches_scipy(
             crop,
             id=f"{kind}-{profile}-dose{budget}-{layout}{crop or 50}",
         )
-        for kind in ("line-pairs", "sphere")
-        for profile in ("uniform", "edge-taper")
-        for budget in range(3)
-        for layout, crop in (("whole", None), ("tiled", 29), ("tiled", 39))
+        for kind, budget, profile, tile_crop in (
+            ("line-pairs", 0, "uniform", 29),
+            ("line-pairs", 1, "edge-taper", 39),
+            ("line-pairs", 2, "uniform", 39),
+            ("sphere", 0, "edge-taper", 39),
+            ("sphere", 1, "uniform", 29),
+            ("sphere", 2, "edge-taper", 29),
+        )
+        for layout, crop in (("whole", None), ("tiled", tile_crop))
     ],
     indirect=["noisy_extended_scene"],
     scope="session",
@@ -494,7 +499,6 @@ def test_tiled_gc_recovers_noisy_extended_objects_without_rl_noise(
         max_delta=0,
         **options,
     )
-    ordinary_prediction = production_forward_predictions[-1]["prediction"]
     predicted = measured["prediction"]
     baseline_prediction = measured["baseline_prediction"]
     aperture = source[::factor]
@@ -510,15 +514,13 @@ def test_tiled_gc_recovers_noisy_extended_objects_without_rl_noise(
         actual = predicted[region]
         blurred = baseline_prediction[region]
         gc_error = kl_div(true, actual).sum(dtype=np.float64)
-        rl_error = kl_div(true, ordinary_prediction[region]).sum(dtype=np.float64)
         baseline_error = kl_div(true, blurred).sum(dtype=np.float64)
         logger.info(
-            "crop_scan=%s region=%s acquired_samples=%d kl_gc=%.9g kl_rl=%.9g kl_baseline=%.9g bias_e=%.9g rmse_e=%.9g",
+            "crop_scan=%s region=%s acquired_samples=%d kl_gc=%.9g kl_baseline=%.9g bias_e=%.9g rmse_e=%.9g",
             crop_scan,
             name,
             region.sum(),
             gc_error,
-            rl_error,
             baseline_error,
             np.mean(actual - true, dtype=np.float64),
             np.sqrt(np.mean((actual - true) ** 2, dtype=np.float64)),

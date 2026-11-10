@@ -144,6 +144,8 @@ def production_forward_predictions(monkeypatch, request):
 
     def observe_reconstruction(image, *args, **kwargs):
         """Assemble actual owned predictions at the production-reported budget."""
+        if not kwargs.get("gradient_consensus", True):
+            return reconstruct(image, *args, **kwargs)
         trace = io.StringIO()
         logger = kwargs.get("logger") or logging.getLogger(__name__)
         level = logger.level

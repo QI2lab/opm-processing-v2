@@ -16,11 +16,20 @@ and full CPU/GPU suites on a qualified runner. GPU tests skip when CuPy or CUDA
 hardware is unavailable; numerical and allocation failures remain errors.
 The existing GPU environment does not need to be synchronized to run tests.
 
-The full suites retain all 72 noisy RLGC numerical cases, eight noisy deskew
-cases and four stage-placement cases. Writer integrations use 16 large-scene
-cases, eight mosaics, three calibration/reconstruction pipelines and two
-relocation/export workflows. These cover both scan modes with representative
-combinations while the numerical cases retain the full scientific matrix.
+Numerical sample sweeps live in focused units. The 24 noisy RLGC cases cover
+line pairs and spheres at three photon budgets, native and coarse scan spacing,
+and whole 50-plane or tiled 200-plane acquisitions. Illumination profiles and
+the two tiled core sizes are balanced across those cases. Eight noisy deskew
+cases retain both scan modes, specimen types and scan spacings.
+
+Five main writer-backed numerical integrations cover two large specimens, two
+mosaics and one calibrated multi-timepoint, multi-channel reconstruction. They
+exercise fixed and automatically planned chunks, whole and tiled RLGC, both scan
+modes, fitted illumination, registration and fusion. Separate focused tests
+cover stage placement, ROI export, storage and resume behavior without repeating
+the numerical sample sweeps. The manual GPU science selection includes all 24
+noisy RLGC units and the five main numerical integrations; the full suite also
+runs the focused workflow checks.
 
 Shared fixtures provide controlled metadata, file structures and pixel arrays.
 Tests use production algorithms and installed packages. Synthetic acquisitions
