@@ -383,7 +383,9 @@ def illumination_fit_case(monkeypatch, topology, storage):
         """Record the calibrated images and execute the installed optimizer."""
         if isinstance(images, np.ndarray):
             calls.append(images.copy())
-        return fit(solver, images, *args, **kwargs)
+        result = fit(solver, images, *args, **kwargs)
+        assert solver.device == "cuda"
+        return result
 
     monkeypatch.setattr(flatfield.BaSiC, "fit", observe_fit)
     return SimpleNamespace(

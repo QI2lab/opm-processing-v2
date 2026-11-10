@@ -116,16 +116,19 @@ uv pip install --no-deps "opm-v2 @ git+https://github.com/QI2lab/opm-v2@ae059d96
 ```
 
 Update producer and writer pins together. Hosted CI runs the explicit CPU core
-and native-writer selection in `.github/workflows/ci.yml`; Linux also runs one
-real illumination fit. RLGC and pair registration are GPU-only. The manual Science
-validation workflow provides `cpu-science`, `gpu-science`, `full-cpu`, and `full-gpu` profiles.
+and native-writer selection in `.github/workflows/ci.yml`. BaSiC fitting, RLGC
+and pair registration are GPU-only; cached-field correction and metadata checks
+remain on CPU. The manual Science validation workflow provides `cpu-science`,
+`gpu-science`, `full-cpu`, and `full-gpu` profiles.
 Supply the JSON label or labels of an existing runner with qualified RAM and
 scratch capacity; standard hosted capacity has not been validated for science
 profiles. GPU profiles require the qualified Python/CUDA/cuCIM environment on
 the runner's PATH, including test/producer dependencies and the Windows cuCIM
 setup where applicable. They install the current checkout editable without
 replacing CUDA libraries. CUDA tests skip when CuPy or a CUDA device is unavailable;
-numerical and allocation errors remain failures. Science profiles serialize to
+BaSiC fitting also requires PyTorch CUDA and skips before expensive fixture setup
+when it is unavailable. Numerical and allocation errors remain failures.
+Science profiles serialize to
 avoid sharing a GPU concurrently.
 Both workflows retain JUnit and coverage XML as run artifacts, including failures.
 Relevant CUDA changes require a real GPU validation result before merge.

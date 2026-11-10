@@ -369,6 +369,8 @@ def pipeline_case(
     native TensorStore storage in pytest temporary directories.
     """
     mode, illumination, step, crop = request.param
+    if illumination:
+        request.getfixturevalue("torch_gpu")
     native_step = simulation_parameters["microscope"]["scan_step_um"]
     native_scans = simulation_parameters[
         "tiled_scan_planes" if crop is not None else "whole_scan_planes"

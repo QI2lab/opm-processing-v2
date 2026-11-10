@@ -1,17 +1,13 @@
 """Illumination function units and simulated processing CLI integration."""
 
-import importlib
 from pathlib import Path
 
 import numpy as np
 import pytest
 import tensorstore as ts
-from scipy.special import kl_div
 
-from opm_processing.dataio.live import read_lifecycle_event
 from opm_processing.dataio.position_collection import open_position_collection
 from opm_processing.imageprocessing.camera import camera_correct, illumination_correct
-from opm_processing.imageprocessing.flatfield import estimate_illuminations
 
 
 @pytest.mark.integration
@@ -167,51 +163,6 @@ def test_processing_applies_the_same_field_at_every_depth(
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize(
-    "illumination_observations", ("maximum", "masked", "tiles"), indirect=True
-)
-def test_real_estimator_predicts_known_detector_illumination(illumination_observations):
-    """Estimate identifiable fields within a predefined absolute camera accuracy target."""
-    case = illumination_observations
-    actual = estimate_illuminations(
-        case.datastore,
-        case.offset,
-        case.conversion,
-        case.coordinates,
-        signal_mask=case.mask,
-    )[0]
-    assert actual.shape == case.expected.shape
-    assert np.all(np.isfinite(actual) & (actual > 0))
-    for expected, estimated, envelope in zip(
-        case.expected, actual, case.envelopes, strict=True
-    ):
-        if np.all(expected == 1):
-            np.testing.assert_array_equal(estimated, 1)
-            continue
-        if case.mask is not None:
-            # An excluded depth must not floor known dim detector regions to unity.
-            assert np.any(estimated[expected < 1] < 1)
-        truth = case.source * expected
-        prediction = case.source * estimated
-        # This is a camera-space accuracy requirement for a nonlinear estimator,
-        # rather than a claim that BaSiC itself performs convex interpolation.
-        assert np.all(
-            np.isfinite(prediction)
-            & (prediction >= envelope.lower)
-            & (prediction <= envelope.upper)
-        )
-        assert np.any((case.source < envelope.lower) | (case.source > envelope.upper))
-        assert (2 * kl_div(truth, prediction)).sum() < (
-            2 * kl_div(truth, case.source)
-        ).sum()
-        if case.detector_x is not None:
-            stripe = np.s_[:, case.detector_x - 3 : case.detector_x + 4]
-            assert (2 * kl_div(truth[stripe], prediction[stripe])).sum() < (
-                2 * kl_div(truth[stripe], case.source)
-            ).sum()
-
-
-@pytest.mark.unit
 @pytest.mark.parametrize("level", (0, -1, np.nan))
 def test_invalid_cached_fields_are_not_reused(tmp_path, level):
     """Reject invalid fields at write time and refresh invalid existing caches."""
@@ -236,95 +187,3 @@ def test_invalid_cached_fields_are_not_reused(tmp_path, level):
         software=FLATFIELD_SOFTWARE,
     )
     assert read_current_flatfield(path, field.shape) is None
-
-
-@pytest.mark.integration
-def test_live_wait_defers_processing_and_selects_flatfield(
-    live_wait_case,
-    monkeypatch,
-    assert_roi_point_accuracy,
-    invoke_cli,
-):
-    """Wait for both completion and chunks, then reuse or estimate illumination."""
-    processing = importlib.import_module("opm_processing.process")
-    from opm_processing.imageprocessing.opmtools import deskew_coverage
-
-    case = live_wait_case
-    estimates = []
-    estimate_in_worker = processing.call_estimate_illuminations
-
-    def estimate_after_completion(store, offset, conversion, positions, gain, mask):
-        """Estimate illumination only after the recorded acquisition completes."""
-        assert case.kind == "estimate"
-        assert (
-            read_lifecycle_event(case.dataset.log, case.dataset.manifest.acquisition_id)
-            == "completed"
-        )
-        np.testing.assert_array_equal(store.read().result(), case.raw)
-        estimates.append(True)
-        return estimate_in_worker(
-            store,
-            offset,
-            conversion,
-            positions,
-            gain,
-            mask,
-        )
-
-    monkeypatch.setattr(
-        processing, "call_estimate_illuminations", estimate_after_completion
-    )
-    invoke_cli(
-        "process",
-        case.dataset.path.parent,
-        live_wait=True,
-        save_float32=True,
-        output=case.destination,
-        max_projection=False,
-        create_fused_max_projection=False,
-        z_downsample_level=1,
-        flatfield_correction=case.kind != "pending-chunks",
-    )
-    assert (
-        case.sleeps
-        == [30.0] * {"estimate": 2, "pending-chunks": 1, "cached": 0}[case.kind]
-    )
-    assert estimates == ([True] if case.kind == "estimate" else [])
-    if case.kind == "pending-chunks":
-        assert not case.field_path.exists()
-    else:
-        field = processing.read_current_flatfield(
-            case.field_path, (1, 1, *case.raw.shape[-2:])
-        )
-        assert field is not None
-        assert np.all(np.isfinite(field) & (field > 0))
-        if case.kind == "cached":
-            np.testing.assert_array_equal(field, 1)
-    output = open_position_collection(case.destination / "sample_deskewed.ome.zarr")
-    data = output.arrays[0].read().result()
-    span = (case.raw.shape[-3] - 1) * case.scene.microscope.scan_step_um
-    np.testing.assert_allclose(
-        output.spatial_origins_zyx_um[0], (0, -span, 0), atol=0.0005, rtol=0
-    )
-    np.testing.assert_allclose(
-        output.voxel_size_um, (0.115, 0.115, 0.115), atol=0, rtol=0
-    )
-    microscope = case.scene.microscope
-    coverage = deskew_coverage(
-        case.raw.shape[-3:],
-        data.shape[-3:],
-        microscope.angle_deg,
-        microscope.scan_step_um,
-        microscope.pixel_size_um,
-    )
-    support = (coverage[..., None] > 0) & (
-        np.arange(data.shape[-1]) < case.raw.shape[-1]
-    )
-    np.testing.assert_array_equal(data[0, 0][~support], 0)
-    assert_roi_point_accuracy(
-        data[case.sample_timepoint : case.sample_timepoint + 1],
-        case.scene,
-        output.spatial_origins_zyx_um[0],
-        output.voxel_size_um,
-        raw_origin=(0, -span, 0),
-    )

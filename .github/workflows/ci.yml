@@ -81,18 +81,6 @@ jobs:
           -k "not test_large_noisy_deskew_preserves_scientific_bounds_across_tiles and not test_saved_deskew_retains_complete_z_extent"
           --strict-markers -p pytest_cov --color=yes --cov --cov-report=xml --cov-report=term-missing --junitxml=cpu-core.xml
 
-      - name: Test real illumination estimation
-        if: runner.os == 'Linux'
-        env:
-          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
-          QT_QPA_PLATFORM: offscreen
-          MPLBACKEND: Agg
-          CUDA_VISIBLE_DEVICES: "-1"
-        run: >-
-          python -m pytest
-          "tests/cpu/test_illumination_processing.py::test_real_estimator_predicts_known_detector_illumination[maximum]"
-          --strict-markers -p pytest_cov --color=yes --cov --cov-append --cov-report=xml --cov-report=term-missing --junitxml=cpu-estimator.xml
-
       - name: Preserve test reports
         if: always()
         uses: actions/upload-artifact@v7

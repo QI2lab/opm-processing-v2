@@ -33,3 +33,13 @@ def cuda_cleanup(cupy_gpu):
     cupy_gpu.cuda.Stream.null.synchronize()
     cupy_gpu.get_default_memory_pool().free_all_blocks()
     cupy_gpu.get_default_pinned_memory_pool().free_all_blocks()
+
+
+@pytest.fixture(scope="session")
+def torch_gpu(cupy_gpu):
+    """Require the actual BaSiC CUDA backend before building optical inputs."""
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("PyTorch CUDA is unavailable for BaSiC fitting")
+    return torch

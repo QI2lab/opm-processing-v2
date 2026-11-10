@@ -323,25 +323,18 @@ def interrupt_completed_tile(monkeypatch):
     return interrupt
 
 
-@pytest.fixture(params=["estimate", "pending-chunks", "cached"])
+@pytest.fixture
 def live_wait_case(
-    request,
     tmp_path,
     opm_v2_live_acquisition_factory,
     monkeypatch,
-    roi_camera_scene,
+    illumination_calibration_ensemble,
 ):
     """Delay real published chunks and lifecycle state for simulated optical input."""
     from opm_processing import process as processing
 
-    kind = request.param
-    if kind == "estimate":
-        ensemble = request.getfixturevalue("illumination_calibration_ensemble")
-        scene, pixels = ensemble.scene, ensemble.raw
-        sample_timepoint = ensemble.sample_timepoint
-    else:
-        scene = roi_camera_scene()
-        pixels, sample_timepoint = scene.pixels, 0
+    ensemble = illumination_calibration_ensemble
+    scene, pixels = ensemble.scene, ensemble.raw
     raw = pixels[..., ::-1, :, :].copy()
     produced = opm_v2_live_acquisition_factory(
         raw,
@@ -353,32 +346,25 @@ def live_wait_case(
     produced.illumination_path.unlink()
     destination = tmp_path / "processed"
     field_path = tmp_path / "sample_flatfield.ome.tif"
-    if kind == "cached":
-        processing.write_flatfield(
-            field_path, np.ones((1, 1, *raw.shape[-2:]), np.float32), 0.115
-        )
     completed_log = log.read_bytes()
-    if kind == "estimate":
-        log.write_text(
-            json.dumps(
-                {
-                    "event": "started",
-                    "acquisition_id": manifest.acquisition_id,
-                }
-            )
-            + "\n",
-            encoding="utf-8",
+    log.write_text(
+        json.dumps(
+            {
+                "event": "started",
+                "acquisition_id": manifest.acquisition_id,
+            }
         )
-    pending = None
-    if kind != "cached":
-        array_root = produced.path / acquisition.array_paths[0]
-        chunk = next(
-            path
-            for path in array_root.rglob("*")
-            if path.is_file() and path.name != "zarr.json"
-        )
-        pending = tmp_path / "pending_camera_chunk"
-        chunk.replace(pending)
+        + "\n",
+        encoding="utf-8",
+    )
+    array_root = produced.path / acquisition.array_paths[0]
+    chunk = next(
+        path
+        for path in array_root.rglob("*")
+        if path.is_file() and path.name != "zarr.json"
+    )
+    pending = tmp_path / "pending_camera_chunk"
+    chunk.replace(pending)
     sleeps = []
 
     def finish(seconds):
@@ -386,21 +372,20 @@ def live_wait_case(
         assert not destination.exists()
         assert not (destination / field_path.name).exists()
         sleeps.append(seconds)
-        if len(sleeps) == 1 and pending is not None:
+        if len(sleeps) == 1:
             pending.replace(chunk)
-        elif len(sleeps) == 2 and kind == "estimate":
+        elif len(sleeps) == 2:
             log.write_bytes(completed_log)
         else:
             pytest.fail("Processing kept waiting after acquisition completion")
 
     monkeypatch.setattr(processing.time, "sleep", finish)
     return SimpleNamespace(
-        kind=kind,
         dataset=produced,
         raw=raw,
         scene=scene,
-        sample_timepoint=sample_timepoint,
+        sample_timepoint=ensemble.sample_timepoint,
         destination=destination,
         sleeps=sleeps,
-        field_path=field_path if kind == "cached" else destination / field_path.name,
+        field_path=destination / field_path.name,
     )

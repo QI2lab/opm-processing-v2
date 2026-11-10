@@ -69,6 +69,7 @@ jobs:
         if: inputs.profile == 'gpu-science'
         run: >-
           python -m pytest
+          tests/gpu/test_illumination.py
           tests/gpu/test_gpu_processing.py::test_bounded_peak_matches_upstream_phase_normalization
           tests/gpu/test_gpu_processing.py::test_fft_convolution_matches_direct_reference
           tests/gpu/test_gpu_processing.py::test_kld_matches_independent_probability_definition
