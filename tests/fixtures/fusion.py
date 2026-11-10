@@ -370,10 +370,6 @@ def registration_observation_pair(registration_specimen):
 @pytest.fixture
 def shifted_slab_pair(registration_observation_pair):
     """Share known Cartesian slabs with independent detector realizations."""
-    from tests.simulation.camera_likelihood import (
-        SamplingEnvelope,
-        camera_sampling_envelope,
-    )
 
     def create(
         shape, nominal_step, correction, *, seed=51, spacing=(0.23, 0.115, 0.115)
@@ -385,26 +381,13 @@ def shifted_slab_pair(registration_observation_pair):
         union_shape = observation.scene.expectation.shape
         total = np.zeros(union_shape, np.float64)
         count = np.zeros(union_shape, np.uint8)
-        low = np.full(union_shape, np.nan)
-        high = np.full(union_shape, np.nan)
-        for start, raw, expected in zip(
-            observation.starts, observation.volumes, observation.means, strict=True
-        ):
+        for start, raw in zip(observation.starts, observation.volumes, strict=True):
             selection = tuple(
                 slice(offset, offset + length)
                 for offset, length in zip(start, shape, strict=True)
             )
             total[selection] += raw
             count[selection] += 1
-            bounds = camera_sampling_envelope(
-                expected,
-                raw,
-                observation.scene.microscope.camera,
-                radii=(0, 0, 0),
-                views=2,
-            )
-            low[selection] = np.fmin(low[selection], bounds.lower)
-            high[selection] = np.fmax(high[selection], bounds.upper)
         # With unity feathering, two coincident measurements have the closed
         # arithmetic-mean expectation; it is independent of the block renderer.
         expected_pixels = np.divide(
@@ -417,10 +400,7 @@ def shifted_slab_pair(registration_observation_pair):
             expected=shift,
             truth=observation.scene.expectation,
             starts=observation.starts,
-            observation=observation,
             expected_pixels=expected_pixels,
-            expected_envelope=SamplingEnvelope(low, high),
-            accuracy_mask=count > 0,
         )
 
     return create

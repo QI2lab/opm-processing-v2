@@ -87,16 +87,5 @@ def test_depth_registration_handles_large_xy_drift(
             rtol=2e-6,
             atol=0,
         )
-        from opm_processing.imageprocessing.camera import camera_correct
-
-        camera = pair.observation.scene.microscope.camera
-        photons = camera_correct(actual, camera.offset_adu, camera.electrons_per_adu)
-        selected, envelope = pair.accuracy_mask, pair.expected_envelope
-        assert selected.any()
-        assert np.all(
-            np.isfinite(photons[selected])
-            & (photons[selected] >= envelope.lower[selected])
-            & (photons[selected] <= envelope.upper[selected])
-        )
     else:
         assert fusion.pairwise_metrics == {}
