@@ -786,25 +786,32 @@ def noisy_scene_masks(microscope_parameters, independent_photon_scene_factory):
             large=True,
             integration_scan_planes=shape[0] if integration else None,
         )
-        source = (
-            integrate_camera_pixels(
-                scene.density,
-                scene.axes,
-                centered_sensor_axes(
-                    shape,
-                    (
-                        microscope.scan_step_um,
-                        microscope.pixel_size_um,
-                        microscope.pixel_size_um,
-                    ),
-                ),
-                pixel_size_um=microscope.pixel_size_um,
-                theta_deg=microscope.angle_deg,
-                samples=microscope.pixel_samples,
-                area_integral=False,
-            )
-            > 0
+        sensor_axes = centered_sensor_axes(
+            shape,
+            (
+                microscope.scan_step_um,
+                microscope.pixel_size_um,
+                microscope.pixel_size_um,
+            ),
         )
+        columns = sensor_axes[2]
+        supported = (columns >= scene.axes[2][0] - microscope.pixel_size_um / 2) & (
+            columns <= scene.axes[2][-1] + microscope.pixel_size_um / 2
+        )
+        source = np.zeros(shape, bool)
+        if supported.any():
+            source[..., supported] = (
+                integrate_camera_pixels(
+                    scene.density,
+                    scene.axes,
+                    (*sensor_axes[:2], columns[supported]),
+                    pixel_size_um=microscope.pixel_size_um,
+                    theta_deg=microscope.angle_deg,
+                    samples=microscope.pixel_samples,
+                    area_integral=False,
+                )
+                > 0
+            )
         theta = np.deg2rad(microscope.angle_deg)
         x, y, z = get_skewed_coords(
             shape, microscope.pixel_size_um, microscope.scan_step_um, theta
@@ -875,7 +882,7 @@ def noisy_extended_scene(
     )
     expectation, raw = observation.expectation, observation.raw
     source, dark = noisy_scene_masks(kind, shape, integration)
-    np.testing.assert_array_equal(expectation[dark], 0)
+    assert not np.any(expectation, where=dark)
     for array in (expectation, raw):
         array.setflags(write=False)
     return microscope, expectation, raw, source, dark

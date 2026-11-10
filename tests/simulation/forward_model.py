@@ -413,15 +413,29 @@ def forward_model(
                 axes, psf_axes, irradiance.shape, strict=True
             )
         )
+        columns = np.asarray(sensor_axes[2])
+        supported = (columns >= optical_axes[2][0] - microscope.pixel_size_um / 2) & (
+            columns <= optical_axes[2][-1] + microscope.pixel_size_um / 2
+        )
+        crop_columns = (
+            columns.ndim == 1
+            and np.isfinite(columns).all()
+            and supported.any()
+            and not supported.all()
+        )
         response = integrate_camera_pixels(
             irradiance,
             optical_axes,
-            sensor_axes,
+            (*sensor_axes[:2], columns[supported]) if crop_columns else sensor_axes,
             pixel_size_um=microscope.pixel_size_um,
             theta_deg=microscope.angle_deg,
             samples=microscope.pixel_samples,
             geometry=metadata.geometry,
         )
+        if crop_columns:
+            full_response = np.zeros(tuple(map(len, sensor_axes)), dtype=response.dtype)
+            full_response[..., supported] = response
+            response = full_response
         dose = 1.0
         if budget is not None:
             # Select physical emission densities from the known optical model:
