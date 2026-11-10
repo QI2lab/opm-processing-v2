@@ -215,7 +215,7 @@ def test_raw_roi_exports_and_resume(
 
 @pytest.mark.integration
 @pytest.mark.parametrize(
-    "mosaic_acquisition", [("mirror", 0.4, 0.001, "whole")], indirect=True
+    "mosaic_acquisition", [("mirror", 0.4, 0.001, "tiled")], indirect=True
 )
 def test_roi_maps_extended_specimen_to_raw_tiles(
     mosaic_acquisition, monkeypatch, invoke_cli

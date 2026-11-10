@@ -32,6 +32,7 @@ def test_roi_deconvolves_recorded_sampling(
         open_position_collection,
     )
     from opm_processing.dataio.processing_state import ProcessingState
+    from opm_processing.imageprocessing.camera import camera_correct
     from opm_processing.imageprocessing.maxtilefusion import (
         regenerate_fused_max_projection,
     )
@@ -135,40 +136,9 @@ def test_roi_deconvolves_recorded_sampling(
 
     def observe_deconvolution(*args, **kwargs):
         """Execute the actual CUDA solver and retain its output for deskew checks."""
-        expected = case.dataset.raw_data[0, len(deconvolved), 0]
-        if case.dataset.metadata.scan_axis_reversed:
-            expected = expected[::-1]
-        from opm_processing.imageprocessing.camera import camera_correct
-
-        expected = camera_correct(
-            expected,
-            case.microscope.camera.offset_adu,
-            case.microscope.camera.electrons_per_adu,
-        )
-        # Locate the actual read in the independently retained producer frames.
-        # A unique photon realization identifies its scan/X preimage exactly.
-        candidates = np.argwhere(expected[:, 0, :] == args[0][0, 0, 0])
-        matches = [
-            (int(scan), int(column))
-            for scan, column in candidates
-            if scan + args[0].shape[0] <= expected.shape[0]
-            and column + args[0].shape[-1] <= expected.shape[-1]
-            and np.array_equal(
-                expected[
-                    scan : scan + args[0].shape[0],
-                    :,
-                    column : column + args[0].shape[-1],
-                ],
-                args[0],
-            )
-        ]
-        assert len(matches) == 1
-        scan, column = matches[0]
-        raw_crops.append(
-            (scan, scan + args[0].shape[0], column, column + args[0].shape[-1])
-        )
-        assert args[0].shape[1] == expected.shape[1]
-        assert args[0].size < expected.size
+        raw_crops.append(args[0].copy())
+        assert args[0].shape[1] == case.dataset.raw_data.shape[-2]
+        assert args[0].size < np.prod(case.dataset.raw_data.shape[-3:])
         result = deconvolve(*args, **kwargs)
         deconvolved.append(result)
         predictions.append(production_forward_predictions[-1])
@@ -280,11 +250,24 @@ def test_roi_deconvolves_recorded_sampling(
             atol=1e-6,
         )
     factor = round(case.microscope.scan_step_um / 0.4)
-    for (record, _seed), recovered, raw_crop in zip(
-        seeds, deconvolved, raw_crops, strict=True
+    for index, ((record, _seed), recovered, actual_input) in enumerate(
+        zip(seeds, deconvolved, raw_crops, strict=True)
     ):
         start, stop, x0, x1 = record["skewed_bounds_sx"]
-        assert (start, stop, x0, x1) == raw_crop
+        original = case.dataset.raw_data[
+            record["time_index"], record["position_index"], 0
+        ]
+        if case.dataset.metadata.scan_axis_reversed:
+            original = original[::-1]
+        np.testing.assert_array_equal(
+            actual_input,
+            camera_correct(
+                original[start:stop, :, x0:x1],
+                case.microscope.camera.offset_adu,
+                case.microscope.camera.electrons_per_adu,
+            ),
+        )
+        raw_crops[index] = (start, stop, x0, x1)
         assert recovered.shape == (
             (stop - start - 1) * factor + 1,
             case.dataset.raw_data.shape[-2],
