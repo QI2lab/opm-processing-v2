@@ -149,7 +149,7 @@ def register_and_fuse(
         pairs and refits the full graph. Zero disables retries; explicit limits
         stay fixed.
     require_gpu : bool
-        Require CUDA registration instead of allowing the CPU backend.
+        Retained for command compatibility; pair registration always requires CUDA.
     regenerate_max_z : bool
         Regenerate all maximum-Z pyramid levels from the existing fused image
         without registering or fusing tiles again.
