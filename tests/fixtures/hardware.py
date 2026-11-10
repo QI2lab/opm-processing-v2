@@ -1,37 +1,8 @@
-"""CPU thread limits, CUDA availability and numerical resource cleanup."""
+"""CPU thread limits and production reconstruction observers."""
 
 from __future__ import annotations
 
 import pytest
-
-
-@pytest.fixture(scope="module")
-def cupy_gpu():
-    """Return CuPy on available CUDA hardware, or skip unavailable hardware."""
-    cp = pytest.importorskip("cupy")
-
-    message = "CuPy found no CUDA devices"
-    try:
-        device_count = cp.cuda.runtime.getDeviceCount()
-    except cp.cuda.runtime.CUDARuntimeError as error:
-        # Driver/device discovery may legitimately fail on a CPU-only host.
-        # Numerical, allocation, FFT and assertion errors must remain failures.
-        if error.status not in (35, 100):  # insufficient driver / no device
-            raise
-        device_count = 0
-        message = f"CUDA device discovery failed: {error}"
-    if device_count < 1:
-        pytest.skip(message)
-    device = cp.cuda.Device(0)
-    device.use()
-    cp.empty(1)
-    device.synchronize()
-
-    yield cp
-
-    cp.cuda.Stream.null.synchronize()
-    cp.get_default_memory_pool().free_all_blocks()
-    cp.get_default_pinned_memory_pool().free_all_blocks()
 
 
 @pytest.fixture(scope="module")
