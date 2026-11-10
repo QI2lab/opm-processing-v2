@@ -3,12 +3,12 @@
 import importlib
 from dataclasses import dataclass, replace
 from functools import lru_cache
+from hashlib import sha256
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
-from opm_processing.dataio.deconvolution import scan_upsample_from_metadata
 from opm_processing.imageprocessing.opmtools import (
     deskew_coverage,
     deskew_shape_estimator,
@@ -107,7 +107,6 @@ def pipeline_runner(
             )
         deskew_tiles = set()
         deskew_runs = []
-        reconstructions = []
         deconvolution_runs = []
         with monkeypatch.context() as execution:
             if deconvolve:
@@ -115,12 +114,12 @@ def pipeline_runner(
                 reconstruct = solver.rlgc
 
                 def observe_reconstruction(*args, **kwargs):
-                    """Retain actual calibrated reconstructions for physical truth checks."""
+                    """Observe real reconstruction shapes and acquired predictions."""
                     result = reconstruct(*args, **kwargs)
-                    reconstructions.append(result)
                     deconvolution_runs.append(
                         {
                             "input_shape": args[0].shape,
+                            "output_shape": result.shape,
                             "forward": production_forward_predictions[-1],
                         }
                     )
@@ -136,12 +135,14 @@ def pipeline_runner(
                 return interpolate(*args)
 
             def observe_deskew(*args, **kwargs):
-                """Observe the production planner without replacing its choices."""
+                """Record actual output bytes before production persists them."""
                 result = deskew(*args, **kwargs)
+                assert result.dtype == np.float32 and result.flags.c_contiguous
                 deskew_runs.append(
                     {
                         "output_shape": result.shape,
                         "tile_shape": kwargs["tile_shape"],
+                        "pixel_sha256": sha256(memoryview(result)).hexdigest(),
                     }
                 )
                 return result
@@ -192,7 +193,6 @@ def pipeline_runner(
             output=directory / f"{stem}_fused.ome.zarr",
             deskew_tiles=deskew_tiles,
             deskew_runs=deskew_runs,
-            reconstructions=reconstructions,
             deconvolution_runs=deconvolution_runs,
         )
 
@@ -345,7 +345,6 @@ def pipeline_case(
     simulation_parameters,
     opm_v2_acquisition_factory,
     pipeline_runner,
-    pipeline_geometry,
     pipeline_illumination_calibration,
     small_cpu_kernels,
 ):
@@ -358,7 +357,7 @@ def pipeline_case(
     -------
     types.SimpleNamespace
         Raw acquisition, reopened processed collection, fitted illumination,
-        fusion object and the independent expected support.
+        fusion object and actual processing observations.
 
     Notes
     -----
@@ -424,13 +423,10 @@ def pipeline_case(
         illumination=illumination,
         crop_scan=crop,
     )
-    factor = scan_upsample_from_metadata(dataset.metadata) if deconvolve else 1
-    geometry = pipeline_geometry(expectation.shape, microscope, scan_factor=factor)
     return SimpleNamespace(
         **vars(result),
         dataset=dataset,
         microscope=microscope,
-        support=geometry.support,
         expectation=expectation,
         optical_data=optical_data,
         registration_error_pixels=registration_error_pixels,

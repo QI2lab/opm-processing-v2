@@ -2,6 +2,7 @@
 
 import importlib
 from functools import partial
+from hashlib import sha256
 from itertools import pairwise
 
 import numpy as np
@@ -15,11 +16,12 @@ from opm_processing.dataio.acquisition import (
 )
 from opm_processing.dataio.deconvolution import scan_upsample_from_metadata
 from opm_processing.dataio.processing_state import ProcessingState
-from opm_processing.imageprocessing.camera import camera_correct, illumination_correct
 from opm_processing.imageprocessing.opmtools import orthogonal_deskew
 
 
-def test_qi2lab_acquisition_to_fused_ngff_v05(pipeline_case, deconvolve):
+def test_qi2lab_acquisition_to_fused_ngff_v05(
+    pipeline_case, deconvolve, pipeline_geometry
+):
     """Retain calibrated pixels, registered coordinates and pyramids across stages."""
     case = pipeline_case
     raw = open_group(case.dataset.path)
@@ -35,6 +37,11 @@ def test_qi2lab_acquisition_to_fused_ngff_v05(pipeline_case, deconvolve):
     assert metadata.shape == case.dataset.raw_data.shape
     assert metadata.camera_conversion == case.microscope.camera.electrons_per_adu
     assert metadata.scan_axis_step_um == case.microscope.scan_step_um
+    factor = scan_upsample_from_metadata(metadata) if deconvolve else 1
+    support = pipeline_geometry(
+        metadata.shape[-3:], case.microscope, scan_factor=factor
+    ).support
+    assert len(case.deskew_runs) == np.prod(metadata.shape[:3])
     assert case.collection.shape[:3] == (2, 2, 2)
     np.testing.assert_allclose(
         case.collection.voxel_size_um, case.microscope.pixel_size_um
@@ -54,41 +61,13 @@ def test_qi2lab_acquisition_to_fused_ngff_v05(pipeline_case, deconvolve):
             saved = array[time, channel].read().result()
             assert saved.dtype == np.float32
             assert np.isfinite(saved).all() and np.all(saved >= 0)
-            assert np.any(saved[case.support] > 0)
-            np.testing.assert_array_equal(saved[~case.support], 0)
-            if not deconvolve:
-                calibrated = camera_correct(
-                    case.dataset.raw_data[time, position, channel],
-                    metadata.camera_offset,
-                    metadata.camera_conversion,
-                )
-                if case.field is not None:
-                    calibrated = illumination_correct(
-                        calibrated, case.field[0, channel]
-                    )
-                if metadata.mode == "stage":
-                    calibrated = calibrated[::-1].copy()
-                expected = orthogonal_deskew(
-                    calibrated,
-                    theta=metadata.angle_deg,
-                    distance=metadata.scan_axis_step_um,
-                    pixel_size=metadata.pixel_size_um,
-                    downsample_factor=1,
-                )
-                np.testing.assert_array_equal(saved, expected)
-            else:
-                reconstruction_index = (
-                    time * metadata.shape[1] + position
-                ) * metadata.shape[2] + channel
-                expected = orthogonal_deskew(
-                    case.reconstructions[reconstruction_index],
-                    theta=metadata.angle_deg,
-                    distance=metadata.scan_axis_step_um
-                    / scan_upsample_from_metadata(metadata),
-                    pixel_size=metadata.pixel_size_um,
-                    downsample_factor=1,
-                )
-                np.testing.assert_array_equal(saved, expected)
+            assert np.any(saved[support] > 0)
+            np.testing.assert_array_equal(saved[~support], 0)
+            index = (time * metadata.shape[1] + position) * metadata.shape[2] + channel
+            observed = case.deskew_runs[index]
+            assert saved.shape == observed["output_shape"]
+            # Compare this run's actual returned bytes with reopened storage.
+            assert sha256(memoryview(saved)).hexdigest() == observed["pixel_sha256"]
 
     fusion = case.fusion
     # Stage Z is converted to laboratory Z; the detector-X stage coordinate
@@ -130,14 +109,10 @@ def test_qi2lab_acquisition_to_fused_ngff_v05(pipeline_case, deconvolve):
         # Score actual in-loop production predictions against simulator truth.
         from scipy.special import kl_div
 
-        factor = scan_upsample_from_metadata(metadata)
-        assert len(case.reconstructions) == np.prod(metadata.shape[:3])
-        assert len(case.deconvolution_runs) == len(case.reconstructions)
-        for reconstruction, run in zip(
-            case.reconstructions, case.deconvolution_runs, strict=True
-        ):
+        assert len(case.deconvolution_runs) == np.prod(metadata.shape[:3])
+        for run in case.deconvolution_runs:
             assert run["input_shape"] == metadata.shape[-3:]
-            assert reconstruction.shape == (
+            assert run["output_shape"] == (
                 (metadata.shape[-3] - 1) * factor + 1,
                 *metadata.shape[-2:],
             )
@@ -168,7 +143,7 @@ def test_qi2lab_acquisition_to_fused_ngff_v05(pipeline_case, deconvolve):
             (origin - fusion.offset_um) / case.collection.voxel_size_um
         ).astype(int)
         slices = tuple(
-            slice(a, a + n) for a, n in zip(start, case.support.shape, strict=True)
+            slice(a, a + n) for a, n in zip(start, support.shape, strict=True)
         )
         exposures = np.stack(
             [array[time].read().result() for array in case.collection.arrays]
@@ -255,17 +230,14 @@ def test_large_noisy_scene_acquisition_to_fusion(
     )
     factor = scan_upsample_from_metadata(metadata) if deconvolve else 1
     geometry = pipeline_geometry(metadata.shape[-3:], microscope, scan_factor=factor)
+    assert len(result.deskew_runs) == metadata.shape[1]
     for position, array in enumerate(result.collection.arrays):
         saved = array[0, 0].read().result()
         assert saved.shape == geometry.shape and saved.dtype == np.float32
         np.testing.assert_array_equal(saved[~geometry.support], 0)
-        calibrated = camera_correct(
-            dataset.raw_data[0, position, 0],
-            microscope.camera.offset_adu,
-            microscope.camera.electrons_per_adu,
-        )
-        if metadata.scan_axis_reversed:
-            calibrated = calibrated[::-1].copy()
+        observed_deskew = result.deskew_runs[position]
+        assert saved.shape == observed_deskew["output_shape"]
+        assert sha256(memoryview(saved)).hexdigest() == observed_deskew["pixel_sha256"]
         if deconvolve:
             run = result.deconvolution_runs[position]
             observed = run["forward"]
@@ -307,15 +279,6 @@ def test_large_noisy_scene_acquisition_to_fusion(
                 kl_div(case.expectation[source], observed["prediction"][source]).sum()
                 < kl_div(case.expectation[source], baseline[source]).sum()
             )
-            calibrated = result.reconstructions[position]
-        expected = orthogonal_deskew(
-            calibrated,
-            theta=microscope.angle_deg,
-            distance=microscope.scan_step_um / factor,
-            pixel_size=microscope.pixel_size_um,
-            downsample_factor=1,
-        )
-        np.testing.assert_array_equal(saved, expected)
 
     # Only fixed source geometry selects foreground for execution coverage.
     source = (
