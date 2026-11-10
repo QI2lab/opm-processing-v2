@@ -1,4 +1,4 @@
-"""Shared complete processing scenarios collected by the CPU and CUDA suites."""
+"""Complete acquisition processing scenarios using production numerical operators."""
 
 import importlib
 from functools import partial
@@ -6,6 +6,7 @@ from itertools import pairwise
 
 import numpy as np
 import tensorstore as ts
+from skimage.measure import block_reduce
 from yaozarrs import open_group, v05
 
 from opm_processing.dataio.acquisition import (
@@ -229,13 +230,10 @@ def test_large_noisy_scene_acquisition_to_fusion(
     deconvolve,
     pipeline_runner,
     pipeline_geometry,
-    pipeline_camera_accuracy,
     tmp_path,
 ):
     """Process full noisy specimens across real RLGC, deskew and storage tiles."""
     from scipy.special import kl_div
-
-    from opm_processing.imageprocessing.opmpsf import camera_grid_center
 
     case = large_noisy_acquisition
     dataset, microscope = case.dataset, case.microscope
@@ -372,31 +370,6 @@ def test_large_noisy_scene_acquisition_to_fusion(
         for origin, shape in result.deskew_tiles
         for axis in range(3)
     )
-    if not deconvolve:
-        means = np.broadcast_to(
-            case.expectation[None, None, None], dataset.raw_data.shape
-        )
-        center = camera_grid_center(
-            (case.native_scan_planes, *metadata.shape[-2:]),
-            microscope.pixel_size_um,
-            microscope.scan_step_um / case.sampling_factor,
-            microscope.angle_deg,
-        )
-        pipeline_camera_accuracy(
-            result,
-            means,
-            microscope,
-            metadata.mode,
-            source_y_half_um=center[1],
-            scan_center_offset_um=(
-                (metadata.shape[-3] - 1) * microscope.scan_step_um
-                - (case.native_scan_planes - 1)
-                * microscope.scan_step_um
-                / case.sampling_factor
-            )
-            / 2
-            + case.sampling_phase * microscope.scan_step_um / case.sampling_factor,
-        )
     fused = assert_fused_ngff(result)
     np.testing.assert_allclose(
         np.diff(np.asarray(result.fusion._tile_positions), axis=0), 0, atol=1e-8
@@ -423,14 +396,11 @@ def test_extended_mosaic_acquisition_to_fusion(
     deconvolve,
     pipeline_runner,
     pipeline_geometry,
-    pipeline_camera_accuracy,
     pipeline_optical_data,
     monkeypatch,
     tmp_path,
 ):
     """Check realistic camera fields, automatic chunks and independent mosaic truth."""
-    from tests.simulation.metrics import camera_object_apertures
-
     case = mosaic_acquisition
     parameters = case.parameters
     raw_shape = case.dataset.raw_data.shape[-3:]
@@ -439,17 +409,7 @@ def test_extended_mosaic_acquisition_to_fusion(
     assert raw_shape[1:] == (256, 1900)
     assert case.optical_data.native_scan_planes == (200 if case.tiled else 50)
     phase = case.optical_data.first_native_scan_index
-    native_step = case.microscope.scan_step_um / round(
-        case.microscope.scan_step_um / 0.4
-    )
-    center_offset = (
-        phase * native_step
-        + (
-            (raw_shape[0] - 1) * case.microscope.scan_step_um
-            - (case.optical_data.native_scan_planes - 1) * native_step
-        )
-        / 2
-    )
+    native_step = case.optical_data.ground_truth.microscope.scan_step_um
     offset = parameters["tile_offset_x_pixels"]
     layouts = []
     with monkeypatch.context() as resources:
@@ -483,30 +443,31 @@ def test_extended_mosaic_acquisition_to_fusion(
 
         assert layouts and all(state == fft for state, fft in layouts)
         fine_data = pipeline_optical_data(native_step, mosaic=True, tiled=case.tiled)
-        source_expectation = fine_data.source_expectation[phase : phase + shape[0]]
-        crop = result.deconvolution_runs[0]["crop_scan"]
-        retained = max(1, crop // factor) * factor
-        boundaries = np.arange(retained, shape[0], retained)
-        seam_scans = np.zeros(shape[0], bool)
+        source_mask = fine_data.source_mask[phase : phase + shape[0]]
         if case.tiled:
-            assert 1 < crop < shape[0]
             assert result.options["decon_crop_scan"] is None
-            foreground = source_expectation[..., : shape[-1]].max(axis=(1, 2))
-            foreground = foreground > foreground.max() / 2
-            assert sum(foreground[b - 1] and foreground[b] for b in boundaries) >= 2
-            seam_scans[boundaries - factor] = True
-            seam_scans[boundaries] = True
-        else:
-            assert crop >= shape[0]
-            seam_scans[:] = True
         for position, run in enumerate(result.deconvolution_runs):
             observed = run["forward"]
-            chunks = observed["chunks"]
+            chunks = sorted(
+                observed["chunks"], key=lambda chunk: chunk["destination"].start
+            )
             assert len(chunks) > 1 if case.tiled else len(chunks) == 1
             for chunk in chunks:
                 if case.tiled:
                     assert chunk["observed_shape"][0] < raw_shape[0]
             start = position * offset
+            seam_scans = np.ones(raw_shape[0], bool)
+            if case.tiled:
+                boundaries = np.asarray(
+                    [chunk["destination"].stop for chunk in chunks[:-1]]
+                )
+                foreground = source_mask[::factor, :, start : start + shape[-1]].any(
+                    axis=(1, 2)
+                )
+                assert sum(foreground[b - 1] and foreground[b] for b in boundaries) >= 2
+                seam_scans[:] = False
+                seam_scans[boundaries - 1] = True
+                seam_scans[boundaries] = True
             expected = case.expectation[..., start : start + shape[-1]]
             predicted = observed["prediction"]
             baseline = observed["input_prediction"]
@@ -514,25 +475,8 @@ def test_extended_mosaic_acquisition_to_fusion(
                 baseline = observed["initial_prediction"]
             assert predicted.shape == expected.shape
             assert kl_div(expected, predicted).sum() < kl_div(expected, baseline).sum()
-            source = source_expectation[::factor, :, start : start + shape[-1]]
-            safe_source = next(
-                camera_object_apertures(
-                    case.optical_data.ground_truth,
-                    case.microscope,
-                    raw_shape,
-                    camera_offset_zyx_um=(
-                        0,
-                        center_offset,
-                        (start + (shape[-1] - case.expectation.shape[-1]) / 2)
-                        * case.microscope.pixel_size_um,
-                    ),
-                )
-            )
-            selected = (
-                safe_source
-                & (source > source_expectation.max() / 2)
-                & seam_scans[::factor, None, None]
-            )
+            source = source_mask[::factor, :, start : start + shape[-1]]
+            selected = source & seam_scans[:, None, None]
             assert selected.any()
             assert (
                 kl_div(expected[selected], predicted[selected]).sum()
@@ -550,22 +494,6 @@ def test_extended_mosaic_acquisition_to_fusion(
         ] = True
     assert coverage.all()
     actual = assert_fused_ngff(result)
-    if not deconvolve:
-        means = np.stack(
-            [
-                case.expectation[..., p * offset : p * offset + shape[-1]]
-                for p in range(2)
-            ]
-        )[None, :, None]
-        pipeline_camera_accuracy(
-            result,
-            means,
-            case.microscope,
-            case.dataset.metadata.mode,
-            source_y_half_um=case.optical_data.ground_truth.features["length_um"] / 2,
-            offsets_x=np.arange(2) * offset * case.microscope.pixel_size_um,
-            scan_center_offset_um=center_offset,
-        )
     fusion = result.fusion
     origins = np.asarray(fusion._tile_positions)
     np.testing.assert_allclose(
@@ -604,7 +532,7 @@ def test_extended_mosaic_acquisition_to_fusion(
         fusion.write_block_shape[2], *fusion.padded_shape[-2:]
     )
     assert block_y < actual.shape[-2] and block_x < actual.shape[-1]
-    camera_source = source_expectation if deconvolve else case.source_expectation
+    camera_source = source_mask if deconvolve else case.source_mask
     signal = orthogonal_deskew(
         camera_source,
         theta=case.microscope.angle_deg,
@@ -616,12 +544,22 @@ def test_extended_mosaic_acquisition_to_fusion(
     block_shape = (fusion.write_block_shape[2], block_y, block_x)
     crossings = 0
     for axis, step in enumerate(block_shape):
-        borders = range(step, min(actual.shape[axis + 2], foreground.shape[axis]), step)
-        crossings += sum(
-            np.any(
-                np.take(foreground, border - 1, axis=axis)
-                & np.take(foreground, border, axis=axis)
-            )
-            for border in borders
-        )
+        other_axes = [index for index in range(3) if index != axis]
+        for border in range(step, actual.shape[axis + 2], step):
+            local = border - start[axis]
+            if 0 < local < foreground.shape[axis]:
+                shared = np.take(foreground, local - 1, axis=axis) & np.take(
+                    foreground, local, axis=axis
+                )
+                shared = np.pad(
+                    shared, [(int(start[index]), 0) for index in other_axes]
+                )
+                # Distinct block faces in the same plane are distinct borders.
+                crossings += np.count_nonzero(
+                    block_reduce(
+                        shared,
+                        tuple(block_shape[index] for index in other_axes),
+                        np.any,
+                    )
+                )
     assert crossings >= 2

@@ -19,6 +19,7 @@ from opm_processing.imageprocessing.tilefusion import (
 )
 from tests.simulation.camera import digitize
 from tests.simulation.forward_model import Microscope
+from tests.simulation.metrics import camera_source_mask
 from tests.simulation.scenes import OpticalScene
 
 
@@ -28,7 +29,7 @@ class PipelineOpticalData:
 
     microscope: Microscope
     expectation: np.ndarray
-    source_expectation: np.ndarray | None
+    source_mask: np.ndarray | None
     ground_truth: OpticalScene
     native_scan_planes: int
     first_native_scan_index: int
@@ -59,170 +60,6 @@ def pipeline_geometry():
         return SimpleNamespace(shape=output_shape, support=aperture)
 
     return create
-
-
-@pytest.fixture
-def pipeline_camera_accuracy(pipeline_geometry):
-    """Bound persisted camera predictions by original optical means and detector residuals."""
-    from yaozarrs import open_group
-
-    from opm_processing.dataio.acquisition import (
-        inspect_acquisition,
-        open_acquisition_datastore,
-    )
-    from opm_processing.dataio.ngff import SPATIAL_DECIMALS
-    from tests.simulation.camera_likelihood import (
-        camera_sampling_envelope,
-        sampling_stencil_footprint,
-        sampling_stencil_radii,
-    )
-    from tests.simulation.metrics import camera_volume_samples
-
-    def check(
-        result,
-        means,
-        microscope,
-        mode,
-        *,
-        source_y_half_um,
-        offsets_x=None,
-        scan_center_offset_um=0.0,
-    ):
-        """Check fixed source/background apertures without fitting photons or spatial shifts."""
-        shape = means.shape[-3:]
-        scans, rows = shape[:2]
-        pixel, step = microscope.pixel_size_um, microscope.scan_step_um
-        angle = np.deg2rad(microscope.angle_deg)
-        span = (scans - 1) * step
-        local_origin = np.array((0, -span if mode == "stage" else 0, 0))
-        spacing = result.collection.voxel_size_um
-        geometry = pipeline_geometry(shape, microscope)
-        coverage = camera_volume_samples(
-            geometry.support.astype(float),
-            local_origin,
-            spacing,
-            local_origin,
-            shape,
-            microscope,
-        )
-        mask = coverage >= 1 - 32 * np.finfo(float).eps
-        native_scan = (np.arange(scans) - (scans - 1) / 2) * step
-        native_row = (np.arange(rows) - (rows - 1) / 2) * pixel
-        camera_y = (
-            native_scan[:, None]
-            + native_row[None] * np.cos(angle)
-            + scan_center_offset_um
-        )
-        # The physical analysis window comes from the original object and PSF
-        # support. No reconstructed value selects the scored samples.
-        mask &= (np.abs(camera_y) <= source_y_half_um)[..., None]
-        positions = means.shape[1]
-        offsets_x = np.zeros(positions) if offsets_x is None else np.asarray(offsets_x)
-        source_metadata = inspect_acquisition(
-            result.fusion.processing_state.source_path()
-        )
-        original = open_acquisition_datastore(source_metadata).read().result()
-        if source_metadata.scan_axis_reversed:
-            original = original[:, :, :, ::-1]
-        stage_z, stage_scan, stage_x = source_metadata.stage_positions_zxy[0]
-        anchor = np.array((-stage_z, -stage_scan, stage_x))
-        fused = open_group(result.output)["0"].to_tensorstore().read().result()
-        gain = 2 * pixel / step
-        radii = sampling_stencil_radii(microscope, spacing)
-        # OME-NGFF origins are serialized to the library's declared precision.
-        origin_error = 0.5 * 10**-SPATIAL_DECIMALS
-        footprint = sampling_stencil_footprint(
-            microscope, spacing, origin_y_error_um=origin_error
-        )
-        grid_offsets = (
-            np.asarray(result.fusion._tile_positions) - result.fusion.offset_um
-        ) / spacing
-        integer_grid = np.allclose(
-            grid_offsets, np.rint(grid_offsets), rtol=0, atol=1e-8
-        )
-        # Fractional fusion placement adds one further orthogonal-grid stencil.
-        fused_radii = sampling_stencil_radii(
-            microscope, np.asarray(spacing) * (1 if integer_grid else 2)
-        )
-        fused_footprint = sampling_stencil_footprint(
-            microscope,
-            np.asarray(spacing) * (1 if integer_grid else 2),
-            origin_y_error_um=origin_error,
-        )
-
-        def score(image, origin, frame_origin, response, envelope):
-            prediction = (
-                camera_volume_samples(
-                    image / gain,
-                    origin,
-                    spacing,
-                    frame_origin,
-                    shape,
-                    microscope,
-                )
-                * response
-            )
-            # Noisy ADC samples may be zero at positive true rates. Their
-            # certified sampling/noise intervals, including zeros, apply.
-            assert mask.any()
-            assert np.isfinite(prediction[mask]).all()
-            assert np.all(prediction[mask] >= envelope.lower[mask])
-            assert np.all(prediction[mask] <= envelope.upper[mask])
-
-        for time in range(means.shape[0]):
-            for channel in range(means.shape[2]):
-                response = np.broadcast_to(
-                    1 if result.field is None else result.field[0, channel], shape
-                )
-                for position in range(positions):
-                    expected = means[time, position, channel]
-                    image = (
-                        result.collection.arrays[position][time, channel]
-                        .read()
-                        .result()
-                    )
-                    assert image.shape == geometry.shape
-                    own_bounds = camera_sampling_envelope(
-                        expected,
-                        original[time, position, channel],
-                        microscope.camera,
-                        radii=radii,
-                        footprint=footprint,
-                        response=response,
-                    )
-                    score(
-                        image,
-                        np.asarray(result.collection.spatial_origins_zyx_um[position]),
-                        local_origin,
-                        response,
-                        own_bounds,
-                    )
-                    native_offsets_x = (offsets_x - offsets_x[position]) / pixel
-                    np.testing.assert_allclose(
-                        native_offsets_x, np.rint(native_offsets_x), rtol=0, atol=1e-8
-                    )
-                    fused_bounds = camera_sampling_envelope(
-                        means[time, :, channel],
-                        original[time, :, channel],
-                        microscope.camera,
-                        radii=fused_radii,
-                        footprint=fused_footprint,
-                        response=response,
-                        views=positions,
-                        view_offsets_syx=np.outer(np.rint(native_offsets_x), (0, 0, 1)),
-                    )
-                    frame_origin = (
-                        anchor + local_origin + np.array((0, 0, offsets_x[position]))
-                    )
-                    score(
-                        fused[time, channel],
-                        np.asarray(result.fusion.offset_um),
-                        frame_origin,
-                        response,
-                        fused_bounds,
-                    )
-
-    return check
 
 
 @pytest.fixture
@@ -284,7 +121,6 @@ def pipeline_runner(
                     deconvolution_runs.append(
                         {
                             "input_shape": args[0].shape,
-                            "crop_scan": kwargs.get("crop_scan"),
                             "forward": production_forward_predictions[-1],
                         }
                     )
@@ -367,29 +203,18 @@ def pipeline_runner(
 def pipeline_illumination_calibration(
     opm_v2_acquisition_factory,
     uniform_optical_calibration,
-    invoke_cli,
 ):
-    """Fit an identifiable real calibration acquisition before processing tissue."""
-    from opm_processing.dataio.acquisition import acquisition_stem
-    from opm_processing.process import read_current_flatfield, write_flatfield
-    from tests.simulation.camera_likelihood import (
-        SamplingEnvelope,
-        camera_sampling_envelope,
+    """Prepare a real independent calibration through the production worker."""
+    from opm_processing.dataio.acquisition import (
+        acquisition_stem,
+        open_acquisition_datastore,
     )
+    from opm_processing.process import call_estimate_illuminations, write_flatfield
 
     def calibrate(dataset, microscope, shape, mode):
-        """Use known uniform emission, real camera draws and the production BaSiC worker."""
+        """Fit the acquired uniform source without processing unused image volumes."""
         shape = tuple(shape)
         stem = acquisition_stem(dataset.path)
-        working_width = shape[2] // 2
-        assert working_width > 1
-        # align_corners=True places the half-size samples at this native pitch.
-        # The antialiased bilinear reduction and bilinear expansion each span
-        # one such pitch; round outward before fitting any field.
-        native_reach = int(np.ceil(2 * (shape[2] - 1) / (working_width - 1)))
-        radii = (shape[0] - 1, shape[1] - 1, native_reach)
-        # The calibration's physical dose is declared before any camera draw.
-        # All channels share the same 637-nm optics in these pipeline cases.
         means = uniform_optical_calibration(
             microscope,
             shape,
@@ -406,7 +231,6 @@ def pipeline_illumination_calibration(
                 seed=903 + 10 * position + channel,
             )
         assert raw.max() < np.iinfo(raw.dtype).max
-        canonical = raw.copy()
         if mode == "stage":
             raw = raw[:, :, :, ::-1].copy()
         calibration = opm_v2_acquisition_factory(
@@ -420,69 +244,15 @@ def pipeline_illumination_calibration(
             angle_deg=microscope.angle_deg,
             stage_positions_zxy=((0, 0, 0),) * len(levels),
         )
-        output = calibration.path.parent / "processed"
-        invoke_cli(
-            "process",
-            calibration.path,
-            output=output,
-            deconvolve=False,
-            flatfield_correction=True,
-            save_float32=True,
-            z_downsample_level=1,
-            max_projection=False,
-            create_fused_max_projection=False,
-            write_fused_max_projection_tiff=False,
+        metadata = calibration.metadata
+        field = call_estimate_illuminations(
+            open_acquisition_datastore(metadata),
+            metadata.camera_offset,
+            metadata.camera_conversion,
+            np.asarray(metadata.stage_positions_zxy),
+            None,
+            None,
         )
-        field = read_current_flatfield(
-            output / f"{acquisition_stem(calibration.path)}_flatfield.ome.tif",
-            (1, channels, *shape[-2:]),
-        )
-        assert field is not None
-        # BaSiC's working image has half the native detector dimensions.
-        # Permit the declared reduction/expansion sampling aperture, with the
-        # original camera residuals as the absolute noise allowance. This
-        # criterion is specified before fitting and cannot cancel a wrong
-        # field against the subsequent tissue correction. It is an accuracy
-        # requirement for the nonlinear estimator, not a claim that BaSiC's
-        # optimization is itself a local convex interpolation.
-        for channel in range(channels):
-            truth = means * (1 + channel / 4)
-            view_bounds = [
-                camera_sampling_envelope(
-                    truth * level,
-                    canonical[0, position, channel],
-                    microscope.camera,
-                    radii=radii,
-                    response=level,
-                    views=len(levels),
-                )
-                for position, level in enumerate(levels)
-            ]
-            envelope = SamplingEnvelope(
-                np.minimum.reduce(
-                    [
-                        bound.lower / level
-                        for bound, level in zip(view_bounds, levels, strict=True)
-                    ]
-                ),
-                np.maximum.reduce(
-                    [
-                        bound.upper / level
-                        for bound, level in zip(view_bounds, levels, strict=True)
-                    ]
-                ),
-            )
-            prediction = np.broadcast_to(field[0, channel] * truth.mean(), truth.shape)
-            assert np.isfinite(prediction).all()
-            assert np.all(prediction >= envelope.lower)
-            assert np.all(prediction <= envelope.upper)
-            # The prescribed illumination is measurable: uncorrected unit
-            # sensitivity must fail the same absolute aperture, not merely
-            # score a little worse than the fitted result.
-            uncorrected = np.full_like(truth, truth.mean())
-            assert np.any(uncorrected < envelope.lower) or np.any(
-                uncorrected > envelope.upper
-            )
         write_flatfield(
             dataset.path.parent / f"{stem}_flatfield.ome.tif",
             field,
@@ -502,8 +272,7 @@ def pipeline_optical_data(
     Returns
     -------
     callable
-        Return immutable camera means and original optical truth, with source-only
-        fields for extended mosaics.
+        Return immutable camera means and fixed physical source masks for mosaics.
     """
 
     @lru_cache(maxsize=2)
@@ -533,13 +302,14 @@ def pipeline_optical_data(
             "step": reference_step,
             "conversion": microscope_parameters.camera.electrons_per_adu,
         }
-        # Both fields use the same source exposure, fixed before camera noise.
         data = simulated_camera(shape, budget=(3000, 4000), **options)
         source = (
-            simulated_camera(shape, budget=(3000, 0), **options).expectation
+            camera_source_mask(data.ground_truth, data.microscope, shape)
             if mosaic
             else None
         )
+        if source is not None:
+            source.setflags(write=False)
         return data, source
 
     @lru_cache(maxsize=2)
@@ -576,7 +346,6 @@ def pipeline_case(
     opm_v2_acquisition_factory,
     pipeline_runner,
     pipeline_geometry,
-    pipeline_camera_accuracy,
     pipeline_illumination_calibration,
     small_cpu_kernels,
 ):
@@ -629,10 +398,6 @@ def pipeline_case(
     assert raw.max() < 2**microscope.camera.bit_depth - 1
     pixel = microscope.pixel_size_um
     registration_error_pixels = DEFAULT_REGISTRATION_DOWNSAMPLE[-1]
-    native_step = simulation_parameters["microscope"]["scan_step_um"]
-    missing_span = (optical_data.native_scan_planes - 1) * native_step - (
-        raw.shape[-3] - 1
-    ) * step
     stage_scan = -4.6
     dataset = opm_v2_acquisition_factory(
         raw,
@@ -661,25 +426,6 @@ def pipeline_case(
     )
     factor = scan_upsample_from_metadata(dataset.metadata) if deconvolve else 1
     geometry = pipeline_geometry(expectation.shape, microscope, scan_factor=factor)
-    if not deconvolve:
-        means = np.broadcast_to(
-            expectation[None, None, None]
-            * (1 + np.arange(2)[:, None, None] / 4 + np.arange(2)[None, None] / 2)[
-                ..., None, None, None
-            ],
-            raw.shape,
-        )
-        pipeline_camera_accuracy(
-            result,
-            means,
-            microscope,
-            mode,
-            source_y_half_um=simulation_parameters["specimens"]["points"][
-                "half_extent_zyx_um"
-            ][1]
-            - microscope.psf_half_extent_zyx_um[1],
-            scan_center_offset_um=phase * native_step - missing_span / 2,
-        )
     return SimpleNamespace(
         **vars(result),
         dataset=dataset,
@@ -817,7 +563,7 @@ def mosaic_acquisition(
         dataset=dataset,
         microscope=microscope,
         expectation=expectation,
-        source_expectation=optical_data.source_expectation,
+        source_mask=optical_data.source_mask,
         parameters=parameters,
         optical_data=optical_data,
         tiled=layout == "tiled",

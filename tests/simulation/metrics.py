@@ -103,14 +103,11 @@ def camera_volume_samples(
     )
 
 
-def camera_object_apertures(
-    ground_truth, microscope, shape, *, camera_offset_zyx_um=(0, 0, 0)
-):
-    """Select source and background camera apertures from original physical axes.
+def camera_source_mask(ground_truth, microscope, shape):
+    """Select the fixed source region from original physical axes.
 
     The finite known object's PSF-eroded interior and Rayleigh-radius emitter
-    neighborhoods are fixed independently of reconstructed values. Pointwise
-    bounds on the complete interior cover every detector row and column.
+    neighborhoods are fixed independently of reconstructed values.
     """
     from tests.simulation.forward_model import camera_psf
 
@@ -119,10 +116,8 @@ def camera_object_apertures(
     x, y, z = get_skewed_coords(shape, pixel, step, angle)
     center = camera_grid_center(shape, pixel, step, microscope.angle_deg)
     coordinates = tuple(
-        coordinate - midpoint + offset
-        for coordinate, midpoint, offset in zip(
-            (z, y, x), center, camera_offset_zyx_um, strict=True
-        )
+        coordinate - midpoint
+        for coordinate, midpoint in zip((z, y, x), center, strict=True)
     )
     radius = 0.61 * microscope.wavelength_um / microscope.numerical_aperture
     interior = np.ones(shape, bool)
@@ -179,9 +174,5 @@ def camera_object_apertures(
             ),
         )
     source = interior & (distance <= radius)
-    background = interior & (distance >= 2 * radius)
-    if not source.any() or not background.any():
-        raise ValueError("The physical camera field must acquire source and background")
-    yield source
-    yield background
-    yield interior
+    assert source.any(), "The physical camera field must acquire the source"
+    return source
