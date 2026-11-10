@@ -20,14 +20,16 @@ Numerical sample sweeps live in focused units. The 24 noisy RLGC cases cover
 line pairs and spheres at three photon budgets, native and coarse scan spacing,
 and whole 50-plane or tiled 200-plane acquisitions. Illumination profiles and
 the two tiled core sizes are balanced across those cases. Eight noisy deskew
-cases retain both scan modes, specimen types and scan spacings.
+cases retain whole/tiled layouts, specimen types and scan spacings.
 
 Five main writer-backed numerical integrations cover two large specimens, two
 mosaics and one calibrated multi-timepoint, multi-channel reconstruction. They
 exercise fixed and automatically planned chunks, whole and tiled RLGC, both scan
 modes, fitted illumination, registration and fusion. Separate focused tests
-cover stage placement, ROI export, storage and resume behavior without repeating
-the numerical sample sweeps. The manual GPU science selection includes all 24
+cover stage placement and ROI export without repeating the numerical sample sweeps.
+Storage and checkpoint checks use CPU processing; GPU command checks exercise
+illumination, deconvolution or fusion, including registration. The manual GPU
+science selection includes all 24
 noisy RLGC units and the five main numerical integrations; the full suite also
 runs the focused workflow checks.
 

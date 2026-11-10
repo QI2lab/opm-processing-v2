@@ -159,6 +159,13 @@ def roi_run(tmp_path: Path, opm_v2_acquisition_factory, roi_camera_scene):
         roi=roi,
         roi_path=roi_path,
         output_dir=tmp_path / "sample_roi",
+        options={
+            "acquisition": metadata,
+            "roi_selection": roi,
+            "output_dir": tmp_path / "sample_roi",
+            "max_projection": False,
+            "create_fused_max_projection": False,
+        },
         truth=scene,
     )
 
