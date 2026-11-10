@@ -140,7 +140,6 @@ def simulated_camera(
     """
     from tests.simulation.camera import digitize
 
-    # Reuse all seven exposure levels in the multi-position ROI workflows.
     @lru_cache(maxsize=8)
     def optical_data(
         shape,
@@ -150,25 +149,16 @@ def simulated_camera(
         integration=False,
         illumination_profile="uniform",
         step=0.4,
-        conversion=0.25,
         geometry="oblique",
-        exposure=1.0,
         budget=None,
     ):
-        """Reuse immutable optical formation independently of detector noise."""
+        """Reuse unit-exposure optics independently of electronic gain and noise."""
         scene = independent_photon_scene_factory(
             kind,
             large=large,
             integration_scan_planes=shape[0] if integration else None,
         )
-        microscope = replace(
-            microscope_parameters,
-            scan_step_um=step,
-            camera=replace(
-                microscope_parameters.camera,
-                electrons_per_adu=conversion,
-            ),
-        )
+        microscope = replace(microscope_parameters, scan_step_um=step)
         expectation = forward_model(
             scene.density,
             Acquisition(
@@ -177,7 +167,6 @@ def simulated_camera(
                 geometry=geometry,
                 illumination_profile=illumination_profile,
                 illumination_half_width_um=scene.illumination_half_width_um,
-                exposure=exposure,
                 camera_photon_budget=(
                     tuple(simulation_parameters["photon_budgets"][0])
                     if budget is None
@@ -205,6 +194,8 @@ def simulated_camera(
         budget=None,
     ):
         """Digitize the shared optical means with the requested detector seed."""
+        if not np.isfinite(exposure) or exposure < 0:
+            raise ValueError("Exposure must be finite and nonnegative")
         if shape is None:
             shape = (
                 simulation_parameters["whole_scan_planes"],
@@ -243,11 +234,15 @@ def simulated_camera(
             integration=integration,
             illumination_profile=illumination_profile,
             step=step,
-            conversion=conversion,
             geometry=geometry,
-            exposure=exposure,
             budget=budget,
         )
+        microscope = replace(
+            microscope,
+            camera=replace(microscope.camera, electrons_per_adu=conversion),
+        )
+        if exposure != 1:
+            expectation = freeze_metadata(expectation * exposure)
         raw = digitize(expectation, microscope.camera, seed=seed)
         return CameraObservation(
             ground_truth=scene,
