@@ -381,6 +381,14 @@ def test_expanded_cache_uses_initial_settings_and_restores_final_limits(
         },
         "retries": 1,
     }
+    with pytest.raises(ValueError, match="settings do not match"):
+        reopened.registration(
+            fusion.data,
+            configuration={
+                **initial,
+                "phase_registration": "phase-supported-periodic-aliases-and-upstream-normalization-v12",
+            },
+        )
     fusion.registration_retries = 0
     with pytest.raises(ValueError, match="settings do not match"):
         fusion.load_pairwise_metrics()

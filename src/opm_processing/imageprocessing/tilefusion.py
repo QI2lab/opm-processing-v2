@@ -3890,7 +3890,7 @@ class TileFusion:
             "overlap_roi": "depth-context-lateral-fallback-axial-contrast-refinement-v4",
             "downsample": ("upstream-block-reduce-with-adaptive-zyx-ssim-support-v2"),
             "phase_registration": (
-                "phase-supported-periodic-aliases-and-upstream-normalization-v12"
+                "phase-original-intensities-periodic-aliases-upstream-normalization-v13"
             ),
             "score": ("retained-full-resolution-grid-ssim-supported-window-v8"),
             "downsample_factors_zyx": list(self.downsample_factors),
