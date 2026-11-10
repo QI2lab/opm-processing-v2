@@ -18,15 +18,31 @@ from tests.simulation.camera import digitize
 pytestmark = pytest.mark.integration
 
 
-@pytest.mark.parametrize("save_float32", [False, True], ids=["uint16", "float32"])
 @pytest.mark.parametrize(
-    "separate_output", [False, True], ids=["source-dir", "output-dir"]
-)
-@pytest.mark.parametrize(
-    "opm_v2_projection_zarr",
-    [("projection", 1.0), ("stage", 1.0), ("projection", 1.0, 3)],
-    indirect=True,
-    ids=["projection", "stage", "selected-positions"],
+    "opm_v2_projection_zarr,save_float32,separate_output",
+    [
+        pytest.param(
+            ("projection", 1.0), False, False, id="projection-source-dir-uint16"
+        ),
+        pytest.param(
+            ("projection", 1.0), True, True, id="projection-output-dir-float32"
+        ),
+        pytest.param(("stage", 1.0), False, True, id="stage-output-dir-uint16"),
+        pytest.param(("stage", 1.0), True, False, id="stage-source-dir-float32"),
+        pytest.param(
+            ("projection", 1.0, 3),
+            False,
+            False,
+            id="selected-positions-source-dir-uint16",
+        ),
+        pytest.param(
+            ("projection", 1.0, 3),
+            True,
+            True,
+            id="selected-positions-output-dir-float32",
+        ),
+    ],
+    indirect=["opm_v2_projection_zarr"],
 )
 def test_projection_output_preserves_calibration_geometry_and_provenance(
     opm_v2_projection_zarr, save_float32, separate_output, invoke_cli

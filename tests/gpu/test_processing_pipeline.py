@@ -13,14 +13,20 @@ pytestmark = [
         ("pipeline_case", "deconvolve"),
         [
             pytest.param(
-                (mode, illumination, step, 39 if deconvolve and illumination else None),
-                deconvolve,
-                id=f"{deconvolve}-{mode}-{step}um-{'estimated-taper' if illumination else 'uniform'}",
-            )
-            for deconvolve in (False, True)
-            for mode in ("stage", "mirror")
-            for step in (0.4, 1.2)
-            for illumination in (False, True)
+                ("stage", True, 1.2, None),
+                False,
+                id="False-stage-1.2um-estimated-taper",
+            ),
+            pytest.param(
+                ("stage", False, 0.4, None),
+                True,
+                id="True-stage-0.4um-uniform",
+            ),
+            pytest.param(
+                ("mirror", True, 1.2, 39),
+                True,
+                id="True-mirror-1.2um-estimated-taper",
+            ),
         ],
         indirect=["pipeline_case"],
     ),

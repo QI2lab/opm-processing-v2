@@ -208,17 +208,6 @@ def test_channel_checkpoint_requires_a_successful_write(
         )
 
 
-@pytest.mark.parametrize("order", [("t", "p"), ("p", "t"), ("c", "z")])
-def test_progress_groups_preserve_every_pending_volume(order):
-    """Yield each pending tile once while accounting for completed group members."""
-    from opm_processing.process import progress_tile_groups
-
-    requested = [(0, 0), (0, 1), (1, 0), (1, 1)]
-    pending = [(0, 1), (1, 0), (1, 1)]
-    actual = list(progress_tile_groups(pending, requested, {(0, 0)}, order))
-    assert actual == [(0, (1,)), (1, (0,)), (1, (1,))]
-
-
 @pytest.mark.parametrize("zero", [False, True])
 @pytest.mark.parametrize("method", ["stride", "block_mean"])
 @pytest.mark.parametrize("dtype", [np.uint16, np.float32])

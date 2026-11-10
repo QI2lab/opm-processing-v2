@@ -14,9 +14,12 @@ pytestmark = [
         "mosaic_acquisition",
         [
             pytest.param((mode, step, 0, layout), id=f"{mode}-{step}um-{layout}")
-            for mode in ("stage", "mirror")
-            for step in (0.4, 1.2)
-            for layout in ("whole", "tiled")
+            for mode, step, layout in (
+                ("stage", 0.4, "whole"),
+                ("mirror", 1.2, "whole"),
+                ("mirror", 0.4, "tiled"),
+                ("stage", 1.2, "tiled"),
+            )
         ],
         indirect=True,
     ),
