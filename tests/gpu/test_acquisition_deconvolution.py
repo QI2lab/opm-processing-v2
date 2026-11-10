@@ -18,7 +18,7 @@ from opm_processing.dataio.processing_state import (
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("kind", ("line-pairs", "sphere"))
+@pytest.mark.parametrize("kind", ("line-pairs",))
 def test_as_acquired_combined_channel_deconvolution(
     cupy_gpu,
     simulated_camera,

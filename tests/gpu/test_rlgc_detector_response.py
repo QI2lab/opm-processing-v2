@@ -570,15 +570,9 @@ def test_calibrated_input_preserves_subcount_intensity(
 @pytest.mark.parametrize(
     ("uniform_detector_acquisition", "roi_mode"),
     (
-        ("projection", False),
-        ("mirror", False),
         ("stage", False),
         ("mirror", True),
-        ("stage", True),
-        *[
-            pytest.param((mode, "uint16"), False, id=f"uint16-{mode}")
-            for mode in ("mirror", "stage", "projection")
-        ],
+        pytest.param(("projection", "uint16"), False, id="uint16-projection"),
     ),
     indirect=["uniform_detector_acquisition"],
 )

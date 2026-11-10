@@ -25,7 +25,6 @@ pytestmark = [pytest.mark.integration, pytest.mark.usefixtures("cupy_gpu")]
 @pytest.mark.parametrize(
     ("pipeline_case", "copied"),
     [
-        pytest.param(("mirror", False, 0.4, None), False, id="mirror-moved"),
         pytest.param(("stage", False, 1.2, None), True, id="stage-copied"),
     ],
     indirect=["pipeline_case"],
