@@ -10,10 +10,15 @@ coordinate-repair utilities, legacy adapters and PTV are outside this suite.
 Use shared fixtures in `tests/fixtures` for data, acquisition settings, optical
 models, storage and cleanup. Reuse those fixtures and parameterize settings rather
 than adding parallel workflow builders. Keep mutable data function-scoped and
-cache only expensive immutable optics, keyed by their complete physical settings.
+cache expensive immutable optics and fixed camera realizations, keyed by their
+complete physical settings.
 Call production functions directly; do not add small pass-through helpers,
 single-use wrappers or generalized test frameworks. Keep tests and NumPy-style
 docstrings concise. Do not import helpers from test modules or `conftest.py`.
+Keep workflow tests focused on their interaction: durable pixels, coordinates,
+selection, resume and storage. Put detailed numerical acceptance in the shared
+core processing cases. Do not replay the processing pipeline or rebuild
+camera-space envelopes in every workflow to check the same operation again.
 
 Unit tests use known analytical objects, independently blurred scenes or explicitly
 prescribed metadata and decision states. Use actual library operators and installed
@@ -57,8 +62,9 @@ Scientific assertions must not fit reconstruction gain or shifts, select regions
 from reconstructed intensities, substitute production output for truth, or relax
 accuracy to match a failure. Use independent camera realizations, fixed physical
 source/background apertures and camera-space recovery/noise measurements.
-Likelihood is an accuracy measure, not a held-out stopping rule. Resolution uses directional
-PSF first minima (Rayleigh); tolerances follow precision, sampling or stated error
+Simulator-truth likelihood evaluates accuracy and never selects production stopping.
+RLGC retains its held-out acquired-prediction KL stopping rule. Resolution uses
+directional PSF first minima (Rayleigh); tolerances follow precision, sampling or stated error
 bounds. Do not use raw camera-count variance as an acceptance distribution for
 nonlinear, correlated reconstruction estimates. Geometry and photon-volume
 checks use the supported 30-degree convention.
@@ -72,16 +78,18 @@ initialization and random halves; default tiled RLGC continues them to the lates
 first-local-KL accepted iteration without replay. Test real allocation fallback
 with CUDA memory-pool limits, not fabricated out-of-memory exceptions.
 
-RLGC reconstruction quality and stopping evaluations use the shared noisy
-line-pair and sphere scenes, with native and sparse scan sampling in whole-volume
+`tests/gpu/conftest.py` scopes the early hardware gate and module cleanup to CUDA tests.
+RLGC and CuPy/cuCIM pair-registration tests belong in `tests/gpu`; CPU workflows
+cover deskew, geometry, cached placement and CPU fusion. RLGC quality evaluations
+use the shared noisy line-pair and sphere scenes, with native and sparse scan sampling in whole-volume
 and tiled layouts.
 
 Large-scene units and writer-backed integrations share the same physical camera
 simulation. Require foreground across multiple observed tile borders and verify
 actual Ryomen execution, shifted final deskew crops and callback continuation
 without replay. Check dark-noise variance in known optical vacuum, excluding
-spatially varying fluorescent background. Noisy deskew samples use certified
-sampling/noise intervals. Reconstruction checks use independent optical truth,
+spatially varying fluorescent background. Noisy deskew samples use bounds from
+the original local camera samples. Reconstruction checks use independent optical truth,
 KL recovery and measured noise behavior, without unvalidated six-sigma photon
 totals or chi-square noise-floor gates.
 
@@ -107,9 +115,21 @@ uv sync --group dev
 uv pip install --no-deps "opm-v2 @ git+https://github.com/QI2lab/opm-v2@ae059d962835520bf2c1b37edbb335bf5e617b23"
 ```
 
-Update producer and writer pins together. Hosted CI runs CPU tests only. Relevant
-CUDA changes also need targeted GPU units/integrations on hardware with
-`OPM_REQUIRE_GPU=1`; only unavailable hardware may skip. Report CPU/CUDA results
-separately and honor any session restriction on reruns. Do not hide failures with
-skip/xfail. Runtime/memory measurements and local investigation reports belong in
-ignored `diagnostics/` or `.tmp/`, outside pytest and published documentation.
+Update producer and writer pins together. Hosted CI runs the explicit CPU core
+and native-writer selection in `.github/workflows/ci.yml`; Linux also runs one
+real illumination fit. RLGC and pair registration are GPU-only. The manual Science
+validation workflow provides `cpu-science`, `gpu-science`, `full-cpu`, and `full-gpu` profiles.
+Supply the JSON label or labels of an existing runner with qualified RAM and
+scratch capacity; standard hosted capacity has not been validated for science
+profiles. GPU profiles require the qualified Python/CUDA/cuCIM environment on
+the runner's PATH, including test/producer dependencies and the Windows cuCIM
+setup where applicable. They install the current checkout editable without
+replacing CUDA libraries. CUDA tests skip when CuPy or a CUDA device is unavailable;
+numerical and allocation errors remain failures. Science profiles serialize to
+avoid sharing a GPU concurrently.
+Both workflows retain JUnit and coverage XML as run artifacts, including failures.
+Relevant CUDA changes require a real GPU validation result before merge.
+Report CPU/CUDA results separately and honor session restrictions on reruns.
+Do not hide numerical failures with skip/xfail. Runtime/memory measurements and local
+investigation reports belong in ignored `diagnostics/` or `.tmp/`, outside
+pytest and published documentation.

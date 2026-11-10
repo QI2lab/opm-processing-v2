@@ -175,10 +175,11 @@ docstring-code-format = true
 minversion = "7.0"
 testpaths = ["tests"]
 addopts = "--strict-markers -p no:cacheprovider -p fakefs"
+log_level = "INFO"
 markers = [
     "unit: isolated numerical or decision behavior with an independent expected result",
     "integration: interacting processing and storage components with independently checked outputs",
-    "cpu: correctness tests using CPU execution, suitable for GitHub-hosted runners",
+    "cpu: correctness tests using CPU execution",
     "gpu: correctness tests that execute CUDA code on a real NVIDIA GPU",
 ]
 filterwarnings = [

@@ -26,6 +26,7 @@ jobs:
       github.event_name != 'pull_request' ||
       (github.event.action != 'opened' && github.event.pull_request.draft == false)
     runs-on: ${{ matrix.platform }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -54,8 +55,52 @@ jobs:
           PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
           QT_QPA_PLATFORM: offscreen
           MPLBACKEND: Agg
-          CUDA_VISIBLE_DEVICES: ""
-        run: python -m pytest tests/cpu --strict-markers -p pytest_cov --color=yes --cov --cov-report=xml --cov-report=term-missing
+          CUDA_VISIBLE_DEVICES: "-1"
+        run: >-
+          python -m pytest
+          tests/cpu/test_camera.py
+          tests/cpu/test_camera_likelihood.py
+          tests/cpu/test_coordinate_origins.py
+          tests/cpu/test_deconvolution_metadata.py
+          tests/cpu/test_fusion_storage.py
+          tests/cpu/test_opm_simulation.py
+          tests/cpu/test_opmpsf.py
+          tests/cpu/test_opmtools.py
+          tests/cpu/test_physical_forward_model.py
+          tests/cpu/test_position_coordinate_metadata.py
+          tests/cpu/test_processing_state.py
+          tests/cpu/test_registration_geometry.py
+          tests/cpu/test_registration_optimization.py
+          tests/cpu/test_registration_periodic.py
+          tests/cpu/test_registration_retries.py
+          tests/cpu/test_tilefusion.py
+          "tests/cpu/test_opm_v2_dataset.py::test_projection_output_preserves_calibration_geometry_and_provenance[projection-source-dir-uint16]"
+          "tests/cpu/test_opm_v2_dataset.py::test_projection_output_preserves_calibration_geometry_and_provenance[stage-source-dir-float32]"
+          "tests/cpu/test_opm_v2_dataset.py::test_projection_output_preserves_calibration_geometry_and_provenance[selected-positions-output-dir-float32]"
+          tests/cpu/test_opm_v2_dataset.py::test_projection_cli_resume_preserves_completed_pixels
+          -k "not test_large_noisy_deskew_preserves_scientific_bounds_across_tiles and not test_saved_deskew_retains_complete_z_extent"
+          --strict-markers -p pytest_cov --color=yes --cov --cov-report=xml --cov-report=term-missing --junitxml=cpu-core.xml
+
+      - name: Test real illumination estimation
+        if: runner.os == 'Linux'
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+          QT_QPA_PLATFORM: offscreen
+          MPLBACKEND: Agg
+          CUDA_VISIBLE_DEVICES: "-1"
+        run: >-
+          python -m pytest
+          "tests/cpu/test_illumination_processing.py::test_real_estimator_predicts_known_detector_illumination[maximum]"
+          --strict-markers -p pytest_cov --color=yes --cov --cov-append --cov-report=xml --cov-report=term-missing --junitxml=cpu-estimator.xml
+
+      - name: Preserve test reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: cpu-${{ matrix.platform }}
+          path: |
+            cpu-*.xml
+            coverage.xml
 
       - name: Coverage
         uses: codecov/codecov-action@v7
