@@ -97,7 +97,6 @@ def test_roi_deconvolves_recorded_sampling(
     stages = []
     deconvolved = []
     predictions = []
-    deskew_inputs = []
     seeds = []
     corrections = []
     measurements = []
@@ -179,7 +178,6 @@ def test_roi_deconvolves_recorded_sampling(
     def observe_deskew(data, *args, **kwargs):
         """Verify deskew receives the reconstruction just returned by RLGC."""
         np.testing.assert_array_equal(data, deconvolved[-1])
-        deskew_inputs.append(data.copy())
         result = deskew(data, *args, **kwargs)
         stages.append("deskew")
         return result
@@ -282,8 +280,8 @@ def test_roi_deconvolves_recorded_sampling(
             atol=1e-6,
         )
     factor = round(case.microscope.scan_step_um / 0.4)
-    for (record, _seed), recovered, retained, raw_crop in zip(
-        seeds, deconvolved, deskew_inputs, raw_crops, strict=True
+    for (record, _seed), recovered, raw_crop in zip(
+        seeds, deconvolved, raw_crops, strict=True
     ):
         start, stop, x0, x1 = record["skewed_bounds_sx"]
         assert (start, stop, x0, x1) == raw_crop
@@ -292,7 +290,6 @@ def test_roi_deconvolves_recorded_sampling(
             case.dataset.raw_data.shape[-2],
             x1 - x0,
         )
-        np.testing.assert_array_equal(retained, recovered)
     cropped = open_position_collection(tiles)
     for position, (recovered, raw_crop, measured) in enumerate(
         zip(deconvolved, raw_crops, predictions, strict=True)
@@ -301,11 +298,7 @@ def test_roi_deconvolves_recorded_sampling(
         x0 += position * case.parameters["tile_offset_x_pixels"]
         x1 += position * case.parameters["tile_offset_x_pixels"]
         expected_native = case.expectation[start:stop, :, x0:x1]
-        baseline = measured["input_prediction"]
-        if baseline is None:
-            # Sparse progress is measured on acquired planes against the
-            # actual production initializer, without test-side interpolation.
-            baseline = measured["initial_prediction"]
+        baseline = measured["baseline_prediction"]
         assert (
             kl_div(expected_native, measured["prediction"]).sum()
             < kl_div(expected_native, baseline).sum()

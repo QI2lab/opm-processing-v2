@@ -68,7 +68,7 @@ def test_as_acquired_combined_channel_deconvolution(
     def observe(*args, **kwargs):
         """Retain the real reconstruction to score against simulated camera means."""
         result = reconstruct(*args, **kwargs)
-        reconstructed.append(result.copy())
+        reconstructed.append(result)
         return result
 
     monkeypatch.setattr(rlgc, "rlgc", observe)
@@ -92,7 +92,7 @@ def test_as_acquired_combined_channel_deconvolution(
     # with both predictions evaluated on the acquired camera planes.
     assert (
         kl_div(observed.expectation, measured["prediction"]).sum()
-        < kl_div(observed.expectation, measured["initial_prediction"]).sum()
+        < kl_div(observed.expectation, measured["baseline_prediction"]).sum()
     )
     output = dataset.path.parent / "as_acquired_decon_deskewed.ome.zarr"
     collection = open_position_collection(output)

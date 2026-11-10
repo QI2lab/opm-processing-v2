@@ -36,16 +36,6 @@ class CameraObservation:
 
 
 @dataclass(frozen=True)
-class OpticalSetup:
-    """Immutable calibrated PSF samples."""
-
-    microscope: Microscope
-    psf: np.ndarray
-    axes: tuple[np.ndarray, ...]
-    irradiance: np.ndarray
-
-
-@dataclass(frozen=True)
 class AnalyticalCameraField:
     """Known analytical concentration on an immutable physical Cartesian grid."""
 
@@ -355,21 +345,15 @@ def cartesian_registration_pair(
 
 
 @pytest.fixture(scope="session")
-def optical_setup(microscope_parameters):
-    """Share one calibrated PSF between profiles, operators and optical specimens."""
+def optical_psf(microscope_parameters):
+    """Share one immutable calibrated PSF between optical operator units."""
     microscope = replace(
         microscope_parameters,
         fine_spacing_um=0.04,
         psf_half_extent_zyx_um=(3.0, 2.0, 2.0),
     )
-    axes, field = emission_psf(microscope, microscope.fine_spacing_um)
     psf, _ = camera_psf(microscope)
-    return OpticalSetup(
-        microscope=microscope,
-        psf=freeze_metadata(psf.astype(np.float32)),
-        axes=freeze_metadata(axes),
-        irradiance=freeze_metadata(field),
-    )
+    return freeze_metadata(psf.astype(np.float32))
 
 
 @pytest.fixture(scope="session")
@@ -708,7 +692,6 @@ def discrete_optical_case(factor, nonuniform):
         response=response,
         truth=truth,
         expectation=expectation,
-        boundary=boundary,
     )
 
 
@@ -784,17 +767,9 @@ def production_point_acquisition(
         )
         kernel = kernel[region]
         kernels[samples] = kernel / kernel.sum()
-    kernel, _ = camera_psf(replace(microscope, fine_spacing_um=spacing))
-    region = tuple(
-        slice((n - size) // 2, (n + size) // 2)
-        for n, size in zip(kernel.shape, shape, strict=True)
-    )
-    kernel = kernel[region]
     return SimpleNamespace(
-        microscope=microscope,
         expectations=freeze_metadata(expectations),
         kernels=freeze_metadata(kernels),
-        kernel=freeze_metadata(kernel / kernel.sum()),
     )
 
 

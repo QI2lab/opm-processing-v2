@@ -24,7 +24,8 @@ def production_forward_predictions(monkeypatch, request):
     -------
     list of dict
         One record per public RLGC call, containing actual acquired-grid
-        predictions and the production-selected iteration count.
+        predictions and the production-selected iteration count. The baseline
+        is the same-grid input prediction or the production initializer.
         CPU tests receive an empty list without importing the CUDA solver.
     """
     calls = []
@@ -83,9 +84,9 @@ def production_forward_predictions(monkeypatch, request):
             },
         )
         entry["visits"] += 1
-        if observed.shape == shape and "input_prediction" not in entry:
+        if observed.shape == shape and "baseline_prediction" not in entry:
             values = forward(observed)[region][owned]
-            entry["input_prediction"] = (
+            entry["baseline_prediction"] = (
                 cp.asnumpy(values) if isinstance(values, cp.ndarray) else values.copy()
             )
             del values
@@ -96,7 +97,7 @@ def production_forward_predictions(monkeypatch, request):
         def observe_forward(estimate):
             """Call the actual operator and keep only its two latest predictions."""
             predicted = forward(estimate)
-            if state is None and "initial_prediction" in entry:
+            if state is None and "baseline_prediction" in entry:
                 return predicted
             values = predicted[region][owned]
             captured = (
@@ -104,8 +105,8 @@ def production_forward_predictions(monkeypatch, request):
             )
             if state is not None:
                 entry["history"].append((completed, captured))
-            if completed == 0:
-                entry["initial_prediction"] = captured
+            if completed == 0 and "baseline_prediction" not in entry:
+                entry["baseline_prediction"] = captured
             return predicted
 
         def observe_update(number, estimate):
@@ -165,11 +166,8 @@ def production_forward_predictions(monkeypatch, request):
         accepted = int(stops[-1]) if stops else 0
         record = {
             name: np.zeros(np.shape(image), dtype=np.float32)
-            for name in ("prediction", "initial_prediction")
+            for name in ("prediction", "baseline_prediction")
         }
-        record["input_prediction"] = (
-            np.zeros(np.shape(image), dtype=np.float32) if run["factor"] == 1 else None
-        )
         record["iterations"] = accepted
         record["chunks"] = [
             {
@@ -191,13 +189,7 @@ def production_forward_predictions(monkeypatch, request):
                 final = dict((*entry["history"], entry.get("tail", (-1, None))))[
                     accepted
                 ]
-            for name in (
-                "prediction",
-                "initial_prediction",
-                "input_prediction",
-            ):
-                if record[name] is None:
-                    continue
+            for name in ("prediction", "baseline_prediction"):
                 target = record[name] if np.ndim(image) == 3 else record[name][None]
                 target[entry["destination"]] = (
                     final if name == "prediction" else entry[name]

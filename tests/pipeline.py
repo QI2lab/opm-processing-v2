@@ -148,9 +148,7 @@ def test_qi2lab_acquisition_to_fused_ngff_v05(pipeline_case, deconvolve):
         ):
             time, _position, channel = index
             observed = run["forward"]
-            baseline = observed["input_prediction"]
-            if baseline is None:
-                baseline = observed["initial_prediction"]
+            baseline = observed["baseline_prediction"]
             expected = case.expectation * (1 + time / 4 + channel / 2)
             assert observed["prediction"].shape == expected.shape
             assert (
@@ -302,9 +300,7 @@ def test_large_noisy_scene_acquisition_to_fusion(
                     <= len(chunk["updates"])
                     <= observed["iterations"] + 2
                 )
-            baseline = observed["input_prediction"]
-            if baseline is None:
-                baseline = observed["initial_prediction"]
+            baseline = observed["baseline_prediction"]
             source = case.source[case.sampling_phase :: case.sampling_factor]
             assert source.any()
             assert (
@@ -470,9 +466,7 @@ def test_extended_mosaic_acquisition_to_fusion(
                 seam_scans[boundaries] = True
             expected = case.expectation[..., start : start + shape[-1]]
             predicted = observed["prediction"]
-            baseline = observed["input_prediction"]
-            if baseline is None:
-                baseline = observed["initial_prediction"]
+            baseline = observed["baseline_prediction"]
             assert predicted.shape == expected.shape
             assert kl_div(expected, predicted).sum() < kl_div(expected, baseline).sum()
             source = source_mask[::factor, :, start : start + shape[-1]]

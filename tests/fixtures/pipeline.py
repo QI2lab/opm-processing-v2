@@ -117,7 +117,7 @@ def pipeline_runner(
                 def observe_reconstruction(*args, **kwargs):
                     """Retain actual calibrated reconstructions for physical truth checks."""
                     result = reconstruct(*args, **kwargs)
-                    reconstructions.append(result.copy())
+                    reconstructions.append(result)
                     deconvolution_runs.append(
                         {
                             "input_shape": args[0].shape,

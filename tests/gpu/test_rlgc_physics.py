@@ -26,7 +26,7 @@ pytestmark = pytest.mark.unit
 )
 def test_full_data_rl_update_preserves_uniform_photon_rates(
     cupy_gpu,
-    optical_setup,
+    optical_psf,
     array_backend,
     variance,
     observed_count,
@@ -38,8 +38,8 @@ def test_full_data_rl_update_preserves_uniform_photon_rates(
     # A power-of-two constant field has only a DC Fourier coefficient. This
     # isolates scalar calibration arithmetic from mixed-radix FFT roundoff;
     # nonconstant optical-adjoint tests cover the general convolution operator.
-    shape = tuple(1 << (2 * size).bit_length() for size in optical_setup.psf.shape)
-    convolution = solver._Convolution(optical_setup.psf, shape)
+    shape = tuple(1 << (2 * size).bit_length() for size in optical_psf.shape)
+    convolution = solver._Convolution(optical_psf, shape)
 
     adjoint = partial(convolution, adjoint=True)
     observed = xp.full(shape, observed_count, dtype=xp.float32)
@@ -236,7 +236,7 @@ def test_gc_kl_scores_forward_prediction(
     prediction = production_forward_predictions[-1]
     assert (
         kl_div(initial, prediction["prediction"]).sum()
-        < kl_div(initial, prediction["input_prediction"]).sum()
+        < kl_div(initial, prediction["baseline_prediction"]).sum()
     )
     # Exercise termination with realizable optical data. The deliberately
     # incompatible data above distinguish prediction KL from object KL, but
@@ -309,14 +309,14 @@ def test_gc_stopping_uses_prescribed_fraction_and_change_limits(
 @pytest.mark.parametrize("factor", [1, 3, 4])
 @pytest.mark.parametrize("crop_scan", [None, 5])
 def test_optical_forward_adjoint_matches_scipy(
-    cupy_gpu, optical_setup, aperiodic_registration_object, factor, crop_scan
+    cupy_gpu, optical_psf, aperiodic_registration_object, factor, crop_scan
 ):
     """Check the actual optical operator against independent CPU convolution."""
     cp = cupy_gpu
     solver = importlib.import_module("opm_processing.imageprocessing.rlgc")
     # Displace the calibrated optical origin by one scan sample to ensure the
     # adjoint test also detects using the unflipped, asymmetric PSF.
-    psf = np.pad(optical_setup.psf, ((2, 0), (0, 0), (0, 0)))
+    psf = np.pad(optical_psf, ((2, 0), (0, 0), (0, 0)))
     psf /= psf.sum()
     shape = (31, 17, 19)
     selection = (slice(None, None, factor), slice(None), slice(None))
@@ -496,11 +496,7 @@ def test_tiled_gc_recovers_noisy_extended_objects_without_rl_noise(
     )
     ordinary_prediction = production_forward_predictions[-1]["prediction"]
     predicted = measured["prediction"]
-    baseline_prediction = measured["input_prediction"]
-    if baseline_prediction is None:
-        # Acquired-plane accuracy compares progress from the production
-        # initializer, rather than a separately interpolated/reblurred image.
-        baseline_prediction = measured["initial_prediction"]
+    baseline_prediction = measured["baseline_prediction"]
     aperture = source[::factor]
     regions = (
         (("source", np.ones(source.shape[0], dtype=bool)),)
