@@ -25,6 +25,7 @@ from opm_processing.dataio.processing_state import (
     processing_state_path,
 )
 from opm_processing.imageprocessing.coordinates import STAGE_COORDINATE_VERSION
+from opm_processing.imageprocessing.opmtools import deskew_shape_estimator
 from opm_processing.process import (
     app,
     is_empty_tile,
@@ -224,7 +225,6 @@ def test_live_processing_preserves_original_optical_emitters(
     expected_dtype,
     roi_camera_scene,
     assert_roi_point_accuracy,
-    deskew_uniform_expectation,
     relocate_acquisition,
     live_mode,
 ) -> None:
@@ -268,7 +268,15 @@ def test_live_processing_preserves_original_optical_emitters(
     output = open_position_collection(root / "live_deskewed.ome.zarr")
     actual = output.arrays[0][0, 0].read().result()
     assert np.dtype(actual.dtype) == expected_dtype
-    assert actual.shape == deskew_uniform_expectation(raw.shape[-3:], 1).shape
+    expected_shape, *_ = deskew_shape_estimator(
+        raw.shape[-3:],
+        theta=scene.microscope.angle_deg,
+        distance=scene.microscope.scan_step_um,
+        pixel_size=scene.microscope.pixel_size_um,
+        crop_after_deskew=False,
+        downsample_factor=1,
+    )
+    assert actual.shape == tuple(expected_shape)
     stage_anchor = np.asarray((-30.0, -100.0, 200.0))
     scan_extent = round((raw.shape[-3] - 1) * scene.microscope.scan_step_um, 3)
     assert_roi_point_accuracy(

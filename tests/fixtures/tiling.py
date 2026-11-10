@@ -169,35 +169,6 @@ def deskew_analytic_truth(deskew_field):
 
 
 @pytest.fixture
-def deskew_uniform_expectation(simulation_parameters):
-    """Provide exact full-image photon truth for a uniform calibrated camera field."""
-
-    def evaluate(input_shape, photons, *, factor=1, dtype=np.uint16):
-        """Apply the known photon-volume Jacobian and independent physical aperture."""
-        calibration = simulation_parameters["microscope"]
-        geometry = {
-            "theta": calibration["angle_deg"],
-            "distance": calibration["scan_step_um"],
-            "pixel_size": calibration["pixel_size_um"],
-        }
-        step = geometry["distance"] / geometry["pixel_size"]
-        shape, *_ = deskew_shape_estimator(
-            input_shape, **geometry, crop_after_deskew=False, downsample_factor=factor
-        )
-        shape = tuple(shape)
-        support = deskew_coverage(
-            input_shape, shape, **geometry, downsample_factor=factor
-        )
-        expected = np.zeros(shape, np.float64)
-        expected[..., : input_shape[2]] = support[..., None] * (
-            float(photons) * 2 / step
-        )
-        return expected.astype(dtype)
-
-    return evaluate
-
-
-@pytest.fixture
 def deskew_roundoff(factor):
     """Bound two float32 weighted sums and their final intensity multiplication.
 
@@ -221,11 +192,16 @@ def deskew_output(deskew_field, factor):
 
 
 @pytest.fixture
-def deskew_mosaic(deskew_field, deskew_output, factor):
+def deskew_mosaic(deskew_field, factor):
     """Provide independent coverage and fluorescence for overlapping oblique tiles."""
     data = deskew_field.data
     gain = 2 / deskew_field.step
-    response_shape = deskew_output[1].shape
+    response_shape, *_ = deskew_shape_estimator(
+        data.shape,
+        **deskew_field.geometry,
+        crop_after_deskew=False,
+        downsample_factor=factor,
+    )
     support = deskew_coverage(
         data.shape, response_shape, **deskew_field.geometry, downsample_factor=factor
     )
