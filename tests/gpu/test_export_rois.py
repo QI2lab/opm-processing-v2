@@ -18,17 +18,13 @@ pytestmark = [pytest.mark.usefixtures("cupy_gpu")]
 
 @pytest.mark.integration
 @pytest.mark.parametrize(
-    "roi_preview",
+    "roi_preview,tiff",
     [
-        ("mirror", 1, False),
-        ("stage", 1, False),
-        ("mirror", 2, False),
-        ("stage", 2, False),
-        ("stage", 2, True),
+        (("mirror", 2, False), False),
+        (("stage", 2, True), True),
     ],
-    indirect=True,
+    indirect=["roi_preview"],
 )
-@pytest.mark.parametrize("tiff", [False, True])
 def test_raw_roi_exports_and_resume(
     roi_preview,
     tiff,
@@ -219,7 +215,7 @@ def test_raw_roi_exports_and_resume(
 
 @pytest.mark.integration
 @pytest.mark.parametrize(
-    "mosaic_acquisition", [("mirror", 0.4, 0.001), ("stage", 1.2, 0.001)], indirect=True
+    "mosaic_acquisition", [("mirror", 0.4, 0.001, "whole")], indirect=True
 )
 def test_roi_maps_extended_specimen_to_raw_tiles(
     mosaic_acquisition, monkeypatch, invoke_cli

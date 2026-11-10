@@ -49,8 +49,8 @@ def roi_preview(
         dataset.path,
         acquisition=dataset.metadata,
         deconvolve=False,
-        max_projection=True,
-        create_fused_max_projection=positions > 1,
+        max_projection=not registered,
+        create_fused_max_projection=positions > 1 and not registered,
         save_float32=True,
         z_downsample_level=1,
     )

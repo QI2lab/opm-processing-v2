@@ -333,7 +333,8 @@ def stage_placement_acquisition(
     pixel_um = simulation_parameters["microscope"]["pixel_size_um"]
     angle = simulation_parameters["microscope"]["angle_deg"]
     step_um = simulation_parameters["microscope"]["scan_step_um"]
-    scans = simulation_parameters["tiled_scan_planes" if crop else "whole_scan_planes"]
+    # Rectangular cropping needs a scan longer than the camera's Y shear.
+    scans = simulation_parameters["whole_scan_planes"] * (2 if crop else 1)
     camera_height, camera_width = simulation_parameters["camera_shape_yx"]
     theta = np.deg2rad(angle)
     bead_zyx_um = pixel_um * np.rint(
@@ -376,7 +377,6 @@ def stage_placement_acquisition(
         microscope,
     )
     raw = np.zeros((1, 3, 1, scans, camera_height, camera_width), dtype=np.uint16)
-    means = np.empty(raw.shape, dtype=np.float32)
     frames = []
     for position, stage_z_um in enumerate(stage_z_values_um):
         sensor_axes = (
@@ -384,14 +384,12 @@ def stage_placement_acquisition(
             nominal_axes[1] - stage_z_um / np.sin(theta),
             column_axis,
         )
-        means[0, position, 0] = forward_model(
+        means = forward_model(
             density,
             Acquisition(scene.axes, sensor_axes=sensor_axes, output="expectation"),
             microscope,
         )
-        raw[0, position, 0] = digitize(
-            means[0, position, 0], microscope.camera, seed=position
-        )
+        raw[0, position, 0] = digitize(means, microscope.camera, seed=position)
         for scan in range(scans):
             if mode == "stage":
                 # Forward acquisition: the stationary plane sees the specimen
@@ -451,7 +449,6 @@ def stage_placement_acquisition(
         camera_conversion=microscope.camera.electrons_per_adu,
         stage_positions_zxy=tuple((value, 0.0, 0.0) for value in stage_z_values_um),
     )
-    dataset.means = means
     dataset.ground_truth = scene
     dataset.stage_z_values_um = stage_z_values_um
     dataset.bead_zyx_um = bead_zyx_um

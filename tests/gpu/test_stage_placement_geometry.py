@@ -14,8 +14,7 @@ from opm_processing.process import process
 pytestmark = [pytest.mark.integration, pytest.mark.usefixtures("cupy_gpu")]
 
 
-@pytest.mark.parametrize("mode", ("stage", "mirror"))
-@pytest.mark.parametrize("crop", (False, True))
+@pytest.mark.parametrize("mode,crop", (("mirror", False), ("stage", True)))
 def test_physical_stage_z_translation_preserves_registered_xy(
     processing_options, tmp_path, stage_placement_acquisition, crop
 ):

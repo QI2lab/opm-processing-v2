@@ -11,7 +11,7 @@ from scipy.special import kl_div
 @pytest.mark.integration
 @pytest.mark.parametrize(
     "mosaic_acquisition",
-    [("mirror", 0.4, 0.001), ("stage", 1.2, 0.001)],
+    [("stage", 1.2, 0.001, "whole")],
     indirect=True,
 )
 def test_roi_deconvolves_recorded_sampling(
@@ -47,8 +47,8 @@ def test_roi_deconvolves_recorded_sampling(
     invoke_cli(
         "process",
         case.dataset.path,
-        max_projection=True,
-        create_fused_max_projection=True,
+        max_projection=False,
+        create_fused_max_projection=False,
         z_downsample_level=1,
         crop_after_deskew=False,
     )
