@@ -400,7 +400,7 @@ def stage_placement_acquisition(
         microscope,
     )
     raw = np.zeros((1, 3, 1, scans, camera_height, camera_width), dtype=np.uint16)
-    means = np.empty(raw.shape, dtype=np.float64)
+    means = np.empty(raw.shape, dtype=np.float32)
     frames = []
     for position, stage_z_um in enumerate(stage_z_values_um):
         sensor_axes = (

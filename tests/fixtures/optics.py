@@ -150,7 +150,8 @@ def simulated_camera(
     """
     from tests.simulation.camera import digitize
 
-    @lru_cache(maxsize=2)
+    # Reuse all seven exposure levels in the multi-position ROI workflows.
+    @lru_cache(maxsize=8)
     def optical_data(
         shape,
         *,

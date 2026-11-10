@@ -186,7 +186,7 @@ def roi_camera_scene(simulated_camera, simulation_parameters):
             )
         pixels = np.empty((times, positions, channels, *shape), np.uint16)
         means = np.empty(pixels.shape, np.float64)
-        for time, position, channel in np.ndindex(pixels.shape[:3]):
+        for time, channel, position in np.ndindex(times, channels, positions):
             observation = simulated_camera(
                 pixels.shape[-3:],
                 conversion=1.0,
