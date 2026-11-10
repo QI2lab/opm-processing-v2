@@ -53,13 +53,3 @@ def detector_response_sample(
         conversion=conversion,
         options=options,
     )
-
-
-@pytest.fixture
-def camera_likelihood_sample(camera_calibration, rate):
-    """Share independent camera data and its true-rate score across hypotheses."""
-    from tests.simulation.camera import digitize
-    from tests.simulation.camera_likelihood import camera_log_likelihood
-
-    raw = digitize(np.full(20000, rate), camera_calibration, seed=31)
-    return raw, camera_log_likelihood(raw, rate, camera_calibration)

@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import numpy as np
-from scipy.ndimage import maximum_filter, minimum_filter, shift
+from scipy.ndimage import maximum_filter, minimum_filter
 from scipy.special import gammaln, log_ndtr, logsumexp, ndtri, xlogy
 from scipy.stats import poisson
 
@@ -83,72 +83,15 @@ def sampling_stencil_radii(
     )
 
 
-def sampling_stencil_footprint(
-    microscope: Microscope,
-    output_spacing_zyx: Sequence[float],
-    *,
-    z_bin_factor: int = 1,
-    origin_y_error_um: float = 0,
-) -> np.ndarray:
-    """Exclude physically unreachable corners of the native-camera stencil.
-
-    A perpendicular projection onto an adjacent scan plane changes laboratory
-    Y by at most ``step*sin(theta)**2``. Detector-row interpolation adds at
-    most ``pixel*cos(theta)`` and inverse camera sampling one output Y pitch.
-    Native Z averaging leaves Y fixed. This necessary geometric condition
-    retains every positive contributor without reproducing interpolation
-    indices or weights.
-
-    Parameters
-    ----------
-    microscope : Microscope
-        Recorded camera pitch, scan spacing and OPM angle.
-    output_spacing_zyx : sequence of float
-        Saved-grid spacing, including any extra fractional-fusion stencil.
-    z_bin_factor : int
-        Native planes per output Z bin.
-    origin_y_error_um : float
-        Independently declared Y-origin serialization error bound.
-
-    Returns
-    -------
-    numpy.ndarray
-        Immutable centered SYX footprint for installed min/max filters.
-    """
-    radii = sampling_stencil_radii(
-        microscope, output_spacing_zyx, z_bin_factor=z_bin_factor
-    )
-    if not np.isfinite(origin_y_error_um) or origin_y_error_um < 0:
-        raise ValueError("Require a finite nonnegative coordinate-error bound")
-    pixel, step = microscope.pixel_size_um, microscope.scan_step_um
-    angle = np.deg2rad(microscope.angle_deg)
-    offsets = np.meshgrid(
-        *(np.arange(-radius, radius + 1) for radius in radii), indexing="ij"
-    )
-    distance_y = offsets[0] * step + offsets[1] * pixel * np.cos(angle)
-    reach_y = (
-        float(output_spacing_zyx[1])
-        + step * np.sin(angle) ** 2
-        + pixel * abs(np.cos(angle))
-        + origin_y_error_um
-    )
-    arithmetic = 32 * np.finfo(float).eps * max(reach_y, step, pixel)
-    support = np.abs(distance_y) <= reach_y + arithmetic
-    support.setflags(write=False)
-    return support
-
-
 def camera_sampling_envelope(
     expectation: ArrayLike,
     raw: ArrayLike,
     camera: Camera,
     *,
     radii: Sequence[int],
-    footprint: ArrayLike | None = None,
     response: ArrayLike = 1,
     views: int = 1,
     z_bin_factor: int = 1,
-    view_offsets_syx: Sequence[Sequence[float]] | None = None,
 ) -> SamplingEnvelope:
     """Bound positive resampling using original optical truth and detector residuals.
 
@@ -171,61 +114,19 @@ def camera_sampling_envelope(
         Explicit detector gain and offset.
     radii : sequence of int
         Native-camera stencil radii supplied by physical geometry.
-    footprint : array-like or None
-        Optional correlated physical support within the rectangular radii.
     response : array-like
         Positive response divided out before image interpolation.
     views : int
         Maximum number of independently acquired views mixed by fusion.
     z_bin_factor : int
         Native planes per output bin, used to bound arithmetic roundoff.
-    view_offsets_syx : sequence of sequence of float or None
-        Known native-camera displacements of stacked views relative to the
-        target frame. Fractional axes require a one-sample nearest-bound guard
-        in radii. Combine bounds in corrected-photon units.
 
     Returns
     -------
     SamplingEnvelope
         Immutable camera-rate bounds including the float32 arithmetic margin.
     """
-    means, codes = np.broadcast_arrays(
-        np.asarray(expectation, np.float64), np.asarray(raw, np.float64)
-    )
-    if view_offsets_syx is not None:
-        offsets = np.asarray(view_offsets_syx, float)
-        if (
-            means.ndim != 4
-            or offsets.shape != (means.shape[0], 3)
-            or not np.isfinite(offsets).all()
-        ):
-            raise ValueError("Require stacked camera views and known SYX offsets")
-        sensitivity = np.broadcast_to(np.asarray(response, float), means.shape[1:])
-        low, high = np.full(means.shape[1:], np.nan), np.full(means.shape[1:], np.nan)
-        for mean, raw, offset in zip(means, codes, offsets, strict=True):
-            bounds = camera_sampling_envelope(
-                mean,
-                raw,
-                camera,
-                radii=radii,
-                footprint=footprint,
-                response=sensitivity,
-                views=max(views, len(offsets)),
-                z_bin_factor=z_bin_factor,
-            )
-            aligned = [
-                shift(
-                    values / sensitivity,
-                    offset,
-                    order=0,
-                    mode="constant",
-                    cval=np.nan,
-                    prefilter=False,
-                )
-                for values in (bounds.lower, bounds.upper)
-            ]
-            low, high = np.fmin(low, aligned[0]), np.fmax(high, aligned[1])
-        return SamplingEnvelope(low * sensitivity, high * sensitivity)
+    means, codes = np.broadcast_arrays(expectation, raw)
     sensitivity = np.broadcast_to(np.asarray(response, np.float64), means.shape)
     radius = np.asarray(radii)
     if (
@@ -243,19 +144,11 @@ def camera_sampling_envelope(
         raise ValueError(
             "Require finite original camera data and positive sampling settings"
         )
-    observed = camera_correct(
-        codes, camera.offset_adu, camera.electrons_per_adu
-    ).astype(np.float64)
+    observed = camera_correct(codes, camera.offset_adu, camera.electrons_per_adu)
     calibrated = observed / sensitivity
     window = tuple(2 * radius.astype(int) + 1)
-    support = None if footprint is None else np.asarray(footprint, bool)
-    if support is not None and (
-        support.shape != window or not support[tuple(radius.astype(int))]
-    ):
-        raise ValueError("Require a centered physical footprint within the stencil")
-    filters = {"size": window} if support is None else {"footprint": support}
-    lower = minimum_filter(calibrated, mode="nearest", **filters) * sensitivity
-    upper = maximum_filter(calibrated, mode="nearest", **filters) * sensitivity
+    lower = minimum_filter(calibrated, mode="nearest", size=window) * sensitivity
+    upper = maximum_filter(calibrated, mode="nearest", size=window) * sensitivity
     # Per view: calibration, four-sample orthogonal interpolation, eight-sample
     # inverse camera interpolation and normalized fusion take fewer than 64
     # positive arithmetic operations. Each extra native Z plane adds eight.
