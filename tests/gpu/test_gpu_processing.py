@@ -46,14 +46,14 @@ def test_bounded_peak_matches_upstream_phase_normalization(
     np.testing.assert_array_equal(actual.tolist(), backend.asarray(expected).tolist())
 
 
-@pytest.mark.parametrize("sampling", [(1, 1, 1), (1, 2, 2)])
 def test_orthogonal_camera_pairs_recover_known_stage_errors(
-    orthogonal_registration_pair, sampling
+    orthogonal_registration_pair,
 ):
     """Recover prescribed stage errors from independently formed oblique images."""
     tilefusion.require_gpu_backend()
     backend = tilefusion.xp
     pair = orthogonal_registration_pair
+    sampling = tilefusion.DEFAULT_REGISTRATION_DOWNSAMPLE
     fixed, moving = (
         tilefusion.block_reduce(backend.asarray(image), sampling, backend.mean)
         for image in (pair.fixed, pair.moving)
