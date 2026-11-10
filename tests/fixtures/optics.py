@@ -768,6 +768,72 @@ def production_point_acquisition(
     )
 
 
+@pytest.fixture(scope="session")
+def noisy_scene_masks(microscope_parameters, independent_photon_scene_factory):
+    """Reuse fixed physical apertures independently of dose and illumination."""
+    from opm_processing.imageprocessing.opmpsf import (
+        camera_grid_center,
+        get_skewed_coords,
+        integrate_camera_pixels,
+    )
+
+    @lru_cache(maxsize=2)
+    def create(kind, shape, integration):
+        """Sample the original object and its finite optical support once."""
+        microscope = microscope_parameters
+        scene = independent_photon_scene_factory(
+            kind,
+            large=True,
+            integration_scan_planes=shape[0] if integration else None,
+        )
+        source = (
+            integrate_camera_pixels(
+                scene.density,
+                scene.axes,
+                centered_sensor_axes(
+                    shape,
+                    (
+                        microscope.scan_step_um,
+                        microscope.pixel_size_um,
+                        microscope.pixel_size_um,
+                    ),
+                ),
+                pixel_size_um=microscope.pixel_size_um,
+                theta_deg=microscope.angle_deg,
+                samples=microscope.pixel_samples,
+                area_integral=False,
+            )
+            > 0
+        )
+        theta = np.deg2rad(microscope.angle_deg)
+        x, y, z = get_skewed_coords(
+            shape, microscope.pixel_size_um, microscope.scan_step_um, theta
+        )
+        center = camera_grid_center(
+            shape,
+            microscope.pixel_size_um,
+            microscope.scan_step_um,
+            microscope.angle_deg,
+        )
+        dark = np.zeros(shape, bool)
+        for coordinate, gt_axis, psf_axis, half_footprint in zip(
+            (z - center[0], y - center[1], x - center[2]),
+            scene.axes,
+            scene.psf_axes,
+            microscope.pixel_size_um / 2 * np.array((np.sin(theta), np.cos(theta), 1)),
+            strict=True,
+        ):
+            dark |= (coordinate + half_footprint < gt_axis[0] + psf_axis[0]) | (
+                coordinate - half_footprint > gt_axis[-1] + psf_axis[-1]
+            )
+        assert dark.any()
+        for array in (source, dark):
+            array.setflags(write=False)
+        return source, dark
+
+    return create
+
+
 @pytest.fixture(
     scope="session",
     params=[
@@ -783,14 +849,9 @@ def noisy_extended_scene(
     microscope_parameters,
     simulation_parameters,
     simulated_camera,
+    noisy_scene_masks,
 ):
     """Observe fixed extended emitters with calibrated noisy camera exposures."""
-    from opm_processing.imageprocessing.opmpsf import (
-        camera_grid_center,
-        get_skewed_coords,
-        integrate_camera_pixels,
-    )
-
     config = simulation_parameters
     kind, profile, budget, layout = request.param[:4]
     integration = len(request.param) > 4 and request.param[4]
@@ -813,49 +874,8 @@ def noisy_extended_scene(
         seed=config["camera_seed"],
     )
     expectation, raw = observation.expectation, observation.raw
-    scene = observation.ground_truth
-    source = (
-        integrate_camera_pixels(
-            scene.density,
-            scene.axes,
-            centered_sensor_axes(
-                shape,
-                (
-                    microscope.scan_step_um,
-                    microscope.pixel_size_um,
-                    microscope.pixel_size_um,
-                ),
-            ),
-            pixel_size_um=microscope.pixel_size_um,
-            theta_deg=microscope.angle_deg,
-            samples=microscope.pixel_samples,
-            area_integral=False,
-        )
-        > 0
-    )
-    theta = np.deg2rad(microscope.angle_deg)
-    x, y, z = get_skewed_coords(
-        shape, microscope.pixel_size_um, microscope.scan_step_um, theta
-    )
-    center = camera_grid_center(
-        shape,
-        microscope.pixel_size_um,
-        microscope.scan_step_um,
-        microscope.angle_deg,
-    )
-    dark = np.zeros(shape, bool)
-    for coordinate, gt_axis, psf_axis, half_footprint in zip(
-        (z - center[0], y - center[1], x - center[2]),
-        scene.axes,
-        scene.psf_axes,
-        microscope.pixel_size_um / 2 * np.array((np.sin(theta), np.cos(theta), 1)),
-        strict=True,
-    ):
-        dark |= (coordinate + half_footprint < gt_axis[0] + psf_axis[0]) | (
-            coordinate - half_footprint > gt_axis[-1] + psf_axis[-1]
-        )
-    assert dark.any()
+    source, dark = noisy_scene_masks(kind, shape, integration)
     np.testing.assert_array_equal(expectation[dark], 0)
-    for array in (expectation, raw, source, dark):
+    for array in (expectation, raw):
         array.setflags(write=False)
     return microscope, expectation, raw, source, dark
