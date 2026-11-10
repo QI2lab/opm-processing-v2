@@ -111,6 +111,8 @@ def assert_uniform_photon_accuracy():
         # Gain is the independent 30-degree photon-volume normalization;
         # coverage only describes the acquisition's geometric support.
         support = gain * coverage
+        supported = support > 0
+        assert supported.any()
         camera = microscope.camera
         selected = range(data.shape[1]) if channels is None else channels
         for time in range(data.shape[0]):
@@ -138,12 +140,10 @@ def assert_uniform_photon_accuracy():
                     high + roundoff + quantum,
                 )
                 actual = data[time, channel]
-                selected = support > 0
-                assert selected.any()
                 assert np.all(
-                    np.isfinite(actual[selected])
-                    & (actual[selected] >= envelope.lower[selected])
-                    & (actual[selected] <= envelope.upper[selected])
+                    np.isfinite(actual[supported])
+                    & (actual[supported] >= envelope.lower[supported])
+                    & (actual[supported] <= envelope.upper[supported])
                 )
                 np.testing.assert_array_equal(actual[support == 0], 0)
 
