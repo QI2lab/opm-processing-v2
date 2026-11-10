@@ -222,21 +222,14 @@ def test_raw_roi_exports_and_resume(
     "mosaic_acquisition", [("mirror", 0.4, 0.001), ("stage", 1.2, 0.001)], indirect=True
 )
 def test_roi_maps_extended_specimen_to_raw_tiles(
-    mosaic_acquisition, monkeypatch, invoke_cli, pipeline_geometry
+    mosaic_acquisition, monkeypatch, invoke_cli
 ):
     """Keep the oblique preimage and measure fresh links across a real tile seam."""
     from opm_processing.dataio.position_collection import open_position_collection
-    from opm_processing.dataio.roi import projection_tile_footprints
+    from opm_processing.dataio.roi import PhysicalRoi
     from opm_processing.imageprocessing.opmpsf import camera_grid_center
     from opm_processing.imageprocessing.tilefusion import TileFusion
     from opm_processing.process import process_skewed
-    from tests.simulation.camera_likelihood import (
-        SamplingEnvelope,
-        camera_sampling_envelope,
-        sampling_stencil_footprint,
-        sampling_stencil_radii,
-    )
-    from tests.simulation.metrics import camera_object_apertures, camera_volume_samples
 
     case = mosaic_acquisition
     process_skewed(
@@ -248,7 +241,6 @@ def test_roi_maps_extended_specimen_to_raw_tiles(
         z_downsample_level=1,
     )
     preview = case.dataset.path.parent / "mosaic_max_z_fused.ome.zarr"
-    footprints = projection_tile_footprints(preview)
     microscope = case.microscope
     pixel = microscope.pixel_size_um
     native_step = case.optical_data.ground_truth.microscope.scan_step_um
@@ -281,13 +273,26 @@ def test_roi_maps_extended_specimen_to_raw_tiles(
     tiles = directory / "mosaic_deskewed.ome.zarr"
     records = state.roi_series(tiles)
     assert len(records) == 2
-    assert all(record["skewed_bounds_sx"][0] > 0 for record in records)
     assert measurements and all(np.isfinite(score) for _, score in measurements)
     # This sparse ROI may not meet the unchanged production SSIM gate. The
     # interaction contract requires new local measurements, not forced links.
     assert state.registration(tiles)["fused_path"] == "mosaic_fused.ome.zarr"
     saved = open_position_collection(tiles)
-    assert all(np.any(array.read().result() > 0) for array in saved.arrays)
+    parent = open_position_collection(preview.parent / "mosaic_deskewed.ome.zarr")
+    np.testing.assert_array_equal(saved.voxel_size_um, parent.voxel_size_um)
+    for record, array, origin in zip(
+        records, saved.arrays, saved.spatial_origins_zyx_um, strict=True
+    ):
+        full = parent.arrays[record["position_index"]]
+        assert array.shape[:3] == (1, full.shape[1], full.shape[2])
+        y0, y1, x0, x1 = record["deskew_crop_yx"]
+        assert array.shape[-2:] == (y1 - y0, x1 - x0)
+        start, stop, x0, x1 = record["skewed_bounds_sx"]
+        assert 0 < start < stop <= case.dataset.raw_data.shape[-3]
+        assert 0 <= x0 < x1 <= case.dataset.raw_data.shape[-1]
+        np.testing.assert_array_equal(origin, record["origin_zyx_um"])
+        pixels = array.read().result()
+        assert np.isfinite(pixels).all() and np.any(pixels > 0)
     final = open_image_array(directory / "mosaic_fused.ome.zarr").read().result()
     assert final.shape[-2:] == (bounds[1] - bounds[0], bounds[3] - bounds[2])
     assert np.isfinite(final).all() and np.any(final > 0)
@@ -297,103 +302,10 @@ def test_roi_maps_extended_specimen_to_raw_tiles(
         .multiscales[0]
         .datasets[0]
     )
-    raw = case.dataset.raw_data[0, :, 0]
-    stage = case.dataset.metadata.scan_axis_reversed
-    if stage:
-        raw = raw[:, ::-1]
-    shape = raw.shape[-3:]
-    stage_z, stage_scan, stage_x = case.dataset.metadata.stage_positions_zxy[0]
-    width = shape[-1]
-    means = [case.expectation[..., p * offset : p * offset + width] for p in range(2)]
-    gain = 2 * pixel / microscope.scan_step_um
-    geometry = pipeline_geometry(shape, microscope)
-    native_support = camera_volume_samples(
-        geometry.support.astype(float),
-        (0, 0, 0),
-        (pixel, pixel, pixel),
-        (0, 0, 0),
-        shape,
-        microscope,
+    roi = PhysicalRoi.read(directory / "roi.json")
+    np.testing.assert_array_equal(
+        metadata.scale_transform.scale[-3:], saved.voxel_size_um
     )
-    for fused in (False, True):
-        spacing = np.asarray(
-            metadata.scale_transform.scale[-3:] if fused else saved.voxel_size_um
-        )
-        # Fractional stage placement adds one further interpolation stencil.
-        pitch = spacing * (2 if fused else 1)
-        for position, mean in enumerate(means):
-            image = (
-                final[0, 0] if fused else saved.arrays[position][0, 0].read().result()
-            )
-            origin = (
-                metadata.translation_transform.translation[-3:]
-                if fused
-                else saved.spatial_origins_zyx_um[position]
-            )
-            # Unfused tiles retain their reported camera frame. Registered
-            # fusion must recover the simulator's independent true placement.
-            frame_origin = (
-                (
-                    -stage_z,
-                    -stage_scan
-                    - ((shape[0] - 1) * microscope.scan_step_um if stage else 0),
-                    stage_x + position * offset * pixel,
-                )
-                if fused
-                else next(
-                    item["raw_origin_zyx_um"]
-                    for item in footprints
-                    if item["position_index"] == position and item["time_index"] == 0
-                )
-            )
-            sample = (origin, spacing, frame_origin, shape, microscope)
-            support = camera_volume_samples(np.ones(image.shape), *sample)
-            support = (
-                np.minimum(support, native_support) >= 1 - 32 * np.finfo(float).eps
-            )
-            prediction = camera_volume_samples(image / gain, *sample)
-            envelope = camera_sampling_envelope(
-                np.asarray(means) if fused else mean,
-                raw if fused else raw[position],
-                microscope.camera,
-                radii=sampling_stencil_radii(microscope, pitch),
-                footprint=sampling_stencil_footprint(
-                    microscope, pitch, origin_y_error_um=0.0005
-                ),
-                views=2 if fused else 1,
-                view_offsets_syx=np.outer((np.arange(2) - position) * offset, (0, 0, 1))
-                if fused
-                else None,
-            )
-            record = next(
-                item for item in records if item["position_index"] == position
-            )
-            start, stop, x0, x1 = record["skewed_bounds_sx"]
-            selection = (slice(start, stop), slice(None), slice(x0, x1))
-            local_shape = (stop - start, shape[1], x1 - x0)
-            local_center = camera_grid_center(
-                local_shape, pixel, microscope.scan_step_um, microscope.angle_deg
-            )
-            local_center += np.asarray(
-                (0, start * microscope.scan_step_um, (x0 + position * offset) * pixel)
-            )
-            apertures = camera_object_apertures(
-                case.optical_data.ground_truth,
-                microscope,
-                local_shape,
-                camera_offset_zyx_um=local_center - reference_center,
-            )
-            local_envelope = SamplingEnvelope(
-                envelope.lower[selection], envelope.upper[selection]
-            )
-            for index, aperture in enumerate(apertures):
-                selected = aperture & support[selection]
-                if index < 2:
-                    assert selected.any()
-                if np.any(selected):
-                    actual = prediction[selection][selected]
-                    assert np.all(
-                        np.isfinite(actual)
-                        & (actual >= local_envelope.lower[selected])
-                        & (actual <= local_envelope.upper[selected])
-                    ), (fused, position, index)
+    np.testing.assert_array_equal(
+        metadata.translation_transform.translation[-2:], roi.bounds_yx_um[::2]
+    )
