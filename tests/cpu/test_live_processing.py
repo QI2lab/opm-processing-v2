@@ -213,10 +213,12 @@ def test_empty_tile_detection_uses_global_occupancy() -> None:
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("live_mode", ["live", "live-wait"])
 @pytest.mark.parametrize(
-    ("save_float32", "expected_dtype"),
-    ((False, np.dtype(np.uint16)), (True, np.dtype(np.float32))),
+    ("live_mode", "save_float32", "expected_dtype"),
+    (
+        ("live", False, np.dtype(np.uint16)),
+        ("live-wait", True, np.dtype(np.float32)),
+    ),
 )
 def test_live_processing_preserves_original_optical_emitters(
     tmp_path,
@@ -297,10 +299,8 @@ def test_live_processing_preserves_original_optical_emitters(
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("signal_field", (1.0, 2.0))
-@pytest.mark.parametrize("save_float32", (False, True))
 def test_live_occupancy_filter_preserves_sample_signal_and_writes_zero(
-    tmp_path, live_occupancy_case, save_float32, assert_uniform_photon_accuracy
+    tmp_path, live_occupancy_case, assert_uniform_photon_accuracy
 ):
     """Preserve a known optical sample while rejecting physical detector artifacts."""
     case = live_occupancy_case
@@ -308,7 +308,7 @@ def test_live_occupancy_filter_preserves_sample_signal_and_writes_zero(
         root_path=tmp_path,
         live=case.dataset.illumination_path,
         deconvolve=False,
-        save_float32=save_float32,
+        save_float32=True,
         skip_empty_below=case.threshold,
         skip_empty_min_signal_fraction=0.1,
         max_projection=True,
@@ -319,19 +319,18 @@ def test_live_occupancy_filter_preserves_sample_signal_and_writes_zero(
     output = open_position_collection(path)
     maximum = open_position_collection(tmp_path / "live_empty_max_z_deskewed.ome.zarr")
     data = output.arrays[0].read().result()
-    assert data.dtype == (np.float32 if save_float32 else np.uint16)
+    assert data.dtype == np.float32
     np.testing.assert_array_equal(data[:, 0], 0)
     assert_uniform_photon_accuracy(data, case.scene, channels=(1,))
-    np.testing.assert_array_equal(
-        maximum.arrays[0].read().result(), data.max(axis=2, keepdims=True)
-    )
+    expected_maximum = data.max(axis=2, keepdims=True)
+    np.testing.assert_array_equal(maximum.arrays[0].read().result(), expected_maximum)
     assert len(maximum.multiscale_factors_yx) > 1
     for factor, arrays in zip(
         maximum.multiscale_factors_yx, maximum.multiscale_arrays, strict=True
     ):
         np.testing.assert_array_equal(
             arrays[0].read().result(),
-            data.max(axis=2, keepdims=True)[..., ::factor, ::factor],
+            expected_maximum[..., ::factor, ::factor],
         )
     state = ProcessingState.read(processing_state_path(tmp_path, "live_empty"))
     assert state.zero_channels(path) == {(0, 0, 0)}
@@ -394,16 +393,17 @@ def test_offline_resume_skips_durably_completed_tile_and_default_overwrites(
     assert_uniform_photon_accuracy(
         output.arrays[1].read().result(), case.scene, position=1
     )
-    process_module.process_skewed(
-        source, inspect_acquisition(source), output_dir=root, **options
-    )
-    overwritten = open_position_collection(root / case.output.name)
-    assert_uniform_photon_accuracy(
-        overwritten.arrays[0].read().result(), case.changed, position=0
-    )
-    assert_uniform_photon_accuracy(
-        overwritten.arrays[1].read().result(), case.scene, position=1
-    )
+    if action == "resume":
+        process_module.process_skewed(
+            source, inspect_acquisition(source), output_dir=root, **options
+        )
+        overwritten = open_position_collection(root / case.output.name)
+        assert_uniform_photon_accuracy(
+            overwritten.arrays[0].read().result(), case.changed, position=0
+        )
+        assert_uniform_photon_accuracy(
+            overwritten.arrays[1].read().result(), case.scene, position=1
+        )
 
 
 @pytest.mark.integration

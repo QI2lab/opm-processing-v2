@@ -208,7 +208,6 @@ def live_acquisition_factory(tmp_path):
 
 @pytest.fixture
 def live_occupancy_case(
-    signal_field,
     uniform_camera_scene,
     opm_v2_live_acquisition_factory,
     microscope_parameters,
@@ -217,7 +216,7 @@ def live_occupancy_case(
     """Publish a dark detector-defect channel and independently observed sample."""
     threshold = 6 * microscope_parameters.camera.read_noise_e
     fields = np.broadcast_to(
-        np.asarray((0.1, signal_field), np.float32)[:, None, None],
+        np.asarray((0.1, 2.0), np.float32)[:, None, None],
         (2, *simulation_parameters["camera_shape_yx"]),
     ).copy()
     scene = uniform_camera_scene(

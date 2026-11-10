@@ -6,7 +6,11 @@ import numpy as np
 import pytest
 from yaozarrs import open_group
 
-from opm_processing.dataio.acquisition import _camera_timing, inspect_acquisition
+from opm_processing.dataio.acquisition import (
+    _camera_timing,
+    inspect_acquisition,
+    open_acquisition_datastore,
+)
 from opm_processing.dataio.position_collection import (
     create_position_collection,
     create_variable_position_collection,
@@ -86,7 +90,7 @@ def test_unknown_time_does_not_become_one_second(tmp_path):
 def test_processing_propagates_hardware_cadence(
     calibrated_mirror_timelapse, invoke_cli, assert_roi_point_accuracy
 ):
-    """Preserve hardware cadence through processing and projection output."""
+    """Preserve calibrated exposures, geometry and cadence through saved projections."""
     raw = calibrated_mirror_timelapse.path
     invoke_cli(
         "process",
@@ -99,6 +103,12 @@ def test_processing_propagates_hardware_cadence(
     pixels = volume.arrays[0].read().result()
     assert volume.shape == (3, 1, 1, *calibrated_mirror_timelapse.shape_zyx)
     assert pixels.dtype == np.uint16
+    np.testing.assert_array_equal(
+        open_acquisition_datastore(raw).read().result(),
+        calibrated_mirror_timelapse.truth.pixels,
+    )
+    assert volume.spatial_origins_zyx_um == ((0.0, 0.0, 0.0),)
+    assert "opm_v2" not in volume.attributes
     assert_roi_point_accuracy(
         pixels,
         calibrated_mirror_timelapse.truth,

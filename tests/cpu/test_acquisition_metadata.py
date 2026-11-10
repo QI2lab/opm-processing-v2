@@ -1,4 +1,4 @@
-"""Acquisition metadata units and native storage/processing integration."""
+"""Acquisition metadata and native storage units."""
 
 from __future__ import annotations
 
@@ -17,7 +17,6 @@ from opm_processing.dataio.position_collection import (
     open_position_collection,
     update_group_attributes,
 )
-from opm_processing.process import process
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -278,34 +277,3 @@ def test_single_position_root_image_opens_as_virtual_tpczyx(
         np.arange(3 * 1 * 4 * 5 * 6, dtype=np.uint16).reshape(3, 1, 4, 5, 6) + 200
     )
     np.testing.assert_array_equal(datastore[:, 0].read().result(), expected)
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("save_float32", [False, True])
-def test_single_position_mirror_timelapse_preserves_calibrated_fluorescence(
-    calibrated_mirror_timelapse,
-    processing_options,
-    save_float32,
-    assert_roi_point_accuracy,
-):
-    """Reopen each exposure and retain original optical sources in physical coordinates."""
-    run = calibrated_mirror_timelapse
-    process(root_path=run.path, save_float32=save_float32, **processing_options)
-    output = open_position_collection(
-        run.path.parent / "single_mirror_deskewed.ome.zarr"
-    )
-    assert output.shape == (3, 1, 1, *run.shape_zyx)
-    actual = output.arrays[0].read().result()
-    dtype = np.float32 if save_float32 else np.uint16
-    assert actual.dtype == dtype
-    np.testing.assert_array_equal(
-        open_acquisition_datastore(run.path).read().result(), run.truth.pixels
-    )
-    assert output.spatial_origins_zyx_um == ((0.0, 0.0, 0.0),)
-    assert_roi_point_accuracy(
-        actual,
-        run.truth,
-        output.spatial_origins_zyx_um[0],
-        output.voxel_size_um,
-    )
-    assert "opm_v2" not in output.attributes

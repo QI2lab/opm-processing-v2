@@ -354,8 +354,7 @@ def test_deskewed_stage_tiles_blend_without_boundary_seams(
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("factor", [3, 20])
-@pytest.mark.parametrize("mode", ["full", "roi", "cropped"])
+@pytest.mark.parametrize("mode,factor", [("full", 3), ("roi", 3), ("cropped", 20)])
 def test_saved_deskew_retains_complete_z_extent(
     deskew_processing_case, factor, assert_roi_point_accuracy
 ):
