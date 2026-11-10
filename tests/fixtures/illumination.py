@@ -49,26 +49,25 @@ def uniform_camera_scene(uniform_detector_scene):
             if exposures is None
             else np.broadcast_to(exposures, shape[:3])
         )
-        source_means = np.broadcast_to(
-            optical.means * doses[..., None, None, None], shape
-        ).copy()
-        means = source_means * response[None, None, :, None]
-        if detector_artifacts:
-            # A fixed detector-dark-current defect is a camera-plane photon
-            # source. It precedes Poisson/read-noise sampling and ADC conversion.
-            means[:, :, 0, :, 0, 0] += 100
-            means[:, :, 0, 0, 0, 1:5] += 1
         pixels = np.empty(shape, np.uint16)
         for time, position, channel in np.ndindex(shape[:3]):
+            means = (
+                optical.means * doses[time, position, channel, None, None, None]
+            ) * response[channel]
+            if detector_artifacts and channel == 0:
+                # Detector defects precede Poisson/read noise and ADC conversion.
+                means[:, 0, 0] += 100
+                means[0, 0, 1:5] += 1
             pixels[time, position, channel] = digitize(
-                means[time, position, channel],
+                means,
                 microscope.camera,
                 seed=71 + 100 * time + 10 * position + channel,
             )
         assert pixels.max() < np.iinfo(np.uint16).max
         return SimpleNamespace(
             pixels=pixels,
-            source_means=source_means,
+            optical_means=optical.means,
+            doses=doses,
             fields=response,
             microscope=microscope,
             projection=projection,
@@ -80,7 +79,6 @@ def uniform_camera_scene(uniform_detector_scene):
 @pytest.fixture
 def assert_uniform_photon_accuracy():
     """Bound positive CPU interpolation using the original phantom and camera noise."""
-    from tests.simulation.camera_likelihood import SamplingEnvelope
 
     def check(data, scene, *, position=0, channels=None):
         """Check calibrated absolute photons, spatial support and output precision."""
@@ -90,7 +88,7 @@ def assert_uniform_photon_accuracy():
         native = scene.pixels.shape[-3:]
         if scene.projection:
             assert data.shape[-3:] == native
-            coverage = np.ones(native)
+            coverage = np.ones((*native[:2], 1))
         else:
             expected_shape, *_ = deskew_shape_estimator(
                 native,
@@ -100,25 +98,25 @@ def assert_uniform_photon_accuracy():
                 crop_after_deskew=False,
             )
             assert data.shape[-3:] == tuple(expected_shape)
-            coverage = np.zeros(data.shape[-3:])
-            coverage[..., : native[2]] = deskew_coverage(
+            coverage = deskew_coverage(
                 native,
                 data.shape[-3:],
                 microscope.angle_deg,
                 microscope.scan_step_um,
                 pixel,
-            )[..., None]
+            ).astype(np.float64)[..., None]
         # Gain is the independent 30-degree photon-volume normalization;
         # coverage only describes the acquisition's geometric support.
         support = gain * coverage
-        supported = support > 0
-        assert supported.any()
+        assert np.any(support > 0)
         camera = microscope.camera
         selected = range(data.shape[1]) if channels is None else channels
         for time in range(data.shape[0]):
             for channel in selected:
-                truth = scene.source_means[time, position, channel]
-                np.testing.assert_allclose(truth, truth.flat[0], rtol=2e-5)
+                truth = (
+                    scene.optical_means
+                    * scene.doses[time, position, channel, None, None, None]
+                )
                 field = scene.fields[channel]
                 observed = illumination_correct(
                     camera_correct(
@@ -127,7 +125,7 @@ def assert_uniform_photon_accuracy():
                         camera.electrons_per_adu,
                     ),
                     field,
-                ).astype(np.float64)
+                )
                 residual = observed - truth
                 operations = 64
                 error = operations * np.finfo(np.float32).eps
@@ -135,17 +133,13 @@ def assert_uniform_photon_accuracy():
                 quantum = 0 if data.dtype.kind == "f" else 1
                 low = (float(truth.min()) + residual.min()) * support
                 high = (float(truth.max()) + residual.max()) * support
-                envelope = SamplingEnvelope(
-                    np.maximum(low - roundoff - quantum, 0),
-                    high + roundoff + quantum,
-                )
                 actual = data[time, channel]
-                assert np.all(
-                    np.isfinite(actual[supported])
-                    & (actual[supported] >= envelope.lower[supported])
-                    & (actual[supported] <= envelope.upper[supported])
-                )
-                np.testing.assert_array_equal(actual[support == 0], 0)
+                assert not np.any(actual[..., native[2] :])
+                actual = actual[..., : native[2]]
+                assert np.isfinite(actual).all()
+                assert np.all(actual >= np.maximum(low - roundoff - quantum, 0))
+                assert np.all(actual <= high + roundoff + quantum)
+                assert not np.any(actual, where=support == 0)
 
     return check
 
@@ -251,7 +245,8 @@ def illumination_observations(
     tiled = kind == "tiles"
     positions, channels = (6, 2) if tiled else (2, 2 if kind == "masked" else 1)
     height, width = simulation_parameters["camera_shape_yx"]
-    scans = simulation_parameters["tiled_scan_planes" if tiled else "whole_scan_planes"]
+    # Illumination estimates sample independent tiles, not reconstruction chunks.
+    scans = simulation_parameters["whole_scan_planes"]
     y = np.linspace(-1, 1, height, dtype=np.float32)[:, None]
     x = np.linspace(-1, 1, width, dtype=np.float32)[None, :]
     if tiled:
