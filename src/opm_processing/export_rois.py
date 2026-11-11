@@ -1,6 +1,7 @@
 """Select maximum-Z ROIs, reconstruct raw regions, and export OME-Zarr/TIFF."""
 
 import json
+import shutil
 from pathlib import Path, PureWindowsPath
 from typing import TYPE_CHECKING, Annotated
 
@@ -177,7 +178,11 @@ def rectangle_bounds(
 
 
 def select_rois(
-    source: Path, shape: tuple[int, ...]
+    source: Path,
+    shape: tuple[int, ...],
+    *,
+    figure_path: Path | None = None,
+    saved_rois: list[PhysicalRoi] | None = None,
 ) -> list[tuple[int, int, int, int]]:
     """Use napari's image transform to obtain level-zero data coordinates.
 
@@ -191,6 +196,10 @@ def select_rois(
         Maximum-Z image or single-position collection to open in napari.
     shape : tuple of int
         Level-zero image dimensions, ending in YX.
+    figure_path : pathlib.Path or None
+        Save a native-resolution overview using the chosen napari channel display.
+    saved_rois : list of PhysicalRoi or None
+        Existing physical rectangles to display read-only when adding a missing figure.
 
     Returns
     -------
@@ -235,25 +244,87 @@ def select_rois(
         # than large stage coordinates, preserving subpixel drawing precision.
         scale=reference.scale[-2:],
         translate=reference.translate[-2:],
+        units=reference.units[-2:],
         shape_type="rectangle",
         edge_color="yellow",
         face_color=[1, 1, 0, 0.15],
     )
     rois.mode = "add_rectangle"
+    if saved_rois is not None:
+        for roi in saved_rois:
+            y0, y1, x0, x1 = roi.bounds_yx_um
+            rois.add(
+                [
+                    rois.world_to_data(vertex)
+                    for vertex in ((y0, x0), (y0, x1), (y1, x1), (y1, x0))
+                ],
+                shape_type="rectangle",
+            )
+        rois.editable = False
+        rois.mode = "pan_zoom"
+
+    def current_bounds() -> list[tuple[int, int, int, int]]:
+        """Read the actual shapes through the image's calibrated transform."""
+        if any(kind != "rectangle" for kind in rois.shape_type):
+            raise ValueError("Only rectangle ROIs are supported")
+        return [
+            rectangle_bounds(
+                np.asarray(
+                    [
+                        reference.world_to_data(rois.data_to_world(vertex))
+                        for vertex in vertices
+                    ]
+                ),
+                shape,
+            )
+            for vertices in rois.data
+        ]
+
+    errors = []
+    if figure_path is not None:
+        from qtpy.QtCore import QEvent, QObject
+
+        from opm_processing.roi_figures import export_roi_overview
+
+        class CaptureOverview(QObject):
+            """Export before Qt destroys the viewer's selected display state."""
+
+            exporting = False
+
+            def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+                """Capture the native overview on close without swallowing errors."""
+                if event.type() == QEvent.Type.Close and self.exporting:
+                    event.ignore()
+                    return True
+                if event.type() == QEvent.Type.Close:
+                    self.exporting = True
+                    errors.clear()
+                    try:
+                        bounds = current_bounds()
+                        if bounds:
+                            typer.echo("Exporting native-resolution ROI overview...")
+                            export_roi_overview(
+                                viewer, layers, source, bounds, figure_path
+                            )
+                    except Exception as error:
+                        errors.append(error)
+                    finally:
+                        self.exporting = False
+                return False
+
+        capture = CaptureOverview(viewer.window._qt_window)
+        viewer.window._qt_window.installEventFilter(capture)
     typer.echo(
-        "Viewing a full-Z maximum projection. Right-click the Z slider to adjust "
+        "Saved ROIs are fixed. Adjust channels/colors/contrast and close napari to save the overview."
+        if saved_rois is not None
+        else "Viewing a full-Z maximum projection. Right-click the Z slider to adjust "
         "slice thickness. Draw YX rectangles, then close napari to export all Z, "
         "channels, and timepoints."
     )
     napari.run()
-    bounds = []
-    for vertices, kind in zip(rois.data, rois.shape_type, strict=True):
-        if kind != "rectangle":
-            raise ValueError("Only rectangle ROIs are supported")
-        world = [rois.data_to_world(vertex) for vertex in vertices]
-        pixels = np.asarray([reference.world_to_data(vertex) for vertex in world])
-        bounds.append(rectangle_bounds(pixels, shape))
-    return bounds
+    if errors:
+        raise RuntimeError("Could not export the ROI overview") from errors[-1]
+    return current_bounds()
 
 
 @app.command(
@@ -286,6 +357,24 @@ def export_rois(
     tiff: Annotated[
         bool, typer.Option(help="Also write compressed OME-BigTIFF; retain OME-Zarr.")
     ] = False,
+    figures: Annotated[
+        bool,
+        typer.Option(
+            help="Save a native PNG ROI overview and dominant AO pupil/colorbar images."
+        ),
+    ] = False,
+    ao_root: Annotated[
+        Path | None,
+        typer.Option(
+            help="Saved AO grid directory for --figures; default automatic discovery."
+        ),
+    ] = None,
+    ao_wavelength_nm: Annotated[
+        float | None,
+        typer.Option(
+            min=0, help="AO phase display wavelength; default recorded AO illumination."
+        ),
+    ] = None,
     flatfield_correction: bool = False,
     save_float32: bool = False,
     z_downsample_level: Annotated[int, typer.Option(min=1)] = 1,
@@ -317,6 +406,12 @@ def export_rois(
         Apply RLGC before orthogonal deskewing; disabled by default.
     tiff : bool
         Export OME-TIFF in addition to the final OME-Zarr image.
+    figures : bool
+        Save a native PNG overview and per-ROI dominant AO correction images.
+    ao_root : pathlib.Path or None
+        Explicit saved AO grid directory when automatic discovery is insufficient.
+    ao_wavelength_nm : float or None
+        Phase display wavelength override in nanometers.
     flatfield_correction : bool
         Reuse or estimate a detector-response flatfield.
     save_float32 : bool
@@ -338,6 +433,8 @@ def export_rois(
     workers : int
         TIFF compression workers.
     """
+    if not figures and (ao_root is not None or ao_wavelength_nm is not None):
+        raise typer.BadParameter("AO figure options require --figures")
     source = resolve_roi_source(root_path)
     footprints = projection_tile_footprints(source)
     if not footprints:
@@ -357,6 +454,7 @@ def export_rois(
         output.expanduser().resolve() if output else source.parent / "roi_exports"
     )
     manifest_path = destination / "selections.json"
+    overview_path = destination / "roi_overview.png"
     saved_manifest = manifest_path
     if resume and output is not None and not saved_manifest.is_file():
         saved_manifest = source.parent / "roi_exports" / "selections.json"
@@ -370,12 +468,35 @@ def export_rois(
         if saved_manifest != manifest_path:
             for name, target in zip(manifest["rois"], selections, strict=True):
                 PhysicalRoi.read(saved_manifest.parent / name).write(target)
+        if figures and not overview_path.is_file():
+            old_overview = saved_manifest.parent / overview_path.name
+            if old_overview.is_file():
+                destination.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(old_overview, overview_path)
+                if old_overview.with_suffix(".json").is_file():
+                    shutil.copy2(
+                        old_overview.with_suffix(".json"),
+                        overview_path.with_suffix(".json"),
+                    )
+            else:
+                from opm_processing.dataio.position_collection import open_image_array
+
+                select_rois(
+                    source,
+                    tuple(open_image_array(resolve_export_image(source)).shape),
+                    figure_path=overview_path,
+                    saved_rois=[PhysicalRoi.read(path) for path in selections],
+                )
     else:
         image_path = resolve_export_image(source)
         root = open_group(image_path)
         dataset = root.ome_metadata().multiscales[0].datasets[0]
         shape = tuple(root[dataset.path].to_tensorstore().shape)
-        bounds = select_rois(source, shape)
+        bounds = (
+            select_rois(source, shape, figure_path=overview_path)
+            if figures
+            else select_rois(source, shape)
+        )
         if not bounds:
             typer.echo("No ROIs selected; no files exported.")
             return
@@ -403,6 +524,21 @@ def export_rois(
         temporary = manifest_path.with_suffix(".tmp")
         temporary.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         temporary.replace(manifest_path)
+    if figures:
+        from opm_processing.export_roi_ao import export_roi_ao
+
+        for selection in selections:
+            report = export_roi_ao(
+                acquisition,
+                PhysicalRoi.read(selection),
+                selection.parent,
+                ao_root=ao_root,
+                wavelength_nm=ao_wavelength_nm,
+            )
+            if report["status"] == "unavailable":
+                typer.echo(
+                    f"AO figures unavailable for {selection.parent.name}: {report['reason']}"
+                )
     for index, selection in enumerate(selections, 1):
         result = process_roi(
             acquisition.path,

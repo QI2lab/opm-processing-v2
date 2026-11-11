@@ -75,6 +75,35 @@ These are lossless zlib-compressed OME-BigTIFF files with global origins,
 per-plane positions, channel metadata, and processing provenance. OME-Zarr
 outputs are retained.
 
+`--figures` also saves `roi_overview.png` beside the ROI folders. It retains the
+maximum-Z projection's native pixel dimensions, the displayed timepoint, and
+napari's visible channel order, colors, contrast, gamma and blending. Yellow
+outlines have no numbers; a labeled white scale bar uses the physical pixel size.
+Native blocks are rendered with napari and assembled using temporary disk space
+beside the output (four bytes per image pixel), without a downsampled copy.
+
+Each ROI folder receives separate `ao_pupil_t###_z###.png` and
+`ao_colorbar_t###_z###.png` files for each applicable acquisition time and AO depth.
+The selected correction covers the largest area within the requested ROI;
+overlapping tiles assigned to the same correction count only once. Recorded tile
+assignments in `ao_grid_geometry.json` take precedence and are checked against
+the raw stage coordinates. Older acquisitions without that file use their saved
+stage plans; this historical assignment is identified as inferred in
+`ao_corrections.json`. Invalid recorded assignments are rejected without falling
+back to inference. The pupil uses the full final coefficient state, including
+the inherited starting correction, with the validated WaveKit basis and SJS
+publication colors and linear phase limits of ±2π. Phase is evaluated at the
+recorded AO illumination wavelength. Use `--ao-wavelength-nm` when older metadata
+does not identify that wavelength, and `--ao-root` when AO results are elsewhere.
+Missing AO results are reported without preventing ROI processing; inconsistent
+plans or ambiguous wavelengths require correction before processing continues.
+
+On resume, existing overview images retain the original napari appearance. If
+an older selection has no overview, `--figures` reopens its fixed rectangles so
+you can choose channels and contrast without redrawing. A new output directory
+reuses the existing overview when available. The overview JSON records its
+display settings and scale-bar length.
+
 Rerun the same command to reuse saved selections and compatible completed
 checkpoints without reopening napari. Local registration checkpoints belong to
 the ROI run; preview registration is never used as the final ROI solution.
