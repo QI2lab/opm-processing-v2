@@ -19,6 +19,62 @@ from tests.simulation.camera import digitize
 pytestmark = pytest.mark.unit
 
 
+def test_scan_chunk_planner_accounts_for_all_channels_and_reuses_crop(
+    cupy_gpu, monkeypatch
+):
+    """Plan from all optical supports once, without allocating a camera volume."""
+    solver = importlib.import_module("opm_processing.imageprocessing.rlgc")
+    shape = (10000, 256, 1900)
+    psfs = ((3, 15, 9), (45, 3, 21))
+    padding = solver._axis_linear_fft_padding
+    calls = []
+
+    def observe_padding(length, support, **kwargs):
+        """Record optical support while executing the actual padding calculation."""
+        calls.append((length, support))
+        return padding(length, support, **kwargs)
+
+    monkeypatch.setattr(solver, "_axis_linear_fft_padding", observe_padding)
+    state = solver.RlgcChunkState()
+    first = state.determine_once(shape, psfs)
+    assert 1 <= first < shape[0]
+    assert calls[:2] == [(256, 15), (1900, 21)]
+    assert {support for _, support in calls[2:]} == {45}
+    count = len(calls)
+    assert state.determine_once(shape, psfs) == first
+    assert len(calls) == count
+
+
+@pytest.mark.parametrize(
+    "invalid,message",
+    [
+        ({"read_noise": -1}, "read_noise"),
+        ({"read_noise": np.nan}, "read_noise"),
+        ({"read_noise": 1e20}, "read_noise"),
+        ({"detector_response": np.zeros((3, 3))}, "Detector response"),
+        ({"detector_response": np.full((3, 3), np.nan)}, "Detector response"),
+        ({"image": np.full((3, 3, 3), np.nan)}, "finite"),
+        ({"psf": np.zeros((1, 1, 1))}, "positive sum"),
+        ({"psf": -np.ones((1, 1, 1))}, "nonnegative"),
+        ({"psf": np.ones((2, 1, 1))}, "odd dimensions"),
+        ({"scan_upsample_factor": 3, "boundary": "reflect"}, "boundary='zero'"),
+    ],
+)
+def test_reconstruction_rejects_nonphysical_calibration(cupy_gpu, invalid, message):
+    """Reject invalid detector counts, optics and noise through the actual solver."""
+    from opm_processing.imageprocessing.rlgc import rlgc
+
+    options = {
+        "image": np.ones((3, 3, 3), np.float32),
+        "psf": np.ones((1, 1, 1), np.float32),
+        "crop_scan": 100,
+        "max_iterations": 1,
+        **invalid,
+    }
+    with pytest.raises(ValueError, match=message):
+        rlgc(**options)
+
+
 @pytest.mark.parametrize("array_backend", ["gpu", "host"])
 @pytest.mark.parametrize(
     "variance, observed_count, expected_multiplier",

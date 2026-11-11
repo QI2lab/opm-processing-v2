@@ -131,6 +131,32 @@ def test_uniform_illumination_preserves_calibrated_intensities():
     )
 
 
+@pytest.mark.parametrize(
+    "profile,offset,message",
+    [
+        ([1, 1], -1, "crop is outside"),
+        ([1, 1], 1, "crop is outside"),
+        ([[1, 1]], 0, "crop is outside"),
+        ([1, 0], 0, "finite and positive"),
+        ([1, -1], 0, "finite and positive"),
+        ([1, np.nan], 0, "finite and positive"),
+        ([1, np.inf], 0, "finite and positive"),
+    ],
+)
+def test_detector_calibration_rejects_invalid_gain_and_crop(
+    camera_codes, profile, offset, message
+):
+    """Reject unusable detector calibration before correcting camera values."""
+    with pytest.raises(ValueError, match=message):
+        camera_correct(
+            camera_codes[:1, :1, :2],
+            100,
+            0.24,
+            detector_gain_x=np.asarray(profile),
+            detector_x_offset=offset,
+        )
+
+
 @pytest.mark.parametrize("shape", [(5, 8), (2, 3, 5, 8)])
 def test_camera_images_and_broadcast_illumination(shape):
     """Broadcast known ADC transfer and illumination over leading image axes."""
