@@ -209,14 +209,14 @@ def assert_fused_ngff(case):
         pytest.param(
             True,
             ("line-pairs", "uniform", 1, "tiled", True),
-            ("mirror", 1, 2),
+            ("mirror", 1, 2, False),
             id="True-line-tiled200-mirror-native",
         ),
         pytest.param(
             True,
             ("sphere", "uniform", 1, "whole", True),
-            ("stage", 3, 1),
-            id="True-sphere-whole50-stage-sparse3",
+            ("stage", 3, 1, True),
+            id="True-sphere-whole50-stage-sparse3-live",
         ),
     ],
     indirect=["noisy_extended_scene", "large_noisy_acquisition"],
@@ -247,6 +247,7 @@ def test_large_noisy_scene_acquisition_to_fusion(
     result = pipeline_runner(
         dataset,
         deconvolve=deconvolve,
+        live=dataset.illumination_path if case.live else None,
         crop_scan=crop_scan if deconvolve else None,
         output=tmp_path / "processed",
         fusion_chunk=(128, 128),

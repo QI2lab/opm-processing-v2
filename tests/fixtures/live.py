@@ -90,6 +90,8 @@ def opm_v2_live_acquisition_factory(tmp_path, opm_v2_acquisition_factory):
     callable
         Persist simulated observations and the illumination supplied to processing.
     """
+    from dataclasses import asdict
+
     from opm_processing.dataio.acquisition import ChannelMetadata
 
     def create(
@@ -99,38 +101,41 @@ def opm_v2_live_acquisition_factory(tmp_path, opm_v2_acquisition_factory):
         illumination=None,
         camera_conversion=0.24,
         camera_read_noise_e=None,
+        **overrides,
     ):
         """Deliver actual frames through the upstream publisher and TensorStore writer."""
         path = tmp_path / f"{name}.ome.zarr"
         document = manifest_document(path, timepoints=raw_data.shape[0])
         document["data_path"] = str(path)
-        document["camera_e_to_adu"] = camera_conversion
         document["index_sizes"] = dict(zip("tpcz", raw_data.shape[:4], strict=True))
-        document["stage_positions_zxy"] = [
-            [30.0, 100.0, 200.0 + 2 * index] for index in range(raw_data.shape[1])
-        ]
-        document["channels"] = [
-            {
-                "name": f"637nm-{index}",
-                "wavelength_nm": 637.0,
-                "exposure_ms": 10.0,
-                "laser_power": 12.0,
-            }
-            for index in range(raw_data.shape[2])
-        ]
-        dataset = opm_v2_acquisition_factory(
-            raw_data,
-            name=name,
-            mode="stage",
-            live_manifest=document,
-            channels=tuple(
+        settings = {
+            "mode": "stage",
+            "channels": tuple(
                 ChannelMetadata(index, f"637nm-{index}", 637.0, 10.0, 12.0)
                 for index in range(raw_data.shape[2])
             ),
-            stage_positions_zxy=tuple(map(tuple, document["stage_positions_zxy"])),
-            camera_conversion=document["camera_e_to_adu"],
+            "stage_positions_zxy": tuple(
+                (30.0, 100.0, 200.0 + 2 * index) for index in range(raw_data.shape[1])
+            ),
+            "camera_conversion": camera_conversion,
+            "orientations": tuple(document["orientations"].items()),
+            **overrides,
+        }
+        document.update(
+            {key: value for key, value in settings.items() if key in document}
+        )
+        document["camera_e_to_adu"] = settings["camera_conversion"]
+        document["channels"] = [asdict(channel) for channel in settings["channels"]]
+        document["stage_positions_zxy"] = [
+            list(position) for position in settings["stage_positions_zxy"]
+        ]
+        document["orientations"] = dict(settings["orientations"])
+        dataset = opm_v2_acquisition_factory(
+            raw_data,
+            name=name,
+            live_manifest=document,
             camera_read_noise_e=camera_read_noise_e,
-            orientations=tuple(document["orientations"].items()),
+            **settings,
         )
         field_path = tmp_path / f"{name}_illumination.ome.tif"
         field = (

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import json
+from functools import partial
 
 import numpy as np
 import pytest
@@ -150,6 +151,15 @@ def test_live_iterator_waits_for_unprocessed_tiles_then_stops(
 
     if resume:
         acquire()
+        with pytest.raises(ValueError, match="outside the manifest plan"):
+            next(
+                iter_live_tiles(
+                    readiness,
+                    dataset.manifest,
+                    dataset.log,
+                    completed_tiles={(1, 0)},
+                )
+            )
     tiles = list(
         iter_live_tiles(
             readiness,
@@ -165,6 +175,29 @@ def test_live_iterator_waits_for_unprocessed_tiles_then_stops(
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("event", ["canceled", "errored"])
+def test_live_iterator_reports_failure_after_a_delivered_tile(
+    live_acquisition_factory, event
+):
+    """Retain delivered tiles while reporting a terminal controller failure."""
+    dataset = live_acquisition_factory(shape=(1, 2, 1, 1, 2, 2), completed=False)
+    dataset.collection.arrays[0].write(np.ones((1, 1, 1, 2, 2), np.uint16)).result()
+    iterator = iter_live_tiles(
+        ZarrTileReadiness(dataset.manifest.apply(inspect_acquisition(dataset.path))),
+        dataset.manifest,
+        dataset.log,
+    )
+    assert next(iterator) == (0, 0)
+    dataset.log.write_text(
+        json.dumps({"event": event, "acquisition_id": dataset.manifest.acquisition_id})
+        + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match=f"{event} after 1 of 2 complete tiles"):
+        next(iterator)
+
+
+@pytest.mark.unit
 def test_lifecycle_reader_ignores_an_incomplete_last_record(tmp_path) -> None:
     """Do not parse a JSONL record while the controller is appending it."""
     log_path = tmp_path / "sample.log.jsonl"
@@ -173,6 +206,8 @@ def test_lifecycle_reader_ignores_an_incomplete_last_record(tmp_path) -> None:
         encoding="utf-8",
     )
     assert read_lifecycle_event(log_path, "id") == "started"
+    with pytest.raises(ValueError, match="does not match"):
+        read_lifecycle_event(log_path, "another-acquisition")
 
 
 @pytest.mark.unit
@@ -362,7 +397,8 @@ def test_offline_resume_skips_durably_completed_tile_and_default_overwrites(
     }
     with interrupt_completed_tile(case.output), pytest.raises(KeyboardInterrupt):
         process_module.process_skewed(dataset.path, dataset.metadata, **options)
-    first = open_position_collection(case.output).arrays[0].read().result()
+    original = open_position_collection(case.output)
+    first = original.arrays[0].read().result()
     assert_uniform_photon_accuracy(first, case.scene, position=0)
     dataset.raw_arrays[0].write(case.changed.pixels[:, 0, :, ::-1].copy()).result()
     root = relocate_acquisition(tmp_path, copy=action == "resume")
@@ -391,6 +427,12 @@ def test_offline_resume_skips_durably_completed_tile_and_default_overwrites(
     assert_uniform_photon_accuracy(
         output.arrays[1].read().result(), case.scene, position=1
     )
+    np.testing.assert_array_equal(
+        output.spatial_origins_zyx_um, original.spatial_origins_zyx_um
+    )
+    np.testing.assert_array_equal(output.voxel_size_um, original.voxel_size_um)
+    state = ProcessingState.read(processing_state_path(root, "offline_resume"))
+    assert state.completed_tiles(root / case.output.name) == {(0, 0), (0, 1)}
 
 
 @pytest.mark.integration
@@ -400,12 +442,29 @@ def test_live_processing_resumes_completed_output_tiles(
     interrupt_completed_tile,
     assert_uniform_photon_accuracy,
     relocate_acquisition,
+    monkeypatch,
 ):
-    """Preserve durable dark tiles and recompute an interrupted physical sample."""
+    """Process the first tile before acquisition completes, then resume on arrival."""
     case = resume_acquisition(live=True)
     dataset = case.dataset
     log_path = tmp_path / "live_resume.log.jsonl"
     lifecycle = log_path.read_bytes()
+    acquisition, manifest, _ = open_live_acquisition(tmp_path)
+    log_path.write_bytes(
+        b"".join(
+            record
+            for record in lifecycle.splitlines(keepends=True)
+            if json.loads(record).get("event") != "completed"
+        )
+    )
+    chunk = next(
+        path
+        for path in (dataset.path / acquisition.array_paths[1]).rglob("*")
+        if path.is_file() and path.name != "zarr.json"
+    )
+    chunk_relative = chunk.relative_to(tmp_path)
+    pending = tmp_path / "pending_camera_chunk"
+    chunk.replace(pending)
     options = {
         "max_projection": True,
         "create_fused_max_projection": False,
@@ -417,10 +476,32 @@ def test_live_processing_resumes_completed_output_tiles(
     maximum = open_position_collection(case.maximum)
     np.testing.assert_array_equal(output.arrays[0].read().result(), 0)
     np.testing.assert_array_equal(maximum.arrays[0].read().result(), 0)
+    assert ZarrTileReadiness(acquisition).ready_tiles() == {(0, 0)}
+    assert read_lifecycle_event(log_path, manifest.acquisition_id) == "started"
     output.arrays[1][0, 0, 0, 0, 0].write(np.uint16(999)).result()
     dataset.raw_arrays[0].write(case.changed.pixels[:, 0, :, ::-1].copy()).result()
     root = relocate_acquisition(tmp_path, copy=True)
+    polls = []
+
+    def publish(seconds):
+        """Release real writer bytes only after the first output is durable."""
+        assert not polls
+        state = ProcessingState.read(processing_state_path(root, "live_resume"))
+        assert state.completed_tiles(root / case.maximum.name) == {(0, 0)}
+        assert (
+            read_lifecycle_event(root / log_path.name, manifest.acquisition_id)
+            == "started"
+        )
+        (root / pending.name).replace(root / chunk_relative)
+        (root / log_path.name).write_bytes(lifecycle)
+        polls.append(seconds)
+
+    processing = importlib.import_module("opm_processing.process")
+    monkeypatch.setattr(
+        processing, "iter_live_tiles", partial(iter_live_tiles, sleeper=publish)
+    )
     process(root_path=root, live=root / dataset.illumination_path.name, **options)
+    assert len(polls) == 1
     resumed = open_position_collection(root / case.output.name)
     projection = open_position_collection(root / case.maximum.name)
     np.testing.assert_array_equal(resumed.arrays[0].read().result(), 0)
@@ -434,3 +515,8 @@ def test_live_processing_resumes_completed_output_tiles(
     state = ProcessingState.read(processing_state_path(root, "live_resume"))
     assert state.completed_tiles(root / case.output.name) == {(0, 0), (0, 1)}
     assert state.completed_tiles(root / case.maximum.name) == {(0, 0), (0, 1)}
+    for before, after in ((output, resumed), (maximum, projection)):
+        np.testing.assert_array_equal(
+            after.spatial_origins_zyx_um, before.spatial_origins_zyx_um
+        )
+        np.testing.assert_array_equal(after.voxel_size_um, before.voxel_size_um)

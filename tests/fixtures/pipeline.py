@@ -87,6 +87,7 @@ def pipeline_runner(
         *,
         deconvolve=False,
         illumination=False,
+        live=None,
         crop_scan=None,
         output=None,
         fusion_chunk=None,
@@ -97,6 +98,7 @@ def pipeline_runner(
             processing_options,
             deconvolve=deconvolve,
             flatfield_correction=illumination,
+            live=live,
             save_float32=True,
             output=output,
         )
@@ -149,7 +151,8 @@ def pipeline_runner(
 
             execution.setattr(opmtools, "interpolate_rows", record_tile)
             execution.setattr(module, "orthogonal_deskew", observe_deskew)
-            invoke_cli("process", dataset.path, **options)
+            source = dataset.path.parent if live is not None else dataset.path
+            invoke_cli("process", source, **options)
         directory = dataset.path.parent if output is None else output
         stem = acquisition_stem(dataset.path)
         processed = (
@@ -436,9 +439,12 @@ def large_noisy_acquisition(
     noisy_extended_scene,
     simulation_parameters,
     opm_v2_acquisition_factory,
+    opm_v2_live_acquisition_factory,
 ):
     """Write independent full-field views of a shared noisy extended specimen."""
-    mode, factor, positions = request.param
+    from opm_processing.dataio.acquisition import ChannelMetadata
+
+    mode, factor, positions, live = request.param
     microscope, expected, raw, source, _dark = noisy_extended_scene
     native_scan_planes = expected.shape[0]
     phase = (native_scan_planes - 1) % factor if mode == "stage" else 0
@@ -459,7 +465,8 @@ def large_noisy_acquisition(
     pixel = microscope.pixel_size_um
     registration_error_pixels = DEFAULT_REGISTRATION_DOWNSAMPLE[-1]
     stage_scan = -4.6
-    dataset = opm_v2_acquisition_factory(
+    writer = opm_v2_live_acquisition_factory if live else opm_v2_acquisition_factory
+    dataset = writer(
         pixels,
         name="large_scene",
         mode=mode,
@@ -469,6 +476,12 @@ def large_noisy_acquisition(
         camera_offset=microscope.camera.offset_adu,
         camera_conversion=microscope.camera.electrons_per_adu,
         camera_read_noise_e=microscope.camera.read_noise_e,
+        channels=(ChannelMetadata(0, "488 + 637", None, 10.0, 10.0),),
+        orientations=(
+            ("camera_XYstage_orientation", "positive"),
+            ("camera_Zstage_orientation", "positive"),
+            ("camera_mirror_orientation", "positive"),
+        ),
         stage_positions_zxy=(
             (2.3, stage_scan, 1.15),
             (2.3, stage_scan, 1.15 + registration_error_pixels * pixel),
@@ -484,6 +497,7 @@ def large_noisy_acquisition(
         sampling_phase=phase,
         native_scan_planes=native_scan_planes,
         registration_error_pixels=registration_error_pixels,
+        live=live,
     )
 
 
