@@ -17,14 +17,15 @@ from opm_processing.dataio.deconvolution import (
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("projection", [False, True])
 def test_actual_acquisition_without_processing_metadata_generates_psf(
-    simulated_camera, opm_v2_acquisition_factory
+    microscope_parameters, opm_v2_acquisition_factory, projection
 ):
     """Raw writer output supplies geometry while processing supplies default optics."""
-    observed = simulated_camera((17, 32, 36), step=1.2)
-    microscope = observed.microscope
+    microscope = microscope_parameters
+    pixels = np.arange(17 * 32 * 36, dtype=np.uint16).reshape(1, 1, 1, 17, 32, 36)
     dataset = opm_v2_acquisition_factory(
-        observed.raw[None, None, None],
+        pixels,
         channels=(ChannelMetadata(0, "561 + 637", None, 10.0, 10.0),),
         scan_axis_step_um=1.2,
         camera_offset=microscope.camera.offset_adu,
@@ -41,10 +42,13 @@ def test_actual_acquisition_without_processing_metadata_generates_psf(
     np.testing.assert_array_equal(
         open_acquisition_datastore(metadata).read().result(), dataset.raw_data
     )
-    kernels, parameters = load_deconvolution_psfs(metadata, reconstruction_step_um=0.4)
+    kernels, parameters = load_deconvolution_psfs(
+        metadata, projection=projection, reconstruction_step_um=0.4
+    )
     assert parameters["lens"]["NA"] == 1.35
     (kernel,) = kernels
     assert kernel.ndim == 3 and all(size % 2 for size in kernel.shape)
+    assert (kernel.shape[0] == 1) == projection
     assert np.all(np.isfinite(kernel) & (kernel >= 0)) and kernel.sum() > 0
     np.testing.assert_allclose(
         kernel,

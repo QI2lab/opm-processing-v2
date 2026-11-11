@@ -1,4 +1,4 @@
-"""Analytical metadata units and CLI inspection of simulated OPM acquisitions."""
+"""Metadata units and CLI inspection of prescribed acquisition and Cartesian grids."""
 
 import json
 
@@ -38,20 +38,33 @@ def test_hardware_timing_uses_camera_exposures(field, factor, planes):
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("exposure", [None, -1, 0, float("nan"), True, "invalid"])
-def test_missing_or_invalid_hardware_exposure_is_not_inferred(exposure):
+@pytest.mark.parametrize(
+    "exposures,message",
+    [
+        (None, None),
+        ([-1], "Invalid camera exposure"),
+        ([0], "Invalid camera exposure"),
+        ([float("nan")], "Invalid camera exposure"),
+        ([float("inf")], "Invalid camera exposure"),
+        ([True], "Invalid camera exposure"),
+        (["invalid"], "Invalid camera exposure"),
+        ([0.001], "rounds to zero"),
+        ([5, 10], "hardware exposures change"),
+    ],
+)
+def test_missing_or_invalid_hardware_exposure_is_not_inferred(exposures, message):
     """Keep unknown camera timing unknown and reject nonphysical exposures."""
     frames = [
         {"mda_event": {"index": {"c": 0}, "metadata": {"Camera": {"exposure_ms": 10}}}}
     ]
-    if exposure is None:
+    if exposures is None:
         assert hardware_timing(frames, 1, 17) == {
             "frame_exposure_ms": [None],
             "volume_time_ms": None,
         }
     else:
-        frames[0]["exposure_ms"] = exposure
-        with pytest.raises(ValueError, match="exposure"):
+        frames = [{**frames[0], "exposure_ms": value} for value in exposures]
+        with pytest.raises(ValueError, match=message):
             hardware_timing(frames, 1, 17)
 
 
@@ -111,15 +124,18 @@ def test_processed_volume_dimensions_use_recorded_lab_grid(
     "selection",
     ["raw-only", "directory", "raw", "processed", "custom-processed", "processed-only"],
 )
-def test_inspect_cli_reports_simulated_raw_and_processed_data(
+def test_inspect_cli_reports_prescribed_acquisition_and_processed_metadata(
     inspection_case,
     selection,
     invoke_cli,
 ):
-    """Inspect real processing products of an optically simulated oblique object."""
+    """Inspect real writer metadata on prescribed camera and Cartesian image grids."""
     case, collection = inspection_case.case, inspection_case.collection
     if collection is not None:
-        assert any(np.any(array.read().result() > 0) for array in collection.arrays)
+        for position, array in enumerate(collection.arrays):
+            np.testing.assert_array_equal(
+                array.read().result(), case.raw_data[:, position]
+            )
     report = json.loads(invoke_cli("inspect-opm", inspection_case.selected).output)
     if selection == "processed-only":
         assert report["raw"] is None

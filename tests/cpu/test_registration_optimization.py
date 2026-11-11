@@ -10,21 +10,17 @@ pytestmark = pytest.mark.unit
 
 @pytest.mark.parametrize("method", ["TWO_ROUND", "TWO_ROUND_ITERATIVE"])
 def test_cycle_rejection_preserves_depth_links_and_component_anchors(
-    fusion_operator, method
+    tile_fusion, method
 ):
     """Remove a bad cycle edge without losing valid depth links or graph anchors."""
-    fusion = fusion_operator(
-        TileFusion,
-        _tile_positions=[(0, 0, 0)] * 6,
-        _tiles_by_time=(tuple(range(6)),),
-        pairwise_metrics={
-            (0, 1): (0, 12, 0, 0.71),
-            (0, 2): (0, -180, 0, 0.95),
-            (1, 3): (0, -180, 0, 0.95),
-            (2, 3): (0, 0, 0, 0.95),
-            (4, 5): (0, -50, 0, 0.95),
-        },
-    )
+    fusion = tile_fusion([np.ones((1, 2, 4, 4), np.uint16)] * 6, [(0, 0, 0)] * 6)
+    fusion.pairwise_metrics = {
+        (0, 1): (0, 12, 0, 0.71),
+        (0, 2): (0, -180, 0, 0.95),
+        (1, 3): (0, -180, 0, 0.95),
+        (2, 3): (0, 0, 0, 0.95),
+        (4, 5): (0, -50, 0, 0.95),
+    }
     fusion.optimize_shifts(method=method)
     np.testing.assert_allclose(
         fusion.global_offsets[:, 1], (0, 0, -180, -180, 0, -50), atol=1e-8

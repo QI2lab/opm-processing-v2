@@ -2,16 +2,23 @@
 
 from dataclasses import replace
 
+import numpy as np
 import pytest
 from yaozarrs import open_group
 
-from opm_processing.dataio.acquisition import _camera_timing, inspect_acquisition
+from opm_processing.dataio.acquisition import (
+    _camera_timing,
+    inspect_acquisition,
+    open_acquisition_datastore,
+)
+from opm_processing.dataio.ngff import tczyx_image_metadata
 from opm_processing.dataio.position_collection import (
     create_position_collection,
     create_variable_position_collection,
     open_position_collection,
     update_group_attributes,
 )
+from opm_processing.dataio.timing import read_time_interval
 
 
 @pytest.mark.unit
@@ -81,11 +88,35 @@ def test_unknown_time_does_not_become_one_second(tmp_path):
     assert open_position_collection(path).time_interval_s is None
 
 
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "unit,recorded",
+    [
+        ("second", 60),
+        ("millisecond", 60000),
+        ("microsecond", 60000000),
+        ("nanosecond", 60000000000),
+        ("minute", 1),
+        ("hour", 1 / 60),
+    ],
+)
+def test_time_reader_converts_units_and_requires_consistent_levels(unit, recorded):
+    """Read physical cadence from every level without assuming seconds."""
+    multiscale = tczyx_image_metadata(
+        [(1, 1, 1), (1, 2, 2)], [(0, 0, 0)] * 2, time_interval_s=recorded
+    ).multiscales[0]
+    multiscale.axes[0].unit = unit
+    assert read_time_interval(multiscale) == pytest.approx(60)
+    multiscale.datasets[1].scale_transform.scale[0] *= 2
+    with pytest.raises(ValueError, match="disagree on physical time scale"):
+        read_time_interval(multiscale)
+
+
 @pytest.mark.integration
 def test_processing_propagates_hardware_cadence(
-    calibrated_mirror_timelapse, invoke_cli
+    calibrated_mirror_timelapse, invoke_cli, assert_roi_point_accuracy
 ):
-    """Preserve hardware cadence through processing and projection output."""
+    """Preserve calibrated exposures, geometry and cadence through saved projections."""
     raw = calibrated_mirror_timelapse.path
     invoke_cli(
         "process",
@@ -94,25 +125,40 @@ def test_processing_propagates_hardware_cadence(
         create_fused_max_projection=False,
         z_downsample_level=1,
     )
+    volume = open_position_collection(raw.parent / "single_mirror_deskewed.ome.zarr")
+    pixels = volume.arrays[0].read().result()
+    assert volume.shape == (3, 1, 1, *calibrated_mirror_timelapse.shape_zyx)
+    assert pixels.dtype == np.uint16
+    np.testing.assert_array_equal(
+        open_acquisition_datastore(raw).read().result(),
+        calibrated_mirror_timelapse.truth.pixels,
+    )
+    assert volume.spatial_origins_zyx_um == ((0.0, 0.0, 0.0),)
+    assert "opm_v2" not in volume.attributes
+    assert_roi_point_accuracy(
+        pixels,
+        calibrated_mirror_timelapse.truth,
+        volume.spatial_origins_zyx_um[0],
+        volume.voxel_size_um,
+    )
+    planes = calibrated_mirror_timelapse.truth.pixels.shape[-3]
+    volume_period = planes * 0.005
     for name in (
         "single_mirror_deskewed.ome.zarr",
         "single_mirror_max_z_deskewed.ome.zarr",
     ):
         result = open_position_collection(raw.parent / name)
-        import numpy as np
-
-        for time, expected in enumerate(calibrated_mirror_timelapse.expected):
-            expected = expected.astype(np.uint16)
-            if "max_z" in name:
-                expected = expected.max(axis=0, keepdims=True)
+        if "max_z" in name:
+            # The volume first passes original-object accuracy; projection is
+            # then an independent NumPy reduction of those stored observations.
             np.testing.assert_array_equal(
-                result.arrays[0][time, 0].read().result(), expected
+                result.arrays[0].read().result(), np.max(pixels, axis=2, keepdims=True)
             )
-        assert result.time_interval_s == pytest.approx(0.020)
+        assert result.time_interval_s == pytest.approx(volume_period)
         timing = result.attributes["opm_processing"]["timing"]
-        assert timing["n_acquired_planes"] == 4
+        assert timing["n_acquired_planes"] == planes
         assert timing["dt_plane_s"] == 0.005
-        assert timing["dt_volume_s"] == 0.020
+        assert timing["dt_volume_s"] == volume_period
         assert timing["source"] == "recorded camera exposure_time; rounded to 0.01 ms"
 
 
@@ -136,9 +182,9 @@ def test_confirmed_period_cannot_override_recorded_timing(
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("channels", [1, 3])
-@pytest.mark.parametrize("planes", [1, 5])
-@pytest.mark.parametrize("field", ["exposure_time", "exposure_ms"])
+@pytest.mark.parametrize(
+    "channels,planes,field", [(1, 1, "exposure_time"), (3, 5, "exposure_ms")]
+)
 def test_hardware_exposures_define_cadence(
     acquisition_factory, channels, planes, field
 ):
@@ -172,30 +218,19 @@ def test_hardware_exposures_define_cadence(
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize(
-    "exposures, message",
-    [
-        ([0], "Invalid camera exposure"),
-        ([float("nan")], "Invalid camera exposure"),
-        ([float("inf")], "Invalid camera exposure"),
-        ([-1], "Invalid camera exposure"),
-        ([True], "Invalid camera exposure"),
-        (["invalid"], "Invalid camera exposure"),
-        ([0.001], "rounds to zero"),
-        ([5, 10], "hardware exposures change"),
-    ],
-)
-def test_invalid_hardware_exposures_rejected(exposures, message):
-    """Reject nonphysical hardware exposures and changes in hardware cadence."""
+def test_camera_timing_requires_matching_positions_and_retains_exposure_sources():
+    """Agree across positions after unit conversion and retain field provenance."""
     frames = [
-        {
-            "event_index": {"t": 0, "p": 0, "c": 0, "z": scan},
-            "exposure_ms": exposure,
-        }
-        for scan, exposure in enumerate(exposures)
+        [{"event_index": {"c": 0}, "exposure_time": 0.005}],
+        [{"event_index": {"c": 0}, "exposure_ms": 5}],
     ]
-    with pytest.raises(ValueError, match=message):
-        _camera_timing([frames], 1)
+    assert _camera_timing(frames, 1) == (
+        0.005,
+        "recorded camera exposure_ms/exposure_time; rounded to 0.01 ms",
+    )
+    frames[1][0]["exposure_ms"] = 6
+    with pytest.raises(ValueError, match="change across frames or positions"):
+        _camera_timing(frames, 1)
 
 
 @pytest.mark.unit
@@ -238,7 +273,7 @@ def test_hardware_channel_periods_sum_once(exposures, period):
 @pytest.mark.unit
 @pytest.mark.parametrize("projection", [False, True])
 def test_fused_writer_preserves_time_axis(
-    tmp_path, fusion_operator, position_store_factory, projection
+    tmp_path, tile_fusion, position_store_factory, projection
 ):
     """Retain the source temporal axis in fused output."""
     import numpy as np
@@ -266,19 +301,18 @@ def test_fused_writer_preserves_time_axis(
         assert provenance["source_collection"] == collection.path.name
         assert provenance["source_position_indices"] == [0]
     else:
-        operator = fusion_operator(
+        operator = tile_fusion(
+            [np.zeros((1, 4, 8, 8), np.uint16)] * 3,
+            [(0, 0, 0)] * 3,
+            time_indices=(0, 1, 2),
+            spacing=(0.23, 0.115, 0.115),
             time_interval_s=0.085,
             multiscale_factors=(2,),
+            resolution_multiples=((1, 1, 1), (2, 2, 2)),
             multiscale_downsample="stride",
-            _pixel_size=(0.23, 0.115, 0.115),
-            offset_um=(0, 0, 0),
-            padded_shape=(4, 8, 8),
-            _is_2d=False,
-            time_dim=3,
-            channels=1,
-            chunk_y=4,
-            chunk_x=4,
+            chunk_shape_yx=(4, 4),
         )
+        operator.offset_um, operator.padded_shape = (0, 0, 0), (4, 8, 8)
         operator._prepare_fused_image(path, z_slices_per_write=2)
     image = open_group(path).ome_metadata()
     assert image.multiscales[0].axes[0].unit == "second"

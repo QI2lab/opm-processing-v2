@@ -1,0 +1,120 @@
+name: Science validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Test selection
+        type: choice
+        required: true
+        default: cpu-science
+        options: [cpu-science, gpu-science, full-cpu, full-gpu]
+      runner:
+        description: Qualified existing runner label or labels as JSON
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+# Qualified profiles may share the same GPU and scratch storage.
+concurrency:
+  group: science
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: ${{ inputs.profile }}
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: 1440
+    env:
+      PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+      QT_QPA_PLATFORM: offscreen
+      MPLBACKEND: Agg
+      CUDA_VISIBLE_DEVICES: ${{ contains(inputs.profile, 'gpu') && '0' || '-1' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up CPU Python
+        if: "!contains(inputs.profile, 'gpu')"
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache-dependency-path: pyproject.toml
+          cache: pip
+
+      - name: Install CPU dependencies
+        if: "!contains(inputs.profile, 'gpu')"
+        run: |
+          python -m pip install -U pip
+          python -m pip install torch==2.9.0 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install --group dev --editable ".[processing]"
+          python -m pip install --no-deps "opm-v2 @ git+https://github.com/QI2lab/opm-v2@ae059d962835520bf2c1b37edbb335bf5e617b23"
+
+      # GPU profiles use the runner's qualified Python/CUDA/cuCIM environment.
+      - name: Install checkout in qualified GPU environment
+        if: contains(inputs.profile, 'gpu')
+        run: |
+          python -m pip install --no-deps --editable .
+          python -m pip install --no-deps "opm-v2 @ git+https://github.com/QI2lab/opm-v2@ae059d962835520bf2c1b37edbb335bf5e617b23"
+
+      - name: CPU science cases
+        if: inputs.profile == 'cpu-science'
+        run: >-
+          python -m pytest
+          tests/cpu/test_opmtools.py::test_large_noisy_deskew_preserves_scientific_bounds_across_tiles
+          --strict-markers -p pytest_cov --color=yes --cov --cov-report=xml --cov-report=term-missing --junitxml=science.xml
+
+      - name: GPU science cases
+        if: inputs.profile == 'gpu-science'
+        run: >-
+          python -m pytest
+          tests/gpu/test_illumination.py
+          tests/gpu/test_gpu_processing.py::test_bounded_peak_matches_upstream_phase_normalization
+          tests/gpu/test_gpu_processing.py::test_fft_convolution_matches_direct_reference
+          tests/gpu/test_gpu_processing.py::test_kld_matches_independent_probability_definition
+          tests/gpu/test_gpu_processing.py::test_exact_signal_registration_recovers_known_3d_translation
+          tests/gpu/test_gpu_processing.py::test_rlgc_empty_image_remains_empty
+          tests/gpu/test_gpu_processing.py::test_split_kl_scores_match_direct_probability_definition
+          tests/gpu/test_registration_geometry.py
+          tests/gpu/test_registration_periodic.py
+          tests/gpu/test_registration_retries.py
+          tests/gpu/test_tilefusion.py
+          tests/gpu/test_photon_splitting.py
+          tests/gpu/test_rlgc_physics.py::test_full_data_rl_update_preserves_uniform_photon_rates
+          tests/gpu/test_rlgc_physics.py::test_gc_checkpoint_continues_same_optical_reconstruction
+          tests/gpu/test_rlgc_physics.py::test_consensus_uses_additive_object_changes
+          tests/gpu/test_rlgc_physics.py::test_kl_preserves_finite_uniform_object
+          tests/gpu/test_rlgc_physics.py::test_gc_kl_scores_forward_prediction
+          tests/gpu/test_rlgc_physics.py::test_gc_stopping_uses_prescribed_fraction_and_change_limits
+          tests/gpu/test_rlgc_physics.py::test_optical_forward_adjoint_matches_scipy
+          tests/gpu/test_rlgc_detector_response.py::test_tiled_consensus_recovers_known_blurred_object
+          tests/gpu/test_rlgc_detector_response.py::test_nonuniform_response_preserves_uniform_fluorescence
+          tests/gpu/test_rlgc_detector_response.py::test_calibrated_input_preserves_subcount_intensity
+          tests/gpu/test_rlgc_physics.py::test_tiled_gc_recovers_noisy_extended_objects_without_rl_noise
+          "tests/gpu/test_gpu_processing.py::test_registration_recovers_displaced_cartesian_observations[applied_shift1]"
+          "tests/gpu/test_processing_pipeline.py::test_large_noisy_scene_acquisition_to_fusion[True-line-tiled200-mirror-native]"
+          "tests/gpu/test_processing_pipeline.py::test_large_noisy_scene_acquisition_to_fusion[True-sphere-whole50-stage-sparse3-live]"
+          tests/gpu/test_rlgc_physics.py::test_scan_chunk_planner_accounts_for_all_channels_and_reuses_crop
+          tests/gpu/test_rlgc_physics.py::test_reconstruction_rejects_nonphysical_calibration
+          "tests/gpu/test_processing_pipeline.py::test_extended_mosaic_acquisition_to_fusion[stage-native-whole]"
+          "tests/gpu/test_processing_pipeline.py::test_extended_mosaic_acquisition_to_fusion[stage-sparse3-tiled]"
+          "tests/gpu/test_processing_pipeline.py::test_qi2lab_acquisition_to_fused_ngff_v05[True-stage-0.4um-estimated-taper]"
+          --strict-markers -p pytest_cov --color=yes --cov --cov-report=xml --cov-report=term-missing --junitxml=science.xml
+
+      - name: Full CPU suite
+        if: inputs.profile == 'full-cpu'
+        run: python -m pytest tests/cpu --strict-markers -p pytest_cov --color=yes --cov --cov-report=xml --cov-report=term-missing --junitxml=science.xml
+
+      - name: Full GPU suite
+        if: inputs.profile == 'full-gpu'
+        run: python -m pytest tests/gpu --strict-markers -p pytest_cov --color=yes --cov --cov-report=xml --cov-report=term-missing --junitxml=science.xml
+
+      - name: Preserve test reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: science-${{ inputs.profile }}
+          path: |
+            science.xml
+            coverage.xml

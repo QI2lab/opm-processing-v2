@@ -127,20 +127,12 @@
       }
     }
   },
-  "kinds": [
-    "points",
-    "line-pairs",
-    "sphere",
-    "siemens-star"
+  "camera_shape_yx": [
+    256,
+    1900
   ],
-  "illumination_profiles": [
-    "uniform",
-    "edge-taper"
-  ],
-  "scan_factors": [
-    1,
-    3
-  ],
+  "whole_scan_planes": 50,
+  "tiled_scan_planes": 200,
   "photon_budgets": [
     [
       1000,
@@ -156,68 +148,11 @@
     ]
   ],
   "camera_seed": 31,
-  "rl": {
-    "iterations": 2000,
-    "checkpoints": [
-      1,
-      2,
-      3,
-      5,
-      10,
-      20,
-      30,
-      50,
-      75,
-      100,
-      150,
-      200,
-      300,
-      500,
-      750,
-      1000,
-      1500,
-      2000
-    ]
-  },
-  "rlgc": {
-    "read_noise": 1.6,
-    "limit": 0.001,
-    "max_delta": 0.001,
-    "rng_seed": 42,
-    "max_iterations": null,
-    "use_kl": true
-  },
-  "rendering": {
-    "dpi": 190,
-    "font_family": "Arial",
-    "best_view": {
-      "points": "XZ",
-      "line-pairs": "XZ",
-      "sphere": "XZ",
-      "siemens-star": "XY"
-    }
-  },
   "pipeline_mosaic": {
-    "half_extent_zyx_um": [
-      0.8,
-      7.0,
-      7.4
-    ],
-    "line_length_um": 12.0,
-    "scan_extent_um": 38.4,
-    "camera_shape_yx": [
-      32,
-      80
-    ],
     "tile_offset_x_pixels": 48,
-    "deskew_tile_shape_zyx": [
-      8,
-      64,
-      32
-    ],
     "fusion_chunk_shape_yx": [
-      8,
-      8
+      32,
+      128
     ],
     "blend_pixels_zyx": [
       0,
@@ -225,12 +160,16 @@
       8
     ]
   },
+  "large_scene": {
+    "line_length_um": 48.0
+  },
+  "integration_line_pairs": {
+    "whole_line_length_um": 6.0,
+    "pair_gap_um": 4.776,
+    "offset_x_um": -0.69,
+    "half_extent_x_um": 15.6
+  },
   "pipeline": {
-    "plane_period_s": 0.02,
-    "scan_extent_um": 7.2,
-    "camera_shape_yx": [
-      32,
-      36
-    ]
+    "plane_period_s": 0.02
   }
 }

@@ -27,12 +27,12 @@ Measured PSFs must be sampled at the inferred reconstruction spacing.
 | `--no-max-projection` | Disable per-tile and stage-placed maximum-Z images. |
 | `--no-create-fused-max-projection` | Disable the stage-placed maximum-Z mosaic. |
 | `--write-fused-max-projection-tiff` | Also save that mosaic as OME-TIFF. |
-| `--decon-crop-scan VALUE` | Set scan planes per deconvolution chunk; default automatic. |
+| `--decon-crop-scan VALUE` | Set retained reconstruction scan planes per deconvolution chunk; default automatic. |
 | `--decon-gpu-id VALUE` | Select the CUDA device; default 0. |
-| `--decon-verbose VALUE` | Opt-in solver diagnostics: default 0 (off); 1 reports chunk geometry and iterations. |
+| `--decon-verbose VALUE` | Opt-in solver diagnostics: default 0 (off); 1 reports chunk geometry, iterations and termination reason. |
 | `--decon-fallback-step-scan VALUE` | Set chunk reduction after GPU allocation failure. |
 | `--decon-psf-paths PATH` | Supply channel-ordered PSFs; repeat for each channel. |
-| `--eager-mode` | Legacy planar KL-stopping option; has no effect with MATLAB-default GC stopping. |
+| `--eager-mode` | Retained for compatibility; has no effect on current KL stopping. |
 
 ```bash
 uv run process "/path/to/acquisition" --deconvolve --flatfield-correction
@@ -48,6 +48,18 @@ See the [live acquisition guide](../../guides/live.md) for required controller
 sidecars and completion behavior.
 
 Append `--help` to list all options and defaults.
+
+Nonempty deconvolution chunks terminate through KL divergence by default: both
+prediction-to-half divergences must increase, and the preceding reconstruction
+is restored. Fraction/change thresholds do not preempt KL. All-zero calibrated
+chunks return zero without iterations. Each overlapping scan chunk reaches its
+first local KL stop and retains its iteration state in system memory. Chunks
+then continue to the latest first local KL stop across the volume, without
+repeating completed iterations.
+
+Sparse reconstruction uses zero boundaries with detector Y/X padding to prevent
+edge wraparound. This padding remains enabled even if the array solver's native
+`pad_yx` compatibility setting is disabled.
 
 The photon-GC solver revision is recorded with the processing configuration.
 Resume rejects incompatible solver configurations; start a fresh output or

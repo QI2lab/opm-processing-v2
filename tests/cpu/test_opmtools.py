@@ -2,11 +2,12 @@
 
 import numpy as np
 import pytest
-import tensorstore as ts
 
-from opm_processing.imageprocessing.opmtools import deskew_row, orthogonal_deskew
-
-pytestmark = pytest.mark.usefixtures("small_cpu_kernels")
+from opm_processing.imageprocessing.opmtools import (
+    deskew_coverage,
+    deskew_row,
+    orthogonal_deskew,
+)
 
 
 @pytest.mark.unit
@@ -33,16 +34,54 @@ def test_deskew_x_ramp_retains_partial_z_bins(deskew_field, factor, deskew_round
     """Keep every Z bin and its full divisor, including a partly supported last bin."""
     case = deskew_field
     actual = orthogonal_deskew(case.data, **case.geometry, downsample_factor=factor)
-    response = orthogonal_deskew(
-        np.full(case.data.shape, 1, dtype=np.float32),
-        **case.geometry,
-        downsample_factor=factor,
+    support = deskew_coverage(
+        case.data.shape, actual.shape, **case.geometry, downsample_factor=factor
     )
-    ramp = np.pad(case.data[0, 0], (0, response.shape[-1] - case.data.shape[-1]))
-    np.testing.assert_allclose(actual, response * ramp, **deskew_roundoff)
+    ramp = np.pad(case.data[0, 0], (0, actual.shape[-1] - case.data.shape[-1]))
+    np.testing.assert_allclose(
+        actual, support[..., None] * ramp * (2 / case.step), **deskew_roundoff
+    )
     if factor in (3, 20):
         assert np.any(actual[-1] > 0)
     np.testing.assert_array_equal(actual[:, 0], 0)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("factor", [1, 2, 3, 20])
+@pytest.mark.parametrize(
+    "deskew_field, supported_y, width",
+    [
+        (("constant", 0.115, (4, 4, 1)), (2, 3, 4), 8),
+        (("constant", 0.23, (4, 4, 1)), (2, 4, 6), 12),
+    ],
+    indirect=["deskew_field"],
+)
+def test_constant_box_has_prescribed_coverage(
+    deskew_field, factor, supported_y, width, deskew_roundoff
+):
+    """Retain a known constant box's three interior rows and zero every other cell.
+
+    At 30 degrees, four detector rows span exactly two laboratory-Z samples.
+    Z=0 has its following foot outside the sensor. At Z=1, projecting onto
+    the two acquired planes leaves both detector feet within [0,3) only at
+    the three prescribed Y coordinates. This supplies a complete analytical
+    image, independent of the production mapper used by workflow fixtures.
+    """
+    case = deskew_field
+    actual = orthogonal_deskew(case.data, **case.geometry, downsample_factor=factor)
+    shape = (2 if factor == 1 else 1, width, 4)
+    assert actual.shape == shape
+    coverage = np.zeros(shape[:2], np.float32)
+    coverage[1 if factor == 1 else 0, supported_y] = np.float32(1 / factor)
+    expected = np.zeros(shape, np.float32)
+    expected[..., 0] = coverage * np.float32(0.24 * 2 / case.step)
+    np.testing.assert_allclose(actual, expected, **deskew_roundoff)
+    np.testing.assert_array_equal(
+        deskew_coverage(
+            case.data.shape, shape, **case.geometry, downsample_factor=factor
+        ),
+        coverage,
+    )
 
 
 @pytest.mark.unit
@@ -131,6 +170,145 @@ def test_tiled_deskew_matches_global_grid(
 
 @pytest.mark.unit
 @pytest.mark.parametrize(
+    "noisy_extended_scene,layout",
+    [
+        pytest.param((kind, "uniform", 1, layout), layout, id=f"{kind}-{layout}")
+        for kind in ("line-pairs", "sphere")
+        for layout in ("whole", "tiled")
+    ],
+    indirect=["noisy_extended_scene"],
+    scope="session",
+)
+@pytest.mark.parametrize("scan_factor", (1, 3), ids=("native", "sparse3"))
+def test_large_noisy_deskew_preserves_scientific_bounds_across_tiles(
+    noisy_extended_scene, layout, scan_factor, tmp_path, monkeypatch
+):
+    """Deskew real noisy optical scenes through bounded Ryomen output tiles."""
+    from dataclasses import replace
+
+    from ryomen import Slicer
+
+    from opm_processing.imageprocessing import opmtools
+    from opm_processing.imageprocessing.camera import camera_correct
+    from tests.simulation.camera_likelihood import (
+        camera_sampling_envelope,
+        sampling_stencil_radii,
+    )
+    from tests.simulation.metrics import camera_volume_samples
+
+    microscope, expectation, raw, source, _dark = noisy_extended_scene
+    assert raw.shape == (50 if layout == "whole" else 200, 256, 1900)
+    microscope = replace(microscope, scan_step_um=microscope.scan_step_um * scan_factor)
+    expectation, raw, source = (
+        array[::scan_factor] for array in (expectation, raw, source)
+    )
+    camera, pixel = microscope.camera, microscope.pixel_size_um
+    data = camera_correct(raw, camera.offset_adu, camera.electrons_per_adu)
+    assert data.size >= 1_000_000
+    z_bin = 5
+    geometry = {
+        "theta": microscope.angle_deg,
+        "distance": microscope.scan_step_um,
+        "pixel_size": pixel,
+        "downsample_factor": z_bin,
+    }
+    shape = opmtools.deskew_shape_estimator(
+        data.shape, **geometry, crop_after_deskew=False
+    )[0]
+    whole = orthogonal_deskew(data, **geometry) if layout == "tiled" else None
+    output = np.lib.format.open_memmap(
+        tmp_path / "deskew.npy", mode="w+", dtype=np.float32, shape=tuple(shape)
+    )
+    output[:] = np.nan
+    tile_shape = (8, 128, 256) if layout == "tiled" else None
+    slicers, visits = [], []
+    interpolate = opmtools.interpolate_rows
+
+    def observe_slicer(*args, **kwargs):
+        """Observe the actual upstream scheduler without replacing its tiles."""
+        result = Slicer(*args, **kwargs)
+        slicers.append(len(result))
+        return result
+
+    def observe_rows(*args):
+        """Record actual origins while executing the unchanged interpolation."""
+        visits.append((args[-1], args[1].shape))
+        return interpolate(*args)
+
+    with monkeypatch.context() as execution:
+        execution.setattr(opmtools, "Slicer", observe_slicer)
+        execution.setattr(opmtools, "interpolate_rows", observe_rows)
+        tiled = orthogonal_deskew(data, **geometry, tile_shape=tile_shape, out=output)
+    assert tiled is output and slicers == [len(visits)]
+    if layout == "tiled":
+        assert len(visits) > 8
+        np.testing.assert_array_equal(tiled, whole)
+        covered = np.zeros(tiled.shape, bool)
+        foreground = orthogonal_deskew(source.astype(np.float32), **geometry) > 0
+        for origin, shape in visits:
+            assert np.all(np.asarray(shape) <= tile_shape)
+            selection = tuple(
+                slice(start, start + size)
+                for start, size in zip(origin, shape, strict=True)
+            )
+            covered[selection] = True
+        assert covered.all()
+        crossings = 0
+        for axis in range(3):
+            borders = sorted(
+                {origin[axis] for origin, _shape in visits if origin[axis]}
+            )
+            crossings += sum(
+                np.any(
+                    np.take(foreground, border - 1, axis=axis)
+                    & np.take(foreground, border, axis=axis)
+                )
+                for border in borders
+            )
+        assert crossings >= 2
+    else:
+        assert visits == [((0, 0, 0), tiled.shape)]
+    coverage_zy = deskew_coverage(data.shape, tiled.shape, **geometry)
+    support = (coverage_zy[..., None] > 0) & (
+        np.arange(tiled.shape[-1]) < data.shape[-1]
+    )
+    np.testing.assert_array_equal(tiled[~support], 0)
+    assert 0 < coverage_zy[-1].max() < 1 and np.any(tiled[-1] > 0)
+    # Bin centers, photon-volume conversion and the source aperture are fixed
+    # by the physical acquisition. No reconstructed intensity chooses a region.
+    origin = ((z_bin - 1) * pixel / 2, 0, 0)
+    spacing = (z_bin * pixel, pixel, pixel)
+    gain = 2 * pixel / microscope.scan_step_um
+    prediction = camera_volume_samples(
+        tiled / gain, origin, spacing, (0, 0, 0), data.shape, microscope
+    )
+    coverage = camera_volume_samples(
+        coverage_zy[..., None] * (np.arange(tiled.shape[-1]) < data.shape[-1]),
+        origin,
+        spacing,
+        (0, 0, 0),
+        data.shape,
+        microscope,
+    )
+    aperture = source & (coverage >= 1 - 32 * np.finfo(np.float32).eps)
+    assert aperture.any()
+    bounds = camera_sampling_envelope(
+        expectation,
+        raw,
+        camera,
+        radii=sampling_stencil_radii(microscope, spacing, z_bin_factor=z_bin),
+        z_bin_factor=z_bin,
+    )
+    assert np.all(
+        np.isfinite(prediction[aperture])
+        & (prediction[aperture] >= bounds.lower[aperture])
+        & (prediction[aperture] <= bounds.upper[aperture])
+    )
+    output.flush()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
     "option,value",
     [
         ("downsample_factor", 0),
@@ -166,7 +344,6 @@ def test_deskewed_stage_tiles_blend_without_boundary_seams(
         support=case.support,
         x_profile=case.x_profile,
         block_shape=[1, 1, 2, 13, 5],
-        fused_ts=ts.array(np.zeros((1, 1, *case.shape), np.float32)),
         output_dtype=np.dtype(np.float32),
     )
     fusion._fuse_by_blocks()
@@ -174,12 +351,10 @@ def test_deskewed_stage_tiles_blend_without_boundary_seams(
     np.testing.assert_allclose(actual, case.expected, rtol=8e-7, atol=0)
 
 
-@pytest.mark.unit
-@pytest.mark.parametrize("factor", [3, 20])
-@pytest.mark.parametrize("mode", ["full", "roi", "cropped"])
-@pytest.mark.parametrize("deskew_field", [("x", 0.4)], indirect=True)
+@pytest.mark.integration
+@pytest.mark.parametrize("mode,factor", [("full", 3), ("roi", 3), ("cropped", 20)])
 def test_saved_deskew_retains_complete_z_extent(
-    deskew_processing_case, factor, deskew_roundoff
+    deskew_processing_case, factor, assert_roi_point_accuracy
 ):
     """Save every supported Z bin and the correct physical full-volume or ROI extent."""
     from opm_processing.dataio.position_collection import open_position_collection
@@ -199,7 +374,23 @@ def test_saved_deskew_retains_complete_z_extent(
     )
     saved = open_position_collection(case.path)
     actual = saved.arrays[0][0, 0].read().result()
-    np.testing.assert_allclose(actual, case.expected, **deskew_roundoff)
+    assert actual.shape == case.expected_shape
+    processing_metadata = saved.attributes["opm_processing"]
+    assert (
+        processing_metadata["timing"]["n_acquired_planes"]
+        == case.truth.pixels.shape[-3]
+    )
+    assert_roi_point_accuracy(
+        actual[None, None],
+        case.truth,
+        saved.spatial_origins_zyx_um[0],
+        saved.voxel_size_um,
+    )
+    width = case.acquisition.index_sizes["x"] - (2 if case.roi is not None else 0)
+    # The finite optical object contains genuine vacuum, even inside the
+    # camera aperture. Require exact padding zeros without inventing photons.
+    np.testing.assert_array_equal(actual[..., :width][case.support == 0], 0)
+    np.testing.assert_array_equal(actual[..., width:], 0)
     assert np.any(actual[-1] > 0)
     assert saved.voxel_size_um[0] == pytest.approx(
         round(factor * case.acquisition.pixel_size_um, 3)
@@ -216,11 +407,7 @@ def test_saved_deskew_retains_complete_z_extent(
         max_workers=1,
     )
     support = fusion._tile_support_zy[0]
-    first_value = 14 if case.roi is not None else 10
-    gain = 2 * case.acquisition.pixel_size_um / case.acquisition.scan_axis_step_um
-    np.testing.assert_allclose(
-        support, case.expected[..., 0] / (first_value * gain), atol=1e-7, rtol=1e-6
-    )
+    np.testing.assert_allclose(support, case.support, atol=1e-7, rtol=1e-6)
     np.testing.assert_allclose(fusion._tile_positions[0], case.origin, atol=1e-12)
     if case.roi is None:
         width = case.acquisition.index_sizes["x"]

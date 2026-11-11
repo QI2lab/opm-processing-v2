@@ -4,7 +4,16 @@
 
 Stage positions define nominal physical tile placement. Overlapping tile bounds,
 processed shapes, voxel spacing, scan angle, and effective registration sampling
-define initial per-pair search envelopes. These account for oblique depth
+define initial per-pair search envelopes. Acquisition overlap comes from
+`opm_v2.configuration.acq_config.Positions`: `scan_axis_overlap_um` takes
+precedence for stage scans; otherwise `scan_axis_overlap` supplies the scan
+fraction. `tile_axis_overlap` and `z_axis_overlap` supply the camera-X and
+depth fractions. Fractions are converted using raw acquisition dimensions and
+calibration, before processing crops or downsampling. The recorded overlap
+sets the search allowance directly, without an additional percentage of it.
+Missing settings fall back to measured nearest-face overlaps, or tile extent
+on untiled axes. Two registration sampling bins provide a minimum allowance.
+These envelopes account for oblique depth
 displacement and retain at least half the nominal overlap outside the depth
 search. Depth alignment uses wider context and requires at least three
 actually matched planes.
@@ -14,6 +23,12 @@ removes Z-invariant XY background from the depth evidence. Original-intensity
 SSIM remains a separate acceptance check; high SSIM alone cannot resolve depth.
 
 Registration estimates image shifts and scores corresponding supported samples.
+Phase translations are periodic in the sampled patch dimensions. All
+equivalents inside the physical correction limits are scored on real-space
+common support, including for thin depth overlaps. This avoids trusting an
+upstream disambiguation that selects a tiny strip at the opposite crop edge.
+The period includes any padding from block reduction. These equivalents
+remain subject to the same SSIM and contextual depth-evidence gates.
 For supported overlaps it compares phase and directional-edge proposals with a
 masked, nonperiodic normalized-correlation peak searched inside the physical
 shift limits. The normalization uses only common acquisition support, so padded

@@ -29,6 +29,52 @@ def centered_axis(half_extent: float, spacing: float) -> np.ndarray:
     return np.arange(-radius, radius + 1) * spacing
 
 
+def line_pairs(
+    axes_zyx: Sequence[np.ndarray],
+    *,
+    spacing_um: float,
+    gaps_um: Sequence[float],
+    pair_gap_um: float,
+    length_um: float,
+    diameter_um: float,
+    voxel_samples: int,
+    offset_x_um: float = 0.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Volume-average finite Y cylinders and return their prescribed X centers.
+
+    The integral of each line equals its physical length. Pair gaps and the
+    optional common translation specify source geometry before any acquisition.
+    """
+    spacing = spacing_um
+    gaps = np.asarray(gaps_um)
+    starts = np.r_[0, np.cumsum(gaps[:-1] + pair_gap_um)]
+    positions = np.column_stack((starts, starts + gaps)).ravel()
+    positions += offset_x_um - (positions[0] + positions[-1]) / 2
+    if not isinstance(voxel_samples, int) or voxel_samples < 1:
+        raise ValueError("Specimen voxel_samples must be a positive integer")
+    density = np.zeros(tuple(len(a) for a in axes_zyx), np.float32)
+    z, y, x = np.meshgrid(*axes_zyx, indexing="ij", sparse=True)
+    for center in positions:
+        line = np.zeros_like(density)
+        for dz, dy, dx in np.ndindex(voxel_samples, voxel_samples, voxel_samples):
+            line += (
+                (z + (dz - (voxel_samples - 1) / 2) * spacing / voxel_samples) ** 2
+                + (
+                    x
+                    + (dx - (voxel_samples - 1) / 2) * spacing / voxel_samples
+                    - center
+                )
+                ** 2
+                <= (diameter_um / 2) ** 2
+            ) & (
+                np.abs(y + (dy - (voxel_samples - 1) / 2) * spacing / voxel_samples)
+                <= length_um / 2
+            )
+        line *= length_um / (line.sum(dtype=np.float64) * spacing**3)
+        density += line
+    return density, positions
+
+
 def meridian_sphere(
     axes_zyx: Sequence[np.ndarray],
     diameter_um: float,

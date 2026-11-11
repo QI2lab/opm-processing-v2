@@ -21,13 +21,16 @@ from opm_processing.dataio.ngff import (
     round_spatial,
     round_spatial_values,
     round_tczyx_transform,
+    tczyx_image_metadata,
 )
 from opm_processing.dataio.processing_state import (
     ProcessingState,
-    processing_state_path,
+    image_processing_state_path,
+    processing_state_image_attributes,
 )
 from opm_processing.dataio.timing import time_axis
 from opm_processing.imageprocessing.coordinates import (
+    STAGE_COORDINATE_VERSION,
     stage_positions_to_image_coordinates,
 )
 
@@ -62,7 +65,7 @@ def regenerate_fused_max_projection(
     fused_suffix = "_fused.ome.zarr"
     acquisition_name = fused_path.name[: -len(fused_suffix)]
     processing_state = ProcessingState.read(
-        processing_state_path(fused_path.parent, acquisition_name)
+        image_processing_state_path(fused_path, acquisition_name)
     )
     processed_path = processing_state.registered_output_for_fused(fused_path)
 
@@ -152,7 +155,18 @@ def regenerate_fused_max_projection(
         output_path,
         projection_image,
         projection_specs,
-        extra_attributes={},
+        extra_attributes={
+            **processing_state_image_attributes(processing_state.path, output_path),
+            **(
+                {
+                    "opm_processing_coordinates": source_root.attrs[
+                        "opm_processing_coordinates"
+                    ]
+                }
+                if "opm_processing_coordinates" in source_root.attrs
+                else {}
+            ),
+        },
         chunks=(
             1,
             1,
@@ -347,6 +361,7 @@ class MaxTileFusion:
         opm_angle_deg: float | None = None,
         time_interval_s: float | None = None,
         source_collection: str | Path | None = None,
+        spatial_offsets_zyx_um: Sequence[Sequence[float]] | None = None,
     ) -> None:
         """Initialize maximum-projection fusion with a bounded source chunk cache.
 
@@ -388,6 +403,8 @@ class MaxTileFusion:
         source_collection : str or pathlib.Path or None
             Source projection collection, recorded to identify the preview's
             tile geometry when multiple processed collections exist.
+        spatial_offsets_zyx_um : sequence of sequence of float or None
+            Per-tile local NGFF offsets, including scan endpoint and deskew crop.
 
         Returns
         -------
@@ -427,6 +444,16 @@ class MaxTileFusion:
             reverse_z=self.reverse_stage_z,
             opm_angle_deg=opm_angle_deg,
         )
+        self._coordinate_attributes = (
+            {"opm_processing_coordinates": {"version": STAGE_COORDINATE_VERSION}}
+            if spatial_offsets_zyx_um is not None
+            else {}
+        )
+        if spatial_offsets_zyx_um is not None:
+            offsets = np.asarray(spatial_offsets_zyx_um, dtype=float)
+            if offsets.shape != placement_coordinates.shape:
+                raise ValueError("Expected one local ZYX image offset per tile")
+            placement_coordinates += offsets
         self.tile_positions = placement_coordinates[:, -2:]
         if source_position_indices is None:
             source_position_indices = range(len(self.tile_positions))
@@ -502,8 +529,8 @@ class MaxTileFusion:
         )
 
         fused_shape_unpadded = (
-            int((max_y - min_y) / self.pixel_size[0]),
-            int((max_x - min_x) / self.pixel_size[1]),
+            int(np.ceil((max_y - min_y) / self.pixel_size[0] - 1e-9)),
+            int(np.ceil((max_x - min_x) / self.pixel_size[1] - 1e-9)),
         )
 
         pad_y = (
@@ -584,50 +611,24 @@ class MaxTileFusion:
         )
         self.multiscale_factors_yx = factors
         interval_s = getattr(self, "time_interval_s", None)
-        t_axis, t_scale = time_axis(interval_s)
         t_origin = (
             0
             if self.time_range is None or interval_s is None
-            else self.time_range[0] * t_scale
+            else self.time_range[0] * interval_s
         )
-        axes = [
-            t_axis,
-            {"name": "c", "type": "channel"},
-            {"name": "z", "type": "space", "unit": "micrometer"},
-            {"name": "y", "type": "space", "unit": "micrometer"},
-            {"name": "x", "type": "space", "unit": "micrometer"},
-        ]
-        datasets = []
+        spatial_scales = []
+        spatial_origins = []
         specs = []
-        for level, factor in enumerate(factors):
-            datasets.append(
-                v05.Dataset(
-                    path=str(level),
-                    coordinateTransformations=[
-                        v05.ScaleTransformation(
-                            scale=round_tczyx_transform(
-                                (
-                                    t_scale,
-                                    1,
-                                    self.z_pixel_size,
-                                    self.pixel_size[0] * factor,
-                                    self.pixel_size[1] * factor,
-                                )
-                            )
-                        ),
-                        v05.TranslationTransformation(
-                            translation=round_tczyx_transform(
-                                (
-                                    t_origin,
-                                    0,
-                                    self.spatial_offset_z_um,
-                                    self.offset[0],
-                                    self.offset[1],
-                                )
-                            )
-                        ),
-                    ],
+        for factor in factors:
+            spatial_scales.append(
+                (
+                    self.z_pixel_size,
+                    self.pixel_size[0] * factor,
+                    self.pixel_size[1] * factor,
                 )
+            )
+            spatial_origins.append(
+                (self.spatial_offset_z_um, self.offset[0], self.offset[1])
             )
             specs.append(
                 (
@@ -641,25 +642,24 @@ class MaxTileFusion:
                     self.output_dtype,
                 )
             )
-        image = v05.Image(
-            multiscales=[
-                v05.Multiscale(
-                    name="fused-max-projection",
-                    axes=axes,
-                    datasets=datasets,
-                )
-            ]
+        image = tczyx_image_metadata(
+            spatial_scales,
+            spatial_origins,
+            time_interval_s=interval_s,
+            time_origin_s=t_origin,
+            name="fused-max-projection",
         )
         _, arrays = prepare_image(
             self.output_path,
             image,
             specs,
             extra_attributes={
+                **self._coordinate_attributes,
                 "opm_processing_projection": {
                     "placement": "stage",
                     "source_collection": self.source_collection,
                     "source_position_indices": list(self.source_position_indices),
-                }
+                },
             },
             chunks=(1, 1, 1, self.chunk_size, self.chunk_size),
             writer="tensorstore",
@@ -767,8 +767,8 @@ class MaxTileFusion:
         fused_height, fused_width = self.fused_shape
         tile_height, tile_width = self.tile_shape
         for tile_idx, (y, x) in enumerate(self.tile_positions):
-            y_start = int((y - self.offset[0]) / self.pixel_size[0])
-            x_start = int((x - self.offset[1]) / self.pixel_size[1])
+            y_start = int(np.round((y - self.offset[0]) / self.pixel_size[0]))
+            x_start = int(np.round((x - self.offset[1]) / self.pixel_size[1]))
             y_end = y_start + tile_height
             x_end = x_start + tile_width
             tile_bounds.append((y_start, y_end, x_start, x_end))

@@ -2,25 +2,51 @@
 
 from __future__ import annotations
 
+import os
+from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
 
 from opm_processing.dataio.acquisition import inspect_acquisition
 from opm_processing.dataio.position_collection import create_position_collection
-from opm_processing.dataio.processing_state import ProcessingState
+from opm_processing.dataio.processing_state import (
+    ProcessingState,
+    processing_state_image_attributes,
+)
+from opm_processing.imageprocessing.tilefusion import _processed_store_identity
 
 
 @pytest.fixture
-def partial_processed_run(tmp_path, live_acquisition_factory):
+def external_journal_image(acquisition_factory, fused_store_factory):
+    """Write a raw source and linked fused image through the real storage writers."""
+    pixels = np.zeros((1, 1, 1, 1, 2, 2), np.uint16)
+    source = acquisition_factory(pixels, name="original/sample").path
+    state = ProcessingState.create(source.parent / "sample.processing.json", source)
+    image = source.parent / "rendered" / "sample_fused.ome.zarr"
+    path = fused_store_factory(
+        pixels[:, 0],
+        name="original/rendered/sample_fused",
+        attributes=processing_state_image_attributes(state.path, image),
+    )
+    return SimpleNamespace(source=source, state=state, image=path)
+
+
+@pytest.fixture
+def partial_processed_run(tmp_path, acquisition_factory):
     """Persist camera input, sentinel output pixels and a partial completion journal."""
 
     def create(*, planar=False, deconvolve=False, completed=None, selection=None):
         """Persist a controlled partial run and its durable completion journal."""
         shape = (2, 3, 1, 1 if planar else 3, 4, 5)
-        dataset = live_acquisition_factory(shape=shape)
+        dataset = acquisition_factory(
+            np.zeros(shape, np.uint16),
+            mode="stage",
+            camera_conversion=0.24,
+            stage_positions_zxy=tuple((30.0, 100.0, 200.0 + 2 * p) for p in range(3)),
+        )
         destination = tmp_path / "processed"
         label = "2d" if planar else "deskewed"
         if deconvolve:
@@ -51,14 +77,6 @@ def partial_processed_run(tmp_path, live_acquisition_factory):
 
 
 @pytest.fixture
-def stored_file_bytes():
-    """Capture current file bytes to verify a read-only state decision cannot modify saved data."""
-    return lambda root: {
-        p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()
-    }
-
-
-@pytest.fixture
 def processing_state(tmp_path):
     """Create an empty durable journal for isolated processing state transitions."""
     source = tmp_path / "sample.ome.zarr"
@@ -66,8 +84,53 @@ def processing_state(tmp_path):
     return ProcessingState.create(tmp_path / "sample.processing.json", source)
 
 
-if TYPE_CHECKING:
-    from pathlib import Path
+@pytest.fixture
+def external_registration_state(request, tmp_path, processing_state, monkeypatch):
+    """Prescribe another output directory and its filesystem-relative-path policy."""
+    processed = tmp_path / "sample_deskewed.ome.zarr"
+    destination = tmp_path.parent / f"{tmp_path.name}-fused"
+    fused = destination / "sample_fused.ome.zarr"
+    maximum = destination / "sample_max_z_fused.ome.zarr"
+    cross_drive_calls = []
+    if request.param:
+        relative = os.path.relpath
+
+        def different_drive(path, start):
+            if path in (fused, maximum):
+                cross_drive_calls.append(path)
+                raise ValueError("path is on another Windows drive")
+            return relative(path, start)
+
+        monkeypatch.setattr(os.path, "relpath", different_drive)
+    return SimpleNamespace(
+        state=processing_state,
+        processed=processed,
+        fused=fused,
+        maximum=maximum,
+        cross_drive=bool(request.param),
+        cross_drive_calls=cross_drive_calls,
+    )
+
+
+@pytest.fixture
+def filesystem_replace_error(monkeypatch):
+    """Inject a failure for one actual filesystem replacement and restore it afterward."""
+
+    @contextmanager
+    def interrupt(destination):
+        """Fail the named destination while letting other real replacements execute."""
+        replace = type(destination).replace
+
+        def fail(path, target, *args, **kwargs):
+            if Path(target).resolve() == destination.resolve():
+                raise OSError("interrupted state replacement")
+            return replace(path, target, *args, **kwargs)
+
+        with monkeypatch.context() as filesystem:
+            filesystem.setattr(type(destination), "replace", fail)
+            yield
+
+    return interrupt
 
 
 @pytest.fixture
@@ -79,9 +142,11 @@ def record_registration(tmp_path):
         tiles: list[dict[str, object]],
         *,
         roi_series: tuple[dict[str, object], ...] = (),
-    ) -> tuple[Path, ProcessingState]:
+    ) -> None:
         """Persist measured placement and completed series for fusion and ROI selection."""
-        stem = processed_path.name.split("_", 1)[0]
+        identity = _processed_store_identity(processed_path)
+        assert identity is not None
+        stem, _suffix = identity
         source = tmp_path / f"{stem}.ome.zarr"
         source.mkdir(exist_ok=True)
         state = ProcessingState.create(tmp_path / f"{stem}.processing.json", source)
@@ -107,6 +172,5 @@ def record_registration(tmp_path):
             processed_path,
             max_projection_path=maximum,
         )
-        return maximum, state
 
     return record

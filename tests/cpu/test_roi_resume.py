@@ -1,32 +1,38 @@
 """Interrupted ROI processing must retain only durably completed channels."""
 
 import importlib
+from copy import copy
 
 import numpy as np
 import pytest
 import tensorstore as ts
 
-from opm_processing import process_roi as roi_command
 from opm_processing.dataio.position_collection import (
     open_position_collection,
 )
 from opm_processing.dataio.processing_state import ProcessingState
+from tests.simulation.camera import digitize
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("roi_run", [2], indirect=True)
 @pytest.mark.parametrize(
     "interruption",
     ("after_channel", "after_final_channel", "during_write", "before_checkpoint"),
 )
-def test_roi_resumes_at_last_durable_channel(roi_run, monkeypatch, interruption):
+def test_roi_resumes_at_last_durable_channel(
+    roi_run, monkeypatch, interruption, assert_roi_point_accuracy
+):
     """Restarting preserves completed data and retries uncommitted channel writes."""
     run = roi_run
     output = run.output_dir / "sample_deskewed.ome.zarr"
     state_path = run.output_dir / "sample.processing.json"
-    expected = run.expected_tiles
     real_complete = ProcessingState.complete_channel
     real_write = run.process.write_checkpointed_roi_channel
-    stop_key = (0, 2, 2) if interruption == "after_final_channel" else (0, 2, 0)
+    channels = run.truth.pixels.shape[2]
+    stop_key = (
+        (0, 2, channels - 1) if interruption == "after_final_channel" else (0, 2, 0)
+    )
 
     def checkpoint(self, path, time, position, channel, **kwargs):
         """Record a channel checkpoint only after the associated pixels are durable."""
@@ -41,7 +47,7 @@ def test_roi_resumes_at_last_durable_channel(roi_run, monkeypatch, interruption)
         """Inject a partial write failure before the channel checkpoint."""
         if key == stop_key:
             # Leave a partial channel and fail the write future before checkpointing.
-            target[0].write(value[0]).result()
+            run.process.write_processed_channel(target[:1], value[:1])
             readonly = ts.open(target.spec(), read=True, write=False).result()
             return real_write(readonly, value, state, path, key, **kwargs)
         return real_write(target, value, state, path, key, **kwargs)
@@ -55,43 +61,120 @@ def test_roi_resumes_at_last_durable_channel(roi_run, monkeypatch, interruption)
         monkeypatch.setattr(ProcessingState, "complete_channel", checkpoint)
         expected_error = KeyboardInterrupt
     with pytest.raises(expected_error):
-        roi_command.process_roi(
-            run.source, run.roi_path, registration_channel=1, deconvolve=False
-        )
+        run.process.process_skewed(run.source, **run.options, resume=True)
 
     state = ProcessingState.read(state_path)
-    saved = {(0, 1, channel) for channel in range(3)}
+    saved = {(0, 1, channel) for channel in range(channels)}
     if interruption == "after_channel":
         saved.add((0, 2, 0))
     elif interruption == "after_final_channel":
-        saved.update((0, 2, channel) for channel in range(3))
+        saved.update((0, 2, channel) for channel in range(channels))
     assert state.completed_channels(output) == saved
     assert state.completed_tiles(output) == {(0, 1)}
 
+    partial = open_position_collection(output)
+    durable = {
+        (position, channel): partial.arrays[position - 1][0, channel].read().result()
+        for _, position, channel in saved
+    }
     # A replay of any completed channel would now produce different pixels.
+    changed = digitize(
+        2 * (run.truth.expectation * run.truth.exposures[..., None, None, None]),
+        run.truth.microscope.camera,
+        seed=73,
+    )
+    assert changed.max() < np.iinfo(np.uint16).max
     for _, position, channel in saved:
-        run.raw_arrays[position][0, channel].write(np.uint16(901)).result()
+        run.raw_arrays[position][0, channel].write(
+            changed[0, position, channel]
+        ).result()
     monkeypatch.setattr(ProcessingState, "complete_channel", real_complete)
     monkeypatch.setattr(run.process, "write_checkpointed_roi_channel", real_write)
-    roi_command.process_roi(
-        run.source, run.roi_path, registration_channel=1, deconvolve=False
-    )
+    run.process.process_skewed(run.source, **run.options, resume=True)
 
     resumed = open_position_collection(output)
-    for array, expected_array in zip(resumed.arrays, expected, strict=False):
-        np.testing.assert_array_equal(array.read().result(), expected_array)
+    for index, array in enumerate(resumed.arrays):
+        pixels = array.read().result()
+        assert_roi_point_accuracy(
+            pixels,
+            run.truth,
+            resumed.spatial_origins_zyx_um[index],
+            resumed.voxel_size_um,
+        )
+        for _, position, channel in saved:
+            if position == index + 1:
+                np.testing.assert_array_equal(
+                    pixels[0, channel], durable[position, channel]
+                )
     state = ProcessingState.read(state_path)
     assert state.completed_tiles(output) == {(0, 1), (0, 2)}
     assert state.completed_channels(output) == {
-        (0, position, channel) for position in (1, 2) for channel in range(3)
+        (0, position, channel) for position in (1, 2) for channel in range(channels)
     }
 
 
 @pytest.mark.integration
-def test_empty_roi_channel_is_checkpointed_and_skipped(roi_run, monkeypatch):
+@pytest.mark.parametrize("roi_run", [2], indirect=True)
+@pytest.mark.parametrize("resume", (True, False))
+def test_roi_processing_respects_resume_choice(
+    roi_run, resume, assert_roi_point_accuracy
+):
+    """Resume preserves saved photons; an explicit restart recalibrates input."""
+    run = roi_run
+    run.process.process_skewed(run.source, **run.options, resume=resume)
+    output_path = run.output_dir / "sample_deskewed.ome.zarr"
+    collection = open_position_collection(output_path)
+    origins = collection.spatial_origins_zyx_um
+    spacing = collection.voxel_size_um
+    before = collection.arrays[0].read().result()
+    unchanged = collection.arrays[1].read().result()
+    for index, pixels in enumerate((before, unchanged)):
+        assert_roi_point_accuracy(
+            pixels,
+            run.truth,
+            collection.spatial_origins_zyx_um[index],
+            collection.voxel_size_um,
+        )
+    changed = copy(run.truth)
+    changed.exposures = run.truth.exposures.copy()
+    changed.exposures[:, 1] *= 2
+    pixels = digitize(
+        2 * (run.truth.expectation * run.truth.exposures[:, 1, :, None, None, None]),
+        changed.microscope.camera,
+        seed=73,
+    )
+    assert pixels.max() < np.iinfo(np.uint16).max
+    run.raw_arrays[1].write(pixels).result()
+    run.process.process_skewed(run.source, **run.options, resume=resume)
+    collection = open_position_collection(output_path)
+    np.testing.assert_array_equal(collection.spatial_origins_zyx_um, origins)
+    np.testing.assert_array_equal(collection.voxel_size_um, spacing)
+    after = collection.arrays[0].read().result()
+    np.testing.assert_array_equal(
+        collection.arrays[1].read().result(),
+        unchanged,
+    )
+    if resume is not False:
+        np.testing.assert_array_equal(after, before)
+    else:
+        assert not np.array_equal(after, before)
+        assert_roi_point_accuracy(
+            after,
+            changed,
+            collection.spatial_origins_zyx_um[0],
+            collection.voxel_size_um,
+        )
+
+
+@pytest.mark.integration
+def test_empty_roi_channel_is_checkpointed_and_skipped(
+    roi_run, monkeypatch, assert_roi_point_accuracy
+):
     """Persist an empty channel before interruption and preserve it on resume."""
     run = roi_run
-    run.raw_arrays[1][0, 0].write(np.uint16(100)).result()
+    camera = run.truth.microscope.camera
+    dark = digitize(np.zeros_like(run.truth.expectation), camera, seed=73)
+    run.raw_arrays[1][0, 0].write(dark).result()
     real_complete = ProcessingState.complete_channel
 
     def stop_after_empty(self, *args, **kwargs):
@@ -101,12 +184,11 @@ def test_empty_roi_channel_is_checkpointed_and_skipped(roi_run, monkeypatch):
 
     monkeypatch.setattr(ProcessingState, "complete_channel", stop_after_empty)
     options = {
-        "acquisition": run.metadata,
-        "roi_selection": run.roi,
-        "output_dir": run.output_dir,
-        "max_projection": False,
-        "create_fused_max_projection": False,
-        "skip_empty_below": 1.0,
+        **run.options,
+        # Zero exposure retains read noise and ADC quantization. Six calibrated
+        # noise standard deviations separate it from the bright optical sample.
+        "skip_empty_below": 6
+        * np.sqrt(camera.read_noise_e**2 + camera.electrons_per_adu**2 / 12),
         "resume": True,
     }
     with pytest.raises(KeyboardInterrupt):
@@ -118,47 +200,24 @@ def test_empty_roi_channel_is_checkpointed_and_skipped(roi_run, monkeypatch):
     assert state.zero_channels(output) == {(0, 1, 0)}
     assert state.completed_tiles(output) == set()
 
-    run.raw_arrays[1][0, 0].write(np.uint16(901)).result()
+    changed = digitize(
+        2 * (run.truth.expectation * run.truth.exposures[0, 1, 0]), camera, seed=131
+    )
+    assert changed.max() < np.iinfo(np.uint16).max
+    run.raw_arrays[1][0, 0].write(changed).result()
     monkeypatch.setattr(ProcessingState, "complete_channel", real_complete)
     run.process.process_skewed(run.source, **options)
     result = open_position_collection(output)
-    expected = run.expected_tiles[0].copy()
-    expected[:, 0] = 0
-    np.testing.assert_array_equal(result.arrays[0].read().result(), expected)
-    np.testing.assert_array_equal(
-        result.arrays[1].read().result(), run.expected_tiles[1]
-    )
+    assert not np.any(result.arrays[0][0, 0].read().result())
+    for index, array in enumerate(result.arrays):
+        assert_roi_point_accuracy(
+            array.read().result(),
+            run.truth,
+            result.spatial_origins_zyx_um[index],
+            result.voxel_size_um,
+            channels=(1, 2) if index == 0 else None,
+        )
     assert ProcessingState.read(state_path).zero_channels(output) == {(0, 1, 0)}
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize(
-    "flag, expected", ((None, True), ("--resume", True), ("--no-resume", False))
-)
-def test_roi_processing_resumes_by_default(roi_run, flag, expected):
-    """CLI resume preserves saved pixels; explicit restart replaces them."""
-    run = roi_run
-    options = {} if flag is None else {"resume": expected}
-    roi_command.process_roi(
-        run.source, run.roi_path, registration_channel=1, deconvolve=False, **options
-    )
-    output_path = run.output_dir / "sample_deskewed.ome.zarr"
-    before = open_position_collection(output_path).arrays[0].read().result()
-    np.testing.assert_array_equal(before, run.expected_tiles[0])
-    run.raw_arrays[1].write(np.uint16(901)).result()
-    roi_command.process_roi(
-        run.source, run.roi_path, registration_channel=1, deconvolve=False, **options
-    )
-    after = open_position_collection(output_path).arrays[0].read().result()
-    np.testing.assert_array_equal(
-        open_position_collection(output_path).arrays[1].read().result(),
-        run.expected_tiles[1],
-    )
-    if expected:
-        np.testing.assert_array_equal(after, before)
-    else:
-        np.testing.assert_array_equal(after, run.overwritten_tile)
-        assert not np.array_equal(after, before)
 
 
 @pytest.mark.unit
@@ -183,75 +242,3 @@ def test_recreated_output_does_not_reuse_stale_checkpoints(tmp_path):
     )
     assert reopened.completed_channels(output) == set()
     assert reopened.completed_tiles(output) == set()
-
-
-@pytest.mark.unit
-def test_roi_command_fuses_selected_tiles_and_projects_pixels(
-    tmp_path, acquisition_factory
-):
-    """Recover a known line through real ROI processing, fusion and projection.
-
-    Notes
-    -----
-    Two colocated views contain the same fluorescent line on a constant
-    background in three spectral channels. Full deskew gain is independently
-    known to be two. Fusion must preserve that gain even at half-filled Z bins.
-    No metadata, reconstruction, registration or storage boundary is mocked.
-    """
-    from opm_processing.dataio.position_collection import open_image_array
-    from opm_processing.dataio.roi import PhysicalRoi
-
-    shape = (1, 2, 3, 64, 64, 32)
-    specimen = np.full(shape[-3:], 100.0)
-    specimen[..., 10] += 500
-    spectral_gains = np.arange(1, 4)
-    raw = np.broadcast_to(
-        specimen[None, None, None] * spectral_gains[None, None, :, None, None, None],
-        shape,
-    ).astype(np.uint16)
-    dataset = acquisition_factory(
-        raw,
-        stage_positions_zxy=((0, 0, 0), (0, 0, 0)),
-        scan_axis_step_um=1.0,
-        pixel_size_um=1.0,
-        camera_offset=0.0,
-        camera_conversion=1.0,
-    )
-    roi = PhysicalRoi(
-        bounds_yx_um=(56.0, 60.0, 4.0, 20.0),
-        source_path=tmp_path / "sample_max_z_fused.ome.zarr",
-        grid_origin_yx_um=(0.0, 0.0),
-        pixel_size_yx_um=(1.0, 1.0),
-        position_indices=(0, 1),
-        tile_footprints=tuple(
-            {
-                "time_index": 0,
-                "position_index": position,
-                "origin_zyx_um": [0.0, 0.0, 0.0],
-                "bounds_yx_um": [0.0, 120.0, 0.0, 32.0],
-            }
-            for position in (0, 1)
-        ),
-    )
-    roi_path = roi.write(tmp_path / "sample_roi.json")
-    roi_command.process_roi(
-        dataset.path,
-        roi_path,
-        registration_channel=1,
-        deconvolve=False,
-        flatfield_correction=False,
-        save_float32=True,
-    )
-    output_dir = tmp_path / "sample_roi"
-    fused = open_image_array(output_dir / "sample_fused.ome.zarr").read().result()
-    projected = (
-        open_image_array(output_dir / "sample_max_z_fused.ome.zarr").read().result()
-    )
-    expected = np.zeros_like(fused)
-    expected[0, :, :16, :4, :16] = (
-        2 * spectral_gains[:, None, None, None] * specimen[0, 0, 4:20]
-    )
-    np.testing.assert_allclose(fused, expected, rtol=1e-6)
-    np.testing.assert_allclose(
-        projected, expected.max(axis=2, keepdims=True), rtol=1e-6
-    )

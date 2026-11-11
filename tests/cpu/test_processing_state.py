@@ -2,16 +2,30 @@
 
 from __future__ import annotations
 
-from unittest.mock import Mock
+from pathlib import Path
 
 import pytest
 
 from opm_processing.dataio.processing_state import (
     ProcessingState,
+    image_processing_state_path,
     processing_state_path,
 )
 
 pytestmark = pytest.mark.unit
+
+
+def test_external_image_journal_link_survives_copying_the_directory_tree(
+    external_journal_image, relocate_acquisition
+):
+    """Prefer the copied relative journal even while original paths still exist."""
+    case = external_journal_image
+    copied = relocate_acquisition(case.source.parent, copy=True)
+    assert (
+        image_processing_state_path(copied / "rendered" / case.image.name, "sample")
+        == copied / case.state.path.name
+    )
+    assert case.state.path.is_file()
 
 
 @pytest.mark.parametrize(
@@ -98,6 +112,38 @@ def test_processing_state_resume_requires_exact_run_configuration(
     assert path.read_bytes() == saved
 
 
+@pytest.mark.parametrize("external_registration_state", [False, True], indirect=True)
+def test_registration_tracks_external_artifacts_in_the_original_journal(
+    external_registration_state,
+):
+    """Record another output location without weakening processed-run ownership."""
+    case = external_registration_state
+    state, processed = case.state, case.processed
+    fused, maximum = case.fused, case.maximum
+    state.initialize_run(processed, configuration={}, overwrite=True)
+    state.save_registration(
+        processed,
+        configuration={"channel": 0},
+        pairwise_metrics={"0,1": [0, 1, 2, 0.9]},
+    )
+    state.complete_registration(processed, fused_path=fused, tiles=())
+    state.set_registered_max_projection(processed, max_projection_path=maximum)
+    reopened = ProcessingState.read(state.path)
+    assert reopened.path.parent == processed.parent
+    assert reopened.registered_output_for_fused(fused) == processed
+    assert reopened.registered_output_for_max_projection(maximum) == processed
+    record = reopened.registration(processed)
+    assert record["pairwise_metrics"] == {"0,1": [0, 1, 2, 0.9]}
+    assert Path(record["fused_path"]).is_absolute() == case.cross_drive
+    assert Path(record["max_projection_path"]).is_absolute() == case.cross_drive
+    assert set(case.cross_drive_calls) == (
+        {fused, maximum} if case.cross_drive else set()
+    )
+    assert (state.path.parent / record["fused_path"]).resolve() == fused
+    with pytest.raises(ValueError, match="must be inside"):
+        reopened.initialize_run(fused, configuration={}, overwrite=True)
+
+
 def test_overwriting_one_run_preserves_siblings_and_invalidates_only_its_registration(
     tmp_path,
     processing_state,
@@ -136,7 +182,7 @@ def test_overwriting_one_run_preserves_siblings_and_invalidates_only_its_registr
 
 
 def test_failed_channel_checkpoint_keeps_previous_durable_state(
-    tmp_path, processing_state, monkeypatch
+    tmp_path, processing_state, filesystem_replace_error
 ):
     """Failure to replace the JSON must leave the preceding checkpoint readable."""
     output = tmp_path / "sample_deskewed.ome.zarr"
@@ -146,12 +192,10 @@ def test_failed_channel_checkpoint_keeps_previous_durable_state(
     state.complete_channel(output, 0, 3, 0, is_zero=True)
     before = state.path.read_bytes()
 
-    monkeypatch.setattr(
-        type(state.path),
-        "replace",
-        Mock(side_effect=OSError("interrupted state replacement")),
-    )
-    with pytest.raises(OSError, match="interrupted state replacement"):
+    with (
+        filesystem_replace_error(state.path),
+        pytest.raises(OSError, match="interrupted state replacement"),
+    ):
         state.complete_channel(output, 0, 3, 1)
 
     assert state.path.read_bytes() == before

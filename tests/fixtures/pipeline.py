@@ -1,161 +1,83 @@
 """Shared qi2lab acquisitions for complete processing and fusion integration."""
 
 import importlib
-from dataclasses import replace
-from functools import lru_cache, partial, wraps
-from inspect import signature
-from itertools import product
+from dataclasses import dataclass, replace
+from functools import lru_cache
+from hashlib import sha256
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
-from opm_processing.dataio.deconvolution import scan_upsample_from_metadata
-from opm_processing.imageprocessing.tilefusion import TileFusion
+from opm_processing.imageprocessing.opmtools import (
+    deskew_coverage,
+    deskew_shape_estimator,
+)
+from opm_processing.imageprocessing.tilefusion import (
+    DEFAULT_REGISTRATION_DOWNSAMPLE,
+    TileFusion,
+)
 from tests.simulation.camera import digitize
-from tests.simulation.forward_model import Acquisition, camera_psf, forward_model
-from tests.simulation.scenes import prepare_scene
+from tests.simulation.forward_model import Microscope
+from tests.simulation.metrics import camera_source_mask
+from tests.simulation.scenes import OpticalScene
 
 
-@pytest.fixture(autouse=True)
-def integration_pipeline_records(request):
-    """Require real producer inputs and durable processing results for integrations.
+@dataclass(frozen=True)
+class PipelineOpticalData:
+    """Immutable camera expectations and source truth for one sensor grid."""
 
-    Parameters
-    ----------
-    request : pytest.FixtureRequest
-        Current test's classification.
-
-    Yields
-    ------
-    dict
-        Actual producer sources and filesystem relocations of those acquisitions.
-    """
-    integration = request.node.get_closest_marker("integration") is not None
-    tmp_path = request.getfixturevalue("tmp_path") if integration else None
-    sources = []
-    relocations = []
-    processed_sources = set()
-    generated_optics_sources = set()
-    if integration:
-        processing = importlib.import_module("opm_processing.process")
-        roi_processing = importlib.import_module("opm_processing.process_roi")
-        patches = request.getfixturevalue("monkeypatch")
-        generate_psfs = processing.load_deconvolution_psfs
-
-        def observe_psfs(acquisition, measured_paths=None, **kwargs):
-            """Require actual generated kernels rather than descriptive output tags."""
-            result = generate_psfs(acquisition, measured_paths, **kwargs)
-            if measured_paths is None and result[1] is not None:
-                generated_optics_sources.add(acquisition.path.resolve())
-            return result
-
-        patches.setattr(processing, "load_deconvolution_psfs", observe_psfs)
-
-        def observe_processor(processor):
-            """Record successful real processing without changing its arguments or output."""
-            parameters = signature(processor)
-
-            @wraps(processor)
-            def execute(*args, **kwargs):
-                """Run the complete production operation before recording its source."""
-                arguments = parameters.bind(*args, **kwargs).arguments
-                acquisition = arguments.get("acquisition")
-                source = (
-                    acquisition.path
-                    if acquisition is not None
-                    else arguments["root_path"]
-                )
-                result = processor(*args, **kwargs)
-                from pathlib import Path
-
-                processed_sources.add(Path(source).resolve())
-                return result
-
-            return execute
-
-        for name in ("process_skewed", "process_projection"):
-            observed = observe_processor(getattr(processing, name))
-            patches.setattr(processing, name, observed)
-            if hasattr(roi_processing, name):
-                patches.setattr(roi_processing, name, observed)
-    yield {"sources": sources, "relocations": relocations}
-    if not integration:
-        return
-    if any(
-        report is not None and (report.failed or report.skipped)
-        for report in (
-            getattr(request.node, "pipeline_report_setup", None),
-            getattr(request.node, "pipeline_report_call", None),
-        )
-    ):
-        return
-    from opm_processing.dataio.position_collection import open_position_collection
-    from opm_processing.dataio.processing_state import ProcessingState
-
-    assert sources, "Integration never finalized a real opm-v2 acquisition"
-    states = [
-        ProcessingState.read(path) for path in tmp_path.rglob("*.processing.json")
-    ]
-    for source in sources:
-        locations = {source.resolve()}
-        for before, after in relocations:
-            locations.update(
-                after / location.relative_to(before)
-                for location in tuple(locations)
-                if location.is_relative_to(before)
-            )
-        assert locations & processed_sources, (
-            f"Integration bypassed actual processing for {source}"
-        )
-        completed = []
-        for state in states:
-            if state.source_path() not in locations:
-                continue
-            for name, record in state.document["outputs"].items():
-                path = state.path.parent / name
-                if record.get("completed_tiles") and path.is_dir():
-                    optics = record["configuration"].get("deconvolution")
-                    if optics is not None:
-                        assert locations & generated_optics_sources, (
-                            "Integration bypassed production PSF generation"
-                        )
-                    collection = open_position_collection(path)
-                    for array in collection.arrays:
-                        pixels = array.read().result()
-                        assert pixels.size and np.isfinite(pixels).all()
-                    if record.get("roi_series"):
-                        expected = {
-                            (tile["time_index"], tile["position_index"])
-                            for tile in record["roi_series"]
-                        }
-                    else:
-                        selection = record["configuration"].get("selection", {})
-                        times = selection.get("time") or (0, collection.shape[0])
-                        positions = selection.get("position") or (
-                            0,
-                            collection.shape[1],
-                        )
-                        expected = set(product(range(*times), range(*positions)))
-                    if state.completed_tiles(path) == expected:
-                        completed.append(path)
-        assert completed, f"Integration never completed a final datastore from {source}"
+    microscope: Microscope
+    expectation: np.ndarray
+    source_mask: np.ndarray | None
+    ground_truth: OpticalScene
+    native_scan_planes: int
+    first_native_scan_index: int
 
 
 @pytest.fixture
-def pipeline_runner(monkeypatch, processing_options, invoke_cli):
+def pipeline_geometry():
+    """Use production geometry for the physical aperture and orthogonal canvas."""
+
+    def create(shape, microscope, *, scan_factor=1):
+        """Cover the oblique scan planes without evaluating an image interpolator."""
+        scans, rows, columns = shape
+        fine_shape = ((scans - 1) * scan_factor + 1, rows, columns)
+        step = microscope.scan_step_um / scan_factor
+        pixel = microscope.pixel_size_um
+        output_shape, _, _, _ = deskew_shape_estimator(
+            fine_shape, microscope.angle_deg, step, pixel, crop_after_deskew=False
+        )
+        output_shape = tuple(output_shape)
+        support = deskew_coverage(
+            fine_shape,
+            output_shape,
+            theta=microscope.angle_deg,
+            distance=step,
+            pixel_size=pixel,
+        )
+        aperture = (support[..., None] > 0) & (np.arange(output_shape[2]) < columns)
+        return SimpleNamespace(shape=output_shape, support=aperture)
+
+    return create
+
+
+@pytest.fixture
+def pipeline_runner(
+    monkeypatch, processing_options, invoke_cli, production_forward_predictions
+):
     """Run real processing and fusion with shared storage and worker boundaries.
 
     Returns
     -------
     callable
         Process a raw acquisition into an independently selected output directory,
-        optionally configuring deskew output tiles, RLGC and fusion block sizes.
+        optionally configuring RLGC and fusion block sizes. Deskew uses the
+        normal production tile planner.
     """
     from opm_processing.dataio.acquisition import acquisition_stem
     from opm_processing.dataio.position_collection import open_position_collection
     from opm_processing.imageprocessing import opmtools
-    from opm_processing.imageprocessing.opmtools import orthogonal_deskew
 
     module = importlib.import_module("opm_processing.process")
     fuse = importlib.import_module("opm_processing.fuse")
@@ -165,11 +87,10 @@ def pipeline_runner(monkeypatch, processing_options, invoke_cli):
         *,
         deconvolve=False,
         illumination=False,
+        live=None,
         crop_scan=None,
         output=None,
-        deskew_tile=None,
-        decon_storage=None,
-        fusion_chunk=(16, 16),
+        fusion_chunk=None,
         blend=(0, 0, 0),
     ):
         """Persist calibrated tiles and registered multiscales using real algorithms."""
@@ -177,6 +98,7 @@ def pipeline_runner(monkeypatch, processing_options, invoke_cli):
             processing_options,
             deconvolve=deconvolve,
             flatfield_correction=illumination,
+            live=live,
             save_float32=True,
             output=output,
         )
@@ -186,61 +108,51 @@ def pipeline_runner(monkeypatch, processing_options, invoke_cli):
                 decon_verbose=0,
             )
         deskew_tiles = set()
-        reconstructions = []
+        deskew_runs = []
         deconvolution_runs = []
-        chunks = []
         with monkeypatch.context() as execution:
             if deconvolve:
                 solver = importlib.import_module("opm_processing.imageprocessing.rlgc")
                 reconstruct = solver.rlgc
-                reconstruct_chunk = solver._rlgc_once
-
-                def observe_chunk(image, psf, *args, **kwargs):
-                    """Record each actual chunk only after its solver completes."""
-                    result = reconstruct_chunk(image, psf, *args, **kwargs)
-                    chunks.append(
-                        {
-                            "input_shape": image.shape,
-                            "output_shape": result.shape,
-                            "psf_shape": psf.shape,
-                            "storage": kwargs.get("storage", "gpu"),
-                        }
-                    )
-                    return result
 
                 def observe_reconstruction(*args, **kwargs):
-                    """Retain actual calibrated reconstructions for physical truth checks."""
-                    if decon_storage is not None:
-                        kwargs["storage"] = decon_storage
-                    before = len(chunks)
+                    """Observe real reconstruction shapes and acquired predictions."""
                     result = reconstruct(*args, **kwargs)
-                    reconstructions.append(result.copy())
                     deconvolution_runs.append(
                         {
                             "input_shape": args[0].shape,
-                            "crop_scan": kwargs.get("crop_scan"),
-                            "chunks": chunks[before:],
+                            "output_shape": result.shape,
+                            "forward": production_forward_predictions[-1],
                         }
                     )
                     return result
 
                 execution.setattr(solver, "rlgc", observe_reconstruction)
-                execution.setattr(solver, "_rlgc_once", observe_chunk)
-            if deskew_tile is not None:
-                interpolate = opmtools.interpolate_rows
+            interpolate = opmtools.interpolate_rows
+            deskew = module.orthogonal_deskew
 
-                def record_tile(*args):
-                    """Record executed global output tiles and run the real kernel."""
-                    deskew_tiles.add((args[-1], args[1].shape))
-                    return interpolate(*args)
+            def record_tile(*args):
+                """Record actual global output tiles while running the real kernel."""
+                deskew_tiles.add((args[-1], args[1].shape))
+                return interpolate(*args)
 
-                execution.setattr(opmtools, "interpolate_rows", record_tile)
-                execution.setattr(
-                    module,
-                    "orthogonal_deskew",
-                    partial(orthogonal_deskew, tile_shape=deskew_tile),
+            def observe_deskew(*args, **kwargs):
+                """Record actual output bytes before production persists them."""
+                result = deskew(*args, **kwargs)
+                assert result.dtype == np.float32 and result.flags.c_contiguous
+                deskew_runs.append(
+                    {
+                        "output_shape": result.shape,
+                        "tile_shape": kwargs["tile_shape"],
+                        "pixel_sha256": sha256(memoryview(result)).hexdigest(),
+                    }
                 )
-            invoke_cli("process", dataset.path, **options)
+                return result
+
+            execution.setattr(opmtools, "interpolate_rows", record_tile)
+            execution.setattr(module, "orthogonal_deskew", observe_deskew)
+            source = dataset.path.parent if live is not None else dataset.path
+            invoke_cli("process", source, **options)
         directory = dataset.path.parent if output is None else output
         stem = acquisition_stem(dataset.path)
         processed = (
@@ -268,11 +180,7 @@ def pipeline_runner(monkeypatch, processing_options, invoke_cli):
                 "fuse",
                 processed,
                 blend_pixels=blend,
-                downsample_factors=(1, 1, 1),
                 registration_channel=dataset.raw_data.shape[2] - 1,
-                ssim_window=3,
-                registration_threshold=0.1,
-                max_registration_shift_zyx=(2, 2, 2),
                 chunk_shape_yx=fusion_chunk,
                 max_workers=1,
                 normalize_depth_intensity=False,
@@ -287,63 +195,144 @@ def pipeline_runner(monkeypatch, processing_options, invoke_cli):
             collection=open_position_collection(processed),
             output=directory / f"{stem}_fused.ome.zarr",
             deskew_tiles=deskew_tiles,
-            reconstructions=reconstructions,
+            deskew_runs=deskew_runs,
             deconvolution_runs=deconvolution_runs,
         )
 
     return run
 
 
-@pytest.fixture(scope="session")
-def pipeline_optical_data(
-    microscope_parameters, simulation_parameters, acquisition_metadata
+@pytest.fixture
+def pipeline_illumination_calibration(
+    opm_v2_acquisition_factory,
+    uniform_optical_calibration,
 ):
-    """Cache production optics and camera means for repeated fields and mosaics.
+    """Prepare a real independent calibration through the production worker."""
+    from opm_processing.dataio.acquisition import (
+        acquisition_stem,
+        open_acquisition_datastore,
+    )
+    from opm_processing.process import call_estimate_illuminations, write_flatfield
+
+    def calibrate(dataset, microscope, shape, mode):
+        """Fit the acquired uniform source without processing unused image volumes."""
+        shape = tuple(shape)
+        stem = acquisition_stem(dataset.path)
+        means = uniform_optical_calibration(
+            microscope,
+            shape,
+            "edge-taper",
+            (5000 / microscope.quantum_efficiency, 0),
+        )
+        channels = dataset.metadata.shape[2]
+        levels = (0.75, 1.25)
+        raw = np.empty((1, len(levels), channels, *shape), np.uint16)
+        for position, channel in np.ndindex(raw.shape[1:3]):
+            raw[0, position, channel] = digitize(
+                means * levels[position] * (1 + channel / 4),
+                microscope.camera,
+                seed=903 + 10 * position + channel,
+            )
+        assert raw.max() < np.iinfo(raw.dtype).max
+        if mode == "stage":
+            raw = raw[:, :, :, ::-1].copy()
+        calibration = opm_v2_acquisition_factory(
+            raw,
+            name=f"illumination-calibration/{stem}_calibration",
+            mode=mode,
+            camera_offset=microscope.camera.offset_adu,
+            camera_conversion=microscope.camera.electrons_per_adu,
+            pixel_size_um=microscope.pixel_size_um,
+            scan_axis_step_um=microscope.scan_step_um,
+            angle_deg=microscope.angle_deg,
+            stage_positions_zxy=((0, 0, 0),) * len(levels),
+        )
+        metadata = calibration.metadata
+        field = call_estimate_illuminations(
+            open_acquisition_datastore(metadata),
+            metadata.camera_offset,
+            metadata.camera_conversion,
+            np.asarray(metadata.stage_positions_zxy),
+            None,
+            None,
+        )
+        write_flatfield(
+            dataset.path.parent / f"{stem}_flatfield.ome.tif",
+            field,
+            microscope.pixel_size_um,
+        )
+        return field
+
+    return calibrate
+
+
+@pytest.fixture(scope="session")
+def pipeline_optical_data(simulation_parameters, optical_camera_data):
+    """Reuse native optical camera fields for repeated exposures and mosaics.
 
     Returns
     -------
     callable
-        Return microscope, noiseless camera means and the matching production PSF
-        for a scan step, illumination selection and extended-mosaic flag.
+        Return immutable camera means and fixed physical source masks for mosaics.
     """
 
-    @lru_cache(maxsize=6)
-    def create(step, illumination=False, *, mosaic=False, scan_extent_factor=1):
-        """Render one calibrated physical specimen before independent camera draws."""
-        microscope = replace(microscope_parameters, scan_step_um=step)
-        settings = simulation_parameters["pipeline_mosaic" if mosaic else "pipeline"]
-        kind = "line-pairs" if mosaic else "points"
-        specimen = simulation_parameters["specimens"][kind]
-        if mosaic:
-            specimen = {
-                "half_extent_zyx_um": settings["half_extent_zyx_um"],
-                "features": dict(
-                    specimen["features"], length_um=settings["line_length_um"]
-                ),
-            }
-        scene = prepare_scene(kind, microscope, parameters=specimen)
-        height, width = settings["camera_shape_yx"]
+    @lru_cache(maxsize=2)
+    def native_data(illumination, mosaic, tiled, kind):
+        """Set exposure once before selecting acquired scan planes."""
+        reference_step = simulation_parameters["microscope"]["scan_step_um"]
+        kind = kind or ("line-pairs" if mosaic else "points")
+        height, width = simulation_parameters["camera_shape_yx"]
+        scans = simulation_parameters[
+            "tiled_scan_planes" if tiled else "whole_scan_planes"
+        ]
         shape = (
-            round(settings["scan_extent_um"] * scan_extent_factor / step) + 1,
+            scans,
             height,
-            width + settings.get("tile_offset_x_pixels", 0),
-        )
-        expected = forward_model(
-            scene.density,
-            Acquisition(
-                scene.axes,
-                shape,
-                illumination_profile="edge-taper" if illumination else "uniform",
-                camera_photon_budget=tuple(simulation_parameters["photon_budgets"][0]),
-                output="expectation",
+            width
+            + (
+                simulation_parameters["pipeline_mosaic"]["tile_offset_x_pixels"]
+                if mosaic
+                else 0
             ),
+        )
+        scene, microscope, expectation = optical_camera_data(
+            shape,
+            kind=kind,
+            large=True,
+            integration=True,
+            illumination_profile="edge-taper" if illumination else "uniform",
+            step=reference_step,
+            geometry="oblique",
+            budget=(3000, 4000),
+        )
+        source = camera_source_mask(scene, microscope, shape) if mosaic else None
+        if source is not None:
+            source.setflags(write=False)
+        return scene, microscope, expectation, source
+
+    @lru_cache(maxsize=2)
+    def create(
+        step, illumination=False, *, mosaic=False, tiled=False, kind=None, phase=0
+    ):
+        """Sample one unchanged physical emission field at the requested scan pitch."""
+        scene, microscope, expectation, native_source = native_data(
+            illumination, mosaic, tiled, kind
+        )
+        microscope = replace(microscope, scan_step_um=step)
+        native_step = simulation_parameters["microscope"]["scan_step_um"]
+        factor = round(step / native_step)
+        assert factor >= 1 and np.isclose(step, factor * native_step)
+        assert 0 <= phase < factor
+        expected = expectation[phase::factor]
+        source = None if native_source is None else native_source[phase::factor]
+        return PipelineOpticalData(
             microscope,
+            expected,
+            source,
+            scene,
+            expectation.shape[0],
+            phase,
         )
-        factor = scan_upsample_from_metadata(
-            replace(acquisition_metadata, scan_axis_step_um=step)
-        )
-        psf, _ = camera_psf(replace(microscope, scan_step_um=step / factor))
-        return microscope, expected, psf.astype(np.float32)
 
     return create
 
@@ -355,11 +344,10 @@ def pipeline_case(
     pipeline_optical_data,
     simulation_parameters,
     opm_v2_acquisition_factory,
-    tmp_path,
     pipeline_runner,
-    small_cpu_kernels,
+    pipeline_illumination_calibration,
 ):
-    """Process independent repeat exposures with a known stage-placement error.
+    """Process time/channel exposures and retain paired views for CLI exports.
 
     Indirect parameters select scan mode, illumination, scan step, FFT scan
     chunk size. All deconvolution uses production-generated optical kernels.
@@ -368,21 +356,38 @@ def pipeline_case(
     -------
     types.SimpleNamespace
         Raw acquisition, reopened processed collection, fitted illumination,
-        fusion object and the independent expected support.
+        fusion object and actual processing observations.
 
     Notes
     -----
-    Both positions observe the same physical field with independent camera
-    noise. Position 1 reports an erroneous one-pixel lateral stage shift.
+    Deconvolution uses one position; the non-deconvolution CLI case uses two
+    independent exposures of the same field. Its second position reports an
+    erroneous lateral shift of one registration-grid pixel.
     BaSiC runs in its production worker process. Camera calibration, RLGC,
     orthogonal interpolation, registration and fusion execute normally, with
     native TensorStore storage in pytest temporary directories.
     """
-    from opm_processing.imageprocessing.opmtools import orthogonal_deskew
-
     mode, illumination, step, crop = request.param
-    microscope, expectation, psf = pipeline_optical_data(step, illumination)
-    raw = np.empty((2, 2, 2, *expectation.shape), dtype=np.uint16)
+    if illumination:
+        request.getfixturevalue("torch_gpu")
+    native_step = simulation_parameters["microscope"]["scan_step_um"]
+    native_scans = simulation_parameters[
+        "tiled_scan_planes" if crop is not None else "whole_scan_planes"
+    ]
+    phase = (native_scans - 1) % round(step / native_step) if mode == "stage" else 0
+    optical_data = pipeline_optical_data(
+        step,
+        illumination,
+        tiled=crop is not None,
+        kind="line-pairs" if deconvolve else None,
+        phase=phase,
+    )
+    microscope, expectation = (
+        optical_data.microscope,
+        optical_data.expectation,
+    )
+    positions = 1 if deconvolve else 2
+    raw = np.empty((2, positions, 2, *expectation.shape), dtype=np.uint16)
     for time, position, channel in np.ndindex(raw.shape[:3]):
         raw[time, position, channel] = digitize(
             expectation * (1 + time / 4 + channel / 2),
@@ -391,48 +396,108 @@ def pipeline_case(
         )
     if mode == "stage":
         raw = raw[:, :, :, ::-1].copy()
+    assert raw.max() < 2**microscope.camera.bit_depth - 1
     pixel = microscope.pixel_size_um
+    registration_error_pixels = DEFAULT_REGISTRATION_DOWNSAMPLE[-1]
+    stage_scan = -4.6
     dataset = opm_v2_acquisition_factory(
         raw,
         name="pipeline",
         mode=mode,
         camera_offset=microscope.camera.offset_adu,
         camera_conversion=microscope.camera.electrons_per_adu,
+        camera_read_noise_e=microscope.camera.read_noise_e,
         pixel_size_um=pixel,
         scan_axis_step_um=step,
         angle_deg=microscope.angle_deg,
-        stage_positions_zxy=((2.3, -4.6, 1.15), (2.3, -4.6, 1.15 + pixel)),
+        stage_positions_zxy=(
+            (2.3, stage_scan, 1.15),
+            (2.3, stage_scan, 1.15 + registration_error_pixels * pixel),
+        )[:positions],
         acquired_plane_count=raw.shape[-3],
         plane_period_s=simulation_parameters["pipeline"]["plane_period_s"],
     )
+    if illumination:
+        pipeline_illumination_calibration(dataset, microscope, expectation.shape, mode)
     result = pipeline_runner(
         dataset,
         deconvolve=deconvolve,
         illumination=illumination,
         crop_scan=crop,
     )
-    factor = scan_upsample_from_metadata(dataset.metadata) if deconvolve else 1
-    reconstruction_shape = (
-        (expectation.shape[0] - 1) * factor + 1,
-        *expectation.shape[1:],
-    )
-    support = (
-        orthogonal_deskew(
-            np.full(reconstruction_shape, 1, dtype=np.float32),
-            distance=step / factor,
-            pixel_size=pixel,
-            theta=microscope.angle_deg,
-            downsample_factor=1,
-        )
-        > 0
-    )
     return SimpleNamespace(
         **vars(result),
         dataset=dataset,
         microscope=microscope,
-        support=support,
         expectation=expectation,
-        psf=psf,
+    )
+
+
+@pytest.fixture
+def large_noisy_acquisition(
+    request,
+    noisy_extended_scene,
+    simulation_parameters,
+    opm_v2_acquisition_factory,
+    opm_v2_live_acquisition_factory,
+):
+    """Write independent full-field views of a shared noisy extended specimen."""
+    from opm_processing.dataio.acquisition import ChannelMetadata
+
+    mode, factor, positions, live = request.param
+    microscope, expected, raw, source, _dark = noisy_extended_scene
+    native_scan_planes = expected.shape[0]
+    phase = (native_scan_planes - 1) % factor if mode == "stage" else 0
+    microscope = replace(microscope, scan_step_um=microscope.scan_step_um * factor)
+    expected = expected[phase::factor]
+    exposures = [raw[phase::factor]]
+    if positions == 2:
+        exposures.append(
+            digitize(
+                expected,
+                microscope.camera,
+                seed=simulation_parameters["camera_seed"] + 1,
+            )
+        )
+    pixels = np.stack(exposures)[None, :, None]
+    if mode == "stage":
+        pixels = pixels[:, :, :, ::-1].copy()
+    pixel = microscope.pixel_size_um
+    registration_error_pixels = DEFAULT_REGISTRATION_DOWNSAMPLE[-1]
+    stage_scan = -4.6
+    writer = opm_v2_live_acquisition_factory if live else opm_v2_acquisition_factory
+    dataset = writer(
+        pixels,
+        name="large_scene",
+        mode=mode,
+        pixel_size_um=pixel,
+        scan_axis_step_um=microscope.scan_step_um,
+        angle_deg=microscope.angle_deg,
+        camera_offset=microscope.camera.offset_adu,
+        camera_conversion=microscope.camera.electrons_per_adu,
+        camera_read_noise_e=microscope.camera.read_noise_e,
+        channels=(ChannelMetadata(0, "488 + 637", None, 10.0, 10.0),),
+        orientations=(
+            ("camera_XYstage_orientation", "positive"),
+            ("camera_Zstage_orientation", "positive"),
+            ("camera_mirror_orientation", "positive"),
+        ),
+        stage_positions_zxy=(
+            (2.3, stage_scan, 1.15),
+            (2.3, stage_scan, 1.15 + registration_error_pixels * pixel),
+        )[:positions],
+    )
+    microscope = replace(microscope, scan_step_um=dataset.metadata.scan_axis_step_um)
+    return SimpleNamespace(
+        dataset=dataset,
+        microscope=microscope,
+        expectation=expected,
+        source=source,
+        sampling_factor=factor,
+        sampling_phase=phase,
+        native_scan_planes=native_scan_planes,
+        registration_error_pixels=registration_error_pixels,
+        live=live,
     )
 
 
@@ -442,25 +507,31 @@ def mosaic_acquisition(
     pipeline_optical_data,
     simulation_parameters,
     opm_v2_acquisition_factory,
-    tmp_path,
-    small_cpu_kernels,
 ):
     """Persist independent adjacent views of the same extended fluorescent object.
 
     Returns
     -------
     types.SimpleNamespace
-        Raw qi2lab acquisition, physical camera expectation, PSF and the shared
+        Raw qi2lab acquisition, physical camera expectation and the shared
         dimensions used to check scan chunks, deskew tiles and mosaic seams.
     """
     mode, step, *encoder_errors = request.param
     scan_encoder_error_um = encoder_errors[0] if encoder_errors else 0.0
-    scan_extent_factor = encoder_errors[1] if len(encoder_errors) > 1 else 1
-    microscope, expectation, psf = pipeline_optical_data(
-        step, mosaic=True, scan_extent_factor=scan_extent_factor
+    layout = encoder_errors[1] if len(encoder_errors) > 1 else "tiled"
+    assert layout in ("whole", "tiled")
+    native_step = simulation_parameters["microscope"]["scan_step_um"]
+    native_scans = simulation_parameters[f"{layout}_scan_planes"]
+    phase = (native_scans - 1) % round(step / native_step) if mode == "stage" else 0
+    optical_data = pipeline_optical_data(
+        step, mosaic=True, tiled=layout == "tiled", phase=phase
+    )
+    microscope, expectation = (
+        optical_data.microscope,
+        optical_data.expectation,
     )
     parameters = simulation_parameters["pipeline_mosaic"]
-    height, width = parameters["camera_shape_yx"]
+    height, width = simulation_parameters["camera_shape_yx"]
     offset = parameters["tile_offset_x_pixels"]
     raw = np.empty((1, 2, 1, expectation.shape[0], height, width), np.uint16)
     for position in range(2):
@@ -472,7 +543,9 @@ def mosaic_acquisition(
         )
     if mode == "stage":
         raw = raw[:, :, :, ::-1].copy()
+    assert raw.max() < 2**microscope.camera.bit_depth - 1
     pixel = microscope.pixel_size_um
+    stage_scan = -4.6
     dataset = opm_v2_acquisition_factory(
         raw,
         name="mosaic",
@@ -483,19 +556,21 @@ def mosaic_acquisition(
         camera_offset=microscope.camera.offset_adu,
         camera_conversion=microscope.camera.electrons_per_adu,
         stage_positions_zxy=(
-            (2.3, -4.6, 1.15),
-            (2.3, -4.6 + scan_encoder_error_um, 1.15 + (offset + 1) * pixel),
+            (2.3, stage_scan, 1.15),
+            (
+                2.3,
+                stage_scan + scan_encoder_error_um,
+                1.15 + (offset + DEFAULT_REGISTRATION_DOWNSAMPLE[-1]) * pixel,
+            ),
         ),
+        camera_read_noise_e=microscope.camera.read_noise_e,
     )
-    factor = scan_upsample_from_metadata(dataset.metadata)
-    fine_expectation = pipeline_optical_data(
-        step / factor, mosaic=True, scan_extent_factor=scan_extent_factor
-    )[1]
     return SimpleNamespace(
         dataset=dataset,
         microscope=microscope,
         expectation=expectation,
-        psf=psf,
+        source_mask=optical_data.source_mask,
         parameters=parameters,
-        reconstruction_expectation=fine_expectation,
+        optical_data=optical_data,
+        tiled=layout == "tiled",
     )

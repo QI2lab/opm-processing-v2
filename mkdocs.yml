@@ -88,6 +88,7 @@ nav:
   - Reference:
       - Commands: reference/cli/index.md
       - inspect-opm: reference/cli/inspect-opm.md
+      - map-legacy-opm: reference/cli/map-legacy-opm.md
       - process: reference/cli/process.md
       - fuse: reference/cli/fuse.md
       - export-ome-tiff: reference/cli/export-ome-tiff.md

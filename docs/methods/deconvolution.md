@@ -1,10 +1,10 @@
 # PSFs and deconvolution
 
-RLGC combines Richardson–Lucy updates with a gradient-consensus gate to limit
-noise amplification. It follows [Manton and collaborators' implementation](https://github.com/jdmanton/rlgc)
-and the MATLAB algorithm accompanying
-[Liu and Stallinga's work](https://doi.org/10.1364/BOE.597710), including its
-`gc_deconv.m` read-noise correction.
+RLGC combines Richardson-Lucy updates with gradient consensus to limit noise
+amplification. Reconstruction and consensus follow Equations (3)-(5) in
+[Liu and Stallinga](https://doi.org/10.1364/BOE.597710). Binomial splitting and
+prediction-to-half KL stopping follow
+[Manton and collaborators' Colab notebook](https://colab.research.google.com/drive/1mfVNSCaYHz1g56g92xBkIoa8190XNJpJ).
 The source header in `imageprocessing/rlgc.py` describes the optical and GPU adaptations.
 
 ## Process an OME-Zarr
@@ -97,17 +97,18 @@ Here `acquisition` is returned by `inspect_acquisition`; `calibrated_data` and
 | `read_noise` | RMS in the same units as `image`; default `0` selects no read noise. |
 | `detector_response` | Optional positive YX illumination/sensitivity response, broadcast over scan planes. Pass the image before dividing by this response; default `None`. |
 | `gpu_id` | CUDA device index; default `0`. |
-| `crop_scan` | Retained scan-chunk length in reconstruction planes; default `None` estimates it from free GPU memory. Each overlapping raw chunk completes deconvolution before the next starts. |
-| `fallback_step_scan` | Tile reduction after allocation failure; default reduces the length by one quarter. |
+| `crop_scan` | Retained scan-chunk length in reconstruction planes; default `None` estimates it from free GPU memory. KL-enabled tiling parks chunks in RAM and continues them to one shared iteration budget. |
+| `fallback_step_scan` | Tile reduction after allocation failure; default reduces the length by one quarter. Shared-KL runs allow fallback only before any completed update. |
 | `rng_seed` | Seed for fresh half-image splits; default `42`. |
-| `verbose` | Chunked processing shows a `decon` progress bar. Diagnostics are off by default (`0`); set `1` for chunk geometry, iterations and stopping reasons. |
-| `limit`, `max_delta` | Reference updated-fraction and relative-change thresholds; both default `0.001`. |
-| `use_kl` | Reference two-half KL stopping; default `True`. |
+| `verbose` | Progress bars show chunk visits. Diagnostics are off by default (`0`); set `1` for chunk geometry, iterations and stopping reasons. |
+| `limit`, `max_delta` | Updated-fraction and relative-change thresholds for RLGC with KL disabled; both default `0.001`. Ordinary RL uses only `max_delta`. |
+| `use_kl` | Select the iteration budget using the reference two-half KL divergence; default `True`. Tiled RLGC shares the largest first-local-KL accepted iteration. Fraction/change thresholds do not preempt KL. |
 | `scan_upsample_factor` | Integer scan-grid refinement; default `1`. For sparse acquisition use `boundary="zero"`. |
 | `boundary` | Default `"reflect"` for native sampling; `"zero"` for the acquired-plane sparse operator. |
-| `max_iterations` | Optional safety cap; default `None` for RLGC. Ordinary RL (`gradient_consensus=False`) requires a finite cap. |
-| `storage` | `"gpu"` (default) or explicitly selected `"host"` for one chunk's reconstruction arrays. FFTs use CUDA in either case. |
-| `callback` | Optional function receiving the iteration index and completed chunk reconstruction. Iteration numbering restarts for each chunk. |
+| `pad_yx` | Symmetric detector-axis padding for native reconstruction; default `True`. Zero-boundary reconstruction always pads Y/X. |
+| `max_iterations` | Optional safety cap; default `None` for RLGC. Ordinary RL (`gradient_consensus=False`) requires a finite cap or positive `max_delta`. |
+| `storage` | `"gpu"` (default) or `"host"` for the active chunk's reconstruction arrays; FFTs use CUDA in either case. KL-enabled tiling also stores continuation checkpoints in system RAM. |
+| `callback` | Optional function receiving provisional iterates, including lookahead updates that may be discarded. Native arrays include padding. Per-chunk iteration numbers continue across visits. |
 
 The return value is a NumPy `float32` array with the input rank. With scan
 refinement N, M acquired planes produce `(M-1)*N+1` output planes; YX dimensions
@@ -116,37 +117,57 @@ See the [Python reference](../reference/python/imageprocessing.md) for all contr
 
 ## Photon gradient consensus
 
-Processing applies the recorded camera offset and conversion before deconvolution,
-clipping negative calibrated estimates to zero and retaining floating-point precision.
-RLGC initializes a constant estimate at the mean calibrated intensity. Each iteration
-uses `do_binosplit.m`'s rounded counts: binomial sampling below 150 and a Gaussian
-approximation at 150 or higher, with out-of-range Gaussian draws replaced by
-half the rounded count. A uniform random fraction of the signed rounding
-remainder is added to the first half. The second half is formed by subtraction.
-For read-noise RMS σ in calibrated input units, split `J + σ²` instead of `J`,
-subtract `σ²/2` from each half, then clip independently at zero, following
-`gc_deconv.m`. Processing reads the camera RMS from the OME-Zarr calibration.
-If read noise is absent, it uses zero and selects the no-read-noise model.
+Processing subtracts the recorded camera offset, applies its conversion, clips
+negative calibrated estimates to zero, and retains floating-point precision.
+RLGC initializes a constant estimate at the mean calibrated intensity for reflected,
+unit-response convolution. Otherwise it uses `sum(J)/sum(A1)` to initialize in object
+units, including detector response, PSF normalization and boundary/sampling geometry. Normalized KL cannot
+identify a global intensity-scale error, so its rollback state must already use
+the recorded sensitivity calibration.
 
-The consensus map blurs `(u1-1)*(u2-1)`, where `u1` and `u2` are the two half-image
-multiplicative updates. It has no intensity weighting. Negative consensus rejects
-an update and zero permits it. The full RL update is computed directly from the
-measured image, since independently clipped halves need not sum to that image.
-The full ratio is `(J + σ²)/max(Ax + σ², 1e-12)`; each half ratio is
-`(half + σ²)/(0.5*max(Ax + σ², 1e-12))`, exactly as in `gc_deconv.m`.
+Each iteration splits integer photons with exact binomial thinning at every
+count level. For fractional calibrated counts `S=n+f`, draw `Binomial(n, 0.5)`
+and independently assign the remainder `f` to either half with equal probability.
+The second half is obtained by subtraction, preserving the measured sum and
+nonnegative halves. Both halves have expected value `S/2`; their conditional
+variance is `(n+f**2)/4`. This fractional extension removes the notebook's
+systematic assignment of the remainder to the second half. It remains an
+approximation for camera data, without claiming independent Poisson halves.
 
-KL stopping is enabled by default. Following `gc_deconv.m`, normalize the predicted
-acquired pixels and each fresh half after adding its `1e-4` pseudocount. Stop when
-both prediction-to-half KL scores exceed their preceding-iteration values,
-keeping the current estimate as MATLAB does. This measurement-space convention
-also applies to sparse scans; object voxels are not compared directly with
-measured pixels. This selects MATLAB's `use_KL=1` branch. Its read-noise correction
-is a shifted-count approximation. CuPy and MATLAB use different random generators,
-so identical seed numbers do not imply identical random halves.
+For recorded read-noise RMS `sigma`, split `J + sigma**2`. The shifted-count
+approximation follows the paper's cited read-noise methods: the full-data ratio
+is `(J + sigma**2)/max(Ax + sigma**2, 1e-12)`, and each half-exposure ratio is
+`2*shifted_half/max(Ax + sigma**2, 1e-12)`. These shifts cancel the half-variance
+subtraction algebraically, avoiding clipped intermediate counts in the updates.
+Processing reads the RMS calibration from acquisition metadata; absent noise
+calibration selects zero. This is an approximate Poisson-Gaussian model.
 
-The existing accepted-update fraction threshold of 0.001 and maximum absolute
-change divided by `max(max(reconstruction), 1e-12)` threshold of 0.001 remain active.
-Ordinary RL has no built-in stopping rule for noisy data.
+Equation (4) forms the additive half-image changes `delta_i = x*(u_i-1)` and
+smooths their product with the optical interaction kernel. The spatially varying
+`x**2` weighting is inside that smoothing. Equation (5) applies the shared
+full-data RL update only where consensus is strictly positive; zero and negative
+consensus retain the preceding voxel value.
+
+KL divergence terminates nonempty RLGC reconstruction by default. As in Colab,
+normalize the acquired camera prediction `Ax` and each fresh half after adding
+a `1e-4` pseudocount. Stop when both prediction-to-half KL scores increase from
+the preceding iteration, restoring the preceding reconstruction. This compares
+measurement-space arrays for both native and refined scan grids. With read
+noise, the KL statistic uses nonnegative variance-corrected halves; the full
+and half RL updates retain the shifted counts described above.
+This defines each chunk's first accepted KL stopping iteration; tiled execution
+uses those iterations to select the shared budget described below.
+
+Accepted-update fraction and maximum-relative-change thresholds do not terminate
+a KL-enabled run. They remain available for RLGC with `use_kl=False`, with both
+defaults `0.001`. Relative change is the largest absolute update divided by
+`max(max(reconstruction), 1e-12)`. An explicitly supplied `max_iterations` remains
+a safety cap. An all-zero calibrated chunk returns zero without iterations.
+
+Both RL and RLGC use the same full-data RL multiplier.
+`gradient_consensus=False` removes the consensus gate and KL termination for
+controlled ordinary-RL comparisons; it does not select a different RL update.
+Ordinary RL uses its explicit iteration cap or positive `max_delta`.
 
 ## PSFs, response and execution
 
@@ -165,22 +186,30 @@ act before emission blur. Without deconvolution, calibration and flatfield divis
 retain their usual order.
 
 The single `rlgc` solver supports planar, native and undersampled reconstruction.
-Native reconstruction uses symmetric PSF halos, efficient FFT dimensions and
-cached workspaces. Large inputs use sequential scan chunks with a discarded
-processing halo of one full PSF scan support on either side. Each haloed chunk
-completes reconstruction using the same optical model and stopping rules; its
-retained interior is copied into the full output. Only the input and output span
-the acquisition. Solver-state memory depends on chunk size and detector extent.
-Allocation failure retries with a smaller scan chunk, without moving full-volume
-solver state into RAM. Device allocations are limited to 80 percent of available
-physical GPU memory, respecting any tighter caller limit, so allocation fallback
-can run before Windows spills device state into shared memory. FFT plans and
-device allocations are reused between chunks and released after the volume.
-Chunk initialization, random halves and stopping histories
-are independent, so chunked and full-volume reconstructions need not be identical.
-NumPy and CuPy random generators need not produce identical random halves.
-Processing records the solver configuration; incompatible outputs cannot be
-mixed by `--resume`.
+Native observations use symmetric PSF halos and a free padded reconstruction,
+with the acquired core returned afterward. Zero-boundary reconstruction always
+includes linear-convolution Y/X padding, even with `pad_yx=False`, preventing
+detector-edge wraparound. Both paths use CuPy's cuFFT-friendly dimensions and
+reuse FFT plans and device allocations. Ryomen schedules scan chunks with a
+discarded halo of one full PSF scan support on either side. With KL enabled, chunks
+share the largest first-local-KL accepted iteration, subject to `max_iterations`.
+This is distinct from a pooled whole-volume KL
+divergence. Haloed reconstruction checkpoints, owned rollback cores and the actual
+random-generator state are parked in system RAM. Each chunk is visited at most
+twice, continuing only missing updates without replaying completed iterations.
+GPU working memory remains bounded by the active chunk; RAM checkpoint storage
+grows with the number and extent of overlapping chunks. Initialization and random
+halves remain per chunk, so tiled and whole-volume reconstructions need not match.
+
+Before allocating checkpoints, the solver checks available RAM for their total
+storage, output and workspace. Insufficient RAM raises an error. Device allocations
+are limited to 80 percent of available physical GPU memory, respecting tighter
+caller limits. In shared-KL runs, startup allocation failure can reduce the scan
+chunk, but an allocation failure after a completed update is reported without
+restarting the reconstruction. FFT plans and device allocations are reused between chunks and
+released after the volume. NumPy and CuPy random generators need not produce
+identical random halves. Processing records the solver revision in its configuration;
+outputs from earlier revisions are incompatible with `--resume`.
 
 ## Sparse scans
 
@@ -190,10 +219,10 @@ grid; missing planes are not zero measurements. An acquisition with M planes
 produces `(M-1)*N+1` reconstruction planes, preserving endpoints.
 
 The PSF and subsequent deskew use the finer spacing. This path uses the same
-photon consensus and stopping rules, including sequential scan chunking. Both `process`
-and `export-rois` infer this factor from acquisition metadata. ROI raw reads remain
+photon consensus and KL divergence termination, including sequential scan
+chunking. Both `process` and `export-rois` infer this factor from acquisition
+metadata. ROI raw reads remain
 on the acquired grid; deconvolution and subsequent deskew use the refined grid.
-Both OPM paths follow `gc_deconv.m` for the noise shift. The MATLAB
-`gc_deconv_up.m` file instead shifts the split by σ rather than σ²; that
-inconsistent split formula is not used here.
+Both OPM paths use the same read-noise variance shift and acquired-camera KL
+comparison.
 See the [solver reference](../reference/python/imageprocessing.md) for Python parameters.

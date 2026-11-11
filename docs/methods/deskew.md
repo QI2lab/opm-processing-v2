@@ -48,6 +48,31 @@ Output shape, padding, origin, and scan orientation are determined from the
 acquisition geometry. See the [geometry diagram](../orthogonal_interpolation_diagram.md)
 for the interpolation construction.
 
+Stage scan origins refer to the first retained camera plane after scan ordering
+and excess-plane removal. A positive stage-X trajectory is reversed, so its
+deskewed image origin includes the displacement to the retained scan endpoint;
+using the acquisition start would shift every absolute image coordinate by one
+scan length. Negative trajectories retain their acquired order. Mixed scan
+directions in one collection are rejected. Deskew cropping adds its physical Y
+offset, and Z averaging places the first output sample at the bin center.
+
+Recorded stage coordinates retain their acquisition reference in the processed
+metadata and physical XYZ OME StageLabels. Spatial metadata is stored to three
+decimal places. Image-placement
+coordinates and local NGFF translations are separate. The
+`opm_processing_coordinates` attributes identify the coordinate version and the
+recorded and orientation-adjusted stage references. The detector reference is
+the first stored camera pixel; this does not invent an optical-center
+calibration. Acquisition records that use depth-normalized scan coordinates
+retain that reference rather than being relabeled as physical stage readbacks.
+
+New fusion can correct the missing endpoint origin of existing positive stage
+deskewed tiles without changing their pixels. Registration caches use the new
+coordinate version. Existing fused images and their ROI coordinates must be
+regenerated together; older stage previews are rejected for ROI selection.
+Legacy negative-direction stage tiles require reprocessing because their
+stored pixel order also differs.
+
 ## Sampling and intensity
 
 Before Z averaging, laboratory spacing is the camera pixel size along each

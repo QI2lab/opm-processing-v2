@@ -7,7 +7,8 @@ prefers deconvolved, deskewed data.
 | Option | Description |
 | --- | --- |
 | `--registration-channel VALUE` | Select the zero-based registration channel; default 0. |
-| `--max-registration-shift-zyx Z Y X` | Override correction limits inferred from stage positions and scan geometry. |
+| `--output-dir PATH` | Write fused volume and maximum-Z OME-Zarrs here; registration and depth-gain records stay beside the processed input. |
+| `--max-registration-shift-zyx Z Y X` | Override correction limits read from recorded acquisition overlaps and bounded by tile geometry. |
 | `--registration-retries VALUE` | Remeasure pairs with expanded automatic limits and refit the entire graph; default 2, 0 disables. Explicit shift limits stay fixed. |
 | `--registration-threshold VALUE` | Minimum overlap similarity; default 0.7. |
 | `--blend-pixels Z Y X` | Set edge blending widths; default 20 600 400. |
@@ -29,3 +30,6 @@ uv run fuse "/path/to/acquisition" --registration-channel 2 --max-registration-s
 ```
 
 Append `--help` to list all options and defaults.
+
+Use the same `--output-dir` with `--regenerate-max-z` to regenerate the
+projection from a fused volume in that folder.

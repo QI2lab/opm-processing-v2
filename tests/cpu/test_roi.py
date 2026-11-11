@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -10,9 +11,8 @@ from yaozarrs import open_group
 
 from opm_processing.dataio.position_collection import (
     create_position_collection,
-    create_variable_position_collection,
-    open_position_collection,
 )
+from opm_processing.dataio.processing_state import ProcessingState
 from opm_processing.dataio.roi import (
     PhysicalRoi,
     align_bounds_to_grid,
@@ -20,14 +20,107 @@ from opm_processing.dataio.roi import (
     roi_from_world_rectangle,
     world_roi_to_skewed_bounds,
 )
+from opm_processing.imageprocessing.maxtilefusion import regenerate_fused_max_projection
 from opm_processing.imageprocessing.tilefusion import TileFusion
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("factor,z_bin", [(1, 1), (3, 2)])
+def test_roi_plan_keeps_raw_origin_clipped_halos_and_refined_extent(factor, z_bin):
+    """Plan the same physical rectangle from native and refined scan samples."""
+    from opm_processing.process import plan_roi_tiles
+
+    roi = PhysicalRoi(
+        bounds_yx_um=(103, 107, 202, 214),
+        source_path=Path("preview.ome.zarr"),
+        grid_origin_yx_um=(100, 200),
+        pixel_size_yx_um=(1, 1),
+        position_indices=(4, 5),
+        tile_footprints=tuple(
+            {
+                "time_index": 1,
+                "position_index": position,
+                "origin_zyx_um": (7, y + 4, 201),
+                "raw_origin_zyx_um": (7, y, 200),
+                "bounds_yx_um": (y, y + 24, 200, 212),
+            }
+            for position, y in ((4, 100), (5, 1000))
+        ),
+    )
+    options = {
+        "channel_count": 2,
+        "pixel_size_um": 1,
+        "scan_step_um": 2,
+        "angle_deg": 30,
+        "z_downsample_level": z_bin,
+        "halo_scan": 1,
+        "halo_x": 2,
+        "scan_upsample_factor": factor,
+    }
+    (plan,) = plan_roi_tiles(roi, (0, 1), (4, 5), (10, 4, 12), **options)
+    assert (plan["time_index"], plan["position_index"]) == (1, 4)
+    assert plan["skewed_bounds_sx"] == [0, 6, 0, 12]
+    assert plan["skewed_shape_syx"] == [6, 4, 12]
+    assert plan["deskew_crop_yx"] == [3, 7, 2, 12]
+    assert plan["shape_tczyx"] == [1, 2, 2 // z_bin, 4, 10]
+    assert plan["origin_zyx_um"] == [7 + (z_bin - 1) / 2, 103, 202]
+    if factor == 3:
+        assert plan["reconstruction_shape_syx"] == [16, 4, 12]
+    else:
+        assert "reconstruction_shape_syx" not in plan
+    with pytest.raises(ValueError, match="does not contain"):
+        plan_roi_tiles(roi, (0,), (4, 5), (10, 4, 12), **options)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("separation", ["paired", "coincident", "time"])
+def test_roi_registration_context_keeps_selection_limits(
+    acquisition_metadata, separation
+):
+    """Use the selected overlap before adding search and SSIM read margins."""
+    from opm_processing.process_roi import roi_with_registration_context
+
+    acquisition = replace(
+        acquisition_metadata,
+        shape=(2, 2, 1, 100, 40, 200),
+        pixel_size_um=1,
+        scan_axis_step_um=1,
+        angle_deg=30,
+    )
+    roi = PhysicalRoi(
+        bounds_yx_um=(40, 60, 100, 120),
+        source_path=Path("preview.ome.zarr"),
+        grid_origin_yx_um=(0, 0),
+        pixel_size_yx_um=(1, 1),
+        position_indices=(0, 1),
+        tile_footprints=tuple(
+            {
+                "time_index": index if separation == "time" else 0,
+                "position_index": index,
+                "origin_zyx_um": (0, 0, x),
+                "bounds_yx_um": (0, 100, x, x + 120),
+            }
+            for index, x in enumerate((0, 80 if separation != "coincident" else 0))
+        ),
+    )
+    expanded, limits = roi_with_registration_context(roi, acquisition, 1)
+    assert roi.bounds_yx_um == (40, 60, 100, 120)
+    if separation == "paired":
+        # Each selected overlap axis is 20 pixels; retain at least half.
+        # The 15-sample SSIM window at fivefold sampling adds 40 pixels.
+        assert limits == (10, 10, 10)
+        assert expanded.bounds_yx_um == (-10, 110, 50, 170)
+        assert expanded.tile_footprints == roi.tile_footprints
+    else:
+        assert expanded is roi and limits is None
+
+
+@pytest.mark.unit
 def test_napari_world_rectangle_round_trips_grid_and_all_z(
-    record_registration, fused_store_factory, tmp_path: Path
+    record_registration, fused_store_factory, acquisition_factory, tmp_path: Path
 ) -> None:
     """Save a pyramid-independent ROI plus every overlapping stage-Z level."""
+    acquisition_factory(np.zeros((1, 10, 1, 1, 2, 2), np.uint16), mode="projection")
     source = tmp_path / "sample_max_z_fused.ome.zarr"
     fused_store_factory(
         np.zeros((1, 1, 1, 8, 8), np.uint16),
@@ -71,9 +164,11 @@ def test_napari_world_rectangle_round_trips_grid_and_all_z(
 def test_napari_image_pixels_are_converted_to_ngff_physical_coordinates(
     record_registration,
     fused_store_factory,
+    acquisition_factory,
     tmp_path: Path,
 ) -> None:
     """Apply NGFF translation after mapping the Shapes layer to Image data."""
+    acquisition_factory(np.zeros((1, 1, 1, 1, 2, 2), np.uint16), mode="projection")
     source = tmp_path / "sample_max_z_fused.ome.zarr"
     fused_store_factory(
         np.zeros((1, 1, 1, 5000, 5000), np.uint16),
@@ -162,9 +257,11 @@ def test_registered_tile_origin_is_selected_per_timepoint() -> None:
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("external", [False, True])
 def test_roi_fusion_keeps_multiple_stage_z_levels_and_crops_only_yx(
     record_registration,
     tmp_path: Path,
+    external,
     acquisition_factory,
 ) -> None:
     """Filter arbitrary source positions while preserving their complete Z span."""
@@ -175,15 +272,16 @@ def test_roi_fusion_keeps_multiple_stage_z_levels_and_crops_only_yx(
         (1.0, 1.0, 1.0),
         stage_positions=((0.0, 0.0, 0.0), (5.0, 0.0, 0.0), (0.0, 100.0, 100.0)),
     )
+    observed = np.arange(100, 116, dtype=np.uint16).reshape(1, 4, 4)
     for array in collection.arrays:
-        array.write(np.ones(array.shape, dtype=np.uint16)).result()
+        array.write(observed[None, None]).result()
     tiles = [
         {"time_index": 0, "position_index": 0, "origin_zyx_um": [0, 0, 0]},
         {"time_index": 0, "position_index": 1, "origin_zyx_um": [5, 0, 0]},
         {"time_index": 0, "position_index": 2, "origin_zyx_um": [0, 100, 100]},
     ]
     acquisition_factory(
-        np.ones((1, 3, 1, 1, 4, 4), np.uint16),
+        np.broadcast_to(observed, (1, 3, 1, 1, 4, 4)),
         mode="projection",
         pixel_size_um=1.0,
         scan_axis_step_um=1.0,
@@ -218,6 +316,7 @@ def test_roi_fusion_keeps_multiple_stage_z_levels_and_crops_only_yx(
 
     fusion = TileFusion(
         processed_path,
+        output_dir=tmp_path / "rendered" if external else None,
         roi_selection=roi,
         max_workers=1,
         reverse_stage_y=False,
@@ -234,116 +333,20 @@ def test_roi_fusion_keeps_multiple_stage_z_levels_and_crops_only_yx(
     assert fusion.offset_um == (0.0, -2.0, -1.0)
     assert fusion.unpadded_shape == (6, 5, 4)
     fusion.run()
-    written = open_group(tmp_path / "sample_fused.ome.zarr")["0"].to_tensorstore()
+    fused = fusion.output_dir / "sample_fused.ome.zarr"
+    written = open_group(fused)["0"].to_tensorstore()
     expected = np.zeros((1, 1, 6, 5, 4), dtype=np.uint16)
-    expected[..., (0, 5), 2:5, 1:4] = 1
+    expected[..., (0, 5), 2:5, 1:4] = observed[..., :3, :3]
     np.testing.assert_array_equal(written.read().result()[..., :6, :5, :4], expected)
-
-
-@pytest.mark.unit
-def test_variable_roi_tiles_are_stored_cropped_and_reopened(
-    record_registration,
-    tmp_path: Path,
-    acquisition_factory,
-) -> None:
-    """ROI series retain their independent crop shapes and physical origins."""
-    processed_path = tmp_path / "sample_decon_deskewed.ome.zarr"
-    shapes = ((1, 1, 2, 4, 4), (1, 1, 2, 5, 3))
-    records = [
-        {
-            "time_index": 0,
-            "position_index": 7,
-            "origin_zyx_um": [0.0, 10.0, 20.0],
-            "shape_tczyx": list(shapes[0]),
-            "skewed_shape_syx": [16, 4, 4],
-            "deskew_crop_yx": [4, 8, 0, 4],
-        },
-        {
-            "time_index": 0,
-            "position_index": 8,
-            "origin_zyx_um": [0.0, 12.0, 22.0],
-            "shape_tczyx": list(shapes[1]),
-            "skewed_shape_syx": [16, 4, 3],
-            "deskew_crop_yx": [6, 11, 0, 3],
-        },
-    ]
-    collection = create_variable_position_collection(
-        processed_path,
-        shapes,
-        (1.0, 1.0, 1.0),
-        spatial_origins_zyx_um=(
-            (0.0, 10.0, 20.0),
-            (0.0, 12.0, 22.0),
-        ),
+    state = ProcessingState.read(tmp_path / "sample.processing.json")
+    assert state.registered_output_for_fused(fused) == processed_path
+    assert state.registration(processed_path)["tiles"] == tiles
+    maximum = fusion.output_dir / "sample_max_z_fused.ome.zarr"
+    regenerate_fused_max_projection(fused, maximum, max_workers=1)
+    np.testing.assert_array_equal(
+        open_group(maximum)["0"].to_tensorstore().read().result(),
+        written.read().result().max(axis=2, keepdims=True),
     )
-    collection.arrays[0].write(np.full(shapes[0], 10, dtype=np.uint16)).result()
-    collection.arrays[1].write(np.full(shapes[1], 30, dtype=np.uint16)).result()
-    # Z=0 has no valid deskew interpolation; Z=1 is supported throughout
-    # both interior Y crops. Store physically valid synthetic tile data.
-    for array in collection.arrays:
-        array[:, :, 0].write(np.uint16(0)).result()
-
-    reopened = open_position_collection(processed_path)
-    assert [tuple(array.shape) for array in reopened.arrays] == list(shapes)
-    assert not any(key.startswith("opm_") for key in reopened.attributes)
-
-    roi_series = tuple(
-        {
-            key: record[key]
-            for key in (
-                "time_index",
-                "position_index",
-                "skewed_shape_syx",
-                "deskew_crop_yx",
-            )
-        }
-        for record in records
-    )
-    acquisition_factory(
-        np.ones((1, 9, 1, 16, 4, 4), np.uint16),
-        pixel_size_um=1.0,
-        scan_axis_step_um=1.0,
-        camera_offset=0.0,
-        camera_conversion=1.0,
-        stage_positions_zxy=((0.0, 0.0, 0.0),) * 9,
-    )
-    record_registration(
-        processed_path,
-        records,
-        roi_series=roi_series,
-    )
-    roi = PhysicalRoi(
-        bounds_yx_um=(10.0, 17.0, 20.0, 25.0),
-        source_path=tmp_path / "sample_max_z_fused.ome.zarr",
-        grid_origin_yx_um=(10.0, 20.0),
-        pixel_size_yx_um=(1.0, 1.0),
-        position_indices=(7, 8),
-    )
-    fusion = TileFusion(
-        processed_path,
-        roi_selection=roi,
-        max_workers=1,
-        multiscale_factors=(2,),
-        chunk_shape_yx=(4, 4),
-        blend_pixels=(0, 0, 0),
-    )
-    assert fusion._variable_roi_tiles is True
-    assert fusion._reuse_registered_roi_placements is False
-    assert fusion._tile_shapes == [(2, 4, 4), (2, 5, 3)]
-    assert fusion._tiles_by_time == ((0, 1),)
-    fusion._compute_fused_image_space()
-    assert fusion.offset_um == (0.0, 10.0, 20.0)
-    assert fusion.unpadded_shape == (2, 7, 5)
-
-    fusion.run()
-    fused = np.asarray(fusion.fused_ts.read().result())
-    assert fused.shape == (1, 1, 2, 8, 6)
-    expected = np.zeros((1, 1, 2, 8, 6), np.uint16)
-    expected[..., :4, :4] = 10
-    expected[..., 2:7, 2:5] = 30
-    expected[..., 2:4, 2:4] = 20
-    expected[:, :, 0] = 0
-    np.testing.assert_array_equal(fused, expected)
 
 
 @pytest.mark.unit

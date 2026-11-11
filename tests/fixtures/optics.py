@@ -1,15 +1,15 @@
 """Physical specimens and shared production optics for reconstruction."""
 
 import json
-from dataclasses import replace
-from functools import lru_cache
+from dataclasses import dataclass, replace
+from functools import lru_cache, partial
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
-from scipy.interpolate import RegularGridInterpolator
 
+from opm_processing.imageprocessing.opmpsf import centered_sensor_axes
 from tests.simulation.forward_model import (
     Acquisition,
     Microscope,
@@ -17,16 +17,37 @@ from tests.simulation.forward_model import (
     emission_psf,
     forward_model,
 )
-from tests.simulation.objects import centered_axis, deposit_point
+from tests.simulation.objects import deposit_point
+from tests.simulation.scenes import OpticalScene, freeze_metadata
+
+
+@dataclass(frozen=True)
+class CameraObservation:
+    """One immutable optical scene and its independent detector observation."""
+
+    ground_truth: OpticalScene
+    microscope: Microscope
+    expectation: np.ndarray
+    raw: np.ndarray
+
+
+@dataclass(frozen=True)
+class AnalyticalCameraField:
+    """Known analytical concentration on an immutable physical Cartesian grid."""
+
+    axes: tuple[np.ndarray, ...]
+    field: np.ndarray
+    shape: tuple[int, int, int]
+    center: tuple[float, float, float]
 
 
 @pytest.fixture(scope="session")
 def simulation_parameters():
     """Load the shared physical acquisition and specimen configuration."""
-    return json.loads(
-        (
-            Path(__file__).resolve().parent / "configs/deconvolution_figures.json"
-        ).read_text()
+    return freeze_metadata(
+        json.loads(
+            (Path(__file__).resolve().parent / "configs/simulation.json").read_text()
+        )
     )
 
 
@@ -40,11 +61,10 @@ def camera_calibration(simulation_parameters):
 
 @pytest.fixture(scope="session")
 def microscope_parameters(simulation_parameters, camera_calibration):
-    """Provide immutable microscope settings for the compact optical fixtures."""
+    """Provide immutable microscope settings from the shared acquisition calibration."""
     options = dict(simulation_parameters["microscope"], camera=camera_calibration)
     options["psf_half_extent_zyx_um"] = tuple(options["psf_half_extent_zyx_um"])
-    # This small physical unit-test grid predates the figure acquisition grid.
-    return replace(Microscope(**options), scan_step_um=0.2)
+    return Microscope(**options)
 
 
 @pytest.fixture(scope="session")
@@ -53,299 +73,441 @@ def independent_photon_scene_factory(microscope_parameters, simulation_parameter
     from tests.simulation.scenes import prepare_scene
 
     @lru_cache(maxsize=2)
-    def build(kind="points", profile="uniform", spacing=0.05):
-        """Reuse cached physical scenes at the requested illumination and grid spacing."""
+    def build(kind="points", *, large=False, integration_scan_planes=None):
+        """Reuse physical scenes on the shared calibrated fine grid."""
+        specimen = simulation_parameters["specimens"][kind]
+        if large and kind == "line-pairs":
+            z, _, x = specimen["half_extent_zyx_um"]
+            length = simulation_parameters["large_scene"]["line_length_um"]
+            features = dict(specimen["features"])
+            if integration_scan_planes is not None:
+                integration = simulation_parameters["integration_line_pairs"]
+                z = max(
+                    z,
+                    simulation_parameters["specimens"]["points"]["half_extent_zyx_um"][
+                        0
+                    ],
+                )
+                if (
+                    integration_scan_planes
+                    == simulation_parameters["whole_scan_planes"]
+                ):
+                    # At feature Z=0, both endpoints and their full optical
+                    # support fit even the coarse camera's common scan range.
+                    length = integration["whole_line_length_um"]
+                # Two finite cylinders straddle actual X tile borders; scan
+                # subsampling cannot remove this independent border coverage.
+                x = integration["half_extent_x_um"]
+                features.update(
+                    pair_gap_um=integration["pair_gap_um"],
+                    offset_x_um=integration["offset_x_um"],
+                )
+            specimen = {
+                "half_extent_zyx_um": (
+                    z,
+                    length / 2 + microscope_parameters.psf_half_extent_zyx_um[1],
+                    x,
+                ),
+                "features": dict(features, length_um=length),
+            }
         return prepare_scene(
             kind,
-            replace(microscope_parameters, fine_spacing_um=spacing),
-            parameters=simulation_parameters["specimens"][kind],
-            illumination_profile=profile,
+            microscope_parameters,
+            parameters=specimen,
         )
 
     return build
 
 
 @pytest.fixture(scope="session")
-def simulated_camera(
+def optical_camera_data(
     microscope_parameters, simulation_parameters, independent_photon_scene_factory
 ):
-    """Cache camera observations of the shared physical ground-truth objects.
+    """Share immutable optical means independently of detector realizations."""
 
-    Returns
-    -------
-    callable
-        Render an SYX acquisition using the single forward model. The result
-        contains the object, optical calibration, camera means and unsigned ADU.
-        Geometry, exposure and detector calibration are explicit inputs.
-    """
-    from tests.simulation.camera import digitize
-
-    @lru_cache(maxsize=24)
-    def render(
+    @lru_cache(maxsize=8)
+    def optical_data(
         shape,
         *,
-        step=0.4,
-        offset=100.0,
-        conversion=0.25,
-        geometry="oblique",
-        exposure=1.0,
-        seed=42,
         kind="points",
-        profile="uniform",
+        large=False,
+        integration=False,
+        illumination_profile="uniform",
+        step=0.4,
+        geometry="oblique",
+        budget=None,
     ):
-        """Simulate optical formation before camera sampling and digitization."""
-        scene = independent_photon_scene_factory(kind)
-        microscope = replace(
-            microscope_parameters,
-            scan_step_um=step,
-            camera=replace(
-                microscope_parameters.camera,
-                offset_adu=offset,
-                electrons_per_adu=conversion,
-            ),
+        """Reuse unit-exposure optics independently of electronic gain and noise."""
+        scene = independent_photon_scene_factory(
+            kind,
+            large=large,
+            integration_scan_planes=shape[0] if integration else None,
         )
+        microscope = replace(microscope_parameters, scan_step_um=step)
         expectation = forward_model(
             scene.density,
             Acquisition(
                 scene.axes,
                 shape,
                 geometry=geometry,
-                exposure=exposure,
-                illumination_profile=profile,
-                camera_photon_budget=tuple(simulation_parameters["photon_budgets"][0]),
+                illumination_profile=illumination_profile,
+                illumination_half_width_um=scene.illumination_half_width_um,
+                camera_photon_budget=(
+                    tuple(simulation_parameters["photon_budgets"][0])
+                    if budget is None
+                    else budget
+                ),
                 output="expectation",
             ),
             microscope,
         )
+        return scene, microscope, freeze_metadata(expectation)
+
+    return optical_data
+
+
+@pytest.fixture(scope="session")
+def simulated_camera(simulation_parameters, optical_camera_data):
+    """Cache native noisy fields while preserving acquired scan coordinates."""
+    from tests.simulation.camera import digitize
+
+    @lru_cache(maxsize=2)
+    def render(
+        shape=None,
+        *,
+        kind="points",
+        large=False,
+        integration=False,
+        illumination_profile="uniform",
+        step=0.4,
+        conversion=0.25,
+        geometry="oblique",
+        exposure=1.0,
+        seed=42,
+        budget=None,
+    ):
+        """Digitize the shared optical means with the requested detector seed."""
+        if not np.isfinite(exposure) or exposure < 0:
+            raise ValueError("Exposure must be finite and nonnegative")
+        if shape is None:
+            shape = (
+                simulation_parameters["whole_scan_planes"],
+                *simulation_parameters["camera_shape_yx"],
+            )
+        native_step = simulation_parameters["microscope"]["scan_step_um"]
+        if step > native_step:
+            factor = round(step / native_step)
+            if not np.isclose(step, factor * native_step, rtol=1e-6, atol=0):
+                raise ValueError(
+                    "Coarse camera sampling must select native scan planes"
+                )
+            native = render(
+                shape,
+                kind=kind,
+                large=large,
+                integration=integration,
+                illumination_profile=illumination_profile,
+                step=native_step,
+                conversion=conversion,
+                geometry=geometry,
+                exposure=exposure,
+                seed=seed,
+                budget=budget,
+            )
+            return CameraObservation(
+                ground_truth=native.ground_truth,
+                microscope=replace(native.microscope, scan_step_um=step),
+                expectation=native.expectation[::factor],
+                raw=native.raw[::factor],
+            )
+        scene, microscope, expectation = optical_camera_data(
+            shape,
+            kind=kind,
+            large=large,
+            integration=integration,
+            illumination_profile=illumination_profile,
+            step=step,
+            geometry=geometry,
+            budget=budget,
+        )
+        microscope = replace(
+            microscope,
+            camera=replace(microscope.camera, electrons_per_adu=conversion),
+        )
+        if exposure != 1:
+            expectation = freeze_metadata(expectation * exposure)
         raw = digitize(expectation, microscope.camera, seed=seed)
-        return SimpleNamespace(
+        return CameraObservation(
             ground_truth=scene,
             microscope=microscope,
             expectation=expectation,
-            raw=raw,
+            raw=freeze_metadata(raw),
         )
 
     return render
 
 
 @pytest.fixture(scope="session")
-def optical_setup(microscope_parameters):
-    """Share one calibrated PSF between profiles, operators and optical specimens."""
+def cartesian_registration_pair(
+    independent_photon_scene_factory, simulation_parameters
+):
+    """Observe known emitters on registration's orthogonal Cartesian ZYX grid.
+
+    Both acquisitions share one known emission dose and calibrated microscope.
+    Independent detector realizations avoid matching a reused camera-noise field.
+    """
+    from opm_processing.imageprocessing.camera import camera_correct
+    from tests.simulation.camera import digitize
+
+    @lru_cache(maxsize=4)
+    def optical_data(applied_shift):
+        """Reuse two immutable optical means at the prescribed physical shift."""
+        scene = independent_photon_scene_factory("points")
+        microscope = scene.microscope
+        shape = (
+            simulation_parameters["whole_scan_planes"],
+            *simulation_parameters["camera_shape_yx"],
+        )
+        spacing = np.array(
+            (
+                microscope.scan_step_um,
+                microscope.pixel_size_um,
+                microscope.pixel_size_um,
+            )
+        )
+        axes = centered_sensor_axes(shape, spacing)
+        dose = forward_model(
+            scene.density,
+            Acquisition(
+                scene.axes,
+                shape,
+                geometry="cartesian",
+                camera_photon_budget=(10000, 30),
+                output="object",
+            ),
+            microscope,
+        )
+        means = []
+        for displacement in (np.zeros(3), np.array(applied_shift)):
+            sensor_axes = tuple(
+                axis - shift * step
+                for axis, shift, step in zip(axes, displacement, spacing, strict=True)
+            )
+            mean = forward_model(
+                dose,
+                Acquisition(
+                    scene.axes,
+                    shape,
+                    sensor_axes=sensor_axes,
+                    geometry="cartesian",
+                    output="expectation",
+                ),
+                microscope,
+            )
+            means.append(mean)
+        return (
+            microscope.camera,
+            freeze_metadata(means),
+            freeze_metadata(-np.array(applied_shift)),
+        )
+
+    @lru_cache(maxsize=2)
+    def render(applied_shift, *, noise=True):
+        """Draw independent exposures and use production camera calibration."""
+        camera, means, expected = optical_data(applied_shift)
+        images = []
+        for index, mean in enumerate(means):
+            observed = (
+                camera_correct(
+                    digitize(mean, camera, seed=42 + index),
+                    camera.offset_adu,
+                    camera.electrons_per_adu,
+                )
+                if noise
+                else mean.astype(np.float32)
+            )
+            images.append(observed)
+        return (*freeze_metadata(images), expected)
+
+    return render
+
+
+@pytest.fixture(scope="session")
+def optical_psf(microscope_parameters):
+    """Share one immutable calibrated PSF between optical operator units."""
     microscope = replace(
         microscope_parameters,
         fine_spacing_um=0.04,
         psf_half_extent_zyx_um=(3.0, 2.0, 2.0),
     )
-    axes, field = emission_psf(microscope, microscope.fine_spacing_um)
-    psf, scale = camera_psf(microscope)
-    return SimpleNamespace(
-        microscope=microscope,
-        psf=psf.astype(np.float32),
-        density_scale=scale,
-        field=RegularGridInterpolator(axes, field, bounds_error=False, fill_value=0),
-    )
-
-
-@pytest.fixture(scope="session", params=["x", "y", "z"])
-def rayleigh_pair(request, optical_setup):
-    """Direction-specific Rayleigh pair using production optical sampling.
-
-    Fine optical samples locate the diffraction PSF's first minimum. The target
-    contrast is measured from the noise-free forward acquisition on the same
-    grid and interpolated profile as the reconstruction. A continuous optical
-    profile is not a contrast threshold for discrete camera samples.
-    The two sources are placed at that physical separation, without snapping
-    their positions to acquisition voxels or creating reconstruction-grid delta PSFs.
-    The common detector field contains the full PSF response of every pair;
-    its scan endpoints also coincide for the tested sparse acquisitions.
-    """
-    from tests.simulation.metrics import first_minimum, two_point_profile
-
-    axis = request.param
-    index = "xyz".index(axis)
-    directions = np.eye(3)
-    direction = directions[index]
-    radius = np.arange(0, 1.8001, 0.005)
-    separations = np.array(
-        [
-            first_minimum(radius, optical_setup.field((radius[:, None] * d)[:, ::-1]))
-            for d in directions
-        ]
-    )
-    separation = separations[index]
-    microscope = optical_setup.microscope
-    theta = np.deg2rad(microscope.angle_deg)
-    xyz_offsets = directions * separations[:, None] / 2
-    offsets = np.column_stack(
-        (
-            (xyz_offsets[:, 1] - xyz_offsets[:, 2] / np.tan(theta))
-            / microscope.scan_step_um,
-            xyz_offsets[:, 2] / (microscope.pixel_size_um * np.sin(theta)),
-            xyz_offsets[:, 0] / microscope.pixel_size_um,
-        )
-    )
-    # Detector half-width >= PSF half-width + maximum source displacement.
-    shape = (
-        2
-        * np.ceil(
-            (np.array(optical_setup.psf.shape) - 1) / 2
-            + np.max(np.abs(offsets), axis=0)
-        ).astype(int)
-        + 1
-    )
-    scan_multiple = np.lcm(3, 4)
-    shape[0] = ((shape[0] - 1 + scan_multiple - 1) // scan_multiple) * scan_multiple + 1
-    offset = offsets[index]
-    axes = tuple(centered_axis(e, 0.04) for e in (4.0, 3.0, 3.0))
-    density = np.zeros(tuple(map(len, axes)), np.float32)
-    for sign in (-1, 1):
-        deposit_point(density, axes, direction * sign * separation / 2, 100000)
-    expectation = forward_model(
-        density, Acquisition(axes, tuple(shape), output="expectation"), microscope
-    )
-    return SimpleNamespace(
-        axis=axis,
-        separation=separation,
-        microscope=microscope,
-        acquisition_dip=two_point_profile(
-            expectation, (np.array(expectation.shape) - 1) / 2, offset, microscope
-        )["valley_depth"],
-        offset=offset,
-        expectation=expectation,
-        psf=optical_setup.psf,
-    )
+    psf, _ = camera_psf(microscope)
+    return freeze_metadata(psf.astype(np.float32))
 
 
 @pytest.fixture(scope="session")
-def planar_point_model():
-    """Return two known emitters and the normalized central YX PSF used to blur them."""
-    y, x = np.mgrid[-3:4, -3:4]
-    central = np.exp(-(y**2 + x**2) / 8).astype(np.float32)
-    central /= central.sum()
-    psf = np.stack((np.ones_like(central), central * 7, np.ones_like(central) * 100))
-    truth = np.zeros((41, 43), np.float32)
-    truth[12, 13] = 2000
-    truth[28, 30] = 3000
-    return truth, central, psf
+def ideal_photon_camera(camera_calibration):
+    """Use the shared camera digitizer for ideal, unsigned photon observations."""
+    return replace(
+        camera_calibration, read_noise_e=0, electrons_per_adu=1, offset_adu=0
+    )
+
+
+@pytest.fixture
+def camera_adc_case(
+    independent_photon_scene_factory,
+    mean,
+    noise,
+    full_model,
+    camera_calibration,
+    simulation_parameters,
+):
+    """Compare calibrated pixel draws with independent exact ADC moments."""
+    from tests.simulation.camera import digitize
+    from tests.simulation.camera_statistics import adc_moments
+
+    camera = replace(camera_calibration, read_noise_e=noise)
+    if full_model:
+        scene = independent_photon_scene_factory()
+        raw = forward_model(
+            scene.density,
+            Acquisition(
+                scene.axes,
+                (1, *simulation_parameters["camera_shape_yx"]),
+                exposure=0,
+                background_electrons=mean,
+                seed=637,
+            ),
+            replace(scene.microscope, camera=camera),
+        )
+    else:
+        raw = digitize(
+            np.full(1_000_000, float(mean)), camera, seed=637 if mean == 0 else 31
+        )
+    return SimpleNamespace(raw=raw, camera=camera, moments=adc_moments(mean, camera))
+
+
+@pytest.fixture
+def measured_psf_calibration(tmp_path, psf_format):
+    """Persist prescribed normalized calibration pixels through actual file writers."""
+    import tifffile
+
+    path = tmp_path / f"measured_psf.{psf_format}"
+    kernel = np.arange(1, 28, dtype=np.float32).reshape(3, 3, 3)
+    kernel /= kernel.sum()
+
+    write = (
+        partial(np.save, path)
+        if psf_format == "npy"
+        else partial(tifffile.imwrite, path, photometric="minisblack", metadata=None)
+    )
+    write(kernel)
+    return SimpleNamespace(path=path, kernel=kernel, write=write)
+
+
+@pytest.fixture
+def uniform_detector_scene(
+    microscope_parameters, uniform_optical_calibration, simulation_parameters
+):
+    """Form a uniform physical emitter field with the existing optical model."""
+
+    def create(projection=False):
+        """Fix the emission dose before applying detector sensitivity and noise."""
+        microscope = replace(
+            microscope_parameters,
+            fine_spacing_um=0.1,
+            scan_step_um=0.4,
+            quantum_efficiency=0.3,
+            camera=replace(microscope_parameters.camera, electrons_per_adu=0.5),
+        )
+        shape = (
+            1 if projection else simulation_parameters["whole_scan_planes"],
+            *simulation_parameters["camera_shape_yx"],
+        )
+        means = uniform_optical_calibration(
+            microscope,
+            shape,
+            geometry="cartesian" if projection else "oblique",
+            photon_budget=(12000 / microscope.quantum_efficiency, 0),
+        )
+        np.testing.assert_allclose(means, 12000, rtol=2e-5)
+        return SimpleNamespace(
+            microscope=microscope,
+            means=means,
+            shape=shape,
+        )
+
+    return create
+
+
+@pytest.fixture
+def uniform_response_case(scan_planes, detector_shape):
+    """Share prescribed constant fluorescence and an asymmetric detector response."""
+    from scipy import ndimage
+
+    response = np.broadcast_to(
+        np.tile(np.array((0.25, 0.5, 1, 2), np.float32), detector_shape[1] // 4),
+        detector_shape,
+    )
+    truth = np.full((scan_planes, *response.shape), 1200, np.float32)
+    psf = np.ones((1 if scan_planes == 1 else 3, 3, 3), np.float32)
+    psf /= psf.sum()
+    measured = ndimage.convolve(truth, psf, mode="reflect") * response
+    return SimpleNamespace(response=response, truth=truth, psf=psf, measured=measured)
 
 
 @pytest.fixture
 def uniform_detector_acquisition(
-    request,
-    acquisition_factory,
     tmp_path,
-    roi_mode,
-    camera_gain_profile,
-    production_psf_parameters,
-    microscope_parameters,
+    opm_v2_acquisition_factory,
+    uniform_detector_scene,
 ):
-    """Persist uniform fluorescence with a known nonuniform camera response."""
-    from opm_processing.imageprocessing.opmtools import orthogonal_deskew
+    """Write a planar fluorescent acquisition with nonuniform detector sensitivity."""
+    from opm_processing.dataio.acquisition import ChannelMetadata
     from opm_processing.process import write_flatfield
+    from tests.simulation.camera import digitize
 
-    generated = isinstance(request.param, tuple)
-    mode = request.param[0] if generated else request.param
-    deconvolution = {}
-    if generated:
-        deconvolution.update(
-            psf_parameters=production_psf_parameters,
-            emission_wavelengths_nm=[microscope_parameters.wavelength_um * 1000],
-        )
-    if mode == "stage":
-        deconvolution["detector_gain_x"] = camera_gain_profile.tolist()
-    shape = (1 if mode == "projection" else 8, 12, 1900)
-    field = np.broadcast_to(
-        np.repeat(np.array((0.25, 0.5, 1.0, 2.0), np.float32), 475), shape[-2:]
+    scene = uniform_detector_scene(projection=True)
+    shape = scene.shape
+    response = np.broadcast_to(
+        np.repeat(np.array((0.25, 0.5, 1, 2), np.float32), shape[-1] // 4), shape[-2:]
     ).copy()
-    response = field.copy()
-    if mode == "stage":
-        response *= camera_gain_profile
-    truth = np.full(shape, 1200, dtype=np.float32)
-    measured = truth * response
-    raw = np.clip(np.rint(100 + measured / 0.5), 0, 65535).astype(np.uint16)
-    dataset = acquisition_factory(
+    # Detector sensitivity changes quantum efficiency after optical integration.
+    # Nominal QE .3 times the largest relative response remains below one.
+    assert scene.microscope.quantum_efficiency * response.max() < 1
+    means = scene.means * response
+    raw = digitize(means, scene.microscope.camera, seed=31)
+    assert raw.max() < np.iinfo(np.uint16).max
+    dataset = opm_v2_acquisition_factory(
         raw[None, None, None],
         name="uniform_detector",
-        mode=mode,
-        camera_conversion=0.5,
-        deconvolution=deconvolution or None,
+        mode="projection",
+        camera_offset=scene.microscope.camera.offset_adu,
+        camera_conversion=scene.microscope.camera.electrons_per_adu,
+        camera_read_noise_e=scene.microscope.camera.read_noise_e,
+        channels=(ChannelMetadata(0, "637", 637, 10, 10),),
+        scan_axis_step_um=scene.microscope.scan_step_um,
+        stage_positions_zxy=((0, 0, 0),),
     )
     write_flatfield(
-        tmp_path / "uniform_detector_flatfield.ome.tif", field[None, None], 0.115
-    )
-    psf_path = tmp_path / "uniform_detector_psf.npy"
-    psf = np.ones((3, 3, 3), np.float32)
-    np.save(psf_path, psf / psf.sum())
-    expected = (
-        truth
-        if mode == "projection"
-        else orthogonal_deskew(
-            np.full(shape, 1200, dtype=np.float32),
-            theta=30.0,
-            distance=0.4,
-            pixel_size=0.115,
-            downsample_factor=1,
-        )
+        tmp_path / "uniform_detector_flatfield.ome.tif",
+        response[None, None],
+        scene.microscope.pixel_size_um,
     )
     options = {
         "deconvolve": True,
         "flatfield_correction": True,
-        "decon_psf_paths": [psf_path],
-        "save_float32": True,
+        "save_float32": False,
         "z_downsample_level": 1,
         "max_projection": False,
         "create_fused_max_projection": False,
         "write_fused_max_projection_tiff": False,
     }
-    if generated:
-        options.pop("decon_psf_paths")
-    if roi_mode:
-        from opm_processing.dataio.roi import PhysicalRoi
-
-        y_stop, x_stop = expected.shape[-2] - 3, expected.shape[-1] - 50
-        roi_path = PhysicalRoi(
-            # Bounds lie inside edge voxels: intersecting-voxel selection is
-            # unambiguous despite binary rounding of physical coordinates.
-            bounds_yx_um=(
-                3.25 * 0.115,
-                (y_stop - 0.25) * 0.115,
-                50.25 * 0.115,
-                (x_stop - 0.25) * 0.115,
-            ),
-            source_path=tmp_path / "uniform_detector_fused.ome.zarr",
-            grid_origin_yx_um=(0, 0),
-            pixel_size_yx_um=(0.115, 0.115),
-            position_indices=(0,),
-            tile_footprints=(
-                {
-                    "time_index": 0,
-                    "position_index": 0,
-                    "origin_zyx_um": [0, 0, 0],
-                    "bounds_yx_um": [
-                        0,
-                        expected.shape[-2] * 0.115,
-                        0,
-                        expected.shape[-1] * 0.115,
-                    ],
-                },
-            ),
-        ).write(tmp_path / "uniform_detector_roi.json")
-        expected = expected[:, 3:y_stop, 50:x_stop]
-        for key in (
-            "max_projection",
-            "create_fused_max_projection",
-            "write_fused_max_projection_tiff",
-        ):
-            options.pop(key)
-        options.update(roi_json=roi_path, output=tmp_path, registration_channel=0)
-    suffix = "projection" if mode == "projection" else "deskewed"
     return SimpleNamespace(
         dataset=dataset,
-        psf_path=psf_path,
-        expected=expected,
+        scene=scene,
+        expectation=means,
         options=options,
-        roi_mode=roi_mode,
-        output=tmp_path / f"uniform_detector_decon_{suffix}.ome.zarr",
+        output=tmp_path / "uniform_detector_decon_projection.ome.zarr",
     )
 
 
@@ -383,7 +545,7 @@ def fine_optical_images(microscope_parameters):
             microscope,
         )
         result.append((axes, psf, image))
-    return result
+    return freeze_metadata(result)
 
 
 @pytest.fixture(scope="session")
@@ -391,11 +553,24 @@ def linear_camera_field():
     """Known concentration ramp, with an even row count and shifted XYZ origin."""
     axes = tuple(np.linspace(-5, 5, 101) for _ in range(3))
     z, y, x = np.meshgrid(*axes, indexing="ij", sparse=True)
-    return SimpleNamespace(
-        axes=axes,
-        field=100 + 2 * x + 3 * y + 5 * z,
+    return AnalyticalCameraField(
+        axes=freeze_metadata(axes),
+        field=freeze_metadata(100 + 2 * x + 3 * y + 5 * z),
         shape=(7, 12, 9),
         center=(0.03, -0.12, 0.21),
+    )
+
+
+@pytest.fixture(scope="session")
+def quadratic_camera_field():
+    """Share a quadratic irradiance with a known trilinear interpolation bound."""
+    axes = tuple(np.arange(-40, 41) * 0.0025 for _ in range(3))
+    z, y, x = np.meshgrid(*axes, indexing="ij", sparse=True)
+    return AnalyticalCameraField(
+        axes=freeze_metadata(axes),
+        field=freeze_metadata(10 + 2 * x**2 + y**2 + z**2),
+        shape=(1, 1, 1),
+        center=(0, 0, 0),
     )
 
 
@@ -424,36 +599,10 @@ def discrete_optical_case(factor, nonuniform):
         response=response,
         truth=truth,
         expectation=expectation,
-        boundary=boundary,
     )
 
 
 @pytest.fixture
-def point_profile_case(request, microscope_parameters):
-    """Provide prescribed emitters and independent expectations on a shared grid."""
-    pattern, offset, separation = request.param
-    center = np.array((8.0, 8.0, 8.0))
-    offset = np.asarray(offset)
-    volume = np.full((17, 17, 17), float(pattern == "flat"))
-    if pattern == "pair":
-        volume[tuple((center - offset).astype(int))] = 100
-        volume[tuple((center + offset).astype(int))] = 200
-    elif pattern == "adjacent":
-        center[2] += 0.5
-        volume[8, 8, 8:10] = 100
-    else:
-        volume[8, 8, 8] = 1
-    return SimpleNamespace(
-        volume=volume,
-        center=center,
-        offset=offset,
-        separation=separation,
-        microscope=microscope_parameters,
-        pattern=pattern,
-    )
-
-
-@pytest.fixture(scope="session")
 def production_psf_parameters(microscope_parameters):
     """Provide explicit optical support and taper calibration for generated kernels."""
     microscope = microscope_parameters
@@ -473,25 +622,7 @@ def production_psf_parameters(microscope_parameters):
     }
 
 
-@pytest.fixture
-def production_psf_grid(monkeypatch):
-    """Observe production optical fields and their declared sample coordinates."""
-    from opm_processing.imageprocessing import opmpsf
-
-    grids = []
-    evaluate = opmpsf.create_psf_silicone_100x
-
-    def capture(*args, **kwargs):
-        """Retain the actual optical field and its declared Cartesian spacing."""
-        field = evaluate(*args, **kwargs)
-        grids.append((field, args[:4]))
-        return field
-
-    monkeypatch.setattr(opmpsf, "create_psf_silicone_100x", capture)
-    return grids
-
-
-@pytest.fixture(scope="module", params=[(0.4, (5, 17, 17)), (1.2, (3, 17, 17))])
+@pytest.fixture(params=[(0.4, (5, 17, 17)), (1.2, (3, 17, 17))])
 def production_point_acquisition(
     request, microscope_parameters, production_psf_parameters
 ):
@@ -543,15 +674,118 @@ def production_point_acquisition(
         )
         kernel = kernel[region]
         kernels[samples] = kernel / kernel.sum()
-    kernel, _ = camera_psf(replace(microscope, fine_spacing_um=spacing))
-    region = tuple(
-        slice((n - size) // 2, (n + size) // 2)
-        for n, size in zip(kernel.shape, shape, strict=True)
-    )
-    kernel = kernel[region]
     return SimpleNamespace(
-        microscope=microscope,
-        expectations=expectations,
-        kernels=kernels,
-        kernel=kernel / kernel.sum(),
+        expectations=freeze_metadata(expectations),
+        kernels=freeze_metadata(kernels),
     )
+
+
+@pytest.fixture(scope="session")
+def noisy_scene_masks(microscope_parameters, independent_photon_scene_factory):
+    """Reuse fixed physical apertures independently of dose and illumination."""
+    from opm_processing.imageprocessing.opmpsf import (
+        camera_grid_center,
+        get_skewed_coords,
+        integrate_camera_pixels,
+    )
+
+    @lru_cache(maxsize=2)
+    def create(kind, shape, integration):
+        """Sample the original object and its finite optical support once."""
+        microscope = microscope_parameters
+        scene = independent_photon_scene_factory(
+            kind,
+            large=True,
+            integration_scan_planes=shape[0] if integration else None,
+        )
+        sensor_axes = centered_sensor_axes(
+            shape,
+            (
+                microscope.scan_step_um,
+                microscope.pixel_size_um,
+                microscope.pixel_size_um,
+            ),
+        )
+        columns = sensor_axes[2]
+        supported = (columns >= scene.axes[2][0] - microscope.pixel_size_um / 2) & (
+            columns <= scene.axes[2][-1] + microscope.pixel_size_um / 2
+        )
+        source = np.zeros(shape, bool)
+        if supported.any():
+            source[..., supported] = (
+                integrate_camera_pixels(
+                    scene.density,
+                    scene.axes,
+                    (*sensor_axes[:2], columns[supported]),
+                    pixel_size_um=microscope.pixel_size_um,
+                    theta_deg=microscope.angle_deg,
+                    samples=microscope.pixel_samples,
+                    area_integral=False,
+                )
+                > 0
+            )
+        theta = np.deg2rad(microscope.angle_deg)
+        x, y, z = get_skewed_coords(
+            shape, microscope.pixel_size_um, microscope.scan_step_um, theta
+        )
+        center = camera_grid_center(
+            shape,
+            microscope.pixel_size_um,
+            microscope.scan_step_um,
+            microscope.angle_deg,
+        )
+        dark = np.zeros(shape, bool)
+        for coordinate, gt_axis, psf_axis, half_footprint in zip(
+            (z - center[0], y - center[1], x - center[2]),
+            scene.axes,
+            scene.psf_axes,
+            microscope.pixel_size_um / 2 * np.array((np.sin(theta), np.cos(theta), 1)),
+            strict=True,
+        ):
+            dark |= (coordinate + half_footprint < gt_axis[0] + psf_axis[0]) | (
+                coordinate - half_footprint > gt_axis[-1] + psf_axis[-1]
+            )
+        assert dark.any()
+        for array in (source, dark):
+            array.setflags(write=False)
+        return source, dark
+
+    return create
+
+
+@pytest.fixture(scope="session")
+def noisy_extended_scene(
+    request,
+    microscope_parameters,
+    simulation_parameters,
+    simulated_camera,
+    noisy_scene_masks,
+):
+    """Observe fixed extended emitters with calibrated noisy camera exposures."""
+    config = simulation_parameters
+    kind, profile, budget, layout = request.param[:4]
+    integration = len(request.param) > 4 and request.param[4]
+    microscope = replace(
+        microscope_parameters, scan_step_um=config["microscope"]["scan_step_um"]
+    )
+    shape = (
+        config[f"{layout}_scan_planes"],
+        *config["camera_shape_yx"],
+    )
+    observation = simulated_camera(
+        shape,
+        kind=kind,
+        large=True,
+        integration=integration,
+        illumination_profile=profile,
+        step=microscope.scan_step_um,
+        conversion=microscope.camera.electrons_per_adu,
+        budget=tuple(config["photon_budgets"][budget]),
+        seed=config["camera_seed"],
+    )
+    expectation, raw = observation.expectation, observation.raw
+    source, dark = noisy_scene_masks(kind, shape, integration)
+    assert not np.any(expectation, where=dark)
+    for array in (expectation, raw):
+        array.setflags(write=False)
+    return microscope, expectation, raw, source, dark

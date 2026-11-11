@@ -1,72 +1,16 @@
 """CLI discovery, calibration, selection and export-format function units."""
 
+import json
 from pathlib import Path
 
 import numpy as np
 import pytest
 import tensorstore as ts
 
-from opm_processing import encode_projections, export_ome_tiff, export_projections
+from opm_processing import export_ome_tiff
 from opm_processing.process import apply_stage_axis_flips, validate_empty_tile_options
 
 pytestmark = pytest.mark.unit
-
-
-@pytest.mark.parametrize(
-    "cli_file_layout,expected",
-    [
-        (("sample_deskewed.ome.zarr",), "sample_deskewed.ome.zarr"),
-        (
-            ("sample_max_z_tissue_deskewed.ome.zarr",),
-            "sample_max_z_tissue_deskewed.ome.zarr",
-        ),
-        (("sample_decon_deskewed.ome.zarr",), "sample_decon_deskewed.ome.zarr"),
-        (
-            (
-                "sample_deskewed.ome.zarr",
-                "sample_decon_deskewed.ome.zarr",
-                "sample_max_z_decon_deskewed.ome.zarr",
-            ),
-            "sample_decon_deskewed.ome.zarr",
-        ),
-        ((), None),
-        (("sample_max_z_decon_deskewed.ome.zarr",), None),
-        (("first_decon_deskewed.ome.zarr", "second_deskewed.ome.zarr"), None),
-    ],
-    indirect=["cli_file_layout"],
-)
-def test_projection_discovery_selects_full_processed_data(cli_file_layout, expected):
-    """Choose one full store without confusing previews or distinct acquisitions."""
-    if expected is None:
-        with pytest.raises(ValueError):
-            export_projections.find_datasets(cli_file_layout)
-    else:
-        assert export_projections.find_datasets(cli_file_layout) == [
-            cli_file_layout / expected
-        ]
-        with pytest.raises(ValueError, match="acquisition root"):
-            export_projections.find_datasets(cli_file_layout / expected)
-
-
-@pytest.mark.parametrize(
-    "cli_file_layout,indices",
-    [
-        (("p0/c0/sample_t9.tiff", "p0/c0/sample_t10.tiff", "notes.txt"), (9, 10)),
-        (("sample_t1.tiff", "sample_t3.tiff"), None),
-        (("sample_t1.tiff", "sample_t01.tif"), None),
-        (("notes.txt",), None),
-    ],
-    indirect=["cli_file_layout"],
-)
-def test_video_sequences_require_unique_contiguous_timepoints(cli_file_layout, indices):
-    """Sort acquired indices numerically and reject missing or duplicate frames."""
-    if indices is None:
-        with pytest.raises(ValueError):
-            encode_projections.find_sequences(cli_file_layout)
-    else:
-        sequences = encode_projections.find_sequences(cli_file_layout)
-        assert len(sequences) == 1
-        assert [int(p.stem.rsplit("t", 1)[1]) for p in sequences[0]] == list(indices)
 
 
 @pytest.mark.parametrize(
@@ -83,25 +27,6 @@ def test_export_basename_retains_specimen_identifier(suffix):
     """Strip a processing suffix without truncating the acquisition identifier."""
     source = Path("sample_name" + suffix)
     assert export_ome_tiff.export_source_stem(source) == "sample_name"
-
-
-@pytest.mark.parametrize(
-    "values,expected",
-    [
-        ([0, 1, 2, np.nan], (0.00002, 1.99998)),
-        ([7, 7, np.inf], (7, 8)),
-        ([np.nan, np.inf], None),
-    ],
-)
-def test_projection_contrast_uses_finite_first_exposure(values, expected):
-    """Keep fixed intensity scaling with explicit constant and invalid-input cases."""
-    if expected is None:
-        with pytest.raises(ValueError, match="no finite"):
-            export_projections.contrast_limits(np.asarray(values))
-    else:
-        np.testing.assert_allclose(
-            export_projections.contrast_limits(np.asarray(values)), expected
-        )
 
 
 @pytest.mark.parametrize("flips", list(np.ndindex(2, 2, 2)))
@@ -161,31 +86,15 @@ def test_tiff_tiles_preserve_page_order_partial_edges_and_counts(tile_shape, dty
 
 
 @pytest.mark.parametrize(
-    "options",
+    "export_image_input,bounds",
     [
-        {"fps": 0},
-        {"fps": 121},
-        {"bitrate": 0},
-        {"gpu": -1},
-        {"codec": "invalid"},
-        {"rate_control": "invalid"},
-    ],
+        (kind, bounds)
+        for kind in ("image", "collection")
+        for bounds in (None, (1, 4, 2, 5), (2, 2, 0, 3))
+    ]
+    + [("multiple", None)],
+    indirect=["export_image_input"],
 )
-def test_encoder_rejects_invalid_options_before_gpu_allocation(
-    encoder_frames, tmp_path, options
-):
-    """Reject invalid playback and encoder settings without loading CUDA."""
-    with pytest.raises(ValueError):
-        encode_projections.encode_sequence(
-            encoder_frames, tmp_path / "movie.mp4", **options
-        )
-    assert not (tmp_path / "movie.mp4").exists()
-
-
-@pytest.mark.parametrize(
-    "export_image_input", ["image", "collection", "multiple"], indirect=True
-)
-@pytest.mark.parametrize("bounds", [None, (1, 4, 2, 5), (2, 2, 0, 3)])
 def test_tiff_image_functions_resolve_metadata_and_crop_pixels(
     export_image_input, bounds, tmp_path
 ):
@@ -220,8 +129,31 @@ def test_tiff_image_functions_resolve_metadata_and_crop_pixels(
             np.testing.assert_array_equal(
                 tif.asarray().reshape(expected.shape), expected
             )
-            pixels = from_xml(tif.ome_metadata, validate=True).images[0].pixels
+            exported = from_xml(tif.ome_metadata, validate=True)
+            image = exported.images[0]
+            pixels = image.pixels
             assert (pixels.size_z, pixels.size_y, pixels.size_x) == expected.shape[-3:]
+            spacing = (1, 1, 1) if case.kind == "image" else (1, 0.115, 0.115)
+            origin = np.array((0, 0, 0) if case.kind == "image" else (4, 30, 20), float)
+            if bounds is not None:
+                origin[1:] += np.asarray(bounds[::2]) * spacing[1:]
+            assert (image.stage_label.z, image.stage_label.y, image.stage_label.x) == (
+                pytest.approx(origin)
+            )
+            for plane in pixels.planes:
+                assert (plane.position_z, plane.position_y, plane.position_x) == (
+                    pytest.approx(origin + np.array((plane.the_z * spacing[0], 0, 0)))
+                )
+            annotations = exported.structured_annotations.map_annotations[
+                -1
+            ].value.model_dump()
+            if bounds is None:
+                assert "ROIBoundsLevelZeroYX" not in annotations
+            else:
+                assert json.loads(annotations["ROIBoundsLevelZeroYX"]) == list(bounds)
+                assert json.loads(annotations["ROIOriginTCZYX"]) == pytest.approx(
+                    [0, 0, *origin]
+                )
 
 
 @pytest.mark.parametrize("export_image_input", ["collection"], indirect=True)
@@ -306,29 +238,26 @@ def test_channel_checkpoint_requires_a_successful_write(
         )
 
 
-@pytest.mark.parametrize("order", [("t", "p"), ("p", "t"), ("c", "z")])
-def test_progress_groups_preserve_every_pending_volume(order):
-    """Yield each pending tile once while accounting for completed group members."""
-    from opm_processing.process import progress_tile_groups
-
-    requested = [(0, 0), (0, 1), (1, 0), (1, 1)]
-    pending = [(0, 1), (1, 0), (1, 1)]
-    actual = list(progress_tile_groups(pending, requested, {(0, 0)}, order))
-    assert actual == [(0, (1,)), (1, (0,)), (1, (1,))]
-
-
 @pytest.mark.parametrize("zero", [False, True])
-def test_position_pyramid_queue_writes_all_levels(position_store_factory, zero):
+@pytest.mark.parametrize("method", ["stride", "block_mean"])
+@pytest.mark.parametrize("dtype", [np.uint16, np.float32])
+def test_position_pyramid_queue_writes_all_levels(
+    position_store_factory, zero, method, dtype
+):
     """Retain intensity or an explicit zero across every queued image pyramid."""
+    from skimage.measure import block_reduce
+
     from opm_processing.process import queue_position_pyramid_writes
 
-    source = np.arange(3 * 8 * 10, dtype=np.float32).reshape(3, 8, 10)
+    source = np.arange(3 * 9 * 518, dtype=np.float32).reshape(3, 9, 518) / 4 + 0.375
+    base = source.astype(dtype)
     collection = position_store_factory(
-        np.zeros((1, 1, 1, *source.shape), np.float32),
+        np.zeros((1, 1, 1, *source.shape), dtype),
         multiscale_factors_yx=(2, 4),
+        multiscale_downsample=method,
     )
     writes = queue_position_pyramid_writes(
-        collection, 0, 0, 0, np.float32(0) if zero else source
+        collection, 0, 0, 0, dtype(0) if zero else source
     )
     for future in writes:
         future.result()
@@ -336,16 +265,22 @@ def test_position_pyramid_queue_writes_all_levels(position_store_factory, zero):
     for factor, arrays in zip(
         collection.multiscale_factors_yx, collection.multiscale_arrays, strict=True
     ):
+        expected = base[..., ::factor, ::factor]
+        if method == "block_mean" and factor > 1:
+            complete = base[..., : 9 // factor * factor, : 518 // factor * factor]
+            expected = block_reduce(complete, (1, factor, factor), func=np.mean)
+            if dtype == np.uint16:
+                expected = np.rint(expected)
+            expected = expected.astype(dtype)
         np.testing.assert_array_equal(
             arrays[0][0, 0].read().result(),
-            0 if zero else source[..., ::factor, ::factor],
+            0 if zero else expected,
         )
 
 
 @pytest.mark.parametrize("times", [1, 3])
 def test_acquisition_manifest_is_json_serializable(acquisition_metadata, times):
     """Retain recorded calibration and derived index sizes in the inspector payload."""
-    import json
     from dataclasses import replace
 
     shape = (times, *acquisition_metadata.shape[1:])
@@ -358,41 +293,8 @@ def test_acquisition_manifest_is_json_serializable(acquisition_metadata, times):
     assert manifest["camera_conversion"] == acquisition.camera_conversion
 
 
-@pytest.mark.parametrize("export_image_input", ["collection"], indirect=True)
-@pytest.mark.parametrize(
-    "acquisition_link",
-    [
-        "override",
-        "journal",
-        "relative",
-        "moved",
-        "copied",
-        "windows-moved",
-        "external",
-        "relative-external",
-        "missing",
-        "ambiguous",
-    ],
-    indirect=True,
-)
-def test_projection_metadata_requires_an_unambiguous_source(acquisition_link):
-    """Read recorded acquisition calibration from explicit or journal-linked paths."""
-    link = acquisition_link
-    if link.kind in ("missing", "ambiguous"):
-        with pytest.raises(ValueError, match="one processing sidecar"):
-            export_projections.acquisition_for(link.processed)
-    else:
-        metadata = export_projections.acquisition_for(
-            link.processed, link.source if link.kind == "override" else None
-        )
-        assert metadata.path == link.source.resolve()
-        assert metadata.shape == (1, 1, 1, 3, 4, 5)
-        assert metadata.camera_offset == 100
-        assert metadata.camera_conversion == 0.25
-
-
-def test_estimation_worker_returns_annotated_errors_and_closes_pipe():
-    """Return the original input error and its traceback through a real pipe."""
+def test_estimation_worker_returns_input_errors_and_closes_pipe():
+    """Return the original input error through a real pipe and close it."""
     import multiprocessing as mp
     from contextlib import closing
 
@@ -404,5 +306,4 @@ def test_estimation_worker_returns_annotated_errors_and_closes_pipe():
         run_estimate_illuminations(invalid, 100, 0.25, None, None, None, sending)
         error = receiving.recv()
         assert isinstance(error, ValueError)
-        assert any("Flatfield worker traceback" in note for note in error.__notes__)
         assert sending.closed

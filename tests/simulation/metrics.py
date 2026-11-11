@@ -1,10 +1,14 @@
-"""Likelihood and resolution measurements for simulated camera acquisitions."""
+"""Likelihood and physical sampling measurements for simulated camera acquisitions."""
 
 import numpy as np
-from scipy import ndimage, signal
-from scipy.ndimage import map_coordinates
-from scipy.signal import find_peaks
-from scipy.special import j1, jn_zeros, kl_div, xlogy
+from scipy.special import kl_div
+
+from opm_processing.imageprocessing.opmpsf import (
+    camera_grid_center,
+    centered_sensor_axes,
+    get_skewed_coords,
+    integrate_camera_pixels,
+)
 
 
 def poisson_log_ratio_moments(expectation, prediction):
@@ -44,207 +48,131 @@ def poisson_log_ratio_moments(expectation, prediction):
     return float(kl_div(truth, predicted).sum()), float(np.sum(rate * log_ratio**2))
 
 
-def camera_score_difference(raw, prediction, baseline, camera):
-    """Score independent camera observations without a brightness-dependent grid.
-
-    Ideal integer observations use the exact Poisson log ratio; its factorial
-    cancels. Gaussian/ADC observations use an independent CPU summation of
-    the physical detector probabilities. This is a validation metric only.
-
-    Parameters
-    ----------
-    raw : array-like
-        Independent digitized camera observations.
-    prediction : array-like
-        Predicted detected photoelectrons before digitization.
-    baseline : array-like
-        Reference prediction in the same units.
-    camera : Camera
-        Explicit physical camera calibration.
-
-    Returns
-    -------
-    numpy.ndarray
-        Pixelwise log-likelihood advantage over the baseline.
-    """
-    if (
-        camera.read_noise_e == 0
-        and camera.electrons_per_adu == 1
-        and camera.offset_adu == 0
-        and np.all(np.asarray(raw) < 2**camera.bit_depth - 1)
-    ):
-        return xlogy(raw, prediction) - xlogy(raw, baseline) - prediction + baseline
-    from tests.simulation.camera_likelihood import camera_log_likelihood
-
-    return camera_log_likelihood(raw, prediction, camera) - camera_log_likelihood(
-        raw, baseline, camera
-    )
-
-
-def predictive_deviance(
-    density, expectation, psf, *, boundary="constant", response=1, selection=None
+def camera_volume_samples(
+    volume,
+    origin_zyx,
+    spacing_zyx,
+    frame_origin_zyx,
+    native_shape,
+    microscope,
 ):
-    """Score absolute expected camera counts, including background, without a fit.
+    """Sample one stored laboratory volume on its original physical camera grid.
 
-    Finite float32 kernels and FFT roundoff may create numerically zero tails.
-    The lower bound is float64's smallest positive *normal*, not a fitted floor.
-    A positive ground-truth rate predicted as zero receives its full log penalty.
-
-    Parameters
-    ----------
-    density : array-like
-        Reconstructed object-grid intensities.
-    expectation : array-like
-        Independently simulated expected detector counts.
-    psf : numpy.ndarray
-        Centered optical kernel on the object grid.
-    boundary : str
-        SciPy boundary mode; constant uses zero-extended FFT convolution.
-    response : array-like or float
-        Detector response applied after blur.
-    selection : array-like or slice or None
-        Optional camera-grid region scored after the complete optical blur.
-
-    Returns
-    -------
-    float
-        Summed absolute Poisson deviance of the detector prediction.
-    """
-    if boundary == "constant":
-        blurred = signal.fftconvolve(density, psf, mode="same")
-    elif boundary == "reflect":
-        # Symmetric extension is SciPy ndimage's reflect boundary. Including
-        # the full kernel halo makes valid FFT convolution exactly equivalent,
-        # without the direct convolution's per-voxel full-PSF work.
-        pads = tuple(((size - 1) // 2, size // 2) for size in psf.shape)
-        blurred = signal.fftconvolve(
-            np.pad(density, pads, mode="symmetric"), psf, mode="valid"
-        )
-    else:
-        blurred = ndimage.convolve(density, psf, mode=boundary)
-    prediction = np.maximum(blurred * response, np.finfo(float).tiny)
-    divergence = kl_div(expectation, prediction)
-    if selection is not None:
-        divergence = divergence[selection]
-    return float(2 * divergence.sum(dtype=np.float64))
-
-
-def first_minimum(distance, intensity):
-    """Return the first sampled minimum after a centered PSF's principal maximum.
-
-    A profile without a minimum inside its modeled support has no measurable
-    Rayleigh separation; it must not receive the lateral Airy value by default.
-    Samples must be ordered physical distances from the central maximum.
-
-    Parameters
-    ----------
-    distance : array-like
-        Increasing physical distances from the PSF center.
-    intensity : array-like
-        Single-emitter optical intensity along that direction.
-
-    Returns
-    -------
-    float
-        Distance to the first sampled local minimum.
-    """
-    distance, intensity = np.asarray(distance), np.asarray(intensity)
-    if (
-        distance.ndim != 1
-        or intensity.shape != distance.shape
-        or np.any(np.diff(distance) <= 0)
-    ):
-        raise ValueError("Require a sampled PSF along increasing physical distance")
-    peaks, _ = find_peaks(-intensity)
-    candidates = peaks[distance[peaks] > 0]
-    if not candidates.size:
-        raise ValueError("PSF support does not contain a directional first minimum")
-    index = int(candidates[0])
-    return float(distance[index])
-
-
-def airy_rayleigh(wavelength_um, numerical_aperture):
-    """Scalar circular-pupil reference: exact Bessel first zero and pair contrast.
-
-    Parameters
-    ----------
-    wavelength_um : float
-        Emission wavelength in micrometers.
-    numerical_aperture : float
-        Circular-pupil numerical aperture.
-
-    Returns
-    -------
-    tuple[float, float]
-        Rayleigh separation in micrometers and equal-pair valley contrast.
-    """
-    root = float(jn_zeros(1, 1)[0])
-    separation = root * wavelength_um / (2 * np.pi * numerical_aperture)
-    # Two equal incoherent points at separation r: midpoint 2 h(r/2), peak 1.
-    dip = 1 - 2 * (2 * j1(root / 2) / (root / 2)) ** 2
-    return separation, float(dip)
-
-
-def two_point_profile(volume, center_syx, offset_syx, microscope):
-    """Measure peaks and valley along known laboratory-coordinate emitter positions.
-
-    Search within half a pair separation of each source. Four interpolated
-    samples per grid interval add no optical information; intensities are
-    never fitted. The profile alone does not define a resolution criterion.
+    This applies the existing sensor quadrature in point-sampling mode. It
+    neither applies a second optical PSF nor reconstructs or normalizes an image.
 
     Parameters
     ----------
     volume : numpy.ndarray
-        Intensity image in oblique scan-YX coordinates.
-    center_syx : sequence of float
-        Pair midpoint in array-index coordinates.
-    offset_syx : sequence of float
-        Index displacement from the midpoint to either emitter.
+        Three-dimensional laboratory-grid intensities or geometric coverage.
+    origin_zyx : sequence of float
+        Laboratory coordinate of the first stored voxel center.
+    spacing_zyx : sequence of float
+        Stored voxel-center spacing in micrometers.
+    frame_origin_zyx : sequence of float
+        Laboratory coordinate of the first canonical camera pixel.
+    native_shape : sequence of int
+        Original camera SYX dimensions.
     microscope : Microscope
-        Recorded pixel pitch, scan step and oblique angle.
+        Physical scan step, detector pitch and oblique angle.
 
     Returns
     -------
-    dict
-        Physical profile coordinates, source positions, peak spacing and valley dip.
+    numpy.ndarray
+        Intensities at the original camera centers in SYX order.
     """
-    offset = np.asarray(offset_syx, dtype=np.float64)
-    theta = np.deg2rad(microscope.angle_deg)
-    pixel_size = microscope.pixel_size_um
-    displacement_xyz = np.array(
-        (
-            offset[2] * pixel_size,
-            offset[0] * microscope.scan_step_um
-            + offset[1] * pixel_size * np.cos(theta),
-            offset[1] * pixel_size * np.sin(theta),
+    shape = tuple(native_shape)
+    pixel, step = microscope.pixel_size_um, microscope.scan_step_um
+    center = camera_grid_center(shape, pixel, step, microscope.angle_deg)
+    reference = np.asarray(frame_origin_zyx) + center
+    axes = tuple(
+        float(origin) + np.arange(size) * float(spacing) - target
+        for origin, spacing, size, target in zip(
+            origin_zyx, spacing_zyx, volume.shape, reference, strict=True
         )
     )
-    separation = 2 * np.linalg.norm(displacement_xyz)
-    positions = np.linspace(-2, 2, int(np.ceil(16 * np.max(np.abs(offset)))) + 1)
-    distance = positions * separation / 2
-    coordinates = np.asarray(center_syx)[:, None] + offset[:, None] * positions
-    profile = map_coordinates(volume, coordinates, order=1, mode="constant", cval=0)
-    peaks, _ = find_peaks(profile)
-    selected = []
-    for expected in (-separation / 2, separation / 2):
-        candidates = peaks[np.abs(distance[peaks] - expected) < separation / 4]
-        if candidates.size:
-            selected.append(int(candidates[np.argmax(profile[candidates])]))
-    result = {
-        "distance_um": distance,
-        "profile": profile,
-        "true_separation_um": float(separation),
-        "peak_positions_um": None,
-        "peak_separation_um": None,
-        "valley_depth": None,
-    }
-    if len(selected) == 2:
-        left, right = selected
-        weaker_peak = min(profile[left], profile[right])
-        if weaker_peak > 0:
-            result.update(
-                peak_positions_um=distance[selected].tolist(),
-                peak_separation_um=float(distance[right] - distance[left]),
-                valley_depth=float(1 - profile[left : right + 1].min() / weaker_peak),
+    native_axes = centered_sensor_axes(shape, (step, pixel, pixel))
+    return integrate_camera_pixels(
+        volume,
+        axes,
+        native_axes,
+        pixel_size_um=pixel,
+        theta_deg=microscope.angle_deg,
+        samples=1,
+        area_integral=False,
+    )
+
+
+def camera_source_mask(ground_truth, microscope, shape):
+    """Select the fixed source region from original physical axes.
+
+    The finite known object's PSF-eroded interior and Rayleigh-radius emitter
+    neighborhoods are fixed independently of reconstructed values.
+    """
+    from tests.simulation.forward_model import camera_psf
+
+    pixel, step = microscope.pixel_size_um, microscope.scan_step_um
+    angle = np.deg2rad(microscope.angle_deg)
+    x, y, z = get_skewed_coords(shape, pixel, step, angle)
+    center = camera_grid_center(shape, pixel, step, microscope.angle_deg)
+    coordinates = tuple(
+        coordinate - midpoint
+        for coordinate, midpoint in zip((z, y, x), center, strict=True)
+    )
+    radius = 0.61 * microscope.wavelength_um / microscope.numerical_aperture
+    interior = np.ones(shape, bool)
+    for coordinate, axis, halo in zip(
+        coordinates,
+        ground_truth.axes,
+        microscope.psf_half_extent_zyx_um,
+        strict=True,
+    ):
+        interior &= (coordinate >= axis[0] + halo) & (coordinate <= axis[-1] - halo)
+    # A valid physical reference also needs the full declared optical support
+    # inside this observed camera ROI, not just inside the original specimen.
+    kernel, _ = camera_psf(microscope)
+    for axis, (length, support) in enumerate(zip(shape, kernel.shape, strict=True)):
+        indices = np.arange(length)
+        dimensions = [1] * len(shape)
+        dimensions[axis] = length
+        interior &= (
+            (indices >= support // 2) & (indices < length - support // 2)
+        ).reshape(dimensions)
+    distance = np.full(shape, np.inf)
+    if ground_truth.kind == "line-pairs":
+        features = ground_truth.features
+        interior &= np.abs(coordinates[1]) <= (
+            features["length_um"] / 2 - microscope.psf_half_extent_zyx_um[1]
+        )
+        axial_distance = np.maximum(
+            np.abs(coordinates[1]) - features["length_um"] / 2, 0
+        )
+        for center in features["positions_x_um"]:
+            distance = np.minimum(
+                distance,
+                np.maximum(
+                    np.sqrt(
+                        coordinates[0] ** 2
+                        + (coordinates[2] - center) ** 2
+                        + axial_distance**2
+                    )
+                    - features["diameter_um"] / 2,
+                    0,
+                ),
             )
-    return result
+        points = features.get("centers_xyz_um", ())
+    else:
+        points = ground_truth.features["centers_xyz_um"]
+    for point in np.asarray(points).reshape(-1, 3)[:, ::-1]:
+        distance = np.minimum(
+            distance,
+            np.sqrt(
+                sum(
+                    (axis - center) ** 2
+                    for axis, center in zip(coordinates, point, strict=True)
+                )
+            ),
+        )
+    source = interior & (distance <= radius)
+    assert source.any(), "The physical camera field must acquire the source"
+    return source

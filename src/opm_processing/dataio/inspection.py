@@ -11,64 +11,15 @@ from yaozarrs import open_group, v05
 
 from opm_processing.dataio.acquisition import (
     AcquisitionMetadata,
-    _event_parts,
     _initial_frame_metadata,
     acquisition_stem,
     inspect_acquisition,
 )
-from opm_processing.dataio.processing_state import ProcessingState
-
-
-def hardware_timing(
-    frames: list[dict], channel_count: int, scan_positions: int
-) -> dict[str, Any]:
-    """Calculate hardware-triggered timing from actual camera frame exposures.
-
-    Parameters
-    ----------
-    frames : list of dict
-        Camera frame records in either supported acquisition metadata format.
-    channel_count : int
-        Number of stored camera channels, including combined-laser images once.
-    scan_positions : int
-        Acquired scan positions, including planes subsequently discarded.
-
-    Returns
-    -------
-    dict
-        Channel-ordered exposures and volume time in milliseconds. Unknown
-        exposures remain None; software arrival times and requested camera
-        settings do not determine hardware timing.
-    """
-    exposures: list[float | None] = [None] * channel_count
-    for frame in frames:
-        if frame.get("exposure_time") is not None:
-            exposure, factor = frame["exposure_time"], 1000
-        elif frame.get("exposure_ms") is not None:
-            exposure, factor = frame["exposure_ms"], 1
-        else:
-            continue
-        try:
-            value = round(float(exposure) * factor, 2)
-        except (TypeError, ValueError) as error:
-            raise ValueError("Invalid camera frame exposure") from error
-        if isinstance(exposure, bool) or not math.isfinite(value) or value <= 0:
-            raise ValueError("Camera frame exposures must be finite and positive")
-        index, _ = _event_parts(frame)
-        channel = int(index.get("c", 0))
-        if not 0 <= channel < channel_count:
-            raise ValueError(
-                "Camera frame channel index is outside the stored channels"
-            )
-        if exposures[channel] is not None and exposures[channel] != value:
-            raise ValueError("Camera frame exposures vary between scans or positions")
-        exposures[channel] = value
-    volume = (
-        round(scan_positions * sum(exposures), 6)
-        if exposures and all(value is not None for value in exposures)
-        else None
-    )
-    return {"frame_exposure_ms": exposures, "volume_time_ms": volume}
+from opm_processing.dataio.processing_state import (
+    ProcessingState,
+    image_processing_state_path,
+)
+from opm_processing.dataio.timing import hardware_timing
 
 
 def raw_report(acquisition: AcquisitionMetadata) -> dict[str, Any]:
@@ -239,8 +190,17 @@ def inspect_dataset(path: str | Path) -> dict[str, Any]:
     path = Path(path).expanduser().resolve()
     direct = (path / "zarr.json").is_file() or (path / ".zattrs").is_file()
     directory = path.parent if direct else path
-    stores = sorted(item for item in directory.glob("*.zarr") if item.is_dir())
+    stores = sorted(
+        item
+        for item in directory.glob("*.zarr")
+        if item.is_dir()
+        and not ((item / ".zarray").is_file() and not (item / ".zgroup").is_file())
+    )
     if direct and path not in stores:
+        if (path / ".zarray").is_file() and not (path / ".zgroup").is_file():
+            raise ValueError(
+                "Legacy raw array: create a Bio-Formats2Raw mapping with map-legacy-opm"
+            )
         stores.append(path)
     roots = {store: open_group(store) for store in stores}
     raw_paths = [store for store, root in roots.items() if "opm_v2" in root.attrs]
@@ -255,20 +215,35 @@ def inspect_dataset(path: str | Path) -> dict[str, Any]:
     if len(raw_paths) > 1:
         raise ValueError("Multiple raw acquisitions found; specify one raw store")
     associated = set()
-    for sidecar in directory.glob("*.processing.json"):
+    linked_sources = set()
+    state_paths = set(directory.glob("*.processing.json"))
+    state_paths.update(
+        image_processing_state_path(store, acquisition_stem(store))
+        for store, root in roots.items()
+        if root.attrs.get("opm_processing", {}).get("processing_state")
+    )
+    for sidecar in sorted(state_paths):
         state = ProcessingState.read(sidecar)
         source = state.source_path()
-        products = {sidecar.parent / name for name in state.document["outputs"]}
+        products = {
+            (sidecar.parent / name).resolve() for name in state.document["outputs"]
+        }
         products.update(
-            sidecar.parent / record[key]
+            (sidecar.parent / record[key]).resolve()
             for record in state.document["registration"].values()
             for key in ("fused_path", "max_projection_path")
             if record.get(key)
         )
-        if source in raw_paths or (direct and path in products):
+        if (
+            source in raw_paths
+            or (direct and path in products)
+            or (not direct and any(store in products for store in roots))
+        ):
             associated.update(products)
-            if source.is_dir() and not raw_paths:
-                raw_paths = [source]
+            if source.is_dir():
+                linked_sources.add(source)
+    if not raw_paths and len(linked_sources) == 1:
+        raw_paths = list(linked_sources)
     raw = raw_report(inspect_acquisition(raw_paths[0])) if raw_paths else None
     if raw is not None:
         prefix = acquisition_stem(raw["path"]) + "_"

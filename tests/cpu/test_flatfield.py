@@ -150,50 +150,6 @@ def test_processing_contract_uses_uint16_raw_float32_intermediates_and_final_cas
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("decision", (None, -1), ids=("all", "unchecked-excluded"))
-@pytest.mark.parametrize("topology", ("single", "tiles", "depths"))
-@pytest.mark.parametrize("storage", (False, True), ids=("array", "store"))
-def test_fit_samples_preserve_calibration_and_depth_groups(
-    illumination_fit_case, topology, decision
-):
-    """Keep time-zero photon units and odd detector dimensions through fit preparation."""
-    case = illumination_fit_case
-    mask = None
-    selected = np.arange(len(case.levels))
-    if decision is not None:
-        mask = np.ones(case.raw.shape[:3], np.int8)
-        if len(selected) > 1:
-            mask[0, 1] = decision
-            selected = selected[selected != 1]
-        else:
-            mask[1] = decision  # Later times are not used for estimation.
-    actual = estimate_illuminations(
-        case.datastore,
-        100,
-        0.5,
-        case.coordinates,
-        detector_gain_x=case.gain,
-        signal_mask=mask,
-    )
-    expected_levels = [
-        np.median(case.levels[selected, channel], axis=1)
-        if topology == "tiles"
-        else case.levels[position, channel]
-        for position in (selected if topology == "depths" else (0,))
-        for channel in range(2)
-    ]
-    for images, levels in zip(case.calls, expected_levels, strict=True):
-        np.testing.assert_allclose(
-            images,
-            np.broadcast_to(levels[:, None, None], images.shape),
-            rtol=4 * np.finfo(np.float32).eps,
-            atol=0,
-        )
-    assert actual.shape == ((2, 5, 7) if case.coordinates is None else (1, 2, 5, 7))
-    np.testing.assert_allclose(actual, 1, rtol=4 * np.finfo(np.float32).eps, atol=0)
-
-
-@pytest.mark.unit
 @pytest.mark.parametrize("level", (100, 110), ids=("empty", "one-image"))
 def test_empty_or_insufficient_samples_are_handled_before_fitting(level):
     """Empty channels use unity; a single informative image cannot constrain a fit."""

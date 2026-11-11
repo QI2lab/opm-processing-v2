@@ -45,6 +45,41 @@ def _lens_parameters(parameters: dict) -> dict:
     return lens
 
 
+def centered_sensor_axes(
+    shape: Sequence[int], spacings: Sequence[float]
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Construct physical pixel-center axes about the sensor midpoint.
+
+    Parameters
+    ----------
+    shape : sequence of int
+        Three positive sensor dimensions in scan-row-column order.
+    spacings : sequence of float
+        Finite physical increments along the three sensor dimensions.
+
+    Returns
+    -------
+    tuple of numpy.ndarray
+        Three centered one-dimensional coordinate arrays in micrometers.
+
+    Raises
+    ------
+    ValueError
+        Dimensions or physical increments cannot describe a sensor grid.
+    """
+    if len(shape) != 3 or any(
+        isinstance(size, bool) or not isinstance(size, (int, np.integer)) or size < 1
+        for size in shape
+    ):
+        raise ValueError("Require three positive sensor dimensions")
+    if len(spacings) != 3 or not np.isfinite(spacings).all():
+        raise ValueError("Require three finite sensor-axis increments")
+    return tuple(
+        (np.arange(size) - (size - 1) / 2) * spacing
+        for size, spacing in zip(shape, spacings, strict=True)
+    )
+
+
 def integrate_camera_pixels(
     optical_field: np.ndarray,
     axes: Sequence[np.ndarray],
@@ -259,6 +294,36 @@ def get_skewed_coords(
     return x, y, z
 
 
+def camera_grid_center(
+    shape: Sequence[int],
+    pixel_size_um: float,
+    scan_axis_step_um: float,
+    theta_deg: float,
+) -> np.ndarray:
+    """Return the midpoint of the recorded oblique camera grid in laboratory ZYX.
+
+    Parameters
+    ----------
+    shape : sequence of int
+        Scan, camera-row and camera-column dimensions.
+    pixel_size_um : float
+        Detector pixel pitch in object space.
+    scan_axis_step_um : float
+        Increment along the scan axis in micrometers.
+    theta_deg : float
+        Camera angle relative to the coverslip in degrees.
+
+    Returns
+    -------
+    numpy.ndarray
+        Physical ZYX midpoint relative to the first acquired pixel.
+    """
+    x, y, z = get_skewed_coords(
+        shape, pixel_size_um, scan_axis_step_um, np.deg2rad(theta_deg)
+    )
+    return np.asarray((z.mean(), y.mean(), x.mean()))
+
+
 def create_psf_silicone_100x(
     dxy: float,
     dz: float,
@@ -431,7 +496,8 @@ def generate_skewed_psf(
         raise ValueError("grid_oversampling must be a positive integer")
     samples = int(samples)
     x, y, _ = get_skewed_coords(roi_skewed_size, dc, dstage, theta)
-    x, y = x - x.mean(), y - y.mean()
+    center = camera_grid_center(roi_skewed_size, dc, dstage, theta_deg)
+    x, y = x - center[2], y - center[1]
     dxy = dc * np.cos(theta) / samples
     dz = dc * np.sin(theta) / samples
     # Cover the complete pixel footprints, with one Z guard plane on each side.
@@ -449,10 +515,7 @@ def generate_skewed_psf(
     psf_grid = create_psf_silicone_100x(
         dxy, dz, nxy, nz, em_wvl, pz, parameters=optical_parameters
     )
-    sensor_axes = tuple(
-        (np.arange(n) - (n - 1) / 2) * spacing
-        for n, spacing in zip(roi_skewed_size, (dstage, dc, dc), strict=True)
-    )
+    sensor_axes = centered_sensor_axes(roi_skewed_size, (dstage, dc, dc))
     axis_z = (np.arange(nz) - (nz - 1) / 2) * dz
     return integrate_camera_pixels(
         psf_grid,

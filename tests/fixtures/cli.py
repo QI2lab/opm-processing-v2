@@ -10,45 +10,6 @@ from typer.testing import CliRunner
 
 
 @pytest.fixture
-def cli_file_layout(request, fs):
-    """Create mocked discovery inputs without replacing any package APIs.
-
-    Returns
-    -------
-    pathlib.Path
-        Acquisition directory containing the requested stores or frame names.
-    """
-    root = Path.cwd() / "cli-files"
-    fs.create_dir(root)
-    for name in request.param:
-        path = root / name
-        if name.endswith(".zarr"):
-            fs.create_dir(path)
-        else:
-            fs.create_file(path)
-    return root
-
-
-@pytest.fixture
-def encoder_frames(tmp_path):
-    """Write calibrated display pixels for encoder input-validation units.
-
-    Returns
-    -------
-    list of pathlib.Path
-        One TIFF with a known acquired volume interval.
-    """
-    import numpy as np
-    import tifffile
-
-    path = tmp_path / "projection_t0.tiff"
-    tifffile.imwrite(
-        path, np.zeros((8, 10), np.uint8), metadata={"volume_interval_ms": 500}
-    )
-    return [path]
-
-
-@pytest.fixture
 def export_image_input(request, acquisition_factory, fused_store_factory):
     """Persist small real OME-Zarr inputs for individual TIFF writer units.
 
@@ -76,64 +37,7 @@ def export_image_input(request, acquisition_factory, fused_store_factory):
 
 
 @pytest.fixture
-def acquisition_link(request, export_image_input, tmp_path):
-    """Persist source-link variants using the production processing journal.
-
-    Returns
-    -------
-    types.SimpleNamespace
-        Processed path, source store and optional explicit acquisition override.
-    """
-    from types import SimpleNamespace
-
-    from opm_processing.dataio.processing_state import ProcessingState
-
-    kind = request.param
-    source = export_image_input.path
-    processed = tmp_path / "linked_deskewed.ome.zarr"
-    if kind not in ("missing", "override"):
-        count = 2 if kind == "ambiguous" else 1
-        for index in range(count):
-            state = ProcessingState.create(
-                tmp_path / f"linked_{index}.processing.json", source
-            )
-            state.initialize_run(processed, configuration={}, overwrite=True)
-            if kind == "relative":
-                state.document["source"]["path"] = source.name
-                state.save()
-            elif kind in (
-                "moved",
-                "copied",
-                "windows-moved",
-                "external",
-                "relative-external",
-            ):
-                historical = tmp_path / "original-location" / source.name
-                if kind == "copied":
-                    import shutil
-
-                    shutil.copytree(source, historical)
-                elif kind in ("external", "relative-external"):
-                    assert source.resolve().is_relative_to(tmp_path.resolve())
-                    assert historical.is_relative_to(tmp_path.resolve())
-                    historical.parent.mkdir()
-                    source.rename(historical)
-                    source = historical
-                state.document["source"]["path"] = (
-                    rf"F:\original-location\{source.name}"
-                    if kind == "windows-moved"
-                    else str(
-                        historical.relative_to(tmp_path)
-                        if kind == "relative-external"
-                        else historical
-                    )
-                )
-                state.save()
-    return SimpleNamespace(processed=processed, source=source, kind=kind)
-
-
-@pytest.fixture
-def relocate_acquisition(tmp_path, integration_pipeline_records):
+def relocate_acquisition(tmp_path):
     """Move or copy actual acquisition artifacts within the test workspace.
 
     Returns
@@ -165,29 +69,9 @@ def relocate_acquisition(tmp_path, integration_pipeline_records):
                     shutil.copy2(source, target)
             else:
                 source.rename(target)
-        integration_pipeline_records["relocations"].append((root, destination))
         return destination
 
     return relocate
-
-
-@pytest.fixture
-def cli_export_options(request):
-    """Pair display, scheduling, time-selection and annotation options.
-
-    Returns
-    -------
-    dict
-        Real projection CLI values; selection retains acquisition timestamps.
-    """
-    selected = request.param == "selected-color"
-    return {
-        "depth_color": selected,
-        "depth_colormap": "viridis" if selected else "turbo",
-        "workers": 2 if selected else 1,
-        "timepoints": (1, 2) if selected else None,
-        "scale_bar_um": 1.0 if selected else None,
-    }
 
 
 @pytest.fixture
