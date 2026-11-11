@@ -23,15 +23,14 @@ pytestmark = [pytest.mark.integration, pytest.mark.usefixtures("cupy_gpu")]
 
 @pytest.mark.parametrize("deconvolve", [False])
 @pytest.mark.parametrize(
-    ("pipeline_case", "copied"),
+    "pipeline_case",
     [
-        pytest.param(("stage", False, 1.2, None), True, id="stage-copied"),
+        pytest.param(("stage", False, 1.2, None), id="stage-copied"),
     ],
     indirect=["pipeline_case"],
 )
 def test_inspection_and_exports_process_simulated_acquisition(
     pipeline_case,
-    copied,
     invoke_cli,
     tmp_path,
     relocate_acquisition,
@@ -41,8 +40,8 @@ def test_inspection_and_exports_process_simulated_acquisition(
     case = pipeline_case
     metadata = case.dataset.metadata
     expected_fused = open_image_array(case.output).read().result()
-    source = relocate_acquisition(case.dataset.path.parent, copy=copied)
-    assert case.dataset.path.exists() == copied
+    source = relocate_acquisition(case.dataset.path.parent, copy=True)
+    assert case.dataset.path.exists()
     dataset_path = source / case.dataset.path.name
     processed = source / case.processed.name
     state_path = source / "pipeline.processing.json"
@@ -65,11 +64,11 @@ def test_inspection_and_exports_process_simulated_acquisition(
     monkeypatch.setattr(
         TileFusion, "register_and_score", staticmethod(observe_measurement)
     )
-    output_dir = tmp_path / "rendered/nested" if copied else source
+    output_dir = tmp_path / "rendered/nested"
     invoke_cli(
         "fuse",
-        source if copied else processed,
-        output_dir=output_dir if copied else None,
+        source,
+        output_dir=output_dir,
         blend_pixels=(0, 0, 0),
         registration_channel=metadata.shape[2] - 1,
         max_workers=1,
@@ -77,8 +76,8 @@ def test_inspection_and_exports_process_simulated_acquisition(
     )
     invoke_cli(
         "fuse",
-        source if copied else dataset_path,
-        output_dir=output_dir if copied else None,
+        source,
+        output_dir=output_dir,
         regenerate_max_z=True,
         max_workers=1,
     )
@@ -100,15 +99,14 @@ def test_inspection_and_exports_process_simulated_acquisition(
         len(projection_tile_footprints(maximum_path))
         == metadata.shape[0] * metadata.shape[1]
     )
-    if copied:
-        assert not (output_dir / state_path.name).exists()
-        assert (source / "pipeline_depth_intensity_gains.json").is_file()
-        assert not (output_dir / "pipeline_depth_intensity_gains.json").exists()
-        _, provenance = load_export_metadata(fused_path)
-        assert json.loads(provenance["Acquisition"])["path"] == str(dataset_path)
-        for path in (fused_path, output_dir):
-            report = json.loads(invoke_cli("inspect-opm", path).output)
-            assert report["raw"]["path"] == str(dataset_path)
+    assert not (output_dir / state_path.name).exists()
+    assert (source / "pipeline_depth_intensity_gains.json").is_file()
+    assert not (output_dir / "pipeline_depth_intensity_gains.json").exists()
+    _, provenance = load_export_metadata(fused_path)
+    assert json.loads(provenance["Acquisition"])["path"] == str(dataset_path)
+    for path in (fused_path, output_dir):
+        report = json.loads(invoke_cli("inspect-opm", path).output)
+        assert report["raw"]["path"] == str(dataset_path)
     assert not confirm_partial_output_resume(
         inspect_acquisition(dataset_path),
         output_dir=source,
@@ -116,9 +114,7 @@ def test_inspection_and_exports_process_simulated_acquisition(
         max_projection=True,
         resume=False,
     )
-    report = json.loads(
-        invoke_cli("inspect-opm", dataset_path if copied else source).output
-    )
+    report = json.loads(invoke_cli("inspect-opm", dataset_path).output)
     manifest = report["raw"]
     assert manifest["shape"] == list(case.dataset.raw_data.shape)
     assert manifest["scan_axis_step_um"] == metadata.scan_axis_step_um
@@ -130,7 +126,7 @@ def test_inspection_and_exports_process_simulated_acquisition(
         "export-ome-tiff",
         fused_path,
         output=destination,
-        workers=1 if copied else 2,
+        workers=1,
     )
     for suffix in ("fused", "max_z_fused"):
         image = output_dir / f"pipeline_{suffix}.ome.zarr"

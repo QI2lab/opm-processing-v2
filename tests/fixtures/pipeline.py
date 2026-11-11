@@ -264,9 +264,7 @@ def pipeline_illumination_calibration(
 
 
 @pytest.fixture(scope="session")
-def pipeline_optical_data(
-    microscope_parameters, simulation_parameters, simulated_camera
-):
+def pipeline_optical_data(simulation_parameters, optical_camera_data):
     """Reuse native optical camera fields for repeated exposures and mosaics.
 
     Returns
@@ -294,43 +292,42 @@ def pipeline_optical_data(
                 else 0
             ),
         )
-        options = {
-            "kind": kind,
-            "large": True,
-            "integration": True,
-            "illumination_profile": "edge-taper" if illumination else "uniform",
-            "step": reference_step,
-            "conversion": microscope_parameters.camera.electrons_per_adu,
-        }
-        data = simulated_camera(shape, budget=(3000, 4000), **options)
-        source = (
-            camera_source_mask(data.ground_truth, data.microscope, shape)
-            if mosaic
-            else None
+        scene, microscope, expectation = optical_camera_data(
+            shape,
+            kind=kind,
+            large=True,
+            integration=True,
+            illumination_profile="edge-taper" if illumination else "uniform",
+            step=reference_step,
+            geometry="oblique",
+            budget=(3000, 4000),
         )
+        source = camera_source_mask(scene, microscope, shape) if mosaic else None
         if source is not None:
             source.setflags(write=False)
-        return data, source
+        return scene, microscope, expectation, source
 
     @lru_cache(maxsize=2)
     def create(
         step, illumination=False, *, mosaic=False, tiled=False, kind=None, phase=0
     ):
         """Sample one unchanged physical emission field at the requested scan pitch."""
-        data, native_source = native_data(illumination, mosaic, tiled, kind)
-        microscope = replace(data.microscope, scan_step_um=step)
+        scene, microscope, expectation, native_source = native_data(
+            illumination, mosaic, tiled, kind
+        )
+        microscope = replace(microscope, scan_step_um=step)
         native_step = simulation_parameters["microscope"]["scan_step_um"]
         factor = round(step / native_step)
         assert factor >= 1 and np.isclose(step, factor * native_step)
         assert 0 <= phase < factor
-        expected = data.expectation[phase::factor]
+        expected = expectation[phase::factor]
         source = None if native_source is None else native_source[phase::factor]
         return PipelineOpticalData(
             microscope,
             expected,
             source,
-            data.ground_truth,
-            data.expectation.shape[0],
+            scene,
+            expectation.shape[0],
             phase,
         )
 
@@ -346,9 +343,8 @@ def pipeline_case(
     opm_v2_acquisition_factory,
     pipeline_runner,
     pipeline_illumination_calibration,
-    small_cpu_kernels,
 ):
-    """Process independent repeat exposures with a known stage-placement error.
+    """Process time/channel exposures and retain paired views for CLI exports.
 
     Indirect parameters select scan mode, illumination, scan step, FFT scan
     chunk size. All deconvolution uses production-generated optical kernels.
@@ -361,9 +357,9 @@ def pipeline_case(
 
     Notes
     -----
-    Both positions observe the same physical field with independent camera
-    noise. Position 1 reports an erroneous lateral shift of one registration-grid
-    pixel (five native detector pixels).
+    Deconvolution uses one position; the non-deconvolution CLI case uses two
+    independent exposures of the same field. Its second position reports an
+    erroneous lateral shift of one registration-grid pixel.
     BaSiC runs in its production worker process. Camera calibration, RLGC,
     orthogonal interpolation, registration and fusion execute normally, with
     native TensorStore storage in pytest temporary directories.
@@ -387,7 +383,8 @@ def pipeline_case(
         optical_data.microscope,
         optical_data.expectation,
     )
-    raw = np.empty((2, 2, 2, *expectation.shape), dtype=np.uint16)
+    positions = 1 if deconvolve else 2
+    raw = np.empty((2, positions, 2, *expectation.shape), dtype=np.uint16)
     for time, position, channel in np.ndindex(raw.shape[:3]):
         raw[time, position, channel] = digitize(
             expectation * (1 + time / 4 + channel / 2),
@@ -413,7 +410,7 @@ def pipeline_case(
         stage_positions_zxy=(
             (2.3, stage_scan, 1.15),
             (2.3, stage_scan, 1.15 + registration_error_pixels * pixel),
-        ),
+        )[:positions],
         acquired_plane_count=raw.shape[-3],
         plane_period_s=simulation_parameters["pipeline"]["plane_period_s"],
     )
@@ -430,8 +427,6 @@ def pipeline_case(
         dataset=dataset,
         microscope=microscope,
         expectation=expectation,
-        optical_data=optical_data,
-        registration_error_pixels=registration_error_pixels,
     )
 
 
@@ -441,25 +436,24 @@ def large_noisy_acquisition(
     noisy_extended_scene,
     simulation_parameters,
     opm_v2_acquisition_factory,
-    small_cpu_kernels,
 ):
     """Write independent full-field views of a shared noisy extended specimen."""
-    mode, factor = request.param
+    mode, factor, positions = request.param
     microscope, expected, raw, source, _dark = noisy_extended_scene
     native_scan_planes = expected.shape[0]
     phase = (native_scan_planes - 1) % factor if mode == "stage" else 0
     microscope = replace(microscope, scan_step_um=microscope.scan_step_um * factor)
     expected = expected[phase::factor]
-    pixels = np.stack(
-        (
-            raw[phase::factor],
+    exposures = [raw[phase::factor]]
+    if positions == 2:
+        exposures.append(
             digitize(
                 expected,
                 microscope.camera,
                 seed=simulation_parameters["camera_seed"] + 1,
-            ),
+            )
         )
-    )[None, :, None]
+    pixels = np.stack(exposures)[None, :, None]
     if mode == "stage":
         pixels = pixels[:, :, :, ::-1].copy()
     pixel = microscope.pixel_size_um
@@ -478,7 +472,7 @@ def large_noisy_acquisition(
         stage_positions_zxy=(
             (2.3, stage_scan, 1.15),
             (2.3, stage_scan, 1.15 + registration_error_pixels * pixel),
-        ),
+        )[:positions],
     )
     microscope = replace(microscope, scan_step_um=dataset.metadata.scan_axis_step_um)
     return SimpleNamespace(
@@ -489,6 +483,7 @@ def large_noisy_acquisition(
         sampling_factor=factor,
         sampling_phase=phase,
         native_scan_planes=native_scan_planes,
+        registration_error_pixels=registration_error_pixels,
     )
 
 
@@ -498,7 +493,6 @@ def mosaic_acquisition(
     pipeline_optical_data,
     simulation_parameters,
     opm_v2_acquisition_factory,
-    small_cpu_kernels,
 ):
     """Persist independent adjacent views of the same extended fluorescent object.
 
