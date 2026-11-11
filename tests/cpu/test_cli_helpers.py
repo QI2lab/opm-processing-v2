@@ -1,5 +1,6 @@
 """CLI discovery, calibration, selection and export-format function units."""
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -85,9 +86,15 @@ def test_tiff_tiles_preserve_page_order_partial_edges_and_counts(tile_shape, dty
 
 
 @pytest.mark.parametrize(
-    "export_image_input", ["image", "collection", "multiple"], indirect=True
+    "export_image_input,bounds",
+    [
+        (kind, bounds)
+        for kind in ("image", "collection")
+        for bounds in (None, (1, 4, 2, 5), (2, 2, 0, 3))
+    ]
+    + [("multiple", None)],
+    indirect=["export_image_input"],
 )
-@pytest.mark.parametrize("bounds", [None, (1, 4, 2, 5), (2, 2, 0, 3)])
 def test_tiff_image_functions_resolve_metadata_and_crop_pixels(
     export_image_input, bounds, tmp_path
 ):
@@ -122,8 +129,31 @@ def test_tiff_image_functions_resolve_metadata_and_crop_pixels(
             np.testing.assert_array_equal(
                 tif.asarray().reshape(expected.shape), expected
             )
-            pixels = from_xml(tif.ome_metadata, validate=True).images[0].pixels
+            exported = from_xml(tif.ome_metadata, validate=True)
+            image = exported.images[0]
+            pixels = image.pixels
             assert (pixels.size_z, pixels.size_y, pixels.size_x) == expected.shape[-3:]
+            spacing = (1, 1, 1) if case.kind == "image" else (1, 0.115, 0.115)
+            origin = np.array((0, 0, 0) if case.kind == "image" else (4, 30, 20), float)
+            if bounds is not None:
+                origin[1:] += np.asarray(bounds[::2]) * spacing[1:]
+            assert (image.stage_label.z, image.stage_label.y, image.stage_label.x) == (
+                pytest.approx(origin)
+            )
+            for plane in pixels.planes:
+                assert (plane.position_z, plane.position_y, plane.position_x) == (
+                    pytest.approx(origin + np.array((plane.the_z * spacing[0], 0, 0)))
+                )
+            annotations = exported.structured_annotations.map_annotations[
+                -1
+            ].value.model_dump()
+            if bounds is None:
+                assert "ROIBoundsLevelZeroYX" not in annotations
+            else:
+                assert json.loads(annotations["ROIBoundsLevelZeroYX"]) == list(bounds)
+                assert json.loads(annotations["ROIOriginTCZYX"]) == pytest.approx(
+                    [0, 0, *origin]
+                )
 
 
 @pytest.mark.parametrize("export_image_input", ["collection"], indirect=True)
@@ -251,7 +281,6 @@ def test_position_pyramid_queue_writes_all_levels(
 @pytest.mark.parametrize("times", [1, 3])
 def test_acquisition_manifest_is_json_serializable(acquisition_metadata, times):
     """Retain recorded calibration and derived index sizes in the inspector payload."""
-    import json
     from dataclasses import replace
 
     shape = (times, *acquisition_metadata.shape[1:])

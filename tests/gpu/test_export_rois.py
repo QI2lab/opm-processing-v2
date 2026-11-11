@@ -1,6 +1,7 @@
 """GPU registration of physical tile overlaps and stored acquisition workflows."""
 
 import json
+from hashlib import sha256
 
 import numpy as np
 import pytest
@@ -84,6 +85,7 @@ def test_raw_roi_exports_and_resume(
     assert missing_channel.exit_code == 2
     assert not calls
     completed = None
+    accepted = {}
     for attempt in range(2):
         # Cover fresh selection after a move and saved-selection/checkpoint
         # resume after a copy, even while the old acquisition remains available.
@@ -133,6 +135,11 @@ def test_raw_roi_exports_and_resume(
                     raw_origin=case.raw_origin_zyx_um,
                     required_point=0,
                 )
+                accepted[1] = (
+                    sha256(np.ascontiguousarray(fused)).digest(),
+                    tuple(metadata.translation_transform.translation),
+                    tuple(metadata.scale_transform.scale),
+                )
         invoke_cli(
             "export-rois",
             directory,
@@ -155,14 +162,23 @@ def test_raw_roi_exports_and_resume(
             assert np.all(data.max(axis=(2, 3, 4)) > 0)
             dataset = root.ome_metadata().multiscales[0].datasets[0]
             origin = dataset.translation_transform.translation
-            assert_roi_point_accuracy(
-                data,
-                case.truth,
-                origin[-3:],
-                dataset.scale_transform.scale[-3:],
-                raw_origin=case.raw_origin_zyx_um,
-                required_point=index - 1,
+            record = (
+                sha256(np.ascontiguousarray(data)).digest(),
+                tuple(origin),
+                tuple(dataset.scale_transform.scale),
             )
+            if attempt == 0:
+                assert_roi_point_accuracy(
+                    data,
+                    case.truth,
+                    origin[-3:],
+                    dataset.scale_transform.scale[-3:],
+                    raw_origin=case.raw_origin_zyx_um,
+                    required_point=index - 1,
+                )
+                accepted[index] = record
+            else:
+                assert record == accepted[index]
             pixel = case.dataset.metadata.pixel_size_um
             assert origin[-2:] == pytest.approx(
                 (case.origin[1] + y0 * pixel, case.origin[2] + x0 * pixel)
@@ -226,6 +242,11 @@ def test_roi_maps_extended_specimen_to_raw_tiles(
     from opm_processing.imageprocessing.opmpsf import camera_grid_center
     from opm_processing.imageprocessing.tilefusion import TileFusion
     from opm_processing.process import process_skewed
+    from tests.simulation.camera_likelihood import (
+        camera_sampling_envelope,
+        sampling_stencil_radii,
+    )
+    from tests.simulation.metrics import camera_volume_samples
 
     case = mosaic_acquisition
     process_skewed(
@@ -275,6 +296,7 @@ def test_roi_maps_extended_specimen_to_raw_tiles(
     assert state.registration(tiles)["fused_path"] == "mosaic_fused.ome.zarr"
     saved = open_position_collection(tiles)
     parent = open_position_collection(preview.parent / "mosaic_deskewed.ome.zarr")
+    roi = PhysicalRoi.read(directory / "roi.json")
     np.testing.assert_array_equal(saved.voxel_size_um, parent.voxel_size_um)
     for record, array, origin in zip(
         records, saved.arrays, saved.spatial_origins_zyx_um, strict=True
@@ -288,7 +310,48 @@ def test_roi_maps_extended_specimen_to_raw_tiles(
         assert 0 <= x0 < x1 <= case.dataset.raw_data.shape[-1]
         np.testing.assert_array_equal(origin, record["origin_zyx_um"])
         pixels = array.read().result()
-        assert np.isfinite(pixels).all() and np.any(pixels > 0)
+        assert np.isfinite(pixels).all()
+        position = record["position_index"]
+        footprint = next(
+            tile for tile in roi.tile_footprints if tile["position_index"] == position
+        )
+        raw_origin = np.asarray(footprint["raw_origin_zyx_um"])
+        frame_origin = raw_origin + np.array(
+            (0, start * microscope.scan_step_um, x0 * pixel)
+        )
+        crop_y, _, crop_x, _ = record["deskew_crop_yx"]
+        np.testing.assert_allclose(
+            origin,
+            frame_origin + np.array((0, crop_y * pixel, crop_x * pixel)),
+            atol=0.0005 + np.finfo(float).eps,
+            rtol=0,
+        )
+        raw = case.dataset.raw_data[0, position, 0, start:stop, :, x0:x1]
+        selection = (
+            slice(start, stop),
+            slice(None),
+            slice(position * offset + x0, position * offset + x1),
+        )
+        grid = (origin, saved.voxel_size_um, frame_origin, raw.shape, microscope)
+        gain = 2 * pixel / microscope.scan_step_um
+        prediction = camera_volume_samples(pixels[0, 0] / gain, *grid)
+        coverage = camera_volume_samples(np.ones_like(pixels[0, 0]), *grid)
+        source = case.source_mask[selection] & (
+            coverage >= 1 - 32 * np.finfo(np.float32).eps
+        )
+        assert source.any()
+        # The ROI changes the deskew lattice phase. Compare with original
+        # acquired photons at physical coordinates, not an integer parent crop.
+        envelope = camera_sampling_envelope(
+            case.expectation[selection],
+            raw,
+            microscope.camera,
+            radii=sampling_stencil_radii(microscope, saved.voxel_size_um),
+        )
+        assert np.all(
+            (prediction[source] >= envelope.lower[source])
+            & (prediction[source] <= envelope.upper[source])
+        )
     final = open_image_array(directory / "mosaic_fused.ome.zarr").read().result()
     assert final.shape[-2:] == (bounds[1] - bounds[0], bounds[3] - bounds[2])
     assert np.isfinite(final).all() and np.any(final > 0)
@@ -298,7 +361,6 @@ def test_roi_maps_extended_specimen_to_raw_tiles(
         .multiscales[0]
         .datasets[0]
     )
-    roi = PhysicalRoi.read(directory / "roi.json")
     np.testing.assert_array_equal(
         metadata.scale_transform.scale[-3:], saved.voxel_size_um
     )

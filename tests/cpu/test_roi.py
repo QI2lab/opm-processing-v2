@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -21,6 +22,97 @@ from opm_processing.dataio.roi import (
 )
 from opm_processing.imageprocessing.maxtilefusion import regenerate_fused_max_projection
 from opm_processing.imageprocessing.tilefusion import TileFusion
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("factor,z_bin", [(1, 1), (3, 2)])
+def test_roi_plan_keeps_raw_origin_clipped_halos_and_refined_extent(factor, z_bin):
+    """Plan the same physical rectangle from native and refined scan samples."""
+    from opm_processing.process import plan_roi_tiles
+
+    roi = PhysicalRoi(
+        bounds_yx_um=(103, 107, 202, 214),
+        source_path=Path("preview.ome.zarr"),
+        grid_origin_yx_um=(100, 200),
+        pixel_size_yx_um=(1, 1),
+        position_indices=(4, 5),
+        tile_footprints=tuple(
+            {
+                "time_index": 1,
+                "position_index": position,
+                "origin_zyx_um": (7, y + 4, 201),
+                "raw_origin_zyx_um": (7, y, 200),
+                "bounds_yx_um": (y, y + 24, 200, 212),
+            }
+            for position, y in ((4, 100), (5, 1000))
+        ),
+    )
+    options = {
+        "channel_count": 2,
+        "pixel_size_um": 1,
+        "scan_step_um": 2,
+        "angle_deg": 30,
+        "z_downsample_level": z_bin,
+        "halo_scan": 1,
+        "halo_x": 2,
+        "scan_upsample_factor": factor,
+    }
+    (plan,) = plan_roi_tiles(roi, (0, 1), (4, 5), (10, 4, 12), **options)
+    assert (plan["time_index"], plan["position_index"]) == (1, 4)
+    assert plan["skewed_bounds_sx"] == [0, 6, 0, 12]
+    assert plan["skewed_shape_syx"] == [6, 4, 12]
+    assert plan["deskew_crop_yx"] == [3, 7, 2, 12]
+    assert plan["shape_tczyx"] == [1, 2, 2 // z_bin, 4, 10]
+    assert plan["origin_zyx_um"] == [7 + (z_bin - 1) / 2, 103, 202]
+    if factor == 3:
+        assert plan["reconstruction_shape_syx"] == [16, 4, 12]
+    else:
+        assert "reconstruction_shape_syx" not in plan
+    with pytest.raises(ValueError, match="does not contain"):
+        plan_roi_tiles(roi, (0,), (4, 5), (10, 4, 12), **options)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("separation", ["paired", "coincident", "time"])
+def test_roi_registration_context_keeps_selection_limits(
+    acquisition_metadata, separation
+):
+    """Use the selected overlap before adding search and SSIM read margins."""
+    from opm_processing.process_roi import roi_with_registration_context
+
+    acquisition = replace(
+        acquisition_metadata,
+        shape=(2, 2, 1, 100, 40, 200),
+        pixel_size_um=1,
+        scan_axis_step_um=1,
+        angle_deg=30,
+    )
+    roi = PhysicalRoi(
+        bounds_yx_um=(40, 60, 100, 120),
+        source_path=Path("preview.ome.zarr"),
+        grid_origin_yx_um=(0, 0),
+        pixel_size_yx_um=(1, 1),
+        position_indices=(0, 1),
+        tile_footprints=tuple(
+            {
+                "time_index": index if separation == "time" else 0,
+                "position_index": index,
+                "origin_zyx_um": (0, 0, x),
+                "bounds_yx_um": (0, 100, x, x + 120),
+            }
+            for index, x in enumerate((0, 80 if separation != "coincident" else 0))
+        ),
+    )
+    expanded, limits = roi_with_registration_context(roi, acquisition, 1)
+    assert roi.bounds_yx_um == (40, 60, 100, 120)
+    if separation == "paired":
+        # Each selected overlap axis is 20 pixels; retain at least half.
+        # The 15-sample SSIM window at fivefold sampling adds 40 pixels.
+        assert limits == (10, 10, 10)
+        assert expanded.bounds_yx_um == (-10, 110, 50, 170)
+        assert expanded.tile_footprints == roi.tile_footprints
+    else:
+        assert expanded is roi and limits is None
 
 
 @pytest.mark.unit
