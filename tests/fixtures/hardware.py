@@ -97,7 +97,9 @@ def production_forward_predictions(monkeypatch, request):
         def observe_forward(estimate):
             """Call the actual operator and keep only its two latest predictions."""
             predicted = forward(estimate)
-            if state is None and "baseline_prediction" in entry:
+            if (
+                state is None or kwargs.get("_finalize")
+            ) and "baseline_prediction" in entry:
                 return predicted
             values = predicted[region][owned]
             captured = (
