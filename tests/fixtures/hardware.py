@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def small_cpu_kernels():
     """Bound worker overhead for small parallel numerical unit-test arrays."""
     from numba import get_num_threads, set_num_threads

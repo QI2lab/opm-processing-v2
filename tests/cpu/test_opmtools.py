@@ -9,8 +9,6 @@ from opm_processing.imageprocessing.opmtools import (
     orthogonal_deskew,
 )
 
-pytestmark = pytest.mark.usefixtures("small_cpu_kernels")
-
 
 @pytest.mark.unit
 @pytest.mark.parametrize(

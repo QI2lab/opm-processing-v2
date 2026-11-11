@@ -94,7 +94,7 @@ def orthogonal_registration_pair(request, simulation_parameters, registration_sp
 
 
 @pytest.fixture
-def deskew_field(request, simulation_parameters):
+def deskew_field(request, simulation_parameters, small_cpu_kernels):
     """Provide calibrated analytic fields and explicit oblique acquisition geometry."""
     kind, step_um, *shape = request.param
     microscope = simulation_parameters["microscope"]
