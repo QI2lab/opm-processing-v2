@@ -194,7 +194,7 @@ def export_relative(
     regions, phase_reference, plotted_records = relative_regions(
         original, saved, include_starting=include_starting
     )
-    phase_path = Path(__file__).with_name("ao_wavekit_phase.py")
+    phase_path = Path(phase_from_modal_coeff.__code__.co_filename).resolve()
     phase_reference["reconstruction"] = {
         "basis_version": BASIS_VERSION,
         "signed_nm_modes": [list(pair) for pair in WAVEKIT_MODE_NM],
