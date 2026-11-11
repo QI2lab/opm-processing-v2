@@ -198,9 +198,9 @@ exclude_lines = [
     "if TYPE_CHECKING:",
     "@overload",
     "except ImportError",
-    "\\.\\.\\.",
+    "^\\s*\\.\\.\\.\\s*(?:#.*)?$",
     "raise NotImplementedError()",
-    "pass",
+    "^\\s*pass\\s*(?:#.*)?$",
 ]
 
 [tool.coverage.run]
