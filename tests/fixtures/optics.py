@@ -50,9 +50,7 @@ def simulation_parameters():
     """Load the shared physical acquisition and specimen configuration."""
     return freeze_metadata(
         json.loads(
-            (
-                Path(__file__).resolve().parent / "configs/deconvolution_figures.json"
-            ).read_text()
+            (Path(__file__).resolve().parent / "configs/simulation.json").read_text()
         )
     )
 

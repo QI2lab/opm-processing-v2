@@ -12,10 +12,3 @@ See [contribution rules](CONTRIBUTING.md) and the
 Simulation setup and the single forward model live in `tests/simulation`.
 Simulation and deconvolution share production PSF generation and pixel integration.
 Shared configurations live in `tests/fixtures/configs`.
-To render the saved synthetic comparison outputs without reconstructing:
-
-```powershell
-uv run --no-sync python -m tests.deconvolution_figures --config tests/fixtures/configs/deconvolution_figures.json --output diagnostics/rlgc_final --render-only
-```
-
-Omit `--render-only` to generate a new comparison series in a new output directory.
