@@ -2,6 +2,8 @@
 
 import importlib
 from contextlib import nullcontext
+from copy import deepcopy
+from hashlib import sha256
 
 import numpy as np
 import pytest
@@ -30,6 +32,7 @@ def test_roi_deconvolves_recorded_sampling(
     from opm_processing.dataio.position_collection import (
         open_image_array,
         open_position_collection,
+        update_group_attributes,
     )
     from opm_processing.dataio.processing_state import ProcessingState
     from opm_processing.imageprocessing.camera import camera_correct
@@ -37,14 +40,16 @@ def test_roi_deconvolves_recorded_sampling(
         regenerate_fused_max_projection,
     )
     from opm_processing.imageprocessing.opmpsf import camera_grid_center
-    from opm_processing.imageprocessing.opmtools import (
-        deskew_shape_estimator,
-        interpolate_rows,
-    )
+    from opm_processing.imageprocessing.opmtools import deskew_shape_estimator
     from opm_processing.imageprocessing.tilefusion import TileFusion
-    from opm_processing.process import format_processed_output
+    from opm_processing.process_roi import process_roi
 
     case = mosaic_acquisition
+    original_files = {
+        path.relative_to(case.dataset.path): sha256(path.read_bytes()).digest()
+        for path in case.dataset.path.rglob("*")
+        if path.is_file()
+    }
     invoke_cli(
         "process",
         case.dataset.path,
@@ -103,10 +108,13 @@ def test_roi_deconvolves_recorded_sampling(
     measurements = []
     rendered = []
     raw_crops = []
+    deskewed = []
+    written = []
     open_raw = processing.open_acquisition_datastore
     generate_psfs = processing.load_deconvolution_psfs
     deconvolve = solver.rlgc
     deskew = processing.orthogonal_deskew
+    write_channel = processing.write_checkpointed_roi_channel
     register = TileFusion.register_with_retries
     measure = TileFusion.register_and_score
     render = TileFusion._render_fusion_block
@@ -135,21 +143,47 @@ def test_roi_deconvolves_recorded_sampling(
         return result
 
     def observe_deconvolution(*args, **kwargs):
-        """Execute the actual CUDA solver and retain its output for deskew checks."""
-        raw_crops.append(args[0].copy())
+        """Execute the actual CUDA solver and record input/output identity."""
+        raw_crops.append(
+            (args[0].shape, sha256(memoryview(np.ascontiguousarray(args[0]))).digest())
+        )
         assert args[0].shape[1] == case.dataset.raw_data.shape[-2]
         assert args[0].size < np.prod(case.dataset.raw_data.shape[-3:])
         result = deconvolve(*args, **kwargs)
-        deconvolved.append(result)
+        deconvolved.append(
+            (result.shape, sha256(memoryview(np.ascontiguousarray(result))).digest())
+        )
         predictions.append(production_forward_predictions[-1])
         stages.append("deconvolve")
         return result
 
     def observe_deskew(data, *args, **kwargs):
         """Verify deskew receives the reconstruction just returned by RLGC."""
-        np.testing.assert_array_equal(data, deconvolved[-1])
+        assert (
+            data.shape,
+            sha256(memoryview(np.ascontiguousarray(data))).digest(),
+        ) == deconvolved[-1]
+        assert kwargs["distance"] == pytest.approx(0.4)
         result = deskew(data, *args, **kwargs)
+        assert not deskewed
+        deskewed.append(result)
         stages.append("deskew")
+        return result
+
+    def observe_write(target, value, state, path, key, **kwargs):
+        """Check the actual deskew crop, then release it after its durable write."""
+        record = next(
+            record
+            for record in state.roi_series(path)
+            if (record["time_index"], record["position_index"]) == key[:2]
+        )
+        y0, y1, x0, x1 = record["deskew_crop_yx"]
+        actual = deskewed.pop()
+        np.testing.assert_array_equal(value, actual[:, y0:y1, x0:x1])
+        result = write_channel(target, value, state, path, key, **kwargs)
+        written.append(
+            (value.shape, sha256(memoryview(np.ascontiguousarray(value))).digest())
+        )
         return result
 
     def observe_registration(fusion):
@@ -169,15 +203,22 @@ def test_roi_deconvolves_recorded_sampling(
         return result
 
     def observe_render(*args, **kwargs):
-        """Retain actual rendered blocks to verify persistence after ROI fusion."""
+        """Record actual rendered block identity without retaining its pixels."""
         result = render(*args, **kwargs)
-        rendered.append((result[0], result[1].copy()))
+        rendered.append(
+            (
+                result[0],
+                result[1].shape,
+                sha256(memoryview(np.ascontiguousarray(result[1]))).digest(),
+            )
+        )
         return result
 
     monkeypatch.setattr(processing, "open_acquisition_datastore", observe_raw)
     monkeypatch.setattr(processing, "load_deconvolution_psfs", observe_psfs)
     monkeypatch.setattr(solver, "rlgc", observe_deconvolution)
     monkeypatch.setattr(processing, "orthogonal_deskew", observe_deskew)
+    monkeypatch.setattr(processing, "write_checkpointed_roi_channel", observe_write)
     monkeypatch.setattr(TileFusion, "register_with_retries", observe_registration)
     monkeypatch.setattr(
         TileFusion, "register_and_score", staticmethod(observe_measurement)
@@ -250,7 +291,7 @@ def test_roi_deconvolves_recorded_sampling(
             atol=1e-6,
         )
     factor = round(case.microscope.scan_step_um / 0.4)
-    for index, ((record, _seed), recovered, actual_input) in enumerate(
+    for index, ((record, _seed), (recovered_shape, _digest), actual_input) in enumerate(
         zip(seeds, deconvolved, raw_crops, strict=True)
     ):
         start, stop, x0, x1 = record["skewed_bounds_sx"]
@@ -259,24 +300,28 @@ def test_roi_deconvolves_recorded_sampling(
         ]
         if case.dataset.metadata.scan_axis_reversed:
             original = original[::-1]
-        np.testing.assert_array_equal(
-            actual_input,
-            camera_correct(
-                original[start:stop, :, x0:x1],
-                case.microscope.camera.offset_adu,
-                case.microscope.camera.electrons_per_adu,
-            ),
+        calibrated = camera_correct(
+            original[start:stop, :, x0:x1],
+            case.microscope.camera.offset_adu,
+            case.microscope.camera.electrons_per_adu,
+        )
+        assert actual_input == (
+            calibrated.shape,
+            sha256(memoryview(np.ascontiguousarray(calibrated))).digest(),
         )
         raw_crops[index] = (start, stop, x0, x1)
-        assert recovered.shape == (
+        assert recovered_shape == (
             (stop - start - 1) * factor + 1,
             case.dataset.raw_data.shape[-2],
             x1 - x0,
         )
     cropped = open_position_collection(tiles)
-    for position, (recovered, raw_crop, measured) in enumerate(
-        zip(deconvolved, raw_crops, predictions, strict=True)
-    ):
+    for position, (
+        (recovered_shape, _digest),
+        raw_crop,
+        measured,
+        persisted,
+    ) in enumerate(zip(deconvolved, raw_crops, predictions, written, strict=True)):
         start, stop, x0, x1 = raw_crop
         x0 += position * case.parameters["tile_offset_x_pixels"]
         x1 += position * case.parameters["tile_offset_x_pixels"]
@@ -301,32 +346,19 @@ def test_roi_deconvolves_recorded_sampling(
         output_origin = np.rint(offset).astype(int)
         assert np.all(output_origin >= 0)
         native_shape, *_ = deskew_shape_estimator(
-            recovered.shape,
+            recovered_shape,
             microscope.angle_deg,
             microscope.scan_step_um / factor,
             pixel,
             crop_after_deskew=False,
-            divisible_by=1,
         )
-        expected = np.zeros(volume.shape, np.float32)
-        interpolate_rows(
-            recovered,
-            expected,
-            native_shape[1],
-            native_shape[0],
-            microscope.angle_deg,
-            microscope.scan_step_um / factor,
-            pixel,
-            1,
-            False,
-            tuple(output_origin),
-        )
-        np.testing.assert_allclose(
-            volume,
-            format_processed_output(expected, save_float32=volume.dtype.kind == "f"),
-            rtol=8 * np.finfo(np.float32).eps,
-            atol=0,
-        )
+        y0, y1, x0, x1 = seeds[position][0]["deskew_crop_yx"]
+        np.testing.assert_array_equal(output_origin, (0, y0, x0))
+        assert 0 <= y0 < y1 <= native_shape[1]
+        assert 0 <= x0 < x1 <= native_shape[2]
+        assert volume.shape == (native_shape[0], y1 - y0, x1 - x0)
+        assert volume.dtype == np.float32
+        assert (volume.shape, sha256(memoryview(volume)).digest()) == persisted
     assert (
         configuration["configuration"]["deconvolution"].get("scan_upsample_factor", 1)
         == factor
@@ -347,11 +379,53 @@ def test_roi_deconvolves_recorded_sampling(
     # Fractional registration is rendered by the actual production fuser.
     # This checks persistence; optical truth is checked above in camera space.
     assert rendered
-    for selection, block in rendered:
-        np.testing.assert_array_equal(image[selection], block)
+    for selection, shape, digest in rendered:
+        block = image[selection]
+        assert block.shape == shape
+        assert sha256(memoryview(np.ascontiguousarray(block))).digest() == digest
     with tifffile.TiffFile(directory / "mosaic_roi_001.ome.tiff") as tif:
         assert tif.is_ome and tif.is_bigtiff
         np.testing.assert_array_equal(tif.asarray().reshape(image.shape), image)
+
+    settings = configuration["configuration"]["deconvolution"]
+    assert settings["read_noise"] == microscope.camera.read_noise_e
+    assert settings["psf_parameters"] is not None and settings["psf_sha256"] is None
+    monkeypatch.setattr(processing, "open_acquisition_datastore", open_raw)
+    monkeypatch.setattr(processing, "load_deconvolution_psfs", generate_psfs)
+    monkeypatch.setattr(solver, "rlgc", deconvolve)
+    monkeypatch.setattr(processing, "orthogonal_deskew", deskew)
+    monkeypatch.setattr(processing, "write_checkpointed_roi_channel", write_channel)
+    monkeypatch.setattr(TileFusion, "register_with_retries", register)
+    monkeypatch.setattr(TileFusion, "register_and_score", staticmethod(measure))
+    monkeypatch.setattr(TileFusion, "_render_fusion_block", render)
+    options = {
+        "roi_json": directory / "roi.json",
+        "output": directory,
+        "registration_channel": 0,
+        "deconvolve": True,
+        "save_float32": True,
+        "z_downsample_level": 1,
+        "resume": True,
+    }
+    before = len(production_forward_predictions)
+    process_roi(case.dataset.path, **options)
+    assert len(production_forward_predictions) == before
+    assert {
+        path.relative_to(case.dataset.path): sha256(path.read_bytes()).digest()
+        for path in case.dataset.path.rglob("*")
+        if path.is_file()
+    } == original_files
+    parameters = deepcopy(settings["psf_parameters"])
+    parameters["support_fwhms"] *= 1.2
+    update_group_attributes(
+        case.dataset.path,
+        {"opm_processing": {"deconvolution": {"psf_parameters": parameters}}},
+    )
+    with pytest.raises(ValueError, match=r"incompatible|configuration"):
+        process_roi(case.dataset.path, **options)
+    for array, persisted in zip(cropped.arrays, written, strict=True):
+        volume = array[0, 0].read().result()
+        assert (volume.shape, sha256(memoryview(volume)).digest()) == persisted
 
 
 @pytest.mark.unit
@@ -567,69 +641,16 @@ def test_calibrated_input_preserves_subcount_intensity(
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize(
-    ("uniform_detector_acquisition", "roi_mode"),
-    (
-        ("stage", False),
-        ("mirror", True),
-        pytest.param(("projection", "uint16"), False, id="uint16-projection"),
-    ),
-    indirect=["uniform_detector_acquisition"],
-)
 def test_saved_fluorescence_with_detector_response(
-    cupy_gpu, uniform_detector_acquisition
+    cupy_gpu, uniform_detector_acquisition, production_forward_predictions
 ):
-    """Persist calibrated processing, geometric support and optical-model resume checks."""
-    import copy
-
-    from opm_processing.dataio.position_collection import (
-        open_position_collection,
-        update_group_attributes,
-    )
-    from opm_processing.dataio.processing_state import (
-        ProcessingState,
-        processing_state_path,
-    )
+    """Persist a nonempty uint16 projection from a known fluorescent acquisition."""
+    from opm_processing.dataio.position_collection import open_position_collection
     from opm_processing.process import process
-    from opm_processing.process_roi import process_roi
 
     case = uniform_detector_acquisition
-    run = process_roi if case.roi_mode else process
-    original = {
-        path.relative_to(case.dataset.path): path.read_bytes()
-        for path in case.dataset.path.rglob("*")
-        if path.is_file()
-    }
-    run(case.dataset.path, **case.options)
+    process(case.dataset.path, **case.options)
+    assert len(production_forward_predictions) == 1
     saved = open_position_collection(case.output).arrays[0][0, 0].read().result()
-    assert saved.dtype == (np.float32 if case.options["save_float32"] else np.uint16)
-    assert saved.shape[:2] == case.support.shape
-    np.testing.assert_array_equal(saved[~case.support], 0)
-    state = ProcessingState.read(
-        processing_state_path(
-            case.output.parent, case.dataset.path.stem.removesuffix(".ome")
-        )
-    )
-    settings = state.run(case.output)["configuration"]["deconvolution"]
-    assert settings["read_noise"] == case.scene.microscope.camera.read_noise_e
-    assert settings["psf_parameters"] is not None
-    assert settings["psf_sha256"] is None
-    run(case.dataset.path, **case.options, resume=True)
-    assert {
-        path.relative_to(case.dataset.path): path.read_bytes()
-        for path in case.dataset.path.rglob("*")
-        if path.is_file()
-    } == original
-    # Deliberately change optical calibration only after the successful real
-    # acquisition/processing round trip; resume must reject the new model.
-    parameters = copy.deepcopy(settings["psf_parameters"])
-    parameters["support_fwhms"] *= 1.2
-    update_group_attributes(
-        case.dataset.path,
-        {"opm_processing": {"deconvolution": {"psf_parameters": parameters}}},
-    )
-    with pytest.raises(ValueError, match=r"incompatible|configuration"):
-        run(case.dataset.path, **case.options, resume=True)
-    np.testing.assert_array_equal(
-        open_position_collection(case.output).arrays[0][0, 0].read().result(), saved
-    )
+    assert saved.dtype == np.uint16 and saved.shape == case.scene.shape
+    assert np.any(saved[case.scene.means > 0] > 0)

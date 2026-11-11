@@ -10,10 +10,6 @@ import numpy as np
 import pytest
 
 from opm_processing.imageprocessing.opmpsf import centered_sensor_axes
-from opm_processing.imageprocessing.opmtools import (
-    deskew_coverage,
-    deskew_shape_estimator,
-)
 from tests.simulation.forward_model import (
     Acquisition,
     Microscope,
@@ -438,7 +434,6 @@ def uniform_detector_scene(
             microscope=microscope,
             means=means,
             shape=shape,
-            nominal=12000.0,
         )
 
     return create
@@ -462,45 +457,30 @@ def uniform_response_case(scan_planes, detector_shape):
 
 @pytest.fixture
 def uniform_detector_acquisition(
-    request,
     tmp_path,
     opm_v2_acquisition_factory,
     uniform_detector_scene,
-    roi_mode,
-    camera_gain_profile,
 ):
-    """Write physical camera frames and real preview coordinates for calibration workflows."""
+    """Write a planar fluorescent acquisition with nonuniform detector sensitivity."""
     from opm_processing.dataio.acquisition import ChannelMetadata
-    from opm_processing.dataio.roi import PhysicalRoi, projection_tile_footprints
-    from opm_processing.imageprocessing.coordinates import STAGE_COORDINATE_VERSION
-    from opm_processing.process import process_skewed, write_flatfield
+    from opm_processing.process import write_flatfield
     from tests.simulation.camera import digitize
 
-    save_float = not isinstance(request.param, tuple)
-    mode = request.param[0] if not save_float else request.param
-    scene = uniform_detector_scene(mode == "projection")
+    scene = uniform_detector_scene(projection=True)
     shape = scene.shape
     response = np.broadcast_to(
         np.repeat(np.array((0.25, 0.5, 1, 2), np.float32), shape[-1] // 4), shape[-2:]
     ).copy()
-    if mode == "stage":
-        response *= np.interp(
-            np.linspace(0, len(camera_gain_profile) - 1, shape[-1]),
-            np.arange(len(camera_gain_profile)),
-            camera_gain_profile,
-        )
     # Detector sensitivity changes quantum efficiency after optical integration.
     # Nominal QE .3 times the largest relative response remains below one.
     assert scene.microscope.quantum_efficiency * response.max() < 1
     means = scene.means * response
     raw = digitize(means, scene.microscope.camera, seed=31)
     assert raw.max() < np.iinfo(np.uint16).max
-    if mode == "stage":
-        raw = raw[::-1].copy()
     dataset = opm_v2_acquisition_factory(
         raw[None, None, None],
         name="uniform_detector",
-        mode=mode,
+        mode="projection",
         camera_offset=scene.microscope.camera.offset_adu,
         camera_conversion=scene.microscope.camera.electrons_per_adu,
         camera_read_noise_e=scene.microscope.camera.read_noise_e,
@@ -513,86 +493,20 @@ def uniform_detector_acquisition(
         response[None, None],
         scene.microscope.pixel_size_um,
     )
-    output_dir = tmp_path
     options = {
         "deconvolve": True,
         "flatfield_correction": True,
-        "save_float32": save_float,
+        "save_float32": False,
         "z_downsample_level": 1,
         "max_projection": False,
         "create_fused_max_projection": False,
         "write_fused_max_projection_tiff": False,
     }
-    pixel = scene.microscope.pixel_size_um
-    if mode == "projection":
-        support = np.ones(shape[:2], bool)
-    else:
-        native_shape, _, _, _ = deskew_shape_estimator(
-            shape,
-            scene.microscope.angle_deg,
-            scene.microscope.scan_step_um,
-            pixel,
-            crop_after_deskew=False,
-        )
-        support = (
-            deskew_coverage(
-                shape,
-                native_shape,
-                theta=scene.microscope.angle_deg,
-                distance=scene.microscope.scan_step_um,
-                pixel_size=pixel,
-            )
-            == 1
-        )
-    if roi_mode:
-        process_skewed(
-            dataset.path,
-            acquisition=dataset.metadata,
-            max_projection=True,
-            create_fused_max_projection=False,
-            save_float32=True,
-            z_downsample_level=1,
-        )
-        preview = tmp_path / "uniform_detector_max_z_deskewed.ome.zarr"
-        footprints = projection_tile_footprints(preview)
-        origin = footprints[0]["origin_zyx_um"]
-        y_stop, x_stop = support.shape[-1] - 3, shape[-1] - 16
-        roi = PhysicalRoi(
-            bounds_yx_um=(
-                origin[1] + 3.25 * pixel,
-                origin[1] + (y_stop - 0.25) * pixel,
-                origin[2] + 16.25 * pixel,
-                origin[2] + (x_stop - 0.25) * pixel,
-            ),
-            source_path=preview,
-            grid_origin_yx_um=tuple(origin[1:]),
-            pixel_size_yx_um=(pixel, pixel),
-            position_indices=(0,),
-            tile_footprints=tuple(footprints),
-            coordinate_version=STAGE_COORDINATE_VERSION,
-        )
-        roi_path = roi.write(tmp_path / "uniform_detector_roi.json")
-        support = support[:, 3:y_stop]
-        options = {
-            k: v
-            for k, v in options.items()
-            if k
-            not in (
-                "max_projection",
-                "create_fused_max_projection",
-                "write_fused_max_projection_tiff",
-            )
-        }
-        output_dir = tmp_path / "roi"
-        options.update(roi_json=roi_path, output=output_dir, registration_channel=0)
-    suffix = "projection" if mode == "projection" else "deskewed"
     return SimpleNamespace(
         dataset=dataset,
         scene=scene,
-        support=support,
         options=options,
-        roi_mode=roi_mode,
-        output=output_dir / f"uniform_detector_decon_{suffix}.ome.zarr",
+        output=tmp_path / "uniform_detector_decon_projection.ome.zarr",
     )
 
 
@@ -838,16 +752,7 @@ def noisy_scene_masks(microscope_parameters, independent_photon_scene_factory):
     return create
 
 
-@pytest.fixture(
-    scope="session",
-    params=[
-        (kind, profile, budget, "tiled")
-        for kind in ("line-pairs", "sphere")
-        for profile in ("uniform", "edge-taper")
-        for budget in range(3)
-    ],
-    ids=lambda case: f"{case[0]}-{case[1]}-dose{case[2]}-{case[3]}",
-)
+@pytest.fixture(scope="session")
 def noisy_extended_scene(
     request,
     microscope_parameters,

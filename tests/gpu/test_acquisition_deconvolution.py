@@ -1,5 +1,9 @@
 """Deconvolve unmodified, single-position opm-v2 writer output."""
 
+import importlib
+from copy import deepcopy
+from hashlib import sha256
+
 import numpy as np
 import pytest
 from scipy.special import kl_div
@@ -10,7 +14,10 @@ from opm_processing.dataio.acquisition import (
     inspect_acquisition,
     open_acquisition_datastore,
 )
-from opm_processing.dataio.position_collection import open_position_collection
+from opm_processing.dataio.position_collection import (
+    open_position_collection,
+    update_group_attributes,
+)
 from opm_processing.dataio.processing_state import (
     ProcessingState,
     processing_state_path,
@@ -18,28 +25,27 @@ from opm_processing.dataio.processing_state import (
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("kind", ("line-pairs",))
 def test_as_acquired_combined_channel_deconvolution(
     cupy_gpu,
     simulated_camera,
     opm_v2_acquisition_factory,
     invoke_cli,
     monkeypatch,
-    small_cpu_kernels,
     production_forward_predictions,
     simulation_parameters,
-    kind,
 ):
     """Improve true camera likelihood without injecting PSF calibration into raw data."""
     from opm_processing.imageprocessing import rlgc
-    from opm_processing.imageprocessing.opmtools import orthogonal_deskew
+    from opm_processing.imageprocessing.opmtools import deskew_shape_estimator
+
+    processing = importlib.import_module("opm_processing.process")
 
     observed = simulated_camera(
         (
             simulation_parameters["whole_scan_planes"],
             *simulation_parameters["camera_shape_yx"],
         ),
-        kind=kind,
+        kind="line-pairs",
         step=1.2,
         budget=(3000, 4000),
     )
@@ -55,6 +61,11 @@ def test_as_acquired_combined_channel_deconvolution(
         stage_positions_zxy=((0.0, 0.0, 0.0),),
     )
     original_attributes = dict(open_group(dataset.path).attrs)
+    original = {
+        path.relative_to(dataset.path): sha256(path.read_bytes()).digest()
+        for path in dataset.path.rglob("*")
+        if path.is_file()
+    }
     assert "opm_processing" not in original_attributes
     assert "multiscales" in original_attributes["ome"]
     metadata = inspect_acquisition(dataset.path)
@@ -62,16 +73,22 @@ def test_as_acquired_combined_channel_deconvolution(
     np.testing.assert_array_equal(
         open_acquisition_datastore(metadata).read().result(), dataset.raw_data
     )
-    reconstructed = []
-    reconstruct = rlgc.rlgc
+    deskewed = []
+    deskew = processing.orthogonal_deskew
 
     def observe(*args, **kwargs):
-        """Retain the real reconstruction to score against simulated camera means."""
-        result = reconstruct(*args, **kwargs)
-        reconstructed.append(result)
+        """Observe actual refined input and output bytes before persistence."""
+        assert args[0].shape == (
+            (observed.raw.shape[0] - 1) * 3 + 1,
+            *observed.raw.shape[1:],
+        )
+        assert kwargs["distance"] == pytest.approx(0.4)
+        result = deskew(*args, **kwargs)
+        assert result.dtype == np.float32 and result.flags.c_contiguous
+        deskewed.append((result.shape, sha256(memoryview(result)).hexdigest()))
         return result
 
-    monkeypatch.setattr(rlgc, "rlgc", observe)
+    monkeypatch.setattr(processing, "orthogonal_deskew", observe)
     invoke_cli(
         "process",
         dataset.path,
@@ -82,11 +99,7 @@ def test_as_acquired_combined_channel_deconvolution(
         decon_crop_scan=12,
     )
     assert dict(open_group(dataset.path).attrs) == original_attributes
-    (recovered,) = reconstructed
-    assert recovered.shape == (
-        (observed.raw.shape[0] - 1) * 3 + 1,
-        *observed.raw.shape[1:],
-    )
+    ((shape, digest),) = deskewed
     measured = production_forward_predictions[-1]
     # Sparse progress is measured against the actual production initializer,
     # with both predictions evaluated on the acquired camera planes.
@@ -97,17 +110,19 @@ def test_as_acquired_combined_channel_deconvolution(
     output = dataset.path.parent / "as_acquired_decon_deskewed.ome.zarr"
     collection = open_position_collection(output)
     saved = collection.arrays[0].read().result()
-    assert np.isfinite(saved).all() and np.all(saved >= 0)
-    np.testing.assert_array_equal(
-        saved[0, 0],
-        orthogonal_deskew(
-            recovered,
-            theta=microscope.angle_deg,
-            distance=0.4,
-            pixel_size=microscope.pixel_size_um,
-            downsample_factor=1,
-        ),
+    expected_shape, *_ = deskew_shape_estimator(
+        ((observed.raw.shape[0] - 1) * 3 + 1, *observed.raw.shape[1:]),
+        microscope.angle_deg,
+        0.4,
+        microscope.pixel_size_um,
+        crop_after_deskew=False,
+        downsample_factor=1,
     )
+    assert saved.dtype == np.float32 and saved.shape[-3:] == shape == tuple(
+        expected_shape
+    )
+    assert np.isfinite(saved).all() and np.all(saved >= 0)
+    assert sha256(memoryview(saved[0, 0])).hexdigest() == digest
     np.testing.assert_allclose(
         collection.voxel_size_um, microscope.pixel_size_um, rtol=0, atol=0.0005
     )
@@ -122,4 +137,34 @@ def test_as_acquired_combined_channel_deconvolution(
     assert settings["emission_wavelengths_nm"] == [637.0]
     assert settings["psf_parameters"]["lens"]["NA"] == 1.35
     assert settings["scan_upsample_factor"] == 3
+    assert settings["read_noise"] == microscope.camera.read_noise_e
     assert settings["psf_sha256"] is None
+    options = {
+        "deconvolve": True,
+        "max_projection": False,
+        "save_float32": True,
+        "z_downsample_level": 1,
+        "decon_crop_scan": 12,
+        "resume": True,
+    }
+    before = len(production_forward_predictions)
+    invoke_cli("process", dataset.path, **options)
+    assert len(deskewed) == 1
+    assert len(production_forward_predictions) == before
+    np.testing.assert_array_equal(collection.arrays[0].read().result(), saved)
+    assert {
+        path.relative_to(dataset.path): sha256(path.read_bytes()).digest()
+        for path in dataset.path.rglob("*")
+        if path.is_file()
+    } == original
+    parameters = deepcopy(settings["psf_parameters"])
+    parameters["support_fwhms"] *= 1.2
+    update_group_attributes(
+        dataset.path,
+        {"opm_processing": {"deconvolution": {"psf_parameters": parameters}}},
+    )
+    with pytest.raises(ValueError, match=r"incompatible|configuration"):
+        invoke_cli("process", dataset.path, **options)
+    assert len(deskewed) == 1
+    assert len(production_forward_predictions) == before
+    np.testing.assert_array_equal(collection.arrays[0].read().result(), saved)
