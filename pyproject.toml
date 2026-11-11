@@ -63,6 +63,7 @@ processing = [
     "ryomen",
     "scikit-image",
     "scipy",
+    "shapely>=2,<3",
     "tifffile",
     "torch==2.9.0; sys_platform == 'win32'",
     "torch; sys_platform != 'win32'",
