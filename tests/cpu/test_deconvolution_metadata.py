@@ -186,33 +186,6 @@ def test_invalid_explicit_wavelengths_do_not_use_defaults(acquisition_metadata, 
         emission_wavelengths_from_metadata(acquisition)
 
 
-@pytest.mark.parametrize("projection", [False, True])
-def test_as_acquired_combined_channel_psf_has_lateral_symmetry(
-    deconvolution_acquisition, projection
-):
-    """A centered emitter has lateral reflection symmetry with default optics."""
-    acquisition = inspect_acquisition(deconvolution_acquisition.path)
-    channel = replace(acquisition.channels[0], name="561 + 637", wavelength_nm=None)
-    acquisition = replace(acquisition, channels=(channel,), scan_axis_step_um=1.2)
-    kernels, parameters = load_deconvolution_psfs(
-        acquisition, projection=projection, reconstruction_step_um=0.4
-    )
-    assert parameters["lens"]["NA"] == 1.35
-    assert len(kernels) == 1
-    kernel = kernels[0]
-    assert kernel.ndim == 3
-    assert (kernel.shape[0] == 1) == projection
-    assert all(size % 2 == 1 for size in kernel.shape)
-    assert np.all(np.isfinite(kernel) & (kernel >= 0))
-    assert kernel.sum() > 0
-    np.testing.assert_allclose(
-        kernel,
-        kernel[..., ::-1],
-        rtol=1e-6,
-        atol=8 * np.finfo(np.float32).eps * kernel.max(),
-    )
-
-
 @pytest.mark.parametrize("profile", [None, [0.7, 0.8, 0.9, 1, 1.1]])
 def test_optical_calibration_round_trips_without_instrument_defaults(
     deconvolution_acquisition, simulation_parameters, profile
