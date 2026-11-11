@@ -60,6 +60,7 @@ jobs:
           python -m pytest
           tests/cpu/test_camera.py
           tests/cpu/test_camera_likelihood.py
+          tests/cpu/test_acquisition_deconvolution.py
           tests/cpu/test_coordinate_origins.py
           tests/cpu/test_deconvolution_metadata.py
           tests/cpu/test_fusion_storage.py
@@ -74,6 +75,12 @@ jobs:
           tests/cpu/test_registration_periodic.py
           tests/cpu/test_registration_retries.py
           tests/cpu/test_tilefusion.py
+          tests/cpu/test_time_axis_metadata.py::test_written_time_axis_interval_and_units
+          tests/cpu/test_time_axis_metadata.py::test_unknown_time_does_not_become_one_second
+          tests/cpu/test_time_axis_metadata.py::test_hardware_channel_periods_sum_once
+          tests/cpu/test_roi.py::test_world_roi_maps_to_skewed_scan_x_and_keeps_all_camera_y
+          tests/cpu/test_roi.py::test_registered_tile_origin_is_selected_per_timepoint
+          tests/cpu/test_cli_helpers.py::test_channel_checkpoint_requires_a_successful_write
           "tests/cpu/test_opm_v2_dataset.py::test_projection_output_preserves_calibration_geometry_and_provenance[projection-source-dir-uint16]"
           "tests/cpu/test_opm_v2_dataset.py::test_projection_output_preserves_calibration_geometry_and_provenance[stage-source-dir-float32]"
           "tests/cpu/test_opm_v2_dataset.py::test_projection_output_preserves_calibration_geometry_and_provenance[selected-positions-output-dir-float32]"

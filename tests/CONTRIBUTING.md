@@ -19,6 +19,11 @@ Keep workflow tests focused on their interaction: durable pixels, coordinates,
 selection, resume and storage. Put detailed numerical acceptance in the shared
 core processing cases. Do not replay the processing pipeline or rebuild
 camera-space envelopes in every workflow to check the same operation again.
+Give each behavior one primary test or parameterized family. Integrations own
+interactions between components, not another numerical parameter sweep. After
+an output passes its scientific check, exact pixel preservation against unchanged
+truth does not require repeating that calculation. Keep independent coordinate
+and checkpoint assertions. See the ownership table in the testing guide.
 
 Unit tests use known analytical objects, independently blurred scenes or explicitly
 prescribed metadata and decision states. Use actual library operators and installed
