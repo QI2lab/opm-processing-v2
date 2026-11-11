@@ -505,6 +505,7 @@ def uniform_detector_acquisition(
     return SimpleNamespace(
         dataset=dataset,
         scene=scene,
+        expectation=means,
         options=options,
         output=tmp_path / "uniform_detector_decon_projection.ome.zarr",
     )

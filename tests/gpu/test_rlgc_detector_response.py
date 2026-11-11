@@ -423,7 +423,10 @@ def test_roi_deconvolves_recorded_sampling(
     )
     with pytest.raises(ValueError, match=r"incompatible|configuration"):
         process_roi(case.dataset.path, **options)
-    for array, persisted in zip(cropped.arrays, written, strict=True):
+    resumed = open_position_collection(tiles)
+    assert resumed.spatial_origins_zyx_um == cropped.spatial_origins_zyx_um
+    assert resumed.voxel_size_um == cropped.voxel_size_um
+    for array, persisted in zip(resumed.arrays, written, strict=True):
         volume = array[0, 0].read().result()
         assert (volume.shape, sha256(memoryview(volume)).digest()) == persisted
 
@@ -642,15 +645,33 @@ def test_calibrated_input_preserves_subcount_intensity(
 
 @pytest.mark.integration
 def test_saved_fluorescence_with_detector_response(
-    cupy_gpu, uniform_detector_acquisition, production_forward_predictions
+    cupy_gpu, uniform_detector_acquisition, production_forward_predictions, monkeypatch
 ):
-    """Persist a nonempty uint16 projection from a known fluorescent acquisition."""
+    """Recover known detector-space fluorescence and persist the accepted estimate."""
     from opm_processing.dataio.position_collection import open_position_collection
-    from opm_processing.process import process
+    from opm_processing.process import format_processed_output, process
 
     case = uniform_detector_acquisition
+    solver = importlib.import_module("opm_processing.imageprocessing.rlgc")
+    reconstruct = solver.rlgc
+    accepted = []
+
+    def observe_reconstruction(*args, **kwargs):
+        """Retain the actual accepted planar estimate before production casts it."""
+        result = reconstruct(*args, **kwargs)
+        accepted.append(result)
+        return result
+
+    monkeypatch.setattr(solver, "rlgc", observe_reconstruction)
     process(case.dataset.path, **case.options)
     assert len(production_forward_predictions) == 1
+    measured = production_forward_predictions[0]
+    truth = case.expectation[0]
+    assert kl_div(truth, measured["prediction"]).sum(dtype=np.float64) < kl_div(
+        truth, measured["baseline_prediction"]
+    ).sum(dtype=np.float64)
     saved = open_position_collection(case.output).arrays[0][0, 0].read().result()
     assert saved.dtype == np.uint16 and saved.shape == case.scene.shape
-    assert np.any(saved[case.scene.means > 0] > 0)
+    np.testing.assert_array_equal(
+        saved, format_processed_output(accepted[0], False).reshape(saved.shape)
+    )

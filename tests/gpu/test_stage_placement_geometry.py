@@ -1,5 +1,7 @@
 """Stage placement across acquisition metadata, deskew and fusion."""
 
+import json
+
 import numpy as np
 import pytest
 from yaozarrs import open_group
@@ -69,6 +71,18 @@ def test_physical_stage_z_translation_preserves_registered_xy(
     fusion.run()
     np.testing.assert_allclose(fusion.global_offsets, 0.0, atol=1.0)
     assert len(fusion.pairwise_metrics) >= 2
+    report = json.loads(
+        (tmp_path / "physical_stage_depth_intensity_gains.json").read_text()
+    )
+    assert report == fusion._depth_intensity_report
+    assert report["enabled"] and report["tile_depth_indices"] == [0, 1, 2]
+    (channel,) = report["channels"]
+    assert (channel["time_index"], channel["channel_index"]) == (0, 0)
+    assert channel["overlap_samples"] > 0
+    np.testing.assert_array_equal(
+        np.asarray(channel["depth_gains"], dtype=fusion._depth_intensity_gains.dtype),
+        fusion._depth_intensity_gains[:, 0],
+    )
     written = open_image_array(tmp_path / "physical_stage_fused.ome.zarr")
     fused = written[0, 0].read().result()
     peak = np.asarray(np.unravel_index(np.argmax(fused), fused.shape))
