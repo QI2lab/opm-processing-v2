@@ -271,7 +271,9 @@ def resume_acquisition(
         scene = uniform_camera_scene(**parameters)
         changed_exposures = exposures.copy()
         changed_exposures[:, 0] = 0.4
-        changed = uniform_camera_scene(**dict(parameters, exposures=changed_exposures))
+        changed = uniform_camera_scene(
+            **dict(parameters, positions=1, exposures=changed_exposures[:, :1])
+        )
         raw = scene.pixels[..., ::-1, :, :].copy()
         name = "live_resume" if live else "offline_resume"
         if live:

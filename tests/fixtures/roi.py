@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
 from itertools import pairwise
 from typing import TYPE_CHECKING
 
@@ -16,7 +17,6 @@ if TYPE_CHECKING:
 def roi_preview(
     request,
     opm_v2_acquisition_factory,
-    small_cpu_kernels,
     roi_camera_scene,
     simulation_parameters,
 ):
@@ -32,7 +32,6 @@ def roi_preview(
 
     mode, positions, registered = request.param
     scene = roi_camera_scene(times=2, positions=positions, channels=2)
-    scene.stage_positions_zxy = ((2.3, -4.6, 1.15),) * positions
     pixels = scene.pixels
     if mode == "stage":
         pixels = pixels[:, :, :, ::-1].copy()
@@ -41,7 +40,7 @@ def roi_preview(
         mode=mode,
         camera_conversion=1.0,
         camera_read_noise_e=scene.microscope.camera.read_noise_e,
-        stage_positions_zxy=scene.stage_positions_zxy,
+        stage_positions_zxy=((2.3, -4.6, 1.15),) * positions,
         acquired_plane_count=pixels.shape[-3],
         plane_period_s=simulation_parameters["pipeline"]["plane_period_s"],
     )
@@ -103,8 +102,8 @@ def napari_model(monkeypatch, tmp_path_factory):
 
 
 @pytest.fixture
-def roi_run(tmp_path: Path, opm_v2_acquisition_factory, roi_camera_scene):
-    """Build a three-channel acquisition with two selected nonzero positions."""
+def roi_run(request, tmp_path: Path, opm_v2_acquisition_factory, roi_camera_scene):
+    """Build a multi-channel acquisition with two selected nonzero positions."""
     import importlib
     from types import SimpleNamespace
 
@@ -112,14 +111,15 @@ def roi_run(tmp_path: Path, opm_v2_acquisition_factory, roi_camera_scene):
     from opm_processing.imageprocessing.opmtools import deskew_shape_estimator
 
     process = importlib.import_module("opm_processing.process")
-    scene = roi_camera_scene(positions=3, channels=3, vary_positions=True)
-    scene.stage_positions_zxy = ((0.0, 0.0, 0.0),) * 3
+    scene = roi_camera_scene(
+        positions=3, channels=getattr(request, "param", 3), vary_positions=True
+    )
     pixels = scene.pixels
     dataset = opm_v2_acquisition_factory(
         pixels,
         camera_conversion=1.0,
         camera_read_noise_e=scene.microscope.camera.read_noise_e,
-        stage_positions_zxy=scene.stage_positions_zxy,
+        stage_positions_zxy=((0.0, 0.0, 0.0),) * 3,
     )
     source, metadata = dataset.path, dataset.metadata
     pixel = scene.microscope.pixel_size_um
@@ -170,9 +170,9 @@ def roi_run(tmp_path: Path, opm_v2_acquisition_factory, roi_camera_scene):
     )
 
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 def roi_camera_scene(simulated_camera, simulation_parameters):
-    """Share actual optical observations and original physical point locations.
+    """Cache immutable optical observations and original physical point locations.
 
     Returns
     -------
@@ -184,6 +184,7 @@ def roi_camera_scene(simulated_camera, simulation_parameters):
 
     from opm_processing.imageprocessing.opmpsf import camera_grid_center
 
+    @lru_cache(maxsize=2)
     def create(*, times=1, positions=1, channels=1, vary_positions=False, shape=None):
         """Render the existing physical point object without a new image simulator."""
         if shape is None:
@@ -192,20 +193,22 @@ def roi_camera_scene(simulated_camera, simulation_parameters):
                 *simulation_parameters["camera_shape_yx"],
             )
         pixels = np.empty((times, positions, channels, *shape), np.uint16)
-        means = np.empty(pixels.shape, np.float32)
+        exposures = np.empty((times, positions, channels), np.float32)
         for time, channel, position in np.ndindex(times, channels, positions):
+            exposure = (
+                1 + time / 4 + channel / 2 + (position / 4 if vary_positions else 0)
+            )
             observation = simulated_camera(
                 pixels.shape[-3:],
                 conversion=1.0,
                 seed=42 + 100 * time + 10 * position + channel,
-                exposure=1
-                + time / 4
-                + channel / 2
-                + (position / 4 if vary_positions else 0),
+                exposure=exposure,
                 budget=(3000, 4000),
             )
             pixels[time, position, channel] = observation.raw
-            means[time, position, channel] = observation.expectation
+            exposures[time, position, channel] = exposure
+            if (time, position, channel) == (0, 0, 0):
+                expectation = observation.expectation
         microscope = observation.microscope
         pixel = microscope.pixel_size_um
         # The simulator centers all sensor axes. Translate the original object
@@ -223,12 +226,14 @@ def roi_camera_scene(simulated_camera, simulation_parameters):
             center
             + np.asarray(observation.ground_truth.features["centers_xyz_um"])[:, ::-1]
         )
+        for values in (pixels, exposures, centers):
+            values.setflags(write=False)
         return SimpleNamespace(
             pixels=pixels,
-            means=means,
+            expectation=expectation,
+            exposures=exposures,
             centers_zyx_um=centers,
             microscope=microscope,
-            ground_truth=observation.ground_truth,
         )
 
     return create
@@ -292,7 +297,7 @@ def assert_roi_point_accuracy():
         # The same physical object has explicitly increasing photon doses in
         # each channel/time. Preserve their ordering as well as their locations;
         # duplicated or swapped output channels cannot satisfy this invariant.
-        expected_counts = scene.means.sum(axis=(1, 3, 4, 5))
+        expected_counts = scene.exposures.sum(axis=1)
         observed_counts = data.sum(axis=(-3, -2, -1), dtype=np.float64)
         selected_channels = (
             list(range(data.shape[1])) if channels is None else list(channels)

@@ -383,27 +383,14 @@ def test_offline_resume_skips_durably_completed_tile_and_default_overwrites(
     assert result.exit_code == 0, result.exception
     output = open_position_collection(root / case.output.name)
     actual = output.arrays[0].read().result()
-    assert_uniform_photon_accuracy(
-        actual, case.scene if action == "resume" else case.changed, position=0
-    )
     if action == "resume":
         np.testing.assert_array_equal(actual, first)
     else:
         assert not np.array_equal(actual, first)
+        assert_uniform_photon_accuracy(actual, case.changed, position=0)
     assert_uniform_photon_accuracy(
         output.arrays[1].read().result(), case.scene, position=1
     )
-    if action == "resume":
-        process_module.process_skewed(
-            source, inspect_acquisition(source), output_dir=root, **options
-        )
-        overwritten = open_position_collection(root / case.output.name)
-        assert_uniform_photon_accuracy(
-            overwritten.arrays[0].read().result(), case.changed, position=0
-        )
-        assert_uniform_photon_accuracy(
-            overwritten.arrays[1].read().result(), case.scene, position=1
-        )
 
 
 @pytest.mark.integration

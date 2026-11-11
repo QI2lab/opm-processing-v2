@@ -82,82 +82,10 @@ def opm_v2_frame_metadata(
     return frame
 
 
-def write_synthetic_acquisition_zarr(
-    *,
-    path: Path,
-    raw_data: np.ndarray,
-    labels: tuple[str, ...],
-    chunks: tuple[int, ...],
-    frame_metadatas: list[dict],
-) -> None:
-    """Write a synthetic group layout for isolated metadata and storage checks.
-
-    This does not execute opm-v2. Acquisition pipeline integrations must use
-    ``opm_v2_acquisition_factory`` instead.
-    """
-    normalized = raw_data if "z" in labels else raw_data[:, :, :, None, :, :]
-    normalized_chunks = chunks if "z" in labels else (*chunks[:3], 1, *chunks[-2:])
-    time_count, position_count, channel_count, z_count, _y_count, _x_count = (
-        int(value) for value in normalized.shape
-    )
-    frames_by_position: list[list[dict]] = [[] for _ in range(position_count)]
-    channel_names = [f"channel-{index}" for index in range(channel_count)]
-    stage_positions = [(0.0, 0.0, 0.0)] * position_count
-    pixel_size_um = 1.0
-    for frame in frame_metadatas:
-        event = frame["mda_event"]
-        index = event["index"]
-        metadata = event["metadata"]
-        position = int(index.get("p", 0))
-        channel = int(index.get("c", 0))
-        frames_by_position[position].append(frame)
-        channel_names[channel] = str(metadata["DAQ"]["current_channel"])
-        stage = metadata["Stage"]
-        stage_positions[position] = (
-            float(stage["z_pos"]),
-            float(stage["x_pos"]),
-            float(stage["y_pos"]),
-        )
-        pixel_size_um = float(frame["pixel_size_um"])
-
-    index_sizes = {"t": time_count, "p": position_count, "c": channel_count}
-    if z_count > 1:
-        index_sizes["z"] = z_count
-    collection = create_position_collection(
-        path,
-        normalized.shape,
-        (1.0, pixel_size_um, pixel_size_um),
-        stage_positions=stage_positions,
-        channels=channel_names,
-        attributes={
-            "opm_v2": {
-                "index_sizes": index_sizes,
-                "acquisition_order": [
-                    axis for axis in labels if axis not in {"y", "x"}
-                ],
-                "configuration": {"acq_config": {}},
-            }
-        },
-        chunks=(
-            normalized_chunks[0],
-            normalized_chunks[2],
-            normalized_chunks[3],
-            normalized_chunks[4],
-            normalized_chunks[5],
-        ),
-    )
-    for position, array in enumerate(collection.arrays):
-        array.write(normalized[:, position]).result()
-    for position, frames in enumerate(frames_by_position):
-        update_group_attributes(
-            path / str(position), {"ome_writers": {"frame_metadata": frames}}
-        )
-
-
 @pytest.fixture
 def opm_v2_projection_zarr(
     request,
-    simulated_camera,
+    optical_camera_data,
     opm_v2_acquisition_factory,
     simulation_parameters,
     uniform_optical_calibration,
@@ -170,35 +98,34 @@ def opm_v2_projection_zarr(
     shape = (2, positions, 2, *simulation_parameters["camera_shape_yx"])
     raw_data = np.empty(shape, dtype=np.uint16)
     expectation = np.empty(shape, dtype=np.float64)
+    _, microscope, source = optical_camera_data(
+        (1, *shape[-2:]),
+        kind="points",
+        large=False,
+        integration=False,
+        illumination_profile="uniform",
+        step=0.4,
+        geometry="cartesian",
+        budget=(1000, 0),
+    )
+    microscope = replace(
+        microscope, camera=replace(microscope.camera, electrons_per_adu=0.25)
+    )
+    background = uniform_optical_calibration(
+        microscope,
+        (1, *shape[-2:]),
+        geometry="cartesian",
+        photon_budget=(2000, 0),
+    )[0]
     for time, position, channel in np.ndindex(shape[:3]):
         exposure = (1 + time / 4 + channel / 2 + position / 8) * illumination_factor
-        observation = simulated_camera(
-            (1, *shape[-2:]),
-            geometry="cartesian",
-            # Uniform excitation scales the emission dose before optics
-            # and detection; this factor does not change detector QE.
-            exposure=exposure,
-            seed=42 + 100 * time + 10 * position + channel,
-            # A prescribed calibration dose supports absolute camera-noise
-            # accuracy without clipping the ADC, including doubled exposure.
-            budget=(1000, 0),
-        )
         # The uniform fluorescent background spans the full physical detector,
         # independently of the compact point object's finite storage domain.
-        optical = (
-            observation.expectation[0]
-            + exposure
-            * uniform_optical_calibration(
-                observation.microscope,
-                (1, *shape[-2:]),
-                geometry="cartesian",
-                photon_budget=(2000, 0),
-            )[0]
-        )
+        optical = source[0] * exposure + exposure * background
         expectation[time, position, channel] = optical
         raw_data[time, position, channel] = digitize(
             optical,
-            observation.microscope.camera,
+            microscope.camera,
             seed=42 + 100 * time + 10 * position + channel,
         )
     assert raw_data.max() < np.iinfo(np.uint16).max
@@ -207,18 +134,18 @@ def opm_v2_projection_zarr(
         name="opm_v2_projection",
         mode=mode,
         suffix=".zarr",
-        camera_read_noise_e=observation.microscope.camera.read_noise_e,
+        camera_read_noise_e=microscope.camera.read_noise_e,
         stage_positions_zxy=tuple(
             (
                 4.0,
                 20.0,
-                30.0 + p * (shape[-1] + 2) * observation.microscope.pixel_size_um,
+                30.0 + p * (shape[-1] + 2) * microscope.pixel_size_um,
             )
             for p in range(positions)
         ),
     )
     dataset.expectation = expectation[:, :, :, None]
-    dataset.microscope = observation.microscope
+    dataset.microscope = microscope
     return dataset
 
 
@@ -253,11 +180,32 @@ def simulated_acquisition_metadata(
 
 
 def write_simulated_acquisition(metadata: AcquisitionMetadata, raw: np.ndarray) -> None:
-    """Persist simulated camera pixels and their physical acquisition metadata."""
-    frames = []
+    """Write prescribed camera metadata and pixels for isolated component units."""
+    index_sizes = dict(zip("tpc", raw.shape[:3], strict=True))
+    if raw.shape[3] > 1:
+        index_sizes["z"] = raw.shape[3]
+    collection = create_position_collection(
+        metadata.path,
+        raw.shape,
+        (1.0, metadata.pixel_size_um, metadata.pixel_size_um),
+        stage_positions=metadata.stage_positions_zxy,
+        channels=tuple(channel.name for channel in metadata.channels),
+        attributes={
+            "opm_v2": {
+                "index_sizes": index_sizes,
+                "acquisition_order": [
+                    axis for axis in metadata.axes if axis not in {"y", "x"}
+                ],
+                "configuration": {"acq_config": {}},
+            }
+        },
+        chunks=(1, 1, 1, *raw.shape[-2:]),
+    )
+    frame_count = 0
     for position, (stage_z, stage_x, stage_y) in enumerate(
         metadata.stage_positions_zxy
     ):
+        frames = []
         for time in range(metadata.shape[0]):
             for scan in range(min(2, metadata.shape[3])):
                 for channel in metadata.channels:
@@ -300,7 +248,7 @@ def write_simulated_acquisition(metadata: AcquisitionMetadata, raw: np.ndarray) 
                             pixel_size_um=metadata.pixel_size_um,
                             camera_offset=metadata.camera_offset,
                             camera_conversion=metadata.camera_conversion,
-                            runner_time_ms=float(len(frames)),
+                            runner_time_ms=float(frame_count),
                             exposure_ms=(
                                 1000 * metadata.plane_period_s / len(metadata.channels)
                                 if metadata.plane_period_s is not None
@@ -309,13 +257,11 @@ def write_simulated_acquisition(metadata: AcquisitionMetadata, raw: np.ndarray) 
                             hardware_triggered=True,
                         )
                     )
-    write_synthetic_acquisition_zarr(
-        path=metadata.path,
-        raw_data=raw,
-        labels=metadata.axes,
-        chunks=(1, 1, 1, 1, *metadata.shape[-2:]),
-        frame_metadatas=frames,
-    )
+                    frame_count += 1
+        collection.arrays[position].write(raw[:, position]).result()
+        update_group_attributes(
+            metadata.path / str(position), {"ome_writers": {"frame_metadata": frames}}
+        )
 
     if metadata.deconvolution is not None:
         update_group_attributes(
@@ -549,7 +495,7 @@ def acquisition_factory(tmp_path):
     The factory accepts a TPCZYX array, a dataset name, a scan mode and keyword
     overrides of AcquisitionMetadata fields. Defaults describe a 30 degree OPM
     with 115 nm detector pixels, 400 nm scans, 100 ADU offset and 0.25 photons/ADU.
-    It returns the path, metadata, original pixels and reopened disk collection.
+    It returns the path, metadata and original pixels.
     This fixture does not establish compatibility with the actual opm-v2 writer.
     """
 
@@ -572,7 +518,6 @@ def acquisition_factory(tmp_path):
             path=metadata.path,
             metadata=metadata,
             raw_data=raw_data,
-            collection=open_position_collection(metadata.path),
         )
 
     return create

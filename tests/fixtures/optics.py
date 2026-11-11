@@ -124,19 +124,10 @@ def independent_photon_scene_factory(microscope_parameters, simulation_parameter
 
 
 @pytest.fixture(scope="session")
-def simulated_camera(
+def optical_camera_data(
     microscope_parameters, simulation_parameters, independent_photon_scene_factory
 ):
-    """Cache native noisy camera fields and preserve their acquired scan coordinates.
-
-    Returns
-    -------
-    callable
-        Render an SYX acquisition using the single forward model. The result
-        contains the object, optical calibration, camera means and unsigned ADU.
-        Geometry, exposure and detector calibration are explicit inputs.
-    """
-    from tests.simulation.camera import digitize
+    """Share immutable optical means independently of detector realizations."""
 
     @lru_cache(maxsize=8)
     def optical_data(
@@ -175,6 +166,14 @@ def simulated_camera(
             microscope,
         )
         return scene, microscope, freeze_metadata(expectation)
+
+    return optical_data
+
+
+@pytest.fixture(scope="session")
+def simulated_camera(simulation_parameters, optical_camera_data):
+    """Cache native noisy fields while preserving acquired scan coordinates."""
+    from tests.simulation.camera import digitize
 
     @lru_cache(maxsize=2)
     def render(
@@ -225,7 +224,7 @@ def simulated_camera(
                 expectation=native.expectation[::factor],
                 raw=native.raw[::factor],
             )
-        scene, microscope, expectation = optical_data(
+        scene, microscope, expectation = optical_camera_data(
             shape,
             kind=kind,
             large=large,

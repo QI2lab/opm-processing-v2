@@ -114,9 +114,8 @@ def test_position_collection_multiscales_preserve_spatial_metadata(
     assert reopened_collection.voxel_size_um == (0.346, 0.115, 0.117)
     assert reopened_collection.stage_positions_zxy == ((1.235, 2.346, 3.457),)
     assert reopened_collection.spatial_origins_zyx_um == ((4.568, 5.679, 6.789),)
-    opened_collection = open_position_collection(path)
-    assert opened_collection.multiscale_factors_yx == (1, 2, 4)
-    assert opened_collection.multiscale_downsample == downsample
+    assert reopened_collection.multiscale_factors_yx == (1, 2, 4)
+    assert reopened_collection.multiscale_downsample == downsample
 
 
 @pytest.mark.unit

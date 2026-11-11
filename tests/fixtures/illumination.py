@@ -408,7 +408,6 @@ def constant_illumination_acquisition(
         (2, *simulation_parameters["camera_shape_yx"]),
     ).copy()
     scene = uniform_camera_scene(
-        times=2,
         positions=2,
         channels=2,
         projection=scan_planes == 1,

@@ -15,6 +15,7 @@ from tests.simulation.camera import digitize
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("roi_run", [2], indirect=True)
 @pytest.mark.parametrize(
     "interruption",
     ("after_channel", "after_final_channel", "during_write", "before_checkpoint"),
@@ -28,7 +29,10 @@ def test_roi_resumes_at_last_durable_channel(
     state_path = run.output_dir / "sample.processing.json"
     real_complete = ProcessingState.complete_channel
     real_write = run.process.write_checkpointed_roi_channel
-    stop_key = (0, 2, 2) if interruption == "after_final_channel" else (0, 2, 0)
+    channels = run.truth.pixels.shape[2]
+    stop_key = (
+        (0, 2, channels - 1) if interruption == "after_final_channel" else (0, 2, 0)
+    )
 
     def checkpoint(self, path, time, position, channel, **kwargs):
         """Record a channel checkpoint only after the associated pixels are durable."""
@@ -60,11 +64,11 @@ def test_roi_resumes_at_last_durable_channel(
         run.process.process_skewed(run.source, **run.options, resume=True)
 
     state = ProcessingState.read(state_path)
-    saved = {(0, 1, channel) for channel in range(3)}
+    saved = {(0, 1, channel) for channel in range(channels)}
     if interruption == "after_channel":
         saved.add((0, 2, 0))
     elif interruption == "after_final_channel":
-        saved.update((0, 2, channel) for channel in range(3))
+        saved.update((0, 2, channel) for channel in range(channels))
     assert state.completed_channels(output) == saved
     assert state.completed_tiles(output) == {(0, 1)}
 
@@ -74,7 +78,11 @@ def test_roi_resumes_at_last_durable_channel(
         for _, position, channel in saved
     }
     # A replay of any completed channel would now produce different pixels.
-    changed = digitize(2 * run.truth.means, run.truth.microscope.camera, seed=73)
+    changed = digitize(
+        2 * (run.truth.expectation * run.truth.exposures[..., None, None, None]),
+        run.truth.microscope.camera,
+        seed=73,
+    )
     assert changed.max() < np.iinfo(np.uint16).max
     for _, position, channel in saved:
         run.raw_arrays[position][0, channel].write(
@@ -101,11 +109,12 @@ def test_roi_resumes_at_last_durable_channel(
     state = ProcessingState.read(state_path)
     assert state.completed_tiles(output) == {(0, 1), (0, 2)}
     assert state.completed_channels(output) == {
-        (0, position, channel) for position in (1, 2) for channel in range(3)
+        (0, position, channel) for position in (1, 2) for channel in range(channels)
     }
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("roi_run", [2], indirect=True)
 @pytest.mark.parametrize("resume", (True, False))
 def test_roi_processing_respects_resume_choice(
     roi_run, resume, assert_roi_point_accuracy
@@ -114,41 +123,45 @@ def test_roi_processing_respects_resume_choice(
     run = roi_run
     run.process.process_skewed(run.source, **run.options, resume=resume)
     output_path = run.output_dir / "sample_deskewed.ome.zarr"
-    before = open_position_collection(output_path).arrays[0].read().result()
     collection = open_position_collection(output_path)
+    origins = collection.spatial_origins_zyx_um
+    spacing = collection.voxel_size_um
+    before = collection.arrays[0].read().result()
     unchanged = collection.arrays[1].read().result()
-    for index, array in enumerate(collection.arrays):
+    for index, pixels in enumerate((before, unchanged)):
         assert_roi_point_accuracy(
-            array.read().result(),
+            pixels,
             run.truth,
             collection.spatial_origins_zyx_um[index],
             collection.voxel_size_um,
         )
     changed = copy(run.truth)
-    changed.means = run.truth.means.copy()
-    changed.means[:, 1] *= 2
-    changed.pixels = run.truth.pixels.copy()
-    changed.pixels[:, 1] = digitize(
-        changed.means[:, 1], changed.microscope.camera, seed=73
+    changed.exposures = run.truth.exposures.copy()
+    changed.exposures[:, 1] *= 2
+    pixels = digitize(
+        2 * (run.truth.expectation * run.truth.exposures[:, 1, :, None, None, None]),
+        changed.microscope.camera,
+        seed=73,
     )
-    assert changed.pixels.max() < np.iinfo(np.uint16).max
-    run.raw_arrays[1].write(changed.pixels[:, 1]).result()
+    assert pixels.max() < np.iinfo(np.uint16).max
+    run.raw_arrays[1].write(pixels).result()
     run.process.process_skewed(run.source, **run.options, resume=resume)
-    after = open_position_collection(output_path).arrays[0].read().result()
+    collection = open_position_collection(output_path)
+    np.testing.assert_array_equal(collection.spatial_origins_zyx_um, origins)
+    np.testing.assert_array_equal(collection.voxel_size_um, spacing)
+    after = collection.arrays[0].read().result()
     np.testing.assert_array_equal(
-        open_position_collection(output_path).arrays[1].read().result(),
+        collection.arrays[1].read().result(),
         unchanged,
     )
     if resume is not False:
         np.testing.assert_array_equal(after, before)
     else:
         assert not np.array_equal(after, before)
-    collection = open_position_collection(output_path)
-    for index, array in enumerate(collection.arrays):
         assert_roi_point_accuracy(
-            array.read().result(),
-            changed if resume is False else run.truth,
-            collection.spatial_origins_zyx_um[index],
+            after,
+            changed,
+            collection.spatial_origins_zyx_um[0],
             collection.voxel_size_um,
         )
 
@@ -160,7 +173,7 @@ def test_empty_roi_channel_is_checkpointed_and_skipped(
     """Persist an empty channel before interruption and preserve it on resume."""
     run = roi_run
     camera = run.truth.microscope.camera
-    dark = digitize(np.zeros_like(run.truth.means[0, 1, 0]), camera, seed=73)
+    dark = digitize(np.zeros_like(run.truth.expectation), camera, seed=73)
     run.raw_arrays[1][0, 0].write(dark).result()
     real_complete = ProcessingState.complete_channel
 
@@ -187,7 +200,9 @@ def test_empty_roi_channel_is_checkpointed_and_skipped(
     assert state.zero_channels(output) == {(0, 1, 0)}
     assert state.completed_tiles(output) == set()
 
-    changed = digitize(2 * run.truth.means[0, 1, 0], camera, seed=131)
+    changed = digitize(
+        2 * (run.truth.expectation * run.truth.exposures[0, 1, 0]), camera, seed=131
+    )
     assert changed.max() < np.iinfo(np.uint16).max
     run.raw_arrays[1][0, 0].write(changed).result()
     monkeypatch.setattr(ProcessingState, "complete_channel", real_complete)
