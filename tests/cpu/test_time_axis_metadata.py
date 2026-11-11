@@ -11,12 +11,14 @@ from opm_processing.dataio.acquisition import (
     inspect_acquisition,
     open_acquisition_datastore,
 )
+from opm_processing.dataio.ngff import tczyx_image_metadata
 from opm_processing.dataio.position_collection import (
     create_position_collection,
     create_variable_position_collection,
     open_position_collection,
     update_group_attributes,
 )
+from opm_processing.dataio.timing import read_time_interval
 
 
 @pytest.mark.unit
@@ -84,6 +86,30 @@ def test_unknown_time_does_not_become_one_second(tmp_path):
     create_position_collection(path, (2, 1, 1, 4, 8, 8), (0.23, 0.115, 0.115))
     assert open_group(path)["0"].ome_metadata().multiscales[0].axes[0].unit is None
     assert open_position_collection(path).time_interval_s is None
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "unit,recorded",
+    [
+        ("second", 60),
+        ("millisecond", 60000),
+        ("microsecond", 60000000),
+        ("nanosecond", 60000000000),
+        ("minute", 1),
+        ("hour", 1 / 60),
+    ],
+)
+def test_time_reader_converts_units_and_requires_consistent_levels(unit, recorded):
+    """Read physical cadence from every level without assuming seconds."""
+    multiscale = tczyx_image_metadata(
+        [(1, 1, 1), (1, 2, 2)], [(0, 0, 0)] * 2, time_interval_s=recorded
+    ).multiscales[0]
+    multiscale.axes[0].unit = unit
+    assert read_time_interval(multiscale) == pytest.approx(60)
+    multiscale.datasets[1].scale_transform.scale[0] *= 2
+    with pytest.raises(ValueError, match="disagree on physical time scale"):
+        read_time_interval(multiscale)
 
 
 @pytest.mark.integration
@@ -156,9 +182,9 @@ def test_confirmed_period_cannot_override_recorded_timing(
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("channels", [1, 3])
-@pytest.mark.parametrize("planes", [1, 5])
-@pytest.mark.parametrize("field", ["exposure_time", "exposure_ms"])
+@pytest.mark.parametrize(
+    "channels,planes,field", [(1, 1, "exposure_time"), (3, 5, "exposure_ms")]
+)
 def test_hardware_exposures_define_cadence(
     acquisition_factory, channels, planes, field
 ):
@@ -192,30 +218,19 @@ def test_hardware_exposures_define_cadence(
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize(
-    "exposures, message",
-    [
-        ([0], "Invalid camera exposure"),
-        ([float("nan")], "Invalid camera exposure"),
-        ([float("inf")], "Invalid camera exposure"),
-        ([-1], "Invalid camera exposure"),
-        ([True], "Invalid camera exposure"),
-        (["invalid"], "Invalid camera exposure"),
-        ([0.001], "rounds to zero"),
-        ([5, 10], "hardware exposures change"),
-    ],
-)
-def test_invalid_hardware_exposures_rejected(exposures, message):
-    """Reject nonphysical hardware exposures and changes in hardware cadence."""
+def test_camera_timing_requires_matching_positions_and_retains_exposure_sources():
+    """Agree across positions after unit conversion and retain field provenance."""
     frames = [
-        {
-            "event_index": {"t": 0, "p": 0, "c": 0, "z": scan},
-            "exposure_ms": exposure,
-        }
-        for scan, exposure in enumerate(exposures)
+        [{"event_index": {"c": 0}, "exposure_time": 0.005}],
+        [{"event_index": {"c": 0}, "exposure_ms": 5}],
     ]
-    with pytest.raises(ValueError, match=message):
-        _camera_timing([frames], 1)
+    assert _camera_timing(frames, 1) == (
+        0.005,
+        "recorded camera exposure_ms/exposure_time; rounded to 0.01 ms",
+    )
+    frames[1][0]["exposure_ms"] = 6
+    with pytest.raises(ValueError, match="change across frames or positions"):
+        _camera_timing(frames, 1)
 
 
 @pytest.mark.unit

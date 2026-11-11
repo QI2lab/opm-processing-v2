@@ -381,6 +381,45 @@ def test_expanded_cache_uses_initial_settings_and_restores_final_limits(
         },
         "retries": 1,
     }
+    limits = record["effective_registration_limits"]
+    for field, invalid, message in (
+        ("effective_registration_limits", None, "lacks effective retry limits"),
+        (
+            "effective_registration_limits",
+            {**limits, "maximum_zyx": [17, 299]},
+            "Invalid effective registration limits",
+        ),
+        (
+            "effective_registration_limits",
+            {**limits, "pairs": {"0,1": [17, -1, 33]}},
+            "Invalid effective registration limits",
+        ),
+        (
+            "effective_registration_limits",
+            {**limits, "retries": -1},
+            "Invalid effective registration limits",
+        ),
+        (
+            "pairwise_metrics",
+            {"0,1": [np.nan, 0, 0, 0.9]},
+            "invalid registration metrics",
+        ),
+        ("pairwise_metrics", {"0,1": [0, 0, 0, 0]}, "invalid registration metrics"),
+        ("pairwise_metrics", {"0,1": [0, 0, 0]}, "invalid registration metrics"),
+    ):
+        original = record[field]
+        record[field] = invalid
+        reopened.save()
+        fusion.processing_state = ProcessingState.read(reopened.path)
+        with pytest.raises(ValueError, match=message):
+            fusion.load_pairwise_metrics()
+        assert fusion.pairwise_metrics == {(0, 1): (15, -284, 0, 0.9)}
+        assert fusion._pair_registration_limits == final_pairs
+        assert fusion.max_registration_shift_zyx == (17, 299, 33)
+        assert fusion._registration_retry_count == 1
+        record[field] = original
+    reopened.save()
+    fusion.processing_state = reopened
     with pytest.raises(ValueError, match="settings do not match"):
         reopened.registration(
             fusion.data,

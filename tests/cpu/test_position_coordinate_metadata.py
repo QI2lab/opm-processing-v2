@@ -5,6 +5,7 @@ import pytest
 from ome_types import from_xml
 from yaozarrs import open_group
 
+from opm_processing.dataio.ngff import pyramid_yx_sampling, tczyx_image_metadata
 from opm_processing.dataio.position_collection import (
     create_position_collection,
     create_variable_position_collection,
@@ -13,6 +14,28 @@ from opm_processing.dataio.position_collection import (
 )
 
 pytestmark = pytest.mark.unit
+
+
+@pytest.mark.parametrize(
+    "scales,origins,message",
+    [
+        ([(1, 2, 3)], [(0, 0, 0)], "equal integer YX scale factors"),
+        ([(1, 1.5, 1.5)], [(0, 0, 0)], "equal integer YX scale factors"),
+        ([(1, 2, 2)], [(0, 0.25, 0.25)], "origins do not match"),
+        (
+            [(1, 2, 2), (1, 4, 4)],
+            [(0, 0, 0), (0, 1.5, 1.5)],
+            "levels disagree on YX sampling",
+        ),
+    ],
+)
+def test_pyramid_reader_rejects_inconsistent_physical_grids(scales, origins, message):
+    """Reject unsupported sampling rather than misplacing coarser pixels."""
+    multiscale = tczyx_image_metadata(
+        [(1, 1, 1), *scales], [(0, 0, 0), *origins]
+    ).multiscales[0]
+    with pytest.raises(ValueError, match=message):
+        pyramid_yx_sampling(multiscale)
 
 
 @pytest.mark.parametrize(
