@@ -57,15 +57,26 @@ def test_depth_registration_handles_large_xy_drift(
         renderer = block_fusion(
             [volume[None] for volume in pair.volumes],
             origins,
-            pair.truth.shape,
+            pair.union_shape,
             block_shape=[1, 1, 7, 31, 37],
             output_dtype=np.dtype(np.float32),
         )
         renderer._fuse_by_blocks()
         actual = renderer.fused_ts.read().result()[0, 0]
+        # Unity feathering gives the arithmetic mean of the acquired operands.
+        total = np.zeros(pair.union_shape, np.float64)
+        count = np.zeros(pair.union_shape, np.uint8)
+        for start, raw in zip(pair.starts, pair.volumes, strict=True):
+            selection = tuple(
+                slice(offset, offset + length)
+                for offset, length in zip(start, raw.shape, strict=True)
+            )
+            total[selection] += raw
+            count[selection] += 1
+        expected = np.divide(total, count, out=np.zeros_like(total), where=count > 0)
         np.testing.assert_allclose(
             actual,
-            pair.expected_pixels,
+            expected,
             rtol=2e-6,
             atol=0,
         )

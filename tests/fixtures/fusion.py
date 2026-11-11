@@ -345,7 +345,7 @@ def registration_observation_pair(registration_specimen):
         )
         scene.expectation = freeze_metadata(scene.expectation)
         starts = (np.maximum(0, -delta), np.maximum(0, delta))
-        volumes, means = [], []
+        volumes = []
         for index, start in enumerate(starts):
             selection = tuple(
                 slice(offset, offset + length)
@@ -353,13 +353,11 @@ def registration_observation_pair(registration_specimen):
             )
             # These are analytical Cartesian operands, not raw OPM frames.
             expected = scene.expectation[selection]
-            means.append(expected)
             volumes.append(
                 digitize(expected, scene.microscope.camera, seed=seed + index + 1)
             )
         return SimpleNamespace(
             volumes=freeze_metadata(volumes),
-            means=freeze_metadata(means),
             starts=freeze_metadata(starts),
             scene=scene,
         )
@@ -378,29 +376,13 @@ def shifted_slab_pair(registration_observation_pair):
         shift = np.asarray(correction, dtype=int)
         delta = shift + np.array((nominal_step, 0, 0))
         observation = registration_observation_pair(shape, tuple(delta), seed=seed)
-        union_shape = observation.scene.expectation.shape
-        total = np.zeros(union_shape, np.float64)
-        count = np.zeros(union_shape, np.uint8)
-        for start, raw in zip(observation.starts, observation.volumes, strict=True):
-            selection = tuple(
-                slice(offset, offset + length)
-                for offset, length in zip(start, shape, strict=True)
-            )
-            total[selection] += raw
-            count[selection] += 1
-        # With unity feathering, two coincident measurements have the closed
-        # arithmetic-mean expectation; it is independent of the block renderer.
-        expected_pixels = np.divide(
-            total, count, out=np.zeros_like(total), where=count > 0
-        )
         return SimpleNamespace(
             volumes=observation.volumes,
             positions=[(0, 0, 0), (nominal_step * spacing[0], 0, 0)],
             spacing=spacing,
             expected=shift,
-            truth=observation.scene.expectation,
+            union_shape=observation.scene.expectation.shape,
             starts=observation.starts,
-            expected_pixels=expected_pixels,
         )
 
     return create
