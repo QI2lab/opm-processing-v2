@@ -564,6 +564,17 @@ def test_nonuniform_response_preserves_uniform_fluorescence(
 
     case = uniform_response_case
     response, truth, psf, measured = case.response, case.truth, case.psf, case.measured
+    restored = np.empty_like(truth)
+    written = 0
+
+    def collect_chunk(core, start, stop):
+        """Consume actual finalized cores and require complete ordered coverage."""
+        nonlocal written
+        assert start == written
+        assert core.shape == (stop - start, *truth.shape[1:])
+        restored[start:stop] = core
+        written = stop
+
     successful_crops = []
     pool = (
         cupy_gpu.get_default_memory_pool()
@@ -582,7 +593,7 @@ def test_nonuniform_response_preserves_uniform_fluorescence(
     )
     try:
         with allocator:
-            restored = solver.rlgc(
+            result = solver.rlgc(
                 measured,
                 psf,
                 crop_scan=crop_scan,
@@ -590,12 +601,15 @@ def test_nonuniform_response_preserves_uniform_fluorescence(
                 verbose=0,
                 storage=storage,
                 on_successful_crop_scan=successful_crops.append,
+                on_reconstructed_chunk=collect_chunk,
             )
     finally:
         if pool is not None:
             assert pool.get_limit() == gpu_budget
             pool.free_all_blocks()
             pool.set_limit(size=original_limit)
+    assert result is None
+    assert written == truth.shape[0]
     np.testing.assert_allclose(restored, truth, rtol=2e-6, atol=2e-3)
     (successful_crop,) = successful_crops
     if gpu_budget is not None and scan_planes == 32 and crop_scan == 20:

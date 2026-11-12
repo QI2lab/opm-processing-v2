@@ -197,6 +197,10 @@ This is distinct from a pooled whole-volume KL
 divergence. Haloed reconstruction checkpoints, owned rollback cores and the actual
 random-generator state are parked in system RAM. Each chunk is visited at most
 twice, continuing only missing updates without replaying completed iterations.
+Acquisition processing consumes finalized cores in scan order, deskewing and
+writing each core while the GPU continues the next one. It does not assemble a
+second full reconstruction. The array API still returns the complete volume
+unless `on_reconstructed_chunk` is supplied.
 GPU working memory remains bounded by the active chunk; RAM checkpoint storage
 grows with the number and extent of overlapping chunks. Initialization and random
 halves remain per chunk, so tiled and whole-volume reconstructions need not match.

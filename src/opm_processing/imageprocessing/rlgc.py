@@ -874,6 +874,7 @@ def _iterate_rlgc(
     smooth: Callable,
     region: tuple[slice, slice, slice],
     *,
+    sensitivity: Array,
     gradient_consensus: bool,
     max_iterations: int | None,
     limit: float,
@@ -905,6 +906,8 @@ def _iterate_rlgc(
         Apply the optical smoothing used by the consensus gate.
     region : tuple of slice
         Unpadded acquired-pixel region used for KL scoring.
+    sensitivity : array-like
+        Adjoint image of unit detector values for this optical geometry.
     gradient_consensus : bool
         Use the reference GC gate and split-image stopping when True.
     max_iterations : int or None
@@ -943,7 +946,6 @@ def _iterate_rlgc(
     variance = _read_noise_variance(read_noise)
     if logger is not None:
         logger.info("%spreparing sensitivity and reconstruction state", log_prefix)
-    sensitivity = xp.maximum(adjoint(xp.ones_like(observed)), xp.float32(1e-12))
     if _checkpoint is not None and _checkpoint.estimate is not None:
         recon, rng = _checkpoint.restore(xp)
         completed = _checkpoint.iterations
@@ -1145,6 +1147,7 @@ def _rlgc_once(
     storage: str = "gpu",
     _checkpoint: _RlgcCheckpoint | None = None,
     _finalize: bool = False,
+    _optical_state: dict | None = None,
 ) -> np.ndarray:
     """Deconvolve calibrated data with the paper's RL and consensus equations.
 
@@ -1193,6 +1196,8 @@ def _rlgc_once(
         Per-chunk continuation for the shared KL-selected iteration budget.
     _finalize : bool
         Return owned output instead of parking another continuation.
+    _optical_state : dict or None
+        Convolution and sensitivity reused for one chunk geometry within a channel.
     gpu_id, safe_mode, pad_yx, normalize_psf, release_memory, logger, log_prefix
         Device, compatibility, padding, normalization and execution diagnostics.
         safe_mode is retained for compatibility; KL always requires both halves.
@@ -1209,14 +1214,17 @@ def _rlgc_once(
     if psf.ndim == 2:
         psf = psf[None]
     for name, array in (("image", image), ("psf", psf)):
-        if array.ndim != 3 or not array.size or not np.isfinite(array).all():
-            raise ValueError(f"{name} must be a finite nonempty 2D or 3D array")
+        if array.ndim != 3 or not array.size:
+            raise ValueError(f"{name} must be a nonempty 2D or 3D array")
     if (
-        np.any(psf < 0)
+        not np.isfinite(psf).all()
+        or np.any(psf < 0)
         or psf.sum(dtype=np.float64) <= 0
         or any(n % 2 == 0 for n in psf.shape)
     ):
-        raise ValueError("psf must be nonnegative with positive sum and odd dimensions")
+        raise ValueError(
+            "psf must be finite and nonnegative with positive sum and odd dimensions"
+        )
     for name, value in (
         ("scan_upsample_factor", scan_upsample_factor),
         ("max_iterations", max_iterations),
@@ -1256,6 +1264,8 @@ def _rlgc_once(
     image = _calibrated_observations(image)
     factor = int(scan_upsample_factor)
     fine_shape = ((image.shape[0] - 1) * factor + 1, *image.shape[1:])
+    if _optical_state is None:
+        _optical_state = {}
     try:
         with cp.cuda.Device(gpu_id):
             if not np.any(image):
@@ -1283,7 +1293,11 @@ def _rlgc_once(
                         "Reduce --decon-crop-scan or free host RAM."
                     )
             core = _observed_region_slices(padded_shape, pads)
-            convolve = _Convolution(psf, padded_shape, crop_scan, normalize_psf)
+            if "convolution" not in _optical_state:
+                _optical_state["convolution"] = _Convolution(
+                    psf, padded_shape, crop_scan, normalize_psf
+                )
+            convolve = _optical_state["convolution"]
             if logger is not None:
                 logger.info(
                     "%sRLGC object_shape=%s padded_shape=%s FFT_tile=%s storage=%s (%.2f GiB per float32 state array)",
@@ -1458,6 +1472,10 @@ def _rlgc_once(
                     slice(start + offset, stop + offset),
                     *(core[1:] if reflected else (slice(None), slice(None))),
                 )
+            if "sensitivity" not in _optical_state:
+                _optical_state["sensitivity"] = xp.maximum(
+                    adjoint(xp.ones_like(observed)), xp.float32(1e-12)
+                )
             recon = _iterate_rlgc(
                 observed,
                 shape,
@@ -1465,6 +1483,7 @@ def _rlgc_once(
                 adjoint,
                 smooth,
                 region,
+                sensitivity=_optical_state["sensitivity"],
                 gradient_consensus=gradient_consensus,
                 max_iterations=max_iterations,
                 limit=limit,
@@ -1556,8 +1575,9 @@ def _chunked_rlgc_once(
     rng_seed: int | None,
     logger: logging.Logger | None,
     log_prefix: str,
+    on_reconstructed_chunk: Callable[[np.ndarray, int, int], None] | None = None,
     **solver_options: object,
-) -> np.ndarray:
+) -> np.ndarray | None:
     """Schedule haloed scan chunks with Ryomen and bounded device state.
 
     Parameters
@@ -1573,13 +1593,17 @@ def _chunked_rlgc_once(
         Destination for chunk and iteration diagnostics.
     log_prefix : str
         Context prepended to diagnostic messages.
+    on_reconstructed_chunk : callable or None
+        Consume finalized owned cores and their fine-scan bounds in ascending order.
+        None assembles and returns the full reconstruction.
     solver_options : keyword arguments
         Optical, numerical, device and storage options for the same RLGC engine.
 
     Returns
     -------
-    numpy.ndarray
+    numpy.ndarray or None
         Full float32 output assembled from disjoint retained chunk interiors.
+        A callback receives those interiors instead, without allocating that output.
         KL-enabled chunks park continuation state in system RAM.
     """
     factor = solver_options.get("scan_upsample_factor", 1)
@@ -1596,7 +1620,7 @@ def _chunked_rlgc_once(
     # retries. Per-chunk cleanup repeatedly rebuilds the same expensive plans.
     solver_options["release_memory"] = False
     if crop_scan >= fine_scan or not np.any(work):
-        return _rlgc_once(
+        result = _rlgc_once(
             image,
             psf,
             rng_seed=rng_seed,
@@ -1604,6 +1628,10 @@ def _chunked_rlgc_once(
             log_prefix=log_prefix,
             **solver_options,
         )
+        if on_reconstructed_chunk is not None:
+            on_reconstructed_chunk(result, 0, fine_scan)
+            return None
+        return result
     if solver_options.get("initial_estimate") is not None:
         raise ValueError(
             "An explicit initial_estimate requires full-frame deconvolution"
@@ -1616,7 +1644,7 @@ def _chunked_rlgc_once(
     if retained + 2 * halo >= work.shape[0]:
         # The entire input fits one haloed chunk. Ryomen clamps larger crops to
         # the image size, which can leave no retained interior for short inputs.
-        return _rlgc_once(
+        result = _rlgc_once(
             image,
             psf,
             rng_seed=rng_seed,
@@ -1624,13 +1652,18 @@ def _chunked_rlgc_once(
             log_prefix=log_prefix,
             **solver_options,
         )
+        if on_reconstructed_chunk is not None:
+            on_reconstructed_chunk(result, 0, fine_scan)
+            return None
+        return result
     slices = Slicer(
-        work,
-        crop_size=(retained + 2 * halo, *work.shape[1:]),
+        work[:, :1, :1],
+        crop_size=(retained + 2 * halo, 1, 1),
         overlap=(halo, 0, 0),
         pad=True,
     )
-    # Ask Ryomen for layout once; keep only coordinates, never duplicated crops.
+    # Only scan coordinates are needed; avoid padding full camera planes just
+    # to obtain Ryomen's layout. Reconstruction reads the original work below.
     layouts = []
     owned_stop = 0
     for tile_index, (crop, source, destination) in enumerate(slices):
@@ -1669,8 +1702,13 @@ def _chunked_rlgc_once(
             log_prefix,
             tile_count,
             solver_options,
+            on_reconstructed_chunk=on_reconstructed_chunk,
         )
-    output = np.empty((fine_scan, *work.shape[1:]), dtype=np.float32)
+    output = (
+        np.empty((fine_scan, *work.shape[1:]), dtype=np.float32)
+        if on_reconstructed_chunk is None
+        else None
+    )
     for tile_index, source_start, source_stop, dest_start, dest_stop in tqdm(
         layouts, desc="decon", unit="chunk", leave=False
     ):
@@ -1694,10 +1732,12 @@ def _chunked_rlgc_once(
             **solver_options,
         )
         local_start = dest_start - source_start * factor
-        output[dest_start:dest_stop] = reconstructed[
-            local_start : local_start + dest_stop - dest_start
-        ]
-        del reconstructed
+        core = reconstructed[local_start : local_start + dest_stop - dest_start]
+        if on_reconstructed_chunk is None:
+            output[dest_start:dest_stop] = core
+        else:
+            on_reconstructed_chunk(core, dest_start, dest_stop)
+        del core, reconstructed
     return output
 
 
@@ -1712,7 +1752,8 @@ def _shared_kl_chunks(
     log_prefix: str,
     tile_count: int,
     solver_options: dict,
-) -> np.ndarray:
+    on_reconstructed_chunk: Callable[[np.ndarray, int, int], None] | None = None,
+) -> np.ndarray | None:
     """Continue parked Ryomen chunks to the latest first-local-KL trigger.
 
     Each initial visit records the accepted and provisional owned cores and
@@ -1757,7 +1798,11 @@ def _shared_kl_chunks(
             shapes, layouts, strict=True
         )
     )
-    output_bytes = fine_scan * math.prod(work.shape[1:]) * 4
+    output_bytes = (
+        fine_scan * math.prod(work.shape[1:]) * 4
+        if on_reconstructed_chunk is None
+        else 0
+    )
     workspace_bytes = (
         max(math.prod(shape) for shape in shapes) * 4 * (10 if storage == "host" else 3)
     )
@@ -1776,7 +1821,11 @@ def _shared_kl_chunks(
             state_bytes,
             workspace_bytes,
         )
-    output = np.zeros((fine_scan, *work.shape[1:]), dtype=np.float32)
+    output = (
+        np.zeros((fine_scan, *work.shape[1:]), dtype=np.float32)
+        if on_reconstructed_chunk is None
+        else None
+    )
     checkpoints = {}
     completed_updates = 0
     observer = solver_options.get("callback")
@@ -1787,7 +1836,8 @@ def _shared_kl_chunks(
         if observer is not None:
             observer(iteration, recon)
 
-    options = dict(solver_options, callback=on_update)
+    optical_state = {}
+    options = dict(solver_options, callback=on_update, _optical_state=optical_state)
     # Allocate the largest optical working set first. Startup allocation fallback
     # remains available, but a later failure must never replay completed updates.
     order = sorted(
@@ -1814,12 +1864,18 @@ def _shared_kl_chunks(
                     dest_stop,
                     storage,
                 )
-            if shapes[index] != previous_shape:
+            current_shape = (stop - start, shapes[index])
+            if current_shape != previous_shape:
+                release_plans = (
+                    bool(optical_state) and shapes[index] != previous_shape[1]
+                )
+                optical_state.clear()
                 # Cached FFT plans own device workspaces. Release the preceding
                 # shape before allocating edge-chunk plans; state is already in RAM.
-                with cp.cuda.Device(solver_options.get("gpu_id", 0)):
-                    clear_rlgc_caches(clear_memory_pool=True)
-                previous_shape = shapes[index]
+                if release_plans:
+                    with cp.cuda.Device(solver_options.get("gpu_id", 0)):
+                        clear_rlgc_caches(clear_memory_pool=True)
+                previous_shape = current_shape
             _rlgc_once(
                 crop,
                 psf,
@@ -1852,11 +1908,20 @@ def _shared_kl_chunks(
             if checkpoints
             else "empty_observation"
         )
-        for index in tqdm(order, desc="decon finish", unit="chunk", leave=False):
+        finish_order = (
+            range(len(layouts)) if on_reconstructed_chunk is not None else order
+        )
+        for index in tqdm(finish_order, desc="decon finish", unit="chunk", leave=False):
+            tile, start, stop, dest_start, dest_stop = layouts[index]
             state = checkpoints.pop(index, None)
             if state is None:
+                if on_reconstructed_chunk is not None:
+                    on_reconstructed_chunk(
+                        np.zeros((dest_stop - dest_start, *work.shape[1:]), np.float32),
+                        dest_start,
+                        dest_stop,
+                    )
                 continue
-            tile, start, stop, dest_start, dest_stop = layouts[index]
             prefix = f"{log_prefix}chunk={tile + 1}/{tile_count} "
             if state.first_kl_stop == common_stop:
                 result = state.accepted
@@ -1868,10 +1933,16 @@ def _shared_kl_chunks(
             else:
                 if state.iterations < common_stop:
                     state.accepted = state.provisional = None
-                    if shapes[index] != previous_shape:
-                        with cp.cuda.Device(solver_options.get("gpu_id", 0)):
-                            clear_rlgc_caches(clear_memory_pool=True)
-                        previous_shape = shapes[index]
+                    current_shape = (stop - start, shapes[index])
+                    if current_shape != previous_shape:
+                        release_plans = (
+                            bool(optical_state) and shapes[index] != previous_shape[1]
+                        )
+                        optical_state.clear()
+                        if release_plans:
+                            with cp.cuda.Device(solver_options.get("gpu_id", 0)):
+                                clear_rlgc_caches(clear_memory_pool=True)
+                        previous_shape = current_shape
                     result = _rlgc_once(
                         work[start:stop],
                         psf,
@@ -1893,7 +1964,10 @@ def _shared_kl_chunks(
                     result = state.estimate[core][state.retained_scan]
                 else:
                     result = state.estimate[state.retained_scan]
-            output[dest_start:dest_stop] = result
+            if on_reconstructed_chunk is None:
+                output[dest_start:dest_stop] = result
+            else:
+                on_reconstructed_chunk(result, dest_start, dest_stop)
             if logger is not None:
                 logger.info("%sstop=%s iterations=%d", prefix, reason, common_stop)
             del state, result
@@ -1928,8 +2002,9 @@ def rlgc(
     fallback_step_scan: int | None = None,
     detector_response: np.ndarray | None = None,
     read_noise: float = 0.0,
+    on_reconstructed_chunk: Callable[[np.ndarray, int, int], None] | None = None,
     **solver_options: object,
-) -> np.ndarray:
+) -> np.ndarray | None:
     """Deconvolve raw scan chunks with bounded device state and shared KL stopping.
 
     The solver first attempts the requested ``crop_scan``. If CUDA memory
@@ -1988,6 +2063,13 @@ def rlgc(
         RMS read noise in the same calibrated units as image. Zero selects
         the photon-only branch; processing supplies the camera calibration.
 
+    on_reconstructed_chunk : callable or None
+        Consume each finalized float32 scan-YX core and its fine-grid start/stop
+        bounds synchronously, in ascending scan order. Shared-KL output starts
+        only after all chunks have selected the common iteration budget. Delivered
+        arrays are never modified again, but may view a chunk's checkpoint;
+        retain only needed context to bound memory. None assembles the output array.
+
     solver_options : keyword arguments
         Numerical parameters forwarded to the single engine: ``use_kl`` enables
         reference KL stopping; ``max_iterations`` is an optional safety cap;
@@ -2003,8 +2085,9 @@ def rlgc(
 
     Returns
     -------
-    numpy.ndarray
-        Deconvolved image as float32.
+    numpy.ndarray or None
+        Deconvolved image as float32, or None when finalized chunks were consumed
+        by on_reconstructed_chunk without assembling a full reconstruction.
     """
     image_arr = np.asarray(image)
     if logger is None and verbose > 0:
@@ -2049,6 +2132,14 @@ def rlgc(
     min_crop_scan = 1
     attempted_crop_scan = min(int(crop_scan), int(image_scan))
     solver_options.setdefault("storage", "gpu")
+    delivered_chunk = False
+
+    def deliver_chunk(core: np.ndarray, start: int, stop: int) -> None:
+        """Do not restart an attempt after its output consumer has advanced."""
+        nonlocal delivered_chunk
+        delivered_chunk = True
+        on_reconstructed_chunk(core, start, stop)
+
     if logger is not None:
         logger.info(
             "%sRLGC acquired_shape=%s PSF_shape=%s retained_scan=%d storage=%s",
@@ -2084,6 +2175,9 @@ def rlgc(
                     log_prefix=log_prefix,
                     detector_response=detector_response,
                     read_noise=read_noise,
+                    on_reconstructed_chunk=(
+                        deliver_chunk if on_reconstructed_chunk is not None else None
+                    ),
                     **solver_options,
                 )
             if release_memory:
@@ -2100,12 +2194,18 @@ def rlgc(
                     attempted_crop_scan,
                     crop_scan,
                 )
-            return output[0] if original_ndim == 2 else output
+            return output[0] if output is not None and original_ndim == 2 else output
         except Exception as exc:
-            if not _is_gpu_memory_error(exc):
+            allocation_error = _is_gpu_memory_error(exc)
+            if not allocation_error or delivered_chunk:
                 if release_memory:
                     with cp.cuda.Device(gpu_id):
                         clear_rlgc_caches(clear_memory_pool=True)
+                if allocation_error:
+                    raise RuntimeError(
+                        "RLGC allocation failed after delivering finalized chunks; "
+                        "refusing to replay reconstruction or output writes."
+                    ) from exc
                 raise
 
             if attempted_crop_scan == min_crop_scan:
