@@ -12,15 +12,15 @@ import multiprocessing as mp
 import sys
 import time
 import traceback
-from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from functools import partial
 from multiprocessing.connection import wait as wait_for_worker
 from pathlib import Path
-from tempfile import TemporaryFile
 from typing import TYPE_CHECKING, Annotated, Any
 
 import numpy as np
+import psutil
 import typer
 from ryomen import Slicer
 from tifffile import TiffFile, TiffWriter, imread
@@ -76,11 +76,12 @@ from opm_processing.imageprocessing.coordinates import (
 from opm_processing.imageprocessing.maxtilefusion import MaxTileFusion
 from opm_processing.imageprocessing.opmtools import (
     deskew_shape_estimator,
+    interpolate_rows,
     orthogonal_deskew,
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator, Sequence
+    from collections.abc import Callable, Iterable, Iterator, Sequence
     from multiprocessing.connection import Connection
 
     import tensorstore as ts
@@ -90,7 +91,6 @@ app.pretty_exceptions_enable = False
 
 # Reject cached fields made before depth estimates shared one maximum field.
 FLATFIELD_SOFTWARE = "opm-processing/basicpy-stage-z-max-camera-contract-v12"
-PROCESSING_TILE_SHAPE = (16, 256, 256)
 
 
 def progress_tile_groups(
@@ -342,50 +342,34 @@ def format_processed_output(data: np.ndarray, save_float32: bool) -> np.ndarray:
     """
     if save_float32:
         return data
-    return np.clip(data, 0, np.iinfo(np.uint16).max).astype(np.uint16)
+    output = np.empty(data.shape, dtype=np.uint16)
+    np.clip(data, 0, np.iinfo(np.uint16).max, out=output, casting="unsafe")
+    return output
 
 
 def write_processed_channel(target: Any, value: np.ndarray | np.generic) -> bool:
-    """Convert and write one channel in bounded tiles sized from storage chunks.
+    """Convert a completed channel in RAM and finish its TensorStore write.
 
     Parameters
     ----------
     target : Any
         Writable ZYX TensorStore selection for one output channel.
     value : numpy.ndarray or numpy.generic
-        Float32 image or scalar fill. A memory-mapped image remains disk-backed.
+        Float32 image or scalar fill.
 
     Returns
     -------
     bool
-        Whether any persisted output sample is nonzero. At most two converted
-        tiles are queued, and all writes finish before the source is released.
+        Whether any persisted output sample is nonzero. The write finishes
+        before the source is released.
     """
     if np.ndim(value) == 0:
         target.write(value).result()
         return bool(value)
-    tile_shape = tuple(
-        min(int(chunk), limit)
-        for chunk, limit in zip(
-            target.chunk_layout.write_chunk.shape, PROCESSING_TILE_SHAPE, strict=True
-        )
-    )
     save_float32 = np.dtype(target.dtype.numpy_dtype) == np.dtype(np.float32)
-    pending = deque()
-    has_signal = False
-    try:
-        for tile, source, destination in Slicer(
-            value, crop_size=tile_shape, overlap=(0, 0, 0), pad=False
-        ):
-            formatted = format_processed_output(tile[source], save_float32)
-            has_signal |= bool(np.any(formatted))
-            pending.append(target[destination].write(formatted))
-            if len(pending) >= 2:
-                pending.popleft().result()
-    finally:
-        for future in pending:
-            future.result()
-    return has_signal
+    formatted = format_processed_output(value, save_float32)
+    target.write(formatted).result()
+    return bool(np.any(formatted))
 
 
 def write_checkpointed_roi_channel(
@@ -418,7 +402,7 @@ def write_checkpointed_roi_channel(
     -------
     bool
         Whether the channel contains nonzero persisted values. Its checkpoint
-        is recorded only after every bounded output write finishes successfully.
+        is recorded only after the channel write finishes successfully.
     """
     has_signal = write_processed_channel(target, value)
     state.complete_channel(output_path, *channel_key, is_zero=is_zero or not has_signal)
@@ -453,69 +437,193 @@ def queue_position_pyramid_writes(
         Write futures that the caller must finish before checkpointing the tile.
     """
     writes = []
-    pending = deque()
-    try:
-        for factor, level_arrays in zip(
-            collection.multiscale_factors_yx, collection.multiscale_arrays, strict=False
-        ):
-            target = level_arrays[position][timepoint, channel]
-            if np.ndim(level_zero) == 0:
-                future = target.write(level_zero)
-                pending.append(future)
-            else:
-                save_float32 = np.dtype(target.dtype.numpy_dtype) == np.dtype(
-                    np.float32
-                )
-                # Strides remain views. Block means must retain the original
-                # base-dtype rounding while bounding their fine-grid input.
-                reduction = (
-                    factor if collection.multiscale_downsample == "block_mean" else 1
-                )
-                tile_shape = tuple(
-                    max(1, min(int(chunk), limit // scale))
-                    for chunk, limit, scale in zip(
-                        target.chunk_layout.write_chunk.shape,
-                        PROCESSING_TILE_SHAPE,
-                        (1, reduction, reduction),
-                        strict=True,
-                    )
-                )
-                layout = level_zero[
-                    ...,
-                    : target.shape[-2] * factor : factor,
-                    : target.shape[-1] * factor : factor,
-                ]
-                for _tile, _source, destination in Slicer(
-                    layout, crop_size=tile_shape, overlap=(0, 0, 0), pad=False
-                ):
-                    selection = (
-                        *destination[:-2],
-                        *(
-                            slice(axis.start * factor, axis.stop * factor)
-                            for axis in destination[-2:]
-                        ),
-                    )
-                    value = np.asarray(level_zero[selection])
-                    if collection.multiscale_downsample == "block_mean":
-                        value = format_processed_output(value, save_float32)
-                    value = downsample_yx(
-                        value, factor, collection.multiscale_downsample
-                    )
-                    future = target[destination].write(
-                        format_processed_output(value, save_float32)
-                    )
-                    pending.append(future)
-                    if len(pending) >= 2:
-                        pending.popleft().result()
-            writes.append(future)
-            if len(pending) >= 2:
-                pending.popleft().result()
-    finally:
-        # Source views can borrow a mapped MIP. Finish their copies before
-        # returning to the caller's ExitStack, retaining two concurrent writes.
-        for future in pending:
-            future.result()
+    save_float32 = np.dtype(collection.arrays[position].dtype.numpy_dtype) == np.dtype(
+        np.float32
+    )
+    base = (
+        level_zero
+        if np.ndim(level_zero) == 0
+        else format_processed_output(level_zero, save_float32)
+    )
+    for factor, level_arrays in zip(
+        collection.multiscale_factors_yx, collection.multiscale_arrays, strict=True
+    ):
+        value = (
+            base
+            if factor == 1 or np.ndim(base) == 0
+            else downsample_yx(base, factor, collection.multiscale_downsample)
+        )
+        writes.append(level_arrays[position][timepoint, channel].write(value))
     return writes
+
+
+def deskew_channel_writer(
+    input_shape: tuple[int, int, int],
+    target: Any,
+    theta: float,
+    distance: float,
+    pixel_size: float,
+    downsample_factor: int,
+    crop_yx: tuple[int, int, int, int] | None = None,
+    max_projection: bool = False,
+) -> tuple[Callable[[np.ndarray, int, int], bool], np.ndarray | None]:
+    """Consume ordered, finalized scan cores using the global deskew geometry.
+
+    Parameters
+    ----------
+    input_shape : tuple[int, int, int]
+        Complete reconstructed scan-YX shape before deskewing.
+    target : Any
+        One output channel's ZYX TensorStore selection.
+    theta, distance, pixel_size : float
+        Acquisition angle, reconstructed scan spacing and detector pixel size.
+    downsample_factor : int
+        Laboratory-Z averaging factor.
+    crop_yx : tuple[int, int, int, int] or None
+        Final global deskew crop; None retains the complete output.
+    max_projection : bool
+        Accumulate the corresponding maximum-Z image in RAM.
+
+    Returns
+    -------
+    tuple
+        Synchronous core consumer and optional projection. The consumer returns
+        cumulative nonzero status after each durable write. Source context is
+        retained only until its final interpolation stencil has been written.
+    """
+    save_float32 = np.dtype(target.dtype.numpy_dtype) == np.dtype(np.float32)
+    full_shape, full_pad_y, _, _ = deskew_shape_estimator(
+        input_shape,
+        theta=theta,
+        distance=distance,
+        pixel_size=pixel_size,
+        crop_after_deskew=False,
+        downsample_factor=downsample_factor,
+    )
+    y0, y1, x0, x1 = 0, full_shape[1], 0, full_shape[2]
+    if crop_yx is not None:
+        y0, y1, x0, x1 = crop_yx
+    projection = (
+        np.zeros((1, *target.shape[1:]), np.float32) if max_projection else None
+    )
+    step_pixels = distance / pixel_size
+    final_nz = int(np.ceil(input_shape[1] * np.sin(np.deg2rad(theta))))
+    z_shear = (final_nz - 1) / np.tan(np.deg2rad(theta))
+    row_bytes = full_shape[0] * (x1 - x0) * (4 if save_float32 else 6)
+    tail = None
+    tail_start = next_y = 0
+    has_signal = False
+
+    def consume_reconstruction(core: np.ndarray, start: int, end: int) -> bool:
+        # Completed cores are immutable. Retain only source planes
+        # needed across the next deskew boundary, never RLGC halos.
+        nonlocal tail, tail_start, next_y, has_signal
+        if next_y >= y1:
+            return has_signal
+        source = core if tail is None else np.concatenate((tail, core))
+        source_start = start if tail is None else tail_start
+        tail = None
+        end_y = (
+            full_shape[1]
+            if end == input_shape[0]
+            else min(full_shape[1], math.floor((end - 1) * step_pixels))
+        )
+        first, last = max(next_y, y0), min(end_y, y1)
+        available = psutil.virtual_memory().available
+        if first < last:
+            full_bytes = math.prod(full_shape) * (4 if save_float32 else 6)
+            if start == 0 and end == input_shape[0] and full_bytes <= available:
+                deskewed = orthogonal_deskew(
+                    source,
+                    theta=theta,
+                    distance=distance,
+                    pixel_size=pixel_size,
+                    downsample_factor=downsample_factor,
+                )[:, y0:y1, x0:x1]
+                has_signal |= write_processed_channel(target[:, : y1 - y0], deskewed)
+                if projection is not None:
+                    np.max(
+                        deskewed,
+                        axis=0,
+                        keepdims=True,
+                        out=projection[:, : y1 - y0],
+                    )
+            else:
+                stops = (last,)
+                if (last - first) * row_bytes > available:
+                    # Ryomen traverses acquired scan only. The final
+                    # interval also owns the camera-footprint tail.
+                    extra_rows = max(
+                        0,
+                        full_shape[1] - math.ceil(input_shape[0] * step_pixels),
+                    )
+                    crop_scan = math.floor(
+                        (available // row_bytes - extra_rows - 2) / step_pixels
+                    )
+                    if crop_scan < 1:
+                        raise MemoryError(
+                            "Deskew requires RAM for one scan interval and its interpolation support"
+                        )
+                    stops = [
+                        last
+                        if destination[-3].stop == source.shape[0]
+                        else min(
+                            last,
+                            math.ceil(
+                                (source_start + destination[-3].stop - 1) * step_pixels
+                            ),
+                        )
+                        for _, _, destination in Slicer(
+                            source,
+                            crop_size=(crop_scan, *source.shape[1:]),
+                            overlap=(0, 0, 0),
+                            pad=False,
+                        )
+                    ]
+                for stop_y in stops:
+                    if stop_y <= first:
+                        continue
+                    deskewed = np.zeros(
+                        (full_shape[0], stop_y - first, x1 - x0), np.float32
+                    )
+                    interpolate_rows(
+                        source,
+                        deskewed,
+                        full_shape[1] - full_pad_y,
+                        final_nz,
+                        theta,
+                        distance,
+                        pixel_size,
+                        downsample_factor,
+                        True,
+                        (0, first, x0),
+                        source_scan_origin=source_start,
+                        source_scan_count=input_shape[0],
+                    )
+                    selection = slice(first - y0, stop_y - y0)
+                    has_signal |= write_processed_channel(
+                        target[:, selection], deskewed
+                    )
+                    if projection is not None:
+                        np.max(
+                            deskewed,
+                            axis=0,
+                            keepdims=True,
+                            out=projection[:, selection],
+                        )
+                    first = stop_y
+                    del deskewed
+        next_y = end_y
+        if end < input_shape[0] and end_y < y1:
+            tail_start = max(
+                source_start,
+                min(end, math.floor((end_y - z_shear) / step_pixels) - 1),
+            )
+            tail = source[tail_start - source_start :].copy()
+
+        return has_signal
+
+    return consume_reconstruction, projection
 
 
 def validate_empty_tile_options(
@@ -2431,175 +2539,106 @@ def process_skewed(
                 if skewed_roi is None and scan_axis_reversed:
                     camera_corrected_data = np.flip(camera_corrected_data, axis=0)
 
-                if deconvolve:
-                    if skewed_roi is not None:
-                        decon_input = camera_corrected_data
-                    elif flyback_crop is not None:
-                        decon_input = camera_corrected_data[
-                            excess_scan_positions:-flyback_crop, :, :
-                        ]
-                    else:
-                        decon_input = camera_corrected_data[
-                            excess_scan_positions:, :, :
-                        ]
-                    factor = decon_scan_upsample
-                    fine_shape = (
-                        (decon_input.shape[0] - 1) * factor + 1,
-                        *decon_input.shape[1:],
-                    )
-                    effective_crop_scan = decon_chunk_state.determine_once(
-                        fine_shape,
-                        [tuple(int(size) for size in psf.shape) for psf in psfs],
-                        gpu_id=decon_gpu_id,
-                    )
-                    deconvolved_data = rlgc(
-                        decon_input,
-                        np.asarray(psfs[chan_idx]),
-                        crop_scan=effective_crop_scan,
-                        gpu_id=decon_gpu_id,
-                        verbose=decon_verbose,
-                        fallback_step_scan=decon_fallback_step_scan,
-                        on_successful_crop_scan=partial(
-                            setattr, decon_chunk_state, "crop_scan"
-                        ),
-                        detector_response=decon_response,
-                        read_noise=decon_read_noise,
-                        scan_upsample_factor=factor,
-                        boundary="reflect" if decon_scan_upsample == 1 else "zero",
-                    )
-                    deskew_input = deconvolved_data
-                elif skewed_roi is not None:
-                    deskew_input = camera_corrected_data
-                else:
-                    stop = -flyback_crop if flyback_crop is not None else None
-                    deskew_input = camera_corrected_data[excess_scan_positions:stop]
+                stop = -flyback_crop if flyback_crop is not None else None
+                deskew_input = (
+                    camera_corrected_data
+                    if skewed_roi is not None
+                    else camera_corrected_data[excess_scan_positions:stop]
+                )
+                factor = decon_scan_upsample if deconvolve else 1
+                fine_shape = (
+                    (deskew_input.shape[0] - 1) * factor + 1,
+                    *deskew_input.shape[1:],
+                )
                 target = (
                     ts_store[pos_idx][t_idx, chan_idx]
                     if roi_series_index is None
                     else ts_store[roi_series_index][0, chan_idx]
                 )
-                tile_shape = tuple(
-                    min(int(chunk), limit)
-                    for chunk, limit in zip(
-                        target.chunk_layout.write_chunk.shape,
-                        PROCESSING_TILE_SHAPE,
-                        strict=True,
+                crop_yx = None
+                if roi_plan is not None:
+                    crop_yx = tuple(map(int, roi_plan["deskew_crop_yx"]))
+                elif crop_after_deskew:
+                    crop_yx = (
+                        crop_y,
+                        crop_y + deskewed_shape[1] - _pad_y,
+                        0,
+                        target.shape[2],
                     )
+                consume_reconstruction, projection = deskew_channel_writer(
+                    fine_shape,
+                    target,
+                    opm_tilt_deg,
+                    reconstruction_step_um,
+                    pixel_size_um,
+                    z_downsample_level,
+                    crop_yx,
+                    max_projection,
                 )
-                full_shape, *_ = deskew_shape_estimator(
-                    deskew_input.shape,
-                    theta=opm_tilt_deg,
-                    distance=reconstruction_step_um,
-                    pixel_size=pixel_size_um,
-                    crop_after_deskew=False,
-                    downsample_factor=z_downsample_level,
-                )
-                with ExitStack() as output_buffers:
-                    deskew_buffer = None
-                    if (
-                        math.prod(full_shape) * np.dtype(np.float32).itemsize
-                        > 128 * 1024**2
-                    ):
-                        backing = output_buffers.enter_context(
-                            TemporaryFile(dir=output_dir)
-                        )
-                        deskew_buffer = np.memmap(
-                            backing,
-                            mode="w+",
-                            dtype=np.float32,
-                            shape=tuple(full_shape),
-                        )
-                        output_buffers.callback(deskew_buffer._mmap.close)
-                    deskewed = orthogonal_deskew(
-                        deskew_input,
-                        theta=opm_tilt_deg,
-                        distance=reconstruction_step_um,
-                        pixel_size=pixel_size_um,
-                        downsample_factor=z_downsample_level,
-                        tile_shape=tile_shape,
-                        out=deskew_buffer,
-                    )
-
-                    if roi_plan is not None:
-                        crop_y0, crop_y1, crop_x0, crop_x1 = (
-                            int(value) for value in roi_plan["deskew_crop_yx"]
-                        )
-                        deskewed = deskewed[
-                            :,
-                            crop_y0:crop_y1,
-                            crop_x0:crop_x1,
-                        ]
-                    elif crop_after_deskew:
-                        cropped_ny = deskewed_shape[1] - _pad_y
-                        deskewed = deskewed[:, crop_y : crop_y + cropped_ny, :]
-
-                    if max_projection:
-                        projection_shape = (
-                            1,
-                            deskewed.shape[1]
-                            + (_pad_y if roi_plan is None and crop_after_deskew else 0),
-                            deskewed.shape[2],
-                        )
-                        if (
-                            math.prod(projection_shape) * np.dtype(np.float32).itemsize
-                            > 128 * 1024**2
-                        ):
-                            projection_file = output_buffers.enter_context(
-                                TemporaryFile(dir=output_dir)
-                            )
-                            max_z_deskewed = np.memmap(
-                                projection_file,
-                                mode="w+",
-                                dtype=np.float32,
-                                shape=projection_shape,
-                            )
-                            output_buffers.callback(max_z_deskewed._mmap.close)
-                        else:
-                            max_z_deskewed = np.empty(projection_shape, np.float32)
-                        np.max(
-                            deskewed,
-                            axis=0,
-                            keepdims=True,
-                            out=max_z_deskewed[:, : deskewed.shape[1]],
-                        )
-                        max_z_deskewed[:, deskewed.shape[1] :] = 0
-                        ts_max_writes.extend(
-                            queue_position_pyramid_writes(
-                                max_z_collection,
-                                pos_idx,
-                                t_idx,
-                                chan_idx,
-                                max_z_deskewed,
-                            )
-                        )
-
-                    if roi_series_index is None:
-                        has_signal = write_processed_channel(
-                            target[:, : deskewed.shape[1], :], deskewed
-                        )
-                        if deskewed.shape[1] < target.shape[1]:
-                            target[:, deskewed.shape[1] :, :].write(
-                                output_dtype.type(0)
-                            ).result()
-                    else:
-                        has_signal = write_checkpointed_roi_channel(
-                            target,
-                            deskewed,
-                            processing_state,
-                            output_path,
-                            channel_key,
-                            is_zero=channel_key in zero_channels,
-                        )
-                    if not has_signal:
-                        zero_channels.add(channel_key)
-
-                # Output writes are durable before releasing a mapped buffer or
-                # retaining another channel's calibration and reconstruction.
+                # Raw/calibration arrays no longer used independently can be
+                # released before allocating deskew output or parked RLGC state.
                 del raw_data, camera_calibrated_data, camera_corrected_data
-                del deskew_input, deskew_buffer
-                deskewed = None
                 if deconvolve:
-                    del decon_input, deconvolved_data
+                    effective_crop_scan = decon_chunk_state.determine_once(
+                        fine_shape,
+                        [tuple(int(size) for size in psf.shape) for psf in psfs],
+                        gpu_id=decon_gpu_id,
+                    )
+                    # One pending CPU chunk overlaps the next GPU continuation.
+                    # Waiting before submission bounds retained source buffers.
+                    with ThreadPoolExecutor(max_workers=1) as deskew_worker:
+                        pending = None
+
+                        def submit_reconstruction(
+                            core: np.ndarray,
+                            start: int,
+                            end: int,
+                            worker: ThreadPoolExecutor = deskew_worker,
+                            consume: Callable[
+                                [np.ndarray, int, int], bool
+                            ] = consume_reconstruction,
+                        ) -> None:
+                            nonlocal pending
+                            if pending is not None:
+                                pending.result()
+                            pending = worker.submit(consume, core, start, end)
+
+                        rlgc(
+                            deskew_input,
+                            np.asarray(psfs[chan_idx]),
+                            crop_scan=effective_crop_scan,
+                            gpu_id=decon_gpu_id,
+                            verbose=decon_verbose,
+                            fallback_step_scan=decon_fallback_step_scan,
+                            on_successful_crop_scan=partial(
+                                setattr, decon_chunk_state, "crop_scan"
+                            ),
+                            detector_response=decon_response,
+                            read_noise=decon_read_noise,
+                            scan_upsample_factor=factor,
+                            boundary="reflect" if decon_scan_upsample == 1 else "zero",
+                            on_reconstructed_chunk=submit_reconstruction,
+                        )
+                        has_signal = pending.result() if pending is not None else False
+                    del submit_reconstruction, pending
+                else:
+                    has_signal = consume_reconstruction(deskew_input, 0, fine_shape[0])
+                if crop_yx is not None and crop_yx[1] - crop_yx[0] < target.shape[1]:
+                    target[:, crop_yx[1] - crop_yx[0] :, :].write(
+                        output_dtype.type(0)
+                    ).result()
+                if projection is not None:
+                    for future in queue_position_pyramid_writes(
+                        max_z_collection, pos_idx, t_idx, chan_idx, projection
+                    ):
+                        future.result()
+                if roi_series_index is not None:
+                    processing_state.complete_channel(
+                        output_path, *channel_key, is_zero=not has_signal
+                    )
+                if not has_signal:
+                    zero_channels.add(channel_key)
+                del deskew_input, consume_reconstruction, projection
             for ts_write in ts_writes:
                 ts_write.result()
             if max_projection:

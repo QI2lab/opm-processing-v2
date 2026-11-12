@@ -106,11 +106,14 @@ processing extracts them from the OME-Zarr. Use `deskew_shape_estimator` with
 `crop_after_deskew=False` and the same `downsample_factor` to allocate output for
 `orthogonal_deskew`, including the final partial Z bin.
 
-For output tiling, pass `tile_shape=(z, y, x)` in averaged output voxels. Each tile
-uses global coordinates and the same source quartets as whole-volume processing.
 An optional writable float32 `out` array must have the estimated output shape;
 NumPy views and memory-mapped arrays are supported. Supplied buffers are fully
-written, including zero support and padding. A memory map can bound resident
-output storage, while the full calibrated input volume remains available.
-Z reversal changes the stored output orientation without restarting averaging at
-tile boundaries.
+written, including zero support and padding.
+
+Acquisition processing deskews the full channel in RAM when it fits. When output
+exceeds available RAM, Ryomen divides only the acquired scan axis, retaining full
+camera YX planes. Each output slab uses global coordinates and is written once.
+Tiled RLGC keeps its shared KL stop and passes finalized scan cores directly to a
+single deskew/write worker while the GPU continues the next core. Only the source
+planes needed across deskew boundaries are retained; RLGC halos are discarded.
+Both paths use the same interpolation kernel and final partial Z bin.

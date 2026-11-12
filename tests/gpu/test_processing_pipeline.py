@@ -79,8 +79,11 @@ def test_qi2lab_acquisition_to_fused_ngff_v05(
             index = (time * metadata.shape[1] + position) * metadata.shape[2] + channel
             observed = case.deskew_runs[index]
             assert saved.shape == observed["output_shape"]
-            # Compare this run's actual returned bytes with reopened storage.
-            assert sha256(memoryview(saved)).hexdigest() == observed["pixel_sha256"]
+            # Compare every actual deskew write with reopened storage.
+            for selection, digest in observed["writes"]:
+                assert (
+                    sha256(np.ascontiguousarray(saved[selection])).hexdigest() == digest
+                )
 
     fusion = case.fusion
     # Stage Z is converted to laboratory Z; the detector-X stage coordinate
@@ -261,7 +264,8 @@ def test_large_noisy_scene_acquisition_to_fusion(
         np.testing.assert_array_equal(saved[~geometry.support], 0)
         observed_deskew = result.deskew_runs[position]
         assert saved.shape == observed_deskew["output_shape"]
-        assert sha256(memoryview(saved)).hexdigest() == observed_deskew["pixel_sha256"]
+        for selection, digest in observed_deskew["writes"]:
+            assert sha256(np.ascontiguousarray(saved[selection])).hexdigest() == digest
         if deconvolve:
             run = result.deconvolution_runs[position]
             observed = run["forward"]
@@ -325,34 +329,21 @@ def test_large_noisy_scene_acquisition_to_fusion(
         > 0
     )
     covered = np.zeros(geometry.shape, bool)
-    tile_shape = result.deskew_runs[0]["tile_shape"]
     for origin, shape in result.deskew_tiles:
-        assert np.all(np.asarray(shape) <= tile_shape)
+        assert origin[0] == origin[2] == 0
+        assert shape[0] == geometry.shape[0] and shape[2] == geometry.shape[2]
         covered[tuple(slice(a, a + n) for a, n in zip(origin, shape, strict=True))] = (
             True
         )
-    assert covered.all() and len(result.deskew_tiles) > 8
-    crossings = 0
-    axis_borders = []
-    for axis in range(3):
-        borders = {
-            origin[axis] for origin, _shape in result.deskew_tiles if origin[axis]
-        }
-        axis_borders.append(sorted(borders))
-        crossings += sum(
-            np.any(
-                np.take(foreground, border - 1, axis=axis)
-                & np.take(foreground, border, axis=axis)
-            )
+    assert covered.all()
+    if tiled_scan and deconvolve:
+        borders = {origin[1] for origin, _ in result.deskew_tiles if origin[1]}
+        assert any(
+            np.any(foreground[:, border - 1] & foreground[:, border])
             for border in borders
         )
-    assert crossings >= 2, (crossings, axis_borders, geometry.shape, tile_shape)
-    assert any(
-        origin[axis] % tile_shape[axis]
-        and origin[axis] + shape[axis] == geometry.shape[axis]
-        for origin, shape in result.deskew_tiles
-        for axis in range(3)
-    )
+    else:
+        assert result.deskew_tiles == {((0, 0, 0), geometry.shape)}
     fused = assert_fused_ngff(result)
     if metadata.shape[1] == 2:
         np.testing.assert_allclose(
@@ -484,11 +475,10 @@ def test_extended_mosaic_acquisition_to_fusion(
             )
 
     support = pipeline_geometry(raw_shape, case.microscope, scan_factor=factor).support
-    assert len(result.deskew_tiles) > 1
-    tile_limits = np.asarray(result.deskew_runs[0]["tile_shape"])
     coverage = np.zeros(result.deskew_runs[0]["output_shape"], bool)
     for origin, tile_shape in result.deskew_tiles:
-        assert np.all(np.asarray(tile_shape) <= tile_limits)
+        assert origin[0] == origin[2] == 0
+        assert tile_shape[0] == coverage.shape[0] and tile_shape[2] == coverage.shape[2]
         coverage[
             tuple(slice(a, a + n) for a, n in zip(origin, tile_shape, strict=True))
         ] = True

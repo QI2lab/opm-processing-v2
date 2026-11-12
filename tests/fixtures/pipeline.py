@@ -117,11 +117,22 @@ def pipeline_runner(
 
                 def observe_reconstruction(*args, **kwargs):
                     """Observe real reconstruction shapes and acquired predictions."""
+                    consume = kwargs["on_reconstructed_chunk"]
+                    output_shape = None
+
+                    def observe_core(core, start, end):
+                        nonlocal output_shape
+                        assert start == (0 if output_shape is None else output_shape[0])
+                        output_shape = (end, *core.shape[1:])
+                        return consume(core, start, end)
+
+                    kwargs["on_reconstructed_chunk"] = observe_core
                     result = reconstruct(*args, **kwargs)
+                    assert result is None
                     deconvolution_runs.append(
                         {
                             "input_shape": args[0].shape,
-                            "output_shape": result.shape,
+                            "output_shape": output_shape,
                             "forward": production_forward_predictions[-1],
                         }
                     )
@@ -129,28 +140,46 @@ def pipeline_runner(
 
                 execution.setattr(solver, "rlgc", observe_reconstruction)
             interpolate = opmtools.interpolate_rows
-            deskew = module.orthogonal_deskew
+            writer = module.deskew_channel_writer
+            write = module.write_processed_channel
 
-            def record_tile(*args):
-                """Record actual global output tiles while running the real kernel."""
-                deskew_tiles.add((args[-1], args[1].shape))
-                return interpolate(*args)
+            def record_tile(*args, **kwargs):
+                """Observe global output slabs while running the real kernel."""
+                deskew_tiles.add((args[9], args[1].shape))
+                return interpolate(*args, **kwargs)
 
-            def observe_deskew(*args, **kwargs):
-                """Record actual output bytes before production persists them."""
-                result = deskew(*args, **kwargs)
-                assert result.dtype == np.float32 and result.flags.c_contiguous
+            def observe_writer(shape, target, *args, **kwargs):
+                """Group real persisted slabs by their processing channel."""
                 deskew_runs.append(
                     {
-                        "output_shape": result.shape,
-                        "tile_shape": kwargs["tile_shape"],
-                        "pixel_sha256": sha256(memoryview(result)).hexdigest(),
+                        "output_shape": target.shape,
+                        "writes": [],
                     }
+                )
+                return writer(shape, target, *args, **kwargs)
+
+            def observe_write(target, value):
+                """Record output bytes without retaining a second image volume."""
+                result = write(target, value)
+                deskew_runs[-1]["writes"].append(
+                    (
+                        tuple(
+                            slice(a, b)
+                            for a, b in zip(
+                                target.domain.inclusive_min,
+                                target.domain.exclusive_max,
+                                strict=True,
+                            )
+                        ),
+                        sha256(memoryview(np.ascontiguousarray(value))).hexdigest(),
+                    )
                 )
                 return result
 
             execution.setattr(opmtools, "interpolate_rows", record_tile)
-            execution.setattr(module, "orthogonal_deskew", observe_deskew)
+            execution.setattr(module, "interpolate_rows", record_tile)
+            execution.setattr(module, "deskew_channel_writer", observe_writer)
+            execution.setattr(module, "write_processed_channel", observe_write)
             source = dataset.path.parent if live is not None else dataset.path
             invoke_cli("process", source, **options)
         directory = dataset.path.parent if output is None else output

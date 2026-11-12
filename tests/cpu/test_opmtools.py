@@ -2,12 +2,14 @@
 
 import numpy as np
 import pytest
+import tensorstore as ts
 
 from opm_processing.imageprocessing.opmtools import (
     deskew_coverage,
     deskew_row,
     orthogonal_deskew,
 )
+from opm_processing.process import deskew_channel_writer
 
 
 @pytest.mark.unit
@@ -117,54 +119,52 @@ def test_source_rows_are_perpendicular_projections(
 
 @pytest.mark.unit
 @pytest.mark.parametrize("factor", [1, 2, 3, 20])
-@pytest.mark.parametrize(
-    "reverse, tile_shape", [(False, (2, 17, 5)), (True, (3, 23, 7))]
-)
+@pytest.mark.parametrize("reverse, crop_scan", [(False, 7), (True, 11)])
 @pytest.mark.parametrize(
     "deskew_field",
     [("constant", 0.4, (48, 97, 41)), ("affine", 1.2, (48, 97, 41))],
     indirect=True,
 )
-def test_tiled_deskew_matches_global_grid(
+def test_scan_chunk_deskew_matches_global_grid(
     deskew_field,
     deskew_output,
     deskew_analytic_truth,
     deskew_roundoff,
     factor,
     reverse,
-    tile_shape,
+    crop_scan,
 ):
-    """Match whole-volume output exactly across Z, Y and X tile boundaries."""
+    """Match scan-core processing to the full grid and independent affine truth."""
     case = deskew_field
     storage, output = deskew_output
     options = dict(
         **case.geometry, downsample_factor=factor, reverse_deskewed_z=reverse
     )
     whole = orthogonal_deskew(case.data, **options)
-    tiled = orthogonal_deskew(case.data, **options, tile_shape=tile_shape, out=output)
+    tiled = orthogonal_deskew(case.data, **options, out=output)
     assert tiled is output
     np.testing.assert_array_equal(tiled, whole)
+    target = ts.array(np.full(whole.shape, np.nan, np.float32))
+    consume, _ = deskew_channel_writer(
+        case.data.shape, target, **case.geometry, downsample_factor=factor
+    )
+    for start in range(0, case.data.shape[0], crop_scan):
+        end = min(start + crop_scan, case.data.shape[0])
+        consume(case.data[start:end], start, end)
+    streamed = target.read().result()
+    if reverse:
+        streamed = streamed[::-1]
+    np.testing.assert_array_equal(streamed, whole)
     expected, interior = deskew_analytic_truth(
         tiled.shape, factor=factor, reverse=reverse
     )
     assert interior.any()
     np.testing.assert_allclose(tiled[interior], expected[interior], **deskew_roundoff)
-    # Assert that the analytical comparison includes foreground on both sides
-    # of actual interior tile borders, rather than only a tile's central region.
-    for axis in (1, 2):
-        borders = np.arange(tile_shape[axis], tiled.shape[axis], tile_shape[axis])
-        assert len(borders) >= 2
-        assert np.any(
-            np.take(interior, borders - 1, axis=axis)
-            & np.take(interior, borders, axis=axis)
-        )
     assert np.isfinite(output).all()
     assert np.isnan(storage[1::2]).all()
     assert np.isnan(storage[:, (0, -1)]).all()
     assert np.isnan(storage[:, :, (0, -1)]).all()
-    explicit = orthogonal_deskew(
-        case.data, **options, tile_shape=tile_shape, zero_initialized=False
-    )
+    explicit = orthogonal_deskew(case.data, **options, zero_initialized=False)
     np.testing.assert_array_equal(explicit, whole)
 
 
@@ -181,10 +181,12 @@ def test_tiled_deskew_matches_global_grid(
 )
 @pytest.mark.parametrize("scan_factor", (1, 3), ids=("native", "sparse3"))
 def test_large_noisy_deskew_preserves_scientific_bounds_across_tiles(
-    noisy_extended_scene, layout, scan_factor, tmp_path, monkeypatch
+    noisy_extended_scene, layout, scan_factor, monkeypatch
 ):
-    """Deskew real noisy optical scenes through bounded Ryomen output tiles."""
+    """Deskew noisy full-camera scenes with scan-only memory-pressure streaming."""
+    import importlib
     from dataclasses import replace
+    from types import SimpleNamespace
 
     from ryomen import Slicer
 
@@ -197,6 +199,7 @@ def test_large_noisy_deskew_preserves_scientific_bounds_across_tiles(
     from tests.simulation.metrics import camera_volume_samples
 
     microscope, expectation, raw, source, _dark = noisy_extended_scene
+    processing = importlib.import_module("opm_processing.process")
     assert raw.shape == (50 if layout == "whole" else 200, 256, 1900)
     microscope = replace(microscope, scan_step_um=microscope.scan_step_um * scan_factor)
     expectation, raw, source = (
@@ -216,11 +219,7 @@ def test_large_noisy_deskew_preserves_scientific_bounds_across_tiles(
         data.shape, **geometry, crop_after_deskew=False
     )[0]
     whole = orthogonal_deskew(data, **geometry) if layout == "tiled" else None
-    output = np.lib.format.open_memmap(
-        tmp_path / "deskew.npy", mode="w+", dtype=np.float32, shape=tuple(shape)
-    )
-    output[:] = np.nan
-    tile_shape = (8, 128, 256) if layout == "tiled" else None
+    target = ts.array(np.full(shape, np.nan, np.float32))
     slicers, visits = [], []
     interpolate = opmtools.interpolate_rows
 
@@ -230,44 +229,46 @@ def test_large_noisy_deskew_preserves_scientific_bounds_across_tiles(
         slicers.append(len(result))
         return result
 
-    def observe_rows(*args):
+    def observe_rows(*args, **kwargs):
         """Record actual origins while executing the unchanged interpolation."""
-        visits.append((args[-1], args[1].shape))
-        return interpolate(*args)
+        visits.append((args[9], args[1].shape, args[0].shape))
+        return interpolate(*args, **kwargs)
 
     with monkeypatch.context() as execution:
-        execution.setattr(opmtools, "Slicer", observe_slicer)
+        execution.setattr(processing, "Slicer", observe_slicer)
         execution.setattr(opmtools, "interpolate_rows", observe_rows)
-        tiled = orthogonal_deskew(data, **geometry, tile_shape=tile_shape, out=output)
-    assert tiled is output and slicers == [len(visits)]
+        execution.setattr(processing, "interpolate_rows", observe_rows)
+        if layout == "tiled":
+            execution.setattr(
+                processing.psutil,
+                "virtual_memory",
+                lambda: SimpleNamespace(available=int(np.prod(shape)) * 3 // 2),
+            )
+        consume, _ = deskew_channel_writer(data.shape, target, **geometry)
+        consume(data, 0, data.shape[0])
+    tiled = target.read().result()
     if layout == "tiled":
-        assert len(visits) > 8
+        assert len(visits) > 1 and slicers == [len(visits)]
         np.testing.assert_array_equal(tiled, whole)
         covered = np.zeros(tiled.shape, bool)
         foreground = orthogonal_deskew(source.astype(np.float32), **geometry) > 0
-        for origin, shape in visits:
-            assert np.all(np.asarray(shape) <= tile_shape)
+        for origin, shape, source_shape in visits:
+            assert origin[0] == origin[2] == 0
+            assert shape[0] == tiled.shape[0] and shape[2] == tiled.shape[2]
+            assert source_shape[1:] == data.shape[1:]
             selection = tuple(
                 slice(start, start + size)
                 for start, size in zip(origin, shape, strict=True)
             )
             covered[selection] = True
         assert covered.all()
-        crossings = 0
-        for axis in range(3):
-            borders = sorted(
-                {origin[axis] for origin, _shape in visits if origin[axis]}
-            )
-            crossings += sum(
-                np.any(
-                    np.take(foreground, border - 1, axis=axis)
-                    & np.take(foreground, border, axis=axis)
-                )
-                for border in borders
-            )
-        assert crossings >= 2
+        borders = sorted({origin[1] for origin, _shape, _source in visits if origin[1]})
+        assert any(
+            np.any(foreground[:, border - 1] & foreground[:, border])
+            for border in borders
+        ), (borders, np.flatnonzero(foreground.any(axis=(0, 2)))[[0, -1]])
     else:
-        assert visits == [((0, 0, 0), tiled.shape)]
+        assert not slicers and visits == [((0, 0, 0), tiled.shape, data.shape)]
     coverage_zy = deskew_coverage(data.shape, tiled.shape, **geometry)
     support = (coverage_zy[..., None] > 0) & (
         np.arange(tiled.shape[-1]) < data.shape[-1]
@@ -304,7 +305,6 @@ def test_large_noisy_deskew_preserves_scientific_bounds_across_tiles(
         & (prediction[aperture] >= bounds.lower[aperture])
         & (prediction[aperture] <= bounds.upper[aperture])
     )
-    output.flush()
 
 
 @pytest.mark.unit
@@ -313,14 +313,12 @@ def test_large_noisy_deskew_preserves_scientific_bounds_across_tiles(
     [
         ("downsample_factor", 0),
         ("downsample_factor", 1.5),
-        ("tile_shape", (1, 0, 2)),
-        ("tile_shape", (1, 2)),
         ("pixel_size", 0),
     ],
 )
 @pytest.mark.parametrize("deskew_field", [("constant", 0.4)], indirect=True)
-def test_deskew_rejects_invalid_sampling_or_tiles(deskew_field, option, value):
-    """Reject nonphysical sampling or invalid tile extents before interpolation."""
+def test_deskew_rejects_invalid_sampling(deskew_field, option, value):
+    """Reject nonphysical sampling before interpolation."""
     options = {**deskew_field.geometry, option: value}
     with pytest.raises(ValueError):
         orthogonal_deskew(deskew_field.data, **options)
@@ -334,9 +332,7 @@ def test_deskewed_stage_tiles_blend_without_boundary_seams(
 ):
     """Preserve uniform fluorescence through real deskew wedges and block fusion."""
     case = deskew_mosaic
-    deskewed = orthogonal_deskew(
-        case.data, **case.geometry, downsample_factor=factor, tile_shape=(2, 17, 5)
-    )
+    deskewed = orthogonal_deskew(case.data, **case.geometry, downsample_factor=factor)
     fusion = block_fusion(
         [deskewed[None], deskewed[None]],
         case.positions,
