@@ -80,8 +80,12 @@ outputs are retained.
 
 `--figures` also saves `roi_overview.png` beside the ROI folders. It retains the
 maximum-Z projection's native pixel dimensions, the displayed timepoint, and
-napari's visible channel order, colors, contrast, gamma and blending. Yellow
-outlines have no numbers; a labeled white scale bar uses the physical pixel size.
+napari's visible channel order, colors, contrast, gamma and blending. Displayed
+90-degree rotations and flips are preserved without resampling. White dashed
+ROI outlines have no numbers (20 µm stroke, 20 µm dashes, 10 µm gaps). A horizontal
+2 mm scale bar with an 80 µm white stroke and black backing is drawn after rotation,
+using the displayed horizontal pixel spacing. Arbitrary-angle rotations and
+shears are rejected because they require resampling.
 Native blocks are rendered with napari and assembled using temporary disk space
 beside the output (four bytes per image pixel), without a downsampled copy.
 

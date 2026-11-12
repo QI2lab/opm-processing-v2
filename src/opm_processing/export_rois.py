@@ -168,7 +168,10 @@ def rectangle_bounds(
     if not np.allclose(vertices[:, :-2], vertices[0, :-2], rtol=0, atol=1e-7):
         raise ValueError("Draw rectangles in the YX view")
     points = vertices[:, -2:]
-    if len(np.unique(points[:, 0])) != 2 or len(np.unique(points[:, 1])) != 2:
+    if np.any(np.ptp(points, axis=0) <= 1e-7) or not np.all(
+        np.isclose(points, points.min(axis=0), rtol=0, atol=1e-7)
+        | np.isclose(points, points.max(axis=0), rtol=0, atol=1e-7)
+    ):
         raise ValueError("ROIs must be axis-aligned YX rectangles")
     low = np.maximum(0, np.floor(points.min(axis=0) + 1e-7)).astype(int)
     high = np.minimum(shape[-2:], np.ceil(points.max(axis=0) - 1e-7)).astype(int)
@@ -246,8 +249,9 @@ def select_rois(
         translate=reference.translate[-2:],
         units=reference.units[-2:],
         shape_type="rectangle",
-        edge_color="yellow",
-        face_color=[1, 1, 0, 0.15],
+        edge_color="white",
+        edge_width=3,
+        face_color=[1, 1, 1, 0.15],
     )
     rois.mode = "add_rectangle"
     if saved_rois is not None:
