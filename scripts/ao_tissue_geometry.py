@@ -1,15 +1,13 @@
 """Calibrated tissue previews and representative saved AO correction locations.
 
 Pupils identify corrections at the centers of their assigned source-tile
-groups. They do not mark calibrated AO measurement sites. Historical source
-assignments are reconstructed from the saved physical stage plans; registered
-image placements come from the repaired processing metadata.
+groups. They do not mark calibrated AO measurement sites. Source assignments use
+recorded mappings or saved physical stage plans; registered image placements
+come from the repaired processing metadata.
 """
 
 from __future__ import annotations
 
-import hashlib
-import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -18,6 +16,8 @@ import numpy as np
 from yaozarrs import open_group
 
 from opm_processing.dataio.acquisition import inspect_acquisition
+from opm_processing.dataio.ao_results import ao_tile_assignments, read_ao_stage_plan
+from opm_processing.dataio.ngff import SPATIAL_DECIMALS
 from opm_processing.dataio.processing_state import (
     ProcessingState,
     image_processing_state_path,
@@ -134,23 +134,6 @@ def _saved_layer(
     if not (layer / "exp_stage_positions.json").is_file():
         raise ValueError(f"Missing experiment stage plan in {layer}")
     return layer
-
-
-def _read_plan(path: Path) -> tuple[list[dict[str, Any]], dict[str, str]]:
-    """Read a saved position plan and retain its exact provenance fingerprint."""
-    content = path.read_bytes()
-    positions = json.loads(content)
-    if not isinstance(positions, list) or not positions:
-        raise ValueError(f"Expected a nonempty saved stage plan: {path}")
-    xyz = np.asarray(
-        [[point[axis] for axis in "xyz"] for point in positions], dtype=float
-    )
-    if not np.isfinite(xyz).all():
-        raise ValueError(f"Saved stage positions must be finite: {path}")
-    return positions, {
-        "path": str(path),
-        "sha256": hashlib.sha256(content).hexdigest(),
-    }
 
 
 def _intended_geometry(
@@ -342,19 +325,23 @@ def read_tissue_geometry(
         if len(set(indices)) != len(indices):
             raise ValueError(f"Duplicate saved AO indices at depth {depth}")
         layer = _saved_layer(root, selected_regions, timepoint, depth)
-        ao_plan, ao_provenance = _read_plan(layer / "ao_stage_positions.json")
-        experiment, experiment_provenance = _read_plan(
-            layer / "exp_stage_positions.json"
+        ao_plan, ao_provenance = read_ao_stage_plan(
+            layer / "ao_stage_positions.json", depth
+        )
+        experiment, experiment_provenance = read_ao_stage_plan(
+            layer / "exp_stage_positions.json", depth
         )
         plan_records.extend((ao_provenance, experiment_provenance))
+        assigned, geometry_source = ao_tile_assignments(
+            layer, acquisition.stage_positions_zxy, ao_plan, experiment
+        )
+        if geometry_source is not None:
+            plan_records.append(geometry_source)
         if min(indices) < 0 or max(indices) >= len(ao_plan):
             raise ValueError(
                 f"Saved AO indices do not identify the stage plan at depth {depth}"
             )
         ao_xy = np.asarray([[point["x"], point["y"]] for point in ao_plan], dtype=float)
-        experiment_xy = np.asarray(
-            [[point["x"], point["y"]] for point in experiment], dtype=float
-        )
         planned_reference = {}
         if planned_grid:
             planned_centers[depth], planned_grids[depth] = _intended_geometry(
@@ -364,19 +351,6 @@ def read_tissue_geometry(
                 "planned_centers_yx_um": planned_centers[depth],
                 "planned_grid_boundaries": planned_grids[depth],
             }
-        # This is the historical rule recorded by the Balmer acquisition.
-        # Preserve its whole-tile assignments rather than importing a later
-        # acquisition planner or drawing a new grid over the tissue.
-        assigned = np.argmin(
-            np.sum((experiment_xy[:, None] - ao_xy[None]) ** 2, axis=2), axis=1
-        )
-        recorded_experiment = np.asarray(
-            [
-                [point["z"], point.get("lab_scan_um", point["x"]), point["y"]]
-                for point in experiment
-            ],
-            dtype=float,
-        )
         depth_tiles = [
             tile
             for tile in footprints
@@ -389,17 +363,11 @@ def read_tissue_geometry(
         assignment_records = []
         for tile in depth_tiles:
             position = int(tile["position_index"])
-            matches = np.flatnonzero(
-                np.all(
-                    np.isclose(recorded_experiment, stage[position], atol=0.02, rtol=0),
-                    axis=1,
-                )
-            )
-            if len(matches) != 1:
+            if position not in assigned:
                 raise ValueError(
                     f"Source tile {position} does not match one saved stage plan at depth {depth}"
                 )
-            region_index = int(assigned[int(matches[0])])
+            region_index = assigned[position]
             assignment_records.append({**tile, "region_index": region_index})
             if region_index in groups:
                 groups[region_index].append(tile)
@@ -429,6 +397,9 @@ def read_tissue_geometry(
         depth_offsets[depth] = offsets.pop() if offsets else None
         depth_records[depth] = {
             **planned_reference,
+            "assignment": "recorded ao_grid_geometry.json tile_ao_indices; entire tile"
+            if geometry_source is not None
+            else "inferred from saved acquisition plans; nearest physical stage XY",
             "assigned_tile_counts": counts,
             "unused_region_indices": [
                 index for index, count in counts.items() if not count
@@ -474,8 +445,8 @@ def read_tissue_geometry(
             "preview_extent_yx_um": list(extent),
             "placement": "mean centers of registered source tiles assigned to each AO correction",
             "pupil_location": "representative correction identity; not an AO measurement landmark",
-            "assignment_rule": "historical nearest physical stage XY to the whole-tile scan origin",
-            "assignment_verification": "inferred from saved plans; no per-frame mirror telemetry",
+            "assignment_rule": "recorded tile assignments when available; otherwise historical nearest physical stage XY",
+            "assignment_verification": "source positions matched to saved plans at recorded coordinate precision; no per-frame mirror telemetry",
             "planned_placement": "intended equal cells across the full acquisition canvas; pupils centered in their intended cells, not recorded sampling sites",
             "planned_grid_definition": "equal physical subdivisions of the calibrated tissue canvas using the recorded requested grid dimensions",
             "planned_index_orientation": "saved physical scan X ranks ascend bottom to top; saved physical stage Y ranks ascend left to right",
@@ -486,7 +457,7 @@ def read_tissue_geometry(
                 if planned_supported
                 else "Intended display requires recorded requested grid dimensions"
             ),
-            "stage_plan_match_tolerance_um": 0.02,
+            "stage_plan_coordinate_decimals": SPATIAL_DECIMALS,
             "stage_plans": plan_records,
             "depths": depth_records,
         },

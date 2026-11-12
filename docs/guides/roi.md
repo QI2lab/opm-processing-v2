@@ -94,7 +94,9 @@ Each ROI folder receives separate `ao_pupil_t###_z###.png` and
 The selected correction covers the largest area within the requested ROI;
 overlapping tiles assigned to the same correction count only once. Recorded tile
 assignments in `ao_grid_geometry.json` take precedence and are checked against
-the raw stage coordinates. Older acquisitions without that file use their saved
+the raw stage coordinates. ROI exports and AO tissue overlays share the same
+assignment reader and match source coordinates after rounding micrometers to
+three decimal places. Older acquisitions without that file use their saved
 stage plans; this historical assignment is identified as inferred in
 `ao_corrections.json`. Invalid recorded assignments are rejected without falling
 back to inference. The pupil uses the full final coefficient state, including

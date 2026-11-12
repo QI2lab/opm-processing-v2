@@ -21,8 +21,11 @@ import numpy as np
 from yaozarrs import open_group
 
 from opm_processing.dataio.acquisition import acquisition_stem
+from opm_processing.dataio.ngff import round_spatial_values
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from opm_processing.dataio.acquisition import AcquisitionMetadata
     from opm_processing.dataio.roi import PhysicalRoi
 
@@ -87,6 +90,100 @@ class AOOptimizationResult:
         if not completed:
             return self.starting_coefficients.copy()
         return self.optimal_coefficients[-1].copy()
+
+
+def read_ao_stage_plan(
+    path: Path, depth: int
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    """Validate a depth's saved position plan and retain its exact fingerprint."""
+    content = path.read_bytes()
+    positions = json.loads(content)
+    if not isinstance(positions, list) or not positions:
+        raise ValueError(f"Expected a nonempty saved stage plan: {path}")
+    xyz = np.asarray(
+        [[point[axis] for axis in "xyz"] for point in positions], dtype=float
+    )
+    if not np.isfinite(xyz).all():
+        raise ValueError(f"Saved stage positions must be finite: {path}")
+    if any(int(point.get("depth_index", depth)) != depth for point in positions):
+        raise ValueError(f"Saved depth indices disagree with AO layer: {path}")
+    return positions, {
+        "path": str(path),
+        "sha256": hashlib.sha256(content).hexdigest(),
+    }
+
+
+def ao_tile_assignments(
+    layer: Path,
+    stage_positions_zxy: Sequence[Sequence[float]],
+    ao: Sequence[dict[str, Any]],
+    experiment: Sequence[dict[str, Any]],
+) -> tuple[dict[int, int], dict[str, str] | None]:
+    """Resolve source-position IDs to the corrections used during acquisition.
+
+    Recorded assignments take precedence and must agree with source coordinates.
+    Older plans reconstruct the historical nearest physical XY assignment.
+    Source identities use Z/laboratory-scan/Y coordinates rounded to three
+    decimals in micrometers. Return the mapping and recorded-geometry provenance,
+    or None for provenance when assignments were inferred from the stage plans.
+    """
+    geometry_path = layer / "ao_grid_geometry.json"
+    position_ids = None
+    provenance = None
+    if geometry_path.is_file():
+        content = geometry_path.read_bytes()
+        geometry = json.loads(content)
+        position_ids = np.asarray(geometry.get("position_indices", []))
+        indices = np.asarray(geometry.get("tile_ao_indices", []))
+        if (
+            geometry.get("schema_version") != 1
+            or geometry.get("units") != "um"
+            or geometry.get("correction_scope") != "entire_tile"
+            or position_ids.shape != (len(experiment),)
+            or indices.shape != position_ids.shape
+            or not np.issubdtype(position_ids.dtype, np.integer)
+            or not np.issubdtype(indices.dtype, np.integer)
+            or len(np.unique(position_ids)) != len(position_ids)
+            or np.any(position_ids < 0)
+            or np.any(position_ids >= len(stage_positions_zxy))
+            or np.any(indices < 0)
+            or np.any(indices >= len(ao))
+        ):
+            raise ValueError(f"Invalid recorded AO mapping: {geometry_path}")
+        provenance = {
+            "path": str(geometry_path),
+            "sha256": hashlib.sha256(content).hexdigest(),
+        }
+    else:
+        xy = np.asarray([[point["x"], point["y"]] for point in ao])
+        positions = np.asarray([[point["x"], point["y"]] for point in experiment])
+        indices = np.argmin(
+            np.sum((positions[:, None] - xy[None]) ** 2, axis=2), axis=1
+        )
+    assignments = {}
+    for row, (point, index) in enumerate(zip(experiment, indices, strict=True)):
+        stage = round_spatial_values(
+            (point["z"], point.get("lab_scan_um", point["x"]), point["y"])
+        )
+        identity = stage
+        if position_ids is not None:
+            identity = int(position_ids[row])
+            if round_spatial_values(stage_positions_zxy[identity]) != stage:
+                raise ValueError(
+                    f"Recorded AO source position {identity} disagrees with raw stage coordinates: {geometry_path}"
+                )
+        if identity in assignments:
+            raise ValueError(f"Duplicate experiment stage position in {layer}: {stage}")
+        assignments[identity] = int(index)
+    if position_ids is None:
+        assignments = {
+            position: assignments[stage]
+            for position, stage in enumerate(
+                map(round_spatial_values, stage_positions_zxy)
+            )
+            if stage in assignments
+        }
+    return assignments, provenance
 
 
 def select_roi_ao(
@@ -155,82 +252,16 @@ def select_roi_ao(
         plans, provenance = [], []
         for name in ("ao_stage_positions.json", "exp_stage_positions.json"):
             path = layer / name
-            content = path.read_bytes()
-            plan = json.loads(content)
-            if not isinstance(plan, list) or not plan:
-                raise ValueError(f"Expected a nonempty saved stage plan: {path}")
-            xyz = np.asarray([[point[axis] for axis in "xyz"] for point in plan])
-            if not np.isfinite(xyz).all():
-                raise ValueError(f"Nonfinite saved stage coordinates: {path}")
-            if any(int(point.get("depth_index", key[1])) != key[1] for point in plan):
-                raise ValueError(f"Saved depth indices disagree with AO layer: {path}")
+            plan, source = read_ao_stage_plan(path, key[1])
             plans.append(plan)
-            provenance.append(
-                {"path": str(path), "sha256": hashlib.sha256(content).hexdigest()}
-            )
+            provenance.append(source)
         ao, experiment = plans
-        geometry_path = layer / "ao_grid_geometry.json"
-        recorded = geometry_path.is_file()
-        position_ids = None
-        if recorded:
-            content = geometry_path.read_bytes()
-            geometry = json.loads(content)
-            position_ids = np.asarray(geometry.get("position_indices", []))
-            indices = np.asarray(geometry.get("tile_ao_indices", []))
-            if (
-                geometry.get("schema_version") != 1
-                or geometry.get("units") != "um"
-                or geometry.get("correction_scope") != "entire_tile"
-                or position_ids.shape != (len(experiment),)
-                or indices.shape != position_ids.shape
-                or not np.issubdtype(position_ids.dtype, np.integer)
-                or not np.issubdtype(indices.dtype, np.integer)
-                or len(np.unique(position_ids)) != len(position_ids)
-                or np.any(position_ids < 0)
-                or np.any(position_ids >= len(acquisition.stage_positions_zxy))
-                or np.any(indices < 0)
-                or np.any(indices >= len(ao))
-            ):
-                raise ValueError(f"Invalid recorded AO mapping: {geometry_path}")
-            provenance.append(
-                {
-                    "path": str(geometry_path),
-                    "sha256": hashlib.sha256(content).hexdigest(),
-                }
-            )
-        else:
-            xy = np.asarray([[point["x"], point["y"]] for point in ao])
-            positions = np.asarray([[point["x"], point["y"]] for point in experiment])
-            indices = np.argmin(
-                np.sum((positions[:, None] - xy[None]) ** 2, axis=2), axis=1
-            )
-        assignments = {}
-        for row, (point, index) in enumerate(zip(experiment, indices, strict=True)):
-            stage = tuple(
-                round(float(value), 3)
-                for value in (
-                    point["z"],
-                    point.get("lab_scan_um", point["x"]),
-                    point["y"],
-                )
-            )
-            identity = stage
-            if position_ids is not None:
-                identity = int(position_ids[row])
-                expected = tuple(
-                    round(float(value), 3)
-                    for value in acquisition.stage_positions_zxy[identity]
-                )
-                if expected != stage:
-                    raise ValueError(
-                        f"Recorded AO source position {identity} disagrees with raw stage coordinates: {geometry_path}"
-                    )
-            if identity in assignments:
-                raise ValueError(
-                    f"Duplicate experiment stage position in {layer}: {stage}"
-                )
-            assignments[identity] = int(index)
-        layers[key] = (layer, assignments, provenance, recorded)
+        assignments, geometry_source = ao_tile_assignments(
+            layer, acquisition.stage_positions_zxy, ao, experiment
+        )
+        if geometry_source is not None:
+            provenance.append(geometry_source)
+        layers[key] = (layer, assignments, provenance, geometry_source is not None)
     if not layers:
         raise ValueError(f"No saved AO grid layers found in {root}")
     y0, y1, x0, x1 = roi.bounds_yx_um
@@ -257,22 +288,14 @@ def select_roi_ao(
             for (tile_time, position), intersection in footprints.items():
                 if tile_time != time:
                     continue
-                identity = (
-                    position
-                    if recorded
-                    else tuple(
-                        round(float(value), 3)
-                        for value in acquisition.stage_positions_zxy[position]
-                    )
-                )
-                if identity not in assignments:
+                if position not in assignments:
                     continue
                 if (time, position) in assigned_tiles:
                     raise ValueError(
                         f"ROI source tile {(time, position)} matches multiple saved AO depth plans"
                     )
                 assigned_tiles.add((time, position))
-                index = assignments[identity]
+                index = assignments[position]
                 groups[index].append(intersection)
                 members[index].append(position)
             if not groups:
