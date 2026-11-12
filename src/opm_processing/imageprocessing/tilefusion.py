@@ -2443,6 +2443,8 @@ class TileFusion:
                 return xp.rint(candidate * sampling) / sampling
             return candidate
 
+        shift_scores: dict[tuple[float, ...], float] = {}
+
         def score_shift(candidate: Any) -> float:
             """Score a sampled candidate on its valid overlapping detector support.
 
@@ -2456,14 +2458,13 @@ class TileFusion:
             float
                 Structural similarity at the retained correction.
             """
-            return _registration_similarity(
-                arr1,
-                arr2,
-                retained_shift(candidate),
-                win_size,
-                masks,
-                registration_axis,
-            )
+            candidate = retained_shift(candidate)
+            key = tuple(float(value) for value in cp.asnumpy(candidate))
+            if key not in shift_scores:
+                shift_scores[key] = _registration_similarity(
+                    arr1, arr2, candidate, win_size, masks, registration_axis
+                )
+            return shift_scores[key]
 
         # Nonlinear histogram matching can move fractional phase peaks. Keep
         # geometric estimation on the original data and match only for SSIM.
