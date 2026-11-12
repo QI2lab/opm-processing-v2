@@ -20,6 +20,10 @@ if TYPE_CHECKING:
     from napari.layers import Image
 
 from opm_processing.dataio.acquisition import acquisition_stem, inspect_acquisition
+from opm_processing.dataio.deconvolution import (
+    load_deconvolution_psfs,
+    scan_upsample_from_metadata,
+)
 from opm_processing.dataio.position_collection import open_image_array
 from opm_processing.dataio.processing_state import (
     ProcessingState,
@@ -530,8 +534,10 @@ def export_rois(
         temporary.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         temporary.replace(manifest_path)
     if figures:
+        from opm_processing.dataio.ao_results import read_ao_layers
         from opm_processing.export_roi_ao import export_roi_ao
 
+        ao_layers = read_ao_layers(acquisition, source, ao_root)
         for selection in selections:
             report = export_roi_ao(
                 acquisition,
@@ -539,11 +545,22 @@ def export_rois(
                 selection.parent,
                 ao_root=ao_root,
                 wavelength_nm=ao_wavelength_nm,
+                ao_layers=ao_layers,
             )
             if report["status"] == "unavailable":
                 typer.echo(
                     f"AO figures unavailable for {selection.parent.name}: {report['reason']}"
                 )
+    prepared_psfs = (
+        load_deconvolution_psfs(
+            acquisition,
+            decon_psf_paths,
+            reconstruction_step_um=acquisition.scan_axis_step_um
+            / scan_upsample_from_metadata(acquisition),
+        )
+        if deconvolve and selections
+        else None
+    )
     for index, selection in enumerate(selections, 1):
         result = process_roi(
             acquisition.path,
@@ -557,6 +574,8 @@ def export_rois(
             decon_gpu_id=decon_gpu_id,
             decon_verbose=decon_verbose,
             decon_psf_paths=decon_psf_paths,
+            acquisition=acquisition,
+            prepared_psfs=prepared_psfs,
             registration_channel=registration_channel,
             resume=resume,
         )

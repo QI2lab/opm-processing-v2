@@ -29,6 +29,7 @@ def export_roi_ao(
     *,
     ao_root: Path | None = None,
     wavelength_nm: float | None = None,
+    ao_layers: dict | None = None,
 ) -> dict[str, Any]:
     """Save full final requested correction phases with saved-plan provenance.
 
@@ -44,6 +45,8 @@ def export_roi_ao(
         Explicit saved AO grid directory, otherwise discover beside acquisition.
     wavelength_nm : float or None
         Optional display wavelength override; otherwise use recorded AO illumination.
+    ao_layers : dict or None
+        Saved AO plans shared by the current ROI batch.
 
     Returns
     -------
@@ -55,7 +58,7 @@ def export_roi_ao(
     from matplotlib.colorbar import ColorbarBase
     from matplotlib.colors import Normalize
 
-    records = select_roi_ao(acquisition, roi, ao_root)
+    records = select_roi_ao(acquisition, roi, ao_root, ao_layers=ao_layers)
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     manifest = {

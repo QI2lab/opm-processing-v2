@@ -111,7 +111,7 @@ def test_roi_deconvolves_recorded_sampling(
     deskewed = []
     written = []
     open_raw = processing.open_acquisition_datastore
-    generate_psfs = processing.load_deconvolution_psfs
+    generate_psfs = export_rois.load_deconvolution_psfs
     deconvolve = solver.rlgc
     deskew = processing.orthogonal_deskew
     write_channel = processing.write_checkpointed_roi_channel
@@ -215,7 +215,7 @@ def test_roi_deconvolves_recorded_sampling(
         return result
 
     monkeypatch.setattr(processing, "open_acquisition_datastore", observe_raw)
-    monkeypatch.setattr(processing, "load_deconvolution_psfs", observe_psfs)
+    monkeypatch.setattr(export_rois, "load_deconvolution_psfs", observe_psfs)
     monkeypatch.setattr(solver, "rlgc", observe_deconvolution)
     monkeypatch.setattr(processing, "orthogonal_deskew", observe_deskew)
     monkeypatch.setattr(processing, "write_checkpointed_roi_channel", observe_write)
@@ -244,7 +244,7 @@ def test_roi_deconvolves_recorded_sampling(
     state = ProcessingState.read(directory / "mosaic.processing.json")
     tiles = directory / "mosaic_decon_deskewed.ome.zarr"
     configuration = state.run(tiles)
-    assert stages[:2] == ["raw", "psfs"]
+    assert stages[:2] == ["psfs", "raw"]
     assert stages[2:-1] == ["deconvolve", "deskew"] * len(seeds)
     assert stages[-1] == "registration"
     assert len(seeds) == 2 and measurements
@@ -391,7 +391,7 @@ def test_roi_deconvolves_recorded_sampling(
     assert settings["read_noise"] == microscope.camera.read_noise_e
     assert settings["psf_parameters"] is not None and settings["psf_sha256"] is None
     monkeypatch.setattr(processing, "open_acquisition_datastore", open_raw)
-    monkeypatch.setattr(processing, "load_deconvolution_psfs", generate_psfs)
+    monkeypatch.setattr(export_rois, "load_deconvolution_psfs", generate_psfs)
     monkeypatch.setattr(solver, "rlgc", deconvolve)
     monkeypatch.setattr(processing, "orthogonal_deskew", deskew)
     monkeypatch.setattr(processing, "write_checkpointed_roi_channel", write_channel)

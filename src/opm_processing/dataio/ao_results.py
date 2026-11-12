@@ -186,40 +186,32 @@ def ao_tile_assignments(
     return assignments, provenance
 
 
-def select_roi_ao(
+def read_ao_layers(
     acquisition: AcquisitionMetadata,
-    roi: PhysicalRoi,
+    preview_path: Path,
     ao_root: Path | None = None,
-) -> list[dict[str, Any]]:
-    """Select the largest saved correction footprint at each ROI time and depth.
+) -> dict:
+    """Read saved AO plans and source-tile assignments once for an ROI batch.
 
     Parameters
     ----------
     acquisition : AcquisitionMetadata
         Original raw acquisition with physical stage positions.
-    roi : PhysicalRoi
-        Selected bounds and source-tile footprints in registered coordinates.
+    preview_path : pathlib.Path
+        Preview used to locate AO results when they are separate from raw data.
     ao_root : pathlib.Path or None
         Saved AO grid root or layer. Otherwise search beside raw data and preview.
 
     Returns
     -------
-    list of dict
-        Selected result paths and saved-plan provenance. Empty when no AO exists.
-        Recorded tile assignments take precedence. Older grids use acquisition's
-        historical nearest physical stage-XY rule. Areas are unions of intersected
-        tile footprints, without repeated overlap.
+    dict
+        Time/depth keys mapped to layer paths, assignments and provenance.
+        Empty when no AO results exist.
     """
-    from shapely import box, union_all
-
-    if not roi.tile_footprints:
-        raise ValueError("AO selection requires saved source-tile footprints")
     if ao_root is None:
         stem = acquisition_stem(acquisition.path)
         roots = []
-        for directory in dict.fromkeys(
-            (acquisition.path.parent, roi.source_path.parent)
-        ):
+        for directory in dict.fromkeys((acquisition.path.parent, preview_path.parent)):
             roots = [
                 directory / name
                 for name in (f"{stem}.ome_ao_grid_results", f"{stem}_ao_grid_results")
@@ -228,7 +220,7 @@ def select_roi_ao(
             if roots:
                 break
         if not roots:
-            return []
+            return {}
         if len(roots) != 1:
             raise ValueError("Multiple saved AO grids found; select --ao-root")
         root = roots[0]
@@ -264,6 +256,47 @@ def select_roi_ao(
         layers[key] = (layer, assignments, provenance, geometry_source is not None)
     if not layers:
         raise ValueError(f"No saved AO grid layers found in {root}")
+    return layers
+
+
+def select_roi_ao(
+    acquisition: AcquisitionMetadata,
+    roi: PhysicalRoi,
+    ao_root: Path | None = None,
+    *,
+    ao_layers: dict | None = None,
+) -> list[dict[str, Any]]:
+    """Select the largest saved correction footprint at each ROI time and depth.
+
+    Parameters
+    ----------
+    acquisition : AcquisitionMetadata
+        Original raw acquisition with physical stage positions.
+    roi : PhysicalRoi
+        Selected bounds and source-tile footprints in registered coordinates.
+    ao_root : pathlib.Path or None
+        Saved AO grid root or layer. Otherwise search beside raw data and preview.
+    ao_layers : dict or None
+        Plans returned by read_ao_layers and shared by the current ROI batch.
+
+    Returns
+    -------
+    list of dict
+        Selected result paths and saved-plan provenance. Empty when no AO exists.
+        Recorded assignments take precedence; older grids use nearest stage XY.
+        Areas are unions of intersected tile footprints without repeated overlap.
+    """
+    from shapely import box, union_all
+
+    if not roi.tile_footprints:
+        raise ValueError("AO selection requires saved source-tile footprints")
+    layers = (
+        read_ao_layers(acquisition, roi.source_path, ao_root)
+        if ao_layers is None
+        else ao_layers
+    )
+    if not layers:
+        return []
     y0, y1, x0, x1 = roi.bounds_yx_um
     boundary = box(x0, y0, x1, y1)
     footprints = {}

@@ -143,6 +143,8 @@ def process_roi(
     decon_psf_paths: list[Path] | None = None,
     resume: bool = True,
     output: Path | None = None,
+    acquisition: AcquisitionMetadata | None = None,
+    prepared_psfs: tuple[list[np.ndarray], dict | None] | None = None,
 ) -> Path:
     """Process a napari-selected world-space ROI and fuse its cropped tiles.
 
@@ -176,6 +178,10 @@ def process_roi(
         Continue completed tile and channel checkpoints; False overwrites output.
     output : pathlib.Path or None
         Output directory; None uses <acquisition>_roi beside the input.
+    acquisition : AcquisitionMetadata or None
+        Already inspected acquisition shared by a batch of ROI exports.
+    prepared_psfs : tuple or None
+        Channel kernels and optical settings returned by load_deconvolution_psfs.
 
 
     Returns
@@ -184,19 +190,22 @@ def process_roi(
         Final TCZYX OME-Zarr image; cropped tiles and checkpoints are retained.
     """
     requested_path = Path(root_path).expanduser().resolve()
-    state_paths = tuple(requested_path.glob("*.processing.json"))
-    if state_paths:
-        if len(state_paths) != 1:
-            raise ValueError(
-                "Pass the raw acquisition path and ROI JSON explicitly when "
-                "the input directory contains multiple processing-state files."
-            )
-        state = ProcessingState.read(state_paths[0])
-        acquisition = inspect_acquisition(state.source_path())
-        context_dir = requested_path
-    else:
-        acquisition = inspect_acquisition(requested_path)
+    if acquisition is not None:
         context_dir = acquisition.path.parent
+    else:
+        state_paths = tuple(requested_path.glob("*.processing.json"))
+        if state_paths:
+            if len(state_paths) != 1:
+                raise ValueError(
+                    "Pass the raw acquisition path and ROI JSON explicitly when "
+                    "the input directory contains multiple processing-state files."
+                )
+            state = ProcessingState.read(state_paths[0])
+            acquisition = inspect_acquisition(state.source_path())
+            context_dir = requested_path
+        else:
+            acquisition = inspect_acquisition(requested_path)
+            context_dir = acquisition.path.parent
     if acquisition.is_2d:
         raise ValueError(
             "ROI processing currently targets skewed 3D acquisitions; use process "
@@ -260,6 +269,7 @@ def process_roi(
         decon_gpu_id=decon_gpu_id,
         decon_verbose=decon_verbose,
         decon_psf_paths=decon_psf_paths,
+        prepared_psfs=prepared_psfs,
         roi_selection=processing_roi,
         resume=resume,
     )

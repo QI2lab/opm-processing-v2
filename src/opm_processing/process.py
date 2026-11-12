@@ -1618,6 +1618,7 @@ def process_skewed(
     live_log_path: Path | None = None,
     roi_selection: PhysicalRoi | None = None,
     resume: bool = False,
+    prepared_psfs: tuple[list[np.ndarray], dict | None] | None = None,
 ) -> None:
     """Calibrate, optionally deconvolve, and deskew mirror or stage scan tiles.
 
@@ -1679,7 +1680,8 @@ def process_skewed(
         full tiles.
     resume : bool
         Reuse compatible output checkpoints; False overwrites this output run.
-
+    prepared_psfs : tuple or None
+        Existing channel kernels and parameters reused across an ROI batch.
 
     Returns
     -------
@@ -1742,8 +1744,14 @@ def process_skewed(
     output_dtype = np.dtype(np.float32 if save_float32 else np.uint16)
     psfs: list[np.ndarray] | None = None
     if deconvolve:
-        psfs, psf_parameters = load_deconvolution_psfs(
-            acquisition, decon_psf_paths, reconstruction_step_um=reconstruction_step_um
+        psfs, psf_parameters = (
+            prepared_psfs
+            if prepared_psfs is not None
+            else load_deconvolution_psfs(
+                acquisition,
+                decon_psf_paths,
+                reconstruction_step_um=reconstruction_step_um,
+            )
         )
     stage_positions = apply_stage_axis_flips(stage_positions_raw, stage_axis_flips)
     stage_z_indices = stage_z_level_indices(stage_positions_raw)
