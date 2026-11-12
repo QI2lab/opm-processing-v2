@@ -7,14 +7,14 @@ prefers deconvolved, deskewed data.
 | Option | Description |
 | --- | --- |
 | `--registration-channel VALUE` | Select the zero-based registration channel; default 0. |
-| `--output-dir PATH` | Write fused volume and maximum-Z OME-Zarrs here; registration and depth-gain records stay beside the processed input. |
+| `--output-dir PATH` | Write fused volume and maximum-Z OME-Zarrs here; registration and depth-normalization records stay beside the processed input. |
 | `--max-registration-shift-zyx Z Y X` | Override correction limits read from recorded acquisition overlaps and bounded by tile geometry. |
 | `--registration-retries VALUE` | Remeasure pairs with expanded automatic limits and refit the entire graph; default 2, 0 disables. Explicit shift limits stay fixed. |
 | `--registration-threshold VALUE` | Minimum overlap similarity; default 0.7. |
 | `--blend-pixels Z Y X` | Set edge blending widths; default 20 600 400. |
 | `--downsample-factors Z Y X` | Set registration sampling factors; default 3 5 5. |
 | `--ssim-window VALUE` | Set the overlap similarity window; default 15. |
-| `--no-normalize-depth-intensity` | Disable brightness matching across depths; XY brightness differences are retained. |
+| `--no-normalize-depth-intensity` | Disable histogram matching to the first acquired depth at each physical XY footprint, or across combined cropped depth layers for ROIs. |
 | `--roi PATH` | Restrict fusion to a saved ROI. |
 | `--regenerate-max-z` | Recreate maximum-Z images from existing fused data. |
 | `--require-gpu` | Require CUDA registration. |

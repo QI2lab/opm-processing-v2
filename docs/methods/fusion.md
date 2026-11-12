@@ -64,18 +64,32 @@ placement between them.
 
 ## Depth intensity normalization
 
-Only registered pairs at the same stage XY and different depths provide gain
-measurements. Supported positive overlap samples are corrected for geometric
-coverage, spatially averaged, and filtered for shared signal. Robust log ratios
-constrain multiplicative gains independently for each timepoint and channel.
-The first depth in each connected gain component is anchored to one; unmeasured
-depths retain unit gains. Every XY tile at a depth shares that depth's gain.
+Full acquisitions and ROIs identify depth layers from repeated visits to recorded
+physical stage XY locations. Registered Z offsets do not create additional
+depth layers. Matching runs separately for each timepoint and channel, after
+flatfield correction, optional deconvolution, and deskewing.
 
-The fitter estimates gains from observations and does not require a tissue
-attenuation coefficient.
+For full acquisitions, the complete supported processed stack at each later
+depth is histogram-matched to the first acquired depth at the same physical XY
+footprint. For ROIs, contributing tiles are combined by acquisition depth inside
+the selected XY bounds. Each combined cropped depth layer is histogram-matched
+to the first acquired layer of that ROI. An unexpectedly missing first depth
+raises an error rather than substituting a later depth.
 
-Gains apply during fusion and are recorded beside the fused volume. Source
-arrays remain unchanged. XY-field brightness differences are preserved.
+Samples are normalized for interpolation coverage before matching. Geometric
+deskew padding is excluded, while valid zero-intensity observations remain in
+the histogram. Combined layers retain the processed output dtype: uint16 inputs
+use the upstream integer histogram path and a lookup table of at most 65,536
+entries; float32 inputs retain floating-point precision.
+The upstream `match_histograms` implementation supplies the
+intensity mapping. cuCIM is preferred when its estimated workspace fits GPU
+memory; scikit-image handles volumes that do not fit or encounter a GPU allocation
+failure.
+
+The resulting mapping applies consistently to every fusion block, with coverage
+restored for weighted accumulation. Source arrays remain unchanged. Matching
+provenance stays beside the processed tiles in
+`<stem>_depth_histograms.json`.
 
 ## Feathering and coverage
 
@@ -92,7 +106,8 @@ has zero feather weight.
 
 ## Execution
 
-Registration uses CuPy/cuCIM when available and otherwise NumPy/scikit-image.
+Registration requires CuPy/cuCIM. The scikit-image fallback applies only to
+depth histogram matching.
 Fusion uses threaded blocks and Numba CPU kernels with bounded memory and queued
 writes. Depth and coverage corrections retain source precision before the final
 output cast, including directly copied regions. Full-volume integer output clips

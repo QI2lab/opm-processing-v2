@@ -100,8 +100,8 @@ def test_inspection_and_exports_process_simulated_acquisition(
         == metadata.shape[0] * metadata.shape[1]
     )
     assert not (output_dir / state_path.name).exists()
-    assert (source / "pipeline_depth_intensity_gains.json").is_file()
-    assert not (output_dir / "pipeline_depth_intensity_gains.json").exists()
+    assert (source / "pipeline_depth_histograms.json").is_file()
+    assert not (output_dir / "pipeline_depth_histograms.json").exists()
     _, provenance = load_export_metadata(fused_path)
     assert json.loads(provenance["Acquisition"])["path"] == str(dataset_path)
     for path in (fused_path, output_dir):

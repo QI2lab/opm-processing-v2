@@ -42,6 +42,7 @@ import psutil
 import tensorstore as ts
 from numba import njit
 from scipy.cluster.hierarchy import DisjointSet
+from skimage.exposure import match_histograms as cpu_match_histograms
 from skimage.measure import block_reduce as cpu_block_reduce
 from tqdm import tqdm
 from yaozarrs.write.v05 import prepare_image
@@ -854,7 +855,6 @@ def _accumulate_tile_block(
     source_z: int = 0,
     source_y: int = 0,
     source_x: int = 0,
-    channel_gains: np.ndarray | None = None,
 ) -> None:
     """Accumulate supported channel rows without copying source sub-volumes.
 
@@ -886,10 +886,6 @@ def _accumulate_tile_block(
         X origin of the weighted crop within the accumulation buffers.
     source_z, source_y, source_x : int
         Crop origin inside the source block, defaulting to its first voxel.
-    channel_gains : numpy.ndarray | None
-        Float32 intensity correction per channel for this acquisition depth,
-        or None for unit gains. Correction precedes feathering without allocating
-        a scaled source block.
 
     Returns
     -------
@@ -898,7 +894,7 @@ def _accumulate_tile_block(
 
     Notes
     -----
-    Uncorrected uint16 sources retain Numba's double-precision multiply/add
+    uint16 sources retain Numba's double-precision multiply/add
     intermediates before storing into float32 accumulation. Casting them first
     can move normalized pixels across an integer truncation boundary.
     """
@@ -910,7 +906,6 @@ def _accumulate_tile_block(
         if not channel_present[c]:
             continue
         weight_channel = 0 if weight.shape[0] == 1 else c
-        gain = np.float32(1) if channel_gains is None else channel_gains[c]
         for idx in range(total):
             dz_i = idx // y_sub
             y_i = idx % y_sub
@@ -925,19 +920,9 @@ def _accumulate_tile_block(
                 w_val = zy_weight * x_weights[x_i]
                 if weight.shape[0] != 1 or c == 0:
                     weight[weight_channel, gz, gy, gx] += w_val * coverage
-                if channel_gains is None:
-                    fused[c, gz, gy, gx] += (
-                        source[c, source_z + dz_i, source_y + y_i, source_x + x_i]
-                        * w_val
-                    )
-                else:
-                    value = (
-                        np.float32(
-                            source[c, source_z + dz_i, source_y + y_i, source_x + x_i]
-                        )
-                        * gain
-                    )
-                    fused[c, gz, gy, gx] += value * w_val
+                fused[c, gz, gy, gx] += (
+                    source[c, source_z + dz_i, source_y + y_i, source_x + x_i] * w_val
+                )
 
 
 @njit(nogil=True, error_model="numpy")
@@ -1200,45 +1185,98 @@ def _select_nearest_registration_pairs(
     return selected
 
 
-def _fit_depth_gains(
-    level_count: int, measurements: Sequence[tuple[int, int, float]]
-) -> np.ndarray:
-    """Fit multiplicative depth gains from registered overlap measurements.
+def _depth_histogram_mapping(
+    source: np.ndarray, reference: np.ndarray
+) -> tuple[tuple[np.ndarray, np.ndarray], str]:
+    """Retain the intensity mapping returned by upstream histogram matching.
 
     Parameters
     ----------
-    level_count : int
-        Number of acquisition depth levels, including unmeasured levels.
-    measurements : sequence of tuple[int, int, float]
-        Fixed depth, moving depth, and log intensity ratio for each patch.
-        Repeated measurements are reduced to their median for each depth pair.
+    source : numpy.ndarray
+        Complete supported, coverage-normalized source intensities.
+    reference : numpy.ndarray
+        Supported intensities from the first acquired depth at the same XY.
 
     Returns
     -------
-    numpy.ndarray
-        One gain per depth. The first depth in each connected component has
-        unit gain; unmeasured depths also retain unit gain.
+    tuple
+        A pair of source/matched intensity arrays and the backend name.
+        Reusing this mapping avoids matching individual fusion blocks.
     """
-    grouped = {}
-    for left, right, log_ratio in measurements:
-        if left > right:
-            left, right, log_ratio = right, left, -log_ratio
-        grouped.setdefault((left, right), []).append(log_ratio)
-    links = [
-        {
-            "i": left,
-            "j": right,
-            "t": np.asarray((np.median(values), 0, 0)),
-            "w": math.sqrt(len(values)),
-        }
-        for (left, right), values in grouped.items()
-    ]
-    anchors = [
-        component[0]
-        for component in _connected_tile_components(range(level_count), grouped)
-    ]
-    shifts = TileFusion._solve_global(links, level_count, anchors)
-    return np.exp(shifts[:, 0])
+    integer_histogram = source.dtype == reference.dtype == np.dtype(np.uint16)
+    # Upstream uses bounded bincount tables for uint16. Float inputs instead
+    # require sorting and full-size inverse indices.
+    required_bytes = (
+        source.nbytes + reference.nbytes + 12 * source.size + 16 * 2**20
+        if integer_histogram
+        else 64 * (source.size + reference.size)
+    )
+    matched = None
+    backend = "scikit-image"
+    if USING_GPU and cp is not None:
+        pool = cp.get_default_memory_pool()
+        available = int(cp.cuda.runtime.memGetInfo()[0]) + pool.free_bytes()
+        if pool.get_limit():
+            available = min(available, pool.get_limit() - pool.used_bytes())
+        if required_bytes <= (available if integer_histogram else 0.8 * available):
+            device_source = device_reference = None
+            try:
+                device_source = cp.asarray(source)
+                device_reference = cp.asarray(reference)
+                matched = cp.asnumpy(
+                    match_histograms(device_source, device_reference, channel_axis=None)
+                )
+                backend = "cucim"
+            except (
+                cp.cuda.memory.OutOfMemoryError,
+                cp.cuda.runtime.CUDARuntimeError,
+            ) as error:
+                if (
+                    isinstance(error, cp.cuda.runtime.CUDARuntimeError)
+                    and error.status != 2
+                ):
+                    raise
+            finally:
+                del device_source, device_reference
+            # Leave the exception scope first: its traceback retains upstream
+            # sort buffers until then. Only allocation failures retry on CPU.
+            if matched is None:
+                pool.free_all_blocks()
+    if matched is None:
+        # Integer matching needs bincount's index conversion or the matched
+        # output. Float matching also retains sort buffers and inverse indices.
+        host_bytes = (
+            8 * max(source.size, reference.size) + 16 * 2**20
+            if integer_histogram
+            else max(
+                56 * source.size,
+                44 * source.size + 20 * reference.size,
+                36 * source.size + 28 * reference.size,
+            )
+        )
+        # The float bound already assumes every sample has a distinct intensity.
+        # Do not apply another reserve to the conservative host-memory bound.
+        available = psutil.virtual_memory().available
+        if host_bytes > available:
+            raise MemoryError(
+                "Depth histogram matching estimates "
+                f"{host_bytes / 2**30:.1f} GiB of additional working memory; "
+                f"{available / 2**30:.1f} GiB is available."
+            )
+        matched = cpu_match_histograms(source, reference, channel_axis=None)
+    if integer_histogram:
+        # Every occurrence of an intensity has the same upstream result. Keep
+        # one result per uint16 value without sorting a billion-voxel vector.
+        lookup = np.full(65536, np.nan, dtype=np.float64)
+        for start in range(0, source.size, 2**20):
+            stop = start + 2**20
+            np.put(lookup, source[start:stop], matched[start:stop])
+        present = np.isfinite(lookup)
+        return (np.flatnonzero(present).astype(np.float64), lookup[present]), backend
+    values, first = np.unique(source, return_index=True)
+    # np.interp consumes float64 knots. Convert once so concurrent block reads
+    # share these maps instead of repeatedly copying the full lookup arrays.
+    return (values.astype(np.float64), matched[first].astype(np.float64)), backend
 
 
 def _registration_sampling(
@@ -1549,15 +1587,16 @@ class TileFusion:
             Optional physical YX crop. Tile selection ignores Z so every stage-Z
             level intersecting the rectangle is retained.
         normalize_depth_intensity : bool
-            Match depth-layer intensities using image-registered overlaps at
-            the same stage XY. All XY tiles at one depth share the same gain.
+            Histogram-match processed layers to the first acquired depth per
+            channel and timepoint. ROIs combine tiles within each cropped depth
+            layer; full acquisitions match at each physical stage XY.
         registration_retries : int
             Maximum automatic search expansions. Each expansion remeasures only
             affected pairs and refits all global offsets. Explicit shift limits
             are never expanded.
         output_dir : str or pathlib.Path or None
             Destination for fused OME-Zarr images. None writes beside the
-            processed tiles. Registration and depth-gain records stay there.
+            processed tiles. Registration and depth-histogram records stay there.
         registration_context_limit_zyx : tuple[int, int, int] or None
             Maximum search supported by a preplanned ROI read context. Clamp
             per-pair automatic limits and retries to this ceiling without
@@ -1786,9 +1825,12 @@ class TileFusion:
         self._blend_pixels = tuple(int(x) for x in blend_pixels)
         self.channel_to_use = int(channel_to_use)
         self.normalize_depth_intensity = bool(normalize_depth_intensity)
-        self._depth_intensity_gains = np.ones(
-            (len(self._tile_positions), int(self.channels)), dtype=np.float32
-        )
+        self._depth_histogram_maps: dict[
+            tuple[int, int], tuple[np.ndarray, np.ndarray]
+        ] = {}
+        self._tile_depth_indices = stage_z_level_indices(
+            self.acquisition.stage_positions_zxy
+        )[np.asarray(self._tile_source_position_indices)]
         self._depth_intensity_report = None
 
         if multiscale_downsample not in ("stride", "block_mean"):
@@ -2200,10 +2242,8 @@ class TileFusion:
             slice(*bounds_zyx[2]),
             dtype=None,
         )
-        return self._scale_depth_source(
-            tile_idx,
+        return self._normalize_coverage(
             patch,
-            channel_index,
             self._tile_support_zy[tile_idx][
                 slice(*bounds_zyx[0]), slice(*bounds_zyx[1])
             ],
@@ -3432,192 +3472,195 @@ class TileFusion:
                 pair = (tile_indices[link["i"]], tile_indices[link["j"]])
                 self.optimized_pairwise_metrics[pair] = self.pairwise_metrics[pair]
 
-    def estimate_depth_intensity_gains(self) -> None:
-        """Estimate channel gains shared by all XY tiles at each depth.
-
-        Sample registered overlaps only between distinct depths acquired at
-        the same XY stage position. Fit robust log intensity ratios separately
-        for each channel and time point, anchoring the first connected depth.
-        Store gains and provenance for fusion without modifying source tiles.
-        Planar acquisitions and acquisitions with one depth retain unit gains.
-
-        Returns
-        -------
-        None
-            Gains and provenance are stored on this instance.
-        """
-        raw_positions = np.asarray(self.acquisition.stage_positions_zxy)
-        source_levels = stage_z_level_indices(raw_positions)
-        levels = source_levels[np.asarray(self._tile_source_position_indices)]
-        level_count = int(source_levels.max()) + 1
-        if self._is_2d or level_count < 2:
-            return
-        observations = {}
-        depth_links = [
-            (i, j, value)
-            for (i, j), value in getattr(self, "optimized_pairwise_metrics", {}).items()
-            if levels[i] != levels[j]
-            and np.allclose(
-                raw_positions[self._tile_source_position_indices[i], 1:],
-                raw_positions[self._tile_source_position_indices[j], 1:],
-                atol=0.001,
-                rtol=0,
-            )
-            and not np.isclose(
-                raw_positions[self._tile_source_position_indices[i], 0],
-                raw_positions[self._tile_source_position_indices[j], 0],
-                atol=0.001,
-                rtol=0,
-            )
-        ]
-        for i, j, value in tqdm(
-            depth_links, desc="match depth intensities", unit="pair"
-        ):
-            # Pairwise image alignment identifies corresponding specimen pixels.
-            # Use it before applying the optimized global placements.
-            offset = np.rint(
-                (np.asarray(self._tile_positions[j]) - self._tile_positions[i])
-                / self._pixel_size
-            ).astype(int) + np.asarray(value[:3], dtype=int)
-            bounds = [
-                (max(0, delta), min(length_i, delta + length_j))
-                for delta, length_i, length_j in zip(
-                    offset, self._tile_shapes[i], self._tile_shapes[j], strict=False
-                )
-            ]
-            if any(hi - lo < 4 for lo, hi in bounds):
-                continue
-            for fraction in (0.2, 0.5, 0.8):
-                patch_bounds = []
-                for axis, (lo, hi) in enumerate(bounds):
-                    length = min(hi - lo, 32 if axis == 0 else 256)
-                    if axis > 0:
-                        length -= length % 4
-                    start = lo + round(fraction * (hi - lo - length))
-                    patch_bounds.append((start, start + length))
-                moving_bounds = [
-                    (lo - delta, hi - delta)
-                    for (lo, hi), delta in zip(patch_bounds, offset, strict=False)
-                ]
-                fixed_slices = tuple(slice(lo, hi) for lo, hi in patch_bounds)
-                moving_slices = tuple(slice(lo, hi) for lo, hi in moving_bounds)
-                fixed = self._read_tile_volume(i, slice(None), *fixed_slices)
-                moving = self._read_tile_volume(j, slice(None), *moving_slices)
-                fixed_coverage = self._tile_support_zy[i][fixed_slices[:2]]
-                moving_coverage = self._tile_support_zy[j][moving_slices[:2]]
-                np.divide(
-                    fixed,
-                    fixed_coverage[None, :, :, None],
-                    out=fixed,
-                    where=fixed_coverage[None, :, :, None] > 0,
-                )
-                np.divide(
-                    moving,
-                    moving_coverage[None, :, :, None],
-                    out=moving,
-                    where=moving_coverage[None, :, :, None] > 0,
-                )
-                support = (fixed_coverage > 0) & (moving_coverage > 0)
-                channels, depth, height, width = fixed.shape
-                fixed = fixed.reshape(
-                    channels, depth, height // 4, 4, width // 4, 4
-                ).mean(axis=(3, 5))
-                moving = moving.reshape(
-                    channels, depth, height // 4, 4, width // 4, 4
-                ).mean(axis=(3, 5))
-                support = support.reshape(depth, height // 4, 4).all(axis=2)[:, :, None]
-                for channel in range(int(self.channels)):
-                    if (
-                        not self._tile_channel_nonzero[(i, channel)]
-                        or not self._tile_channel_nonzero[(j, channel)]
-                    ):
-                        continue
-                    a, b = fixed[channel], moving[channel]
-                    valid = (
-                        support & np.isfinite(a) & np.isfinite(b) & (a > 0) & (b > 0)
-                    )
-                    if np.count_nonzero(valid) < 64:
-                        continue
-                    signal = a + b
-                    valid &= signal >= np.median(signal[valid])
-                    log_ratio = float(np.median(np.log(a[valid]) - np.log(b[valid])))
-                    if math.isfinite(log_ratio):
-                        key = (int(self._tile_time_indices[i]), channel)
-                        observations.setdefault(key, []).append(
-                            (int(levels[i]), int(levels[j]), log_ratio)
-                        )
-        records = []
-        for (time, channel), measurements in sorted(observations.items()):
-            gains = _fit_depth_gains(level_count, measurements)
-            for tile, (tile_time, level) in enumerate(
-                zip(self._tile_time_indices, levels, strict=False)
-            ):
-                if tile_time == time:
-                    self._depth_intensity_gains[tile, channel] = gains[level]
-            records.append(
-                {
-                    "time_index": time,
-                    "channel_index": channel,
-                    "depth_gains": gains.tolist(),
-                    "overlap_samples": len(measurements),
-                }
-            )
-            print(
-                f"Depth intensity gains t={time}, c={channel}: {np.round(gains, 3).tolist()}"
-            )
-        self._depth_intensity_report = {
-            "enabled": True,
-            "method": "same-XY-registered-overlaps-robust-depth-log-gains-v1",
-            "anchor": "first depth in each connected depth component",
-            "tile_depth_indices": levels.tolist(),
-            "channels": records,
-        }
-
-    def _scale_depth_source(
-        self,
-        tile: int,
-        source: np.ndarray,
-        channel: int | None = None,
-        coverage_zy: np.ndarray | None = None,
-    ) -> np.ndarray:
-        """Apply depth gains and normalize incomplete interpolation bins.
+    def _depth_layer_values(self, tiles: list[int], channel: int) -> np.ndarray:
+        """Combine supported processed pixels in one acquisition depth layer.
 
         Parameters
         ----------
-        tile : int
-            Source tile index.
-        source : numpy.ndarray
-            Source intensities in CZYX order, or ZYX for one selected channel.
-        channel : int | None
-            Selected channel index for a ZYX source, or None for all channels.
-        coverage_zy : numpy.ndarray | None
-            Valid-sample fractions for the selected ZY rows, or None when
-            geometric normalization is performed by weighted accumulation.
-            Divide partially filled bins by their nonzero coverage. Padding
-            stays unchanged, and fully covered sources retain the fast path.
+        tiles : list[int]
+            Tiles in the layer, already placed in registered coordinates.
+        channel : int
+            Channel to combine using the production feather accumulator.
 
         Returns
         -------
         numpy.ndarray
-            Float32 corrected intensities, or the original block when gains
-            are unit and bins are complete. The input array is never modified.
+            Complete supported layer intensities in the processed output dtype,
+            including valid zeros. Float accumulation is cast only after blending.
         """
-        scaled = source
-        gains = getattr(self, "_depth_intensity_gains", None)
-        if gains is not None:
-            gain = gains[tile] if channel is None else gains[tile, channel]
-            if not np.all(gain == 1):
-                if channel is None:
-                    gain = gain[:, None, None, None]
-                scaled = source.astype(np.float32, copy=False) * gain
-        if coverage_zy is not None and np.any((coverage_zy > 0) & (coverage_zy < 1)):
-            if scaled is source:
-                scaled = source.astype(np.float32, copy=True)
-            coverage = coverage_zy[:, :, None]
-            if channel is None:
-                coverage = coverage[None]
-            np.divide(scaled, coverage, out=scaled, where=coverage > 0)
-        return scaled
+        active = [tile for tile in tiles if self._tile_channel_nonzero[(tile, channel)]]
+        if not active:
+            return np.empty(0, dtype=np.float32)
+        origins = np.rint(
+            (np.asarray(self._tile_positions)[active] - self.offset_um)
+            / self._pixel_size
+        ).astype(int)
+        shapes = np.asarray(self._tile_shapes)[active]
+        lower = np.maximum(origins.min(axis=0), 0)
+        upper = np.minimum((origins + shapes).max(axis=0), self.unpadded_shape)
+        if np.any(upper <= lower):
+            return np.empty(0, dtype=np.float32)
+        voxel_count = math.prod(int(value) for value in upper - lower)
+        if 16 * voxel_count > 0.8 * psutil.virtual_memory().available:
+            raise MemoryError("Insufficient RAM to combine a complete depth layer.")
+        bounds = tuple(
+            int(value) for pair in zip(lower, upper, strict=True) for value in pair
+        )
+        contributors = [
+            (tile, tuple(origin)) for tile, origin in zip(active, origins, strict=True)
+        ]
+        numerator, weights = self._accumulate_fusion_tiles(
+            bounds, contributors, channel
+        )
+        layer = (
+            numerator
+            if numerator.dtype == self.output_dtype
+            else np.empty(numerator.shape, dtype=self.output_dtype)
+        )
+        _normalize_block(numerator, weights, layer)
+        del numerator
+        values = layer[0][weights[0] > 0]
+        if not np.isfinite(values).all():
+            raise ValueError(
+                "Nonfinite processed intensities in depth histogram matching."
+            )
+        return values
+
+    def match_depth_histograms(self) -> None:
+        """Match each channel to its first acquired depth before depth blending.
+
+        ROIs combine all cropped tiles belonging to an acquisition depth. Full
+        acquisitions match depths separately at each recorded physical stage XY.
+        Histograms use complete supported processed layers, including dark
+        samples, and exclude geometric padding. Maps are applied during fusion;
+        stored source pixels are never modified.
+
+        Returns
+        -------
+        None
+            Stores upstream intensity maps and reference provenance.
+        """
+        self._depth_histogram_maps.clear()
+        levels = self._tile_depth_indices
+        self._depth_intensity_report = {
+            "enabled": True,
+            "method": "combined-cropped-depth-histograms-v1"
+            if self.roi_selection is not None
+            else "same-XY-depth-histograms-v1",
+            "reference": "first acquired depth",
+            "intensity_dtype": self.output_dtype.name,
+            "tile_depth_indices": levels.tolist(),
+            "tile_source_position_indices": list(self._tile_source_position_indices),
+            "channels": [],
+        }
+        if self._is_2d:
+            return
+        if self.offset_um is None:
+            self._compute_fused_image_space()
+        positions = np.asarray(self.acquisition.stage_positions_zxy)
+        groups = {}
+        for tile, (time, position) in enumerate(
+            zip(
+                self._tile_time_indices, self._tile_source_position_indices, strict=True
+            )
+        ):
+            key = (
+                (int(time),)
+                if self.roi_selection is not None
+                else (int(time), *np.round(positions[position, 1:], 3))
+            )
+            groups.setdefault(key, {}).setdefault(int(levels[tile]), []).append(tile)
+        maps = {}
+        for key, layers in tqdm(
+            groups.items(), desc="match depth histograms", unit="footprint"
+        ):
+            if 0 not in layers:
+                raise ValueError(
+                    f"First acquired depth is missing from processed footprint {key}."
+                )
+            if len(layers) < 2:
+                continue
+            for channel in range(int(self.channels)):
+                reference = self._depth_layer_values(layers[0], channel)
+                if not reference.size:
+                    if any(
+                        self._tile_channel_nonzero[(tile, channel)]
+                        for level, tiles in layers.items()
+                        if level != 0
+                        for tile in tiles
+                    ):
+                        raise ValueError(
+                            f"First acquired depth has no supported channel {channel} data "
+                            f"for footprint {key}."
+                        )
+                    continue
+                record = {
+                    "time_index": key[0],
+                    "channel_index": channel,
+                    "reference_position_indices": [
+                        self._tile_source_position_indices[tile] for tile in layers[0]
+                    ],
+                    "reference_voxels": int(reference.size),
+                    "layers": [],
+                }
+                if len(key) == 3:
+                    record["stage_xy_um"] = [float(value) for value in key[1:]]
+                for level, tiles in sorted(layers.items()):
+                    if level == 0:
+                        continue
+                    source = self._depth_layer_values(tiles, channel)
+                    if not source.size:
+                        continue
+                    mapping, backend = _depth_histogram_mapping(source, reference)
+                    for tile in tiles:
+                        maps[tile, channel] = mapping
+                    record["layers"].append(
+                        {
+                            "depth_index": level,
+                            "source_position_indices": [
+                                self._tile_source_position_indices[tile]
+                                for tile in tiles
+                            ],
+                            "source_voxels": int(source.size),
+                            "mapping_knots": int(mapping[0].size),
+                            "backend": backend,
+                        }
+                    )
+                    print(
+                        f"Depth histogram t={key[0]}, c={channel}, depth={level}: {backend}"
+                    )
+                    del source
+                self._depth_intensity_report["channels"].append(record)
+                del reference
+        self._depth_histogram_maps = maps
+
+    @staticmethod
+    def _normalize_coverage(
+        source: np.ndarray,
+        coverage_zy: np.ndarray,
+    ) -> np.ndarray:
+        """Normalize incomplete interpolation bins without modifying the input.
+
+        Parameters
+        ----------
+        source : numpy.ndarray
+            Source intensities in CZYX order, or ZYX for one selected channel.
+        coverage_zy : numpy.ndarray
+            Valid-sample fractions for the selected ZY rows. Divide partially
+            filled bins by their nonzero coverage; leave padding unchanged.
+
+        Returns
+        -------
+        numpy.ndarray
+            Float32 normalized intensities, or the original block when all
+            supported bins are complete.
+        """
+        if not np.any((coverage_zy > 0) & (coverage_zy < 1)):
+            return source
+        normalized = source.astype(np.float32, copy=True)
+        coverage = coverage_zy[:, :, None]
+        np.divide(normalized, coverage, out=normalized, where=coverage > 0)
+        return normalized
 
     def _cast_fusion_values(self, source: np.ndarray) -> np.ndarray:
         """Convert fusion intensities to the configured output dtype.
@@ -4159,7 +4202,8 @@ class TileFusion:
         concurrent_buffers = max(
             1, int(self._max_workers) + int(self.max_in_flight_writes)
         )
-        bytes_per_voxel = max(16, 16 * int(self.channels))
+        buffer_bytes = 40 if self._depth_histogram_maps else 16
+        bytes_per_voxel = buffer_bytes * max(1, int(self.channels))
         bytes_per_z_plane = int(self.chunk_y) * int(self.chunk_x) * bytes_per_voxel
         max_z = max(
             output_chunk_z,
@@ -4200,9 +4244,10 @@ class TileFusion:
         )
         per_block_budget = max(1, budget // concurrent_buffers)
 
-        # One source, output, accumulation and per-channel weights can all be
-        # float32. TensorStore's source cache has its own separate limit.
-        bytes_per_voxel = max(16, 16 * int(self.channels))
+        # Histogram matching also retains the current depth's accumulation and
+        # weights while combining depths. TensorStore has a separate cache limit.
+        buffer_bytes = 40 if self._depth_histogram_maps else 16
+        bytes_per_voxel = buffer_bytes * max(1, int(self.channels))
         max_xy_pixels = max(
             1,
             per_block_budget // (max(1, z_depth) * bytes_per_voxel),
@@ -4224,6 +4269,141 @@ class TileFusion:
             block_x = max(self.chunk_x, (block_x // self.chunk_x) * self.chunk_x)
         return int(block_y), int(block_x)
 
+    def _match_fusion_depth(
+        self,
+        tile: int,
+        values: np.ndarray,
+        weights: np.ndarray,
+        channel: int | None = None,
+    ) -> np.ndarray:
+        """Apply a saved depth map to normalized CZYX pixels, preserving padding.
+
+        Parameters
+        ----------
+        tile : int
+            Tile identifying the acquisition footprint or shared ROI depth map.
+        values : numpy.ndarray
+            Coverage-normalized CZYX values, optionally for one channel.
+        weights : numpy.ndarray
+            Positive weights identify measured pixels; one channel may broadcast.
+        channel : int or None
+            Acquisition channel represented by a single-channel input.
+
+        Returns
+        -------
+        numpy.ndarray
+            Matched values. Unmapped inputs retain their existing dtype.
+        """
+        maps = self._depth_histogram_maps
+        channels = range(int(self.channels)) if channel is None else (channel,)
+        for index, source_channel in enumerate(channels):
+            mapping = maps.get((tile, source_channel))
+            if mapping is None:
+                continue
+            values = values.astype(np.float32, copy=False)
+            values[index] = np.interp(self._cast_fusion_values(values[index]), *mapping)
+            valid_weight = weights[0 if weights.shape[0] == 1 else index]
+            np.copyto(values[index], 0, where=valid_weight <= 0)
+        return values
+
+    def _accumulate_fusion_tiles(
+        self,
+        bounds: tuple[int, int, int, int, int, int],
+        contributors: Sequence[tuple[int, tuple[int, int, int]]],
+        channel: int | None = None,
+        match_depth: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Accumulate processed tiles with the production feather/coverage kernel.
+
+        Parameters
+        ----------
+        bounds : tuple[int, int, int, int, int, int]
+            Half-open canvas ZYX bounds. Contributors are clipped to these bounds.
+        contributors : sequence of tuple
+            Tile indices and integer canvas ZYX origins.
+        channel : int or None
+            Read one acquisition channel, or all channels when None.
+        match_depth : bool
+            Apply individual footprint maps for full-acquisition fusion. ROI
+            maps are applied to the combined layer by the caller instead.
+
+        Returns
+        -------
+        tuple[numpy.ndarray, numpy.ndarray]
+            Float32 CZYX numerator and weights; selected channels retain C=1.
+            Weights share C=1 when every contributor has every selected channel.
+        """
+        z0, z1, y0, y1, x0, x1 = bounds
+        channels = list(range(int(self.channels))) if channel is None else [channel]
+        channel_flags = [
+            np.asarray(
+                [self._tile_channel_nonzero[(p, c)] for c in channels],
+                dtype=np.bool_,
+            )
+            for p, _ in contributors
+        ]
+        fused = np.zeros((len(channels), z1 - z0, y1 - y0, x1 - x0), np.float32)
+        weight = np.zeros(
+            (
+                1 if all(np.all(flags) for flags in channel_flags) else len(channels),
+                *fused.shape[1:],
+            ),
+            np.float32,
+        )
+        maps = self._depth_histogram_maps
+        for (p, (oz, oy, ox)), present in zip(contributors, channel_flags, strict=True):
+            if not np.any(present):
+                continue
+            shape = self._tile_shapes[p]
+            gz0, gz1 = max(z0, oz), min(z1, oz + shape[0])
+            gy0, gy1 = max(y0, oy), min(y1, oy + shape[1])
+            gx0, gx1 = max(x0, ox), min(x1, ox + shape[2])
+            if gz0 >= gz1 or gy0 >= gy1 or gx0 >= gx1:
+                continue
+            local_z = slice(gz0 - oz, gz1 - oz)
+            local_y = slice(gy0 - oy, gy1 - oy)
+            local_x = slice(gx0 - ox, gx1 - ox)
+            source = self._read_tile_volume(
+                p,
+                slice(None) if channel is None else slice(channel, channel + 1),
+                local_z,
+                local_y,
+                local_x,
+                dtype=None,
+            )
+            coverage = self._tile_support_zy[p][local_z, local_y]
+            profiles = self._tile_profiles[p]
+            z_weights, y_weights, x_weights = (
+                profiles[0][local_z],
+                profiles[1][local_y],
+                profiles[2][local_x],
+            )
+            if (
+                match_depth
+                and self.roi_selection is None
+                and any((p, c) in maps for c in channels)
+            ):
+                source = self._normalize_coverage(source, coverage)
+                valid = (coverage[None, :, :, None] > 0) & (
+                    x_weights[None, None, None, :] > 0
+                )
+                source = self._match_fusion_depth(p, source, valid, channel)
+                source *= coverage[None, :, :, None]
+            _accumulate_tile_block(
+                fused,
+                weight,
+                source,
+                present,
+                coverage,
+                z_weights,
+                y_weights,
+                x_weights,
+                gz0 - z0,
+                gy0 - y0,
+                gx0 - x0,
+            )
+        return fused, weight
+
     def _render_fusion_block(
         self,
         t: int,
@@ -4232,11 +4412,10 @@ class TileFusion:
     ) -> tuple[Any, np.ndarray, int, int]:
         """Render one independent output block without writing it.
 
-        Each contributing tile is read at most once. Exclusive regions apply
-        depth gains and interpolation coverage before copying into the output.
-        Overlaps use float32 feather accumulation and
-        normalize without crop, clipping, or cast buffers. Float32 output reuses
-        the accumulation buffer; uint16 normalization writes directly into output.
+        Exclusive regions normalize coverage before applying a depth map.
+        ROI overlaps combine tiles within each acquisition depth before matching
+        that layer, then blend the corrected depths with their original weights.
+        Full-acquisition overlaps apply the matching map for each XY footprint.
 
         Parameters
         ----------
@@ -4253,52 +4432,17 @@ class TileFusion:
             Destination selection, rendered pixels, direct-copy region count, and blended region count.
         """
         z0, z1, y0, y1, x0, x1 = bounds
-        common_shape = (int(self.z_dim), int(self.y_dim), int(self.x_dim))
-        tile_shapes = getattr(
-            self,
-            "_tile_shapes",
-            [common_shape] * len(self._tile_positions),
-        )
-        regions = _partition_fusion_block(bounds, contributors, tile_shapes)
-        tile_supports = getattr(self, "_tile_support_zy", None)
-        if tile_supports is None:
-            tile_supports = [self._deskew_support_zy] * len(tile_shapes)
-
-        if len(regions) == 1 and len(regions[0][1]) == 1:
-            region, region_contributors = regions[0]
-            rz0, rz1, ry0, ry1, rx0, rx1 = region
-            p, (oz, oy, ox) = region_contributors[0]
-            direct = self._read_tile_volume(
-                p,
-                slice(None),
-                slice(rz0 - oz, rz1 - oz),
-                slice(ry0 - oy, ry1 - oy),
-                slice(rx0 - ox, rx1 - ox),
-                dtype=None,
+        regions = _partition_fusion_block(bounds, contributors, self._tile_shapes)
+        maps = self._depth_histogram_maps
+        match_roi_layers = bool(maps) and self.roi_selection is not None
+        single_tile = len(regions) == 1 and len(regions[0][1]) == 1
+        output = (
+            None
+            if single_tile
+            else np.zeros(
+                (int(self.channels), z1 - z0, y1 - y0, x1 - x0),
+                dtype=self.output_dtype,
             )
-            direct = self._cast_fusion_values(
-                self._scale_depth_source(
-                    p,
-                    direct,
-                    coverage_zy=tile_supports[p][
-                        rz0 - oz : rz1 - oz, ry0 - oy : ry1 - oy
-                    ],
-                )
-            )
-            selection = (
-                t,
-                slice(None),
-                slice(rz0, rz1),
-                slice(ry0, ry1),
-                slice(rx0, rx1),
-            )
-            return selection, direct, 1, 0
-
-        depth_gains = getattr(self, "_depth_intensity_gains", None)
-
-        output = np.zeros(
-            (int(self.channels), z1 - z0, y1 - y0, x1 - x0),
-            dtype=getattr(self, "output_dtype", np.dtype(np.uint16)),
         )
         direct_regions = 0
         blended_regions = 0
@@ -4320,87 +4464,66 @@ class TileFusion:
                     slice(rx0 - ox, rx1 - ox),
                     dtype=None,
                 )
-                output[output_selection] = self._cast_fusion_values(
-                    self._scale_depth_source(
-                        p,
-                        source,
-                        coverage_zy=tile_supports[p][
-                            rz0 - oz : rz1 - oz, ry0 - oy : ry1 - oy
-                        ],
+                coverage = self._tile_support_zy[p][
+                    rz0 - oz : rz1 - oz, ry0 - oy : ry1 - oy
+                ]
+                source = self._normalize_coverage(source, coverage)
+                if any((p, c) in maps for c in range(int(self.channels))):
+                    x_profile = self._tile_profiles[p][2]
+                    valid = (coverage[None, :, :, None] > 0) & (
+                        x_profile[None, None, None, rx0 - ox : rx1 - ox] > 0
                     )
-                )
+                    source = self._match_fusion_depth(p, source, valid)
+                    for channel_index in range(int(self.channels)):
+                        if not self._tile_channel_nonzero[(p, channel_index)]:
+                            source[channel_index] = 0
+                source = self._cast_fusion_values(source)
+                if single_tile:
+                    return (
+                        (
+                            t,
+                            slice(None),
+                            slice(rz0, rz1),
+                            slice(ry0, ry1),
+                            slice(rx0, rx1),
+                        ),
+                        source,
+                        1,
+                        0,
+                    )
+                output[output_selection] = source
                 del source
                 direct_regions += 1
                 continue
 
-            fused = np.zeros(
-                (
-                    int(self.channels),
-                    rz1 - rz0,
-                    ry1 - ry0,
-                    rx1 - rx0,
-                ),
-                dtype=np.float32,
-            )
-            channel_flags = [
-                np.asarray(
-                    [
-                        self._tile_channel_nonzero[(p, channel_index)]
-                        for channel_index in range(int(self.channels))
-                    ],
-                    dtype=np.bool_,
+            if match_roi_layers:
+                depth_contributors: dict[
+                    int, list[tuple[int, tuple[int, int, int]]]
+                ] = {}
+                for contributor in region_contributors:
+                    level = int(self._tile_depth_indices[contributor[0]])
+                    depth_contributors.setdefault(level, []).append(contributor)
+                fused = np.zeros(
+                    (int(self.channels), rz1 - rz0, ry1 - ry0, rx1 - rx0),
+                    dtype=np.float32,
                 )
-                for p, _offset in region_contributors
-            ]
-            shared_weights = all(np.all(present) for present in channel_flags)
-            weight = np.zeros(
-                (1 if shared_weights else int(self.channels), *fused.shape[1:]),
-                dtype=np.float32,
-            )
-            for (p, (oz, oy, ox)), present in zip(
-                region_contributors, channel_flags, strict=True
-            ):
-                local_z = slice(rz0 - oz, rz1 - oz)
-                local_y = slice(ry0 - oy, ry1 - oy)
-                local_x = slice(rx0 - ox, rx1 - ox)
-                source = self._read_tile_volume(
-                    p,
-                    slice(None),
-                    local_z,
-                    local_y,
-                    local_x,
-                    dtype=None,
+                weight = np.zeros_like(fused)
+                for layer_contributors in depth_contributors.values():
+                    layer, layer_weight = self._accumulate_fusion_tiles(
+                        region, layer_contributors
+                    )
+                    _normalize_block(layer, layer_weight, layer)
+                    layer = self._match_fusion_depth(
+                        layer_contributors[0][0], layer, layer_weight
+                    )
+                    layer *= layer_weight
+                    fused += layer
+                    weight += layer_weight
+                    del layer, layer_weight
+            else:
+                fused, weight = self._accumulate_fusion_tiles(
+                    region, region_contributors, match_depth=True
                 )
-                tile_support = tile_supports[p]
-                tile_profiles = getattr(self, "_tile_profiles", None)
-                if tile_profiles is None:
-                    z_profile = self.z_profile
-                    y_profile = self.y_profile
-                    x_profile = self.x_profile
-                else:
-                    z_profile, y_profile, x_profile = tile_profiles[p]
-                _accumulate_tile_block(
-                    fused,
-                    weight,
-                    source,
-                    present,
-                    tile_support[local_z, local_y],
-                    z_profile[local_z],
-                    y_profile[local_y],
-                    x_profile[local_x],
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    (
-                        None
-                        if depth_gains is None or np.all(depth_gains[p] == 1)
-                        else depth_gains[p]
-                    ),
-                )
-                del source
 
             region_output = output[output_selection]
             if output.dtype == np.dtype(np.float32):
@@ -4412,10 +4535,8 @@ class TileFusion:
             for channel_index in range(int(self.channels)):
                 active_tiles = [
                     tile_index
-                    for (tile_index, _offset), present in zip(
-                        region_contributors, channel_flags, strict=True
-                    )
-                    if present[channel_index]
+                    for tile_index, _offset in region_contributors
+                    if self._tile_channel_nonzero[(tile_index, channel_index)]
                 ]
                 if not active_tiles:
                     region_output[channel_index] = 0
@@ -4433,17 +4554,20 @@ class TileFusion:
                     slice(ry0 - oy, ry1 - oy),
                     slice(rx0 - ox, rx1 - ox),
                     dtype=None,
-                )[0]
-                region_output[channel_index] = self._cast_fusion_values(
-                    self._scale_depth_source(
-                        tile_index,
-                        source,
-                        channel_index,
-                        tile_supports[tile_index][
-                            rz0 - oz : rz1 - oz, ry0 - oy : ry1 - oy
-                        ],
-                    )
                 )
+                coverage = self._tile_support_zy[tile_index][
+                    rz0 - oz : rz1 - oz, ry0 - oy : ry1 - oy
+                ]
+                source = self._normalize_coverage(source, coverage)
+                if (tile_index, channel_index) in maps:
+                    x_profile = self._tile_profiles[tile_index][2]
+                    valid = (coverage[None, :, :, None] > 0) & (
+                        x_profile[None, None, None, rx0 - ox : rx1 - ox] > 0
+                    )
+                    source = self._match_fusion_depth(
+                        tile_index, source, valid, channel_index
+                    )
+                region_output[channel_index] = self._cast_fusion_values(source)[0]
                 del source
             blended_regions += 1
 
@@ -4845,6 +4969,8 @@ class TileFusion:
         RuntimeError
             If required intermediate computations fail.
         """
+        self._depth_histogram_maps.clear()
+        self._depth_intensity_report = None
         reuse_registered = getattr(
             self,
             "_reuse_registered_roi_placements",
@@ -4859,14 +4985,6 @@ class TileFusion:
         else:
             self.register_with_retries()
 
-        if self.normalize_depth_intensity:
-            self.estimate_depth_intensity_gains()
-
-        gc.collect()
-        if USING_GPU and cp is not None:
-            cp.get_default_memory_pool().free_all_blocks()
-            cp.get_default_pinned_memory_pool().free_all_blocks()
-
         if not reuse_registered:
             self._tile_positions = [
                 tuple(np.array(pos) + off * np.array(self._pixel_size))
@@ -4876,6 +4994,14 @@ class TileFusion:
             ]
 
         self._compute_fused_image_space()
+        if self.normalize_depth_intensity:
+            self.match_depth_histograms()
+
+        gc.collect()
+        if USING_GPU and cp is not None:
+            cp.get_default_memory_pool().free_all_blocks()
+            cp.get_default_pinned_memory_pool().free_all_blocks()
+
         self._pad_to_multiscale_multiple()
 
         omezarr = self.output_dir / f"{self.acquisition_name}_fused.ome.zarr"
@@ -4884,7 +5010,7 @@ class TileFusion:
         self._write_multiscales()
         report_path = (
             self.processing_state.path.parent
-            / f"{self.acquisition_name}_depth_intensity_gains.json"
+            / f"{self.acquisition_name}_depth_histograms.json"
         )
         report_path.write_text(
             json.dumps(self._depth_intensity_report or {"enabled": False}, indent=2)

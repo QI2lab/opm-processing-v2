@@ -33,6 +33,6 @@ source-documented functions.
 
 ## Fusion
 
-::: opm_processing.imageprocessing.tilefusion.TileFusion.estimate_depth_intensity_gains
+::: opm_processing.imageprocessing.tilefusion.TileFusion.match_depth_histograms
 
 ::: opm_processing.imageprocessing.tilefusion.TileFusion.run

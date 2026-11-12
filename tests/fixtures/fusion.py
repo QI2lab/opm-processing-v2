@@ -172,7 +172,6 @@ def block_fusion(tile_fusion):
         output_dtype=np.uint16,
         time_indices=None,
         profiles=None,
-        depth_gains=None,
         x_profile=None,
         y_profile=None,
         max_workers=1,
@@ -214,8 +213,6 @@ def block_fusion(tile_fusion):
                     y_weights[:] = y_profile
                 if x_profile is not None:
                     x_weights[:] = x_profile
-        if depth_gains is not None:
-            fusion._depth_intensity_gains = depth_gains
         return fusion
 
     return create
@@ -413,19 +410,18 @@ def projection_fusion(tmp_path):
 
 @pytest.fixture
 def fusion_mosaic(aperiodic_registration_object):
-    """Prescribe a Cartesian unit object with attenuated, partial tile operands."""
+    """Prescribe a Cartesian unit object with partially supported tile operands."""
     from opm_processing.process import format_processed_output
 
     shape = (28, 46, 69)
     # Preserve the prescribed integer intensity + fractional offset, avoiding
-    # cast boundaries while testing masks, gains and block layouts exactly.
+    # cast boundaries while testing masks and block layouts exactly.
     field = aperiodic_registration_object(shape, seed=51)
     assert 0 <= field.min() <= field.max() <= np.iinfo(np.uint16).max
     field = format_processed_output(field, save_float32=False).astype(np.float32)
     field += np.float32(0.375)
     field[:, 2, 4] = 0  # Real darkness inside valid support.
-    tiles, origins, supports, profiles, gains, present = (
-        [],
+    tiles, origins, supports, profiles, present = (
         [],
         [],
         [],
@@ -451,11 +447,10 @@ def fusion_mosaic(aperiodic_registration_object):
             coverage[-1, 1:] = 0.5
             x_profile = np.linspace(0.25, 1, extent[2], dtype=np.float32)
             x_profile[-1] = 0  # No detector support in a padded column.
-            gain = np.array((1.25, 2), np.float32) + position * 0.25
             truth = np.stack(
                 [field[selection] * (1 + time + channel) for channel in range(2)]
             )
-            pixels = truth / gain[:, None, None, None] * coverage[None, ..., None]
+            pixels = truth * coverage[None, ..., None]
             pixels[..., -1] = 0
             for channel in range(2):
                 active = not (position == 1 and channel == time)
@@ -476,14 +471,12 @@ def fusion_mosaic(aperiodic_registration_object):
                     x_profile,
                 )
             )
-            gains.append(gain)
     return SimpleNamespace(
         tiles=tiles,
         origins=origins,
         shape=shape,
         supports=supports,
         profiles=profiles,
-        gains=np.asarray(gains),
         present=present,
         expected=expected,
     )
@@ -496,11 +489,7 @@ def weighted_fusion_case(strided, shared, partial):
     first[0, 1, 1, 1] = 0
     first[0, 1, 1, 3] = -20
     first[1, 1, 1, 1] = 90000
-    gains = np.asarray((2, 4, 8), np.float32)
-    # Exact inverse transmissions isolate the operator's arithmetic from the
-    # separate physical attenuation-estimation tests.
-    second = (first * np.float32(0.5) + np.float32(10)) / gains[:, None, None, None]
-    depth_gains = (None, gains)
+    second = first * np.float32(0.5) + np.float32(10)
     crop = np.s_[:, 1:3, 1:4, 1:9:2] if strided else np.s_[:, 1:3, 1:4, 1:5]
     source_views = (first[crop], second[crop])
     present = (
@@ -565,7 +554,6 @@ def weighted_fusion_case(strided, shared, partial):
         second=second,
         source_views=source_views,
         present=present,
-        depth_gains=depth_gains,
         support=support,
         z_weights=z_weights,
         y_weights=y_weights,

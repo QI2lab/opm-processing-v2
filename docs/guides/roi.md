@@ -64,6 +64,16 @@ Deconvolution is disabled unless `--deconvolve` is supplied.
 single-channel data. Saved full-volume transforms, displaced for the raw and
 deskew crops, initialize the local registration.
 
+Contributing tiles are combined by acquisition depth inside the ROI, using
+recorded stage positions to identify layers. For each channel and timepoint,
+each combined cropped depth layer is histogram-matched to the first acquired
+layer of that ROI, after flatfield correction, optional deconvolution, and
+deskewing. Geometric padding is excluded; valid zero-intensity pixels are
+retained. cuCIM is preferred, with scikit-image used when GPU memory is
+insufficient. An unexpectedly missing first acquired layer raises an error.
+Matching provenance is saved in `<stem>_depth_histograms.json`. Processed
+source stacks remain unchanged.
+
 ## Outputs and resume
 
 The default destination is `roi_exports` beside the preview. Use `--output`

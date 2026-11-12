@@ -20,7 +20,7 @@ uv run fuse "G:\data\acquisition" --registration-channel 0 --output-dir "H:\fuse
 ```
 
 The destination is created if needed. The processing journal, cached pairwise
-registration, final tile positions, and depth-gain report stay beside the
+registration, final tile positions, and depth-normalization report stay beside the
 deskewed input. Choosing another destination reuses compatible registration.
 The external image stores contain a link to that journal so projection
 regeneration, ROI selection, and TIFF export can still find their provenance.
@@ -115,13 +115,18 @@ a dataset expected to be connected produces disconnected groups.
 
 ## Match brightness across depths
 
-Depth normalization is enabled by default. Registered overlaps at the same
-stage XY supply one gain per depth, timepoint, and channel, shared across that
-depth's XY tiles. Differences between XY fields are retained. Fitted gains are
-saved in `<stem>_depth_intensity_gains.json`; source tiles remain unchanged.
+Depth normalization is enabled by default. For full acquisitions, each channel's
+processed depth stack is histogram-matched to the first acquired depth at the
+same physical stage XY footprint and timepoint. ROI processing combines tiles
+by acquisition depth within the crop, then matches each combined depth layer to
+the ROI's first acquired layer. Matching uses all geometrically supported pixels,
+including valid zeros. An unexpectedly missing first depth raises an error.
+cuCIM is preferred, with scikit-image used when GPU memory is insufficient.
+Provenance is saved in `<stem>_depth_histograms.json`; source tiles remain
+unchanged.
 
-Use `--no-normalize-depth-intensity` to omit these gains. The
-[method page](../methods/fusion.md) explains gain fitting and geometric coverage.
+Use `--no-normalize-depth-intensity` to omit histogram matching. The
+[method page](../methods/fusion.md) explains matching and geometric coverage.
 
 ## Recreate the registered projection
 

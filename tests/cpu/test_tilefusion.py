@@ -29,11 +29,10 @@ def test_weighted_fusion_rows_preserve_masks_offsets_and_output_range(
 ):
     """Preserve known affine samples, channel masks and scalar weighted counts."""
     case = weighted_fusion_case
-    for source, pixels, channels, gains in zip(
+    for source, pixels, channels in zip(
         (case.first, case.second),
         case.source_views,
         case.present,
-        case.depth_gains,
         strict=True,
     ):
         tilefusion_module._accumulate_tile_block(
@@ -49,11 +48,10 @@ def test_weighted_fusion_rows_preserve_masks_offsets_and_output_range(
             2,
             3,
             *case.source_origin,
-            gains,
         )
     # Both views have the same prescribed feather weights. Their normalized
     # mixture has closed-form scalar values: at the first location, a real
-    # black pixel and ten corrected photons give five, not ten. The other
+    # black pixel and ten photons give five, not ten. The other
     # channels exercise absent contributors and a value above uint16 range.
     np.testing.assert_array_equal(
         case.accumulated[:, 1, 2, 3],
@@ -382,7 +380,6 @@ def test_fusion_is_independent_of_blocks_and_workers(
         block_shape=[1, 1, *block_shape],
         output_dtype=np.dtype(dtype),
         profiles=case.profiles,
-        depth_gains=case.gains,
         time_indices=(0, 0, 0, 1, 1, 1),
         chunk_shape_yx=block_shape[1:],
         max_workers=workers,

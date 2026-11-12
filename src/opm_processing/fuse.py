@@ -75,8 +75,9 @@ def register_and_fuse(
         typer.Option(
             "--normalize-depth-intensity/--no-normalize-depth-intensity",
             help=(
-                "Match brightness between depth layers using one gain per "
-                "channel shared by all XY tiles at each depth."
+                "Histogram-match each channel's processed depth stacks to the "
+                "first acquired depth at the same physical XY footprint. "
+                "ROI processing matches combined cropped depth layers."
             ),
         ),
     ] = True,
@@ -142,8 +143,10 @@ def register_and_fuse(
         Maximum ZYX corrections in pixels; None reads recorded acquisition
         overlaps and bounds each pair using stage and scan geometry.
     normalize_depth_intensity : bool
-        Match registered depth layers using channel gains shared across XY tiles
-        at each depth and timepoint. Save the gains beside the processed tiles.
+        Histogram-match each channel's processed depth stacks to the first
+        acquired depth at the same physical XY footprint and timepoint. ROI
+        processing matches combined cropped layers by acquisition depth. Save
+        matching provenance beside the processed tiles.
     registration_retries : int
         Maximum automatic search expansions; each remeasures only expanded
         pairs and refits the full graph. Zero disables retries; explicit limits
@@ -158,7 +161,7 @@ def register_and_fuse(
         retaining every Z plane; None fuses the full acquisition.
     output_dir : pathlib.Path or None
         Fused image destination; None writes beside the processed input.
-        Registration and depth-gain records remain beside the processed tiles.
+        Registration and depth-normalization records remain beside the processed tiles.
 
     Returns
     -------
