@@ -57,6 +57,7 @@ from opm_processing.dataio.position_collection import (
 )
 from opm_processing.dataio.processing_state import (
     ProcessingState,
+    image_processing_state_path,
     processing_state_path,
 )
 from opm_processing.dataio.roi import (
@@ -1847,7 +1848,15 @@ def process_skewed(
     else:
         flatfield_path = output_dir / f"{acquisition_stem(root_path)}_flatfield.ome.tif"
         source_flatfield = root_path.parent / flatfield_path.name
-        if not flatfield_path.exists() and source_flatfield.exists():
+        if roi_selection is not None:
+            source_state = image_processing_state_path(
+                roi_selection.source_path, acquisition_stem(root_path)
+            )
+            flatfield_root = (
+                source_state.parent if source_state.is_file() else root_path.parent
+            )
+            flatfield_path = flatfield_root / flatfield_path.name
+        elif not flatfield_path.exists() and source_flatfield.exists():
             flatfield_path = source_flatfield
     provided_flatfields = (
         np.asarray(imread(flatfield_path), dtype=np.float32).reshape(

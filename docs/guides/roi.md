@@ -56,6 +56,9 @@ registration and fusion, including when the preview was already registered.
 The final image is cropped to the requested physical XY bounds. Single-position
 ROIs are assembled across time without measuring pairwise registration links.
 `--flatfield-correction` enables the same illumination handling as `process`.
+ROIs share the flatfield beside the preview's linked processing journal, falling
+back to the raw acquisition directory when no journal is available. A missing
+field is estimated from the full acquisition; ROI-local fields are ignored.
 Deconvolution is disabled unless `--deconvolve` is supplied.
 `--registration-channel` is required and uses zero-based indices; choose 0 for
 single-channel data. Saved full-volume transforms, displaced for the raw and
