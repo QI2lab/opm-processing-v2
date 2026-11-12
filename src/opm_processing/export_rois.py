@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from napari.layers import Image
 
 from opm_processing.dataio.acquisition import acquisition_stem, inspect_acquisition
+from opm_processing.dataio.position_collection import open_image_array
 from opm_processing.dataio.processing_state import (
     ProcessingState,
     image_processing_state_path,
@@ -490,8 +491,6 @@ def export_rois(
                         overview_path.with_suffix(".json"),
                     )
             else:
-                from opm_processing.dataio.position_collection import open_image_array
-
                 select_rois(
                     source,
                     tuple(open_image_array(resolve_export_image(source)).shape),
@@ -499,14 +498,9 @@ def export_rois(
                     saved_rois=[PhysicalRoi.read(path) for path in selections],
                 )
     else:
-        image_path = resolve_export_image(source)
-        root = open_group(image_path)
-        dataset = root.ome_metadata().multiscales[0].datasets[0]
-        shape = tuple(root[dataset.path].to_tensorstore().shape)
-        bounds = (
-            select_rois(source, shape, figure_path=overview_path)
-            if figures
-            else select_rois(source, shape)
+        shape = tuple(open_image_array(resolve_export_image(source)).shape)
+        bounds = select_rois(
+            source, shape, figure_path=overview_path if figures else None
         )
         if not bounds:
             typer.echo("No ROIs selected; no files exported.")
