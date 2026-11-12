@@ -638,6 +638,11 @@ def build_illumination_signal_decisions(
         desc="Finding illumination tiles",
         unit="nonzero tile",
     )
+    scan_count = int(datastore.shape[-3])
+    first_stop = min(
+        scan_count, max(1, int(datastore.chunk_layout.read_chunk.shape[-3] or 1))
+    )
+    tile_pixels = math.prod(datastore.shape[-3:])
     try:
         for _stage_level, positions in enumerate(position_groups):
             target_count = min(32, len(positions))
@@ -655,18 +660,26 @@ def build_illumination_signal_decisions(
             for channel in range(decisions.shape[2]):
                 nonempty_count = 0
                 for position in candidates:
-                    raw = np.squeeze(datastore[0, position, channel, :].read().result())
-                    calibrated = camera_correct(
-                        raw,
-                        camera_offset,
-                        camera_conversion,
-                        detector_gain_x=detector_gain_x,
-                    )
-                    is_empty = is_empty_tile(
-                        calibrated,
-                        threshold,
-                        min_signal_fraction,
-                    )
+                    signal_pixels = 0
+                    for first, last in ((0, first_stop), (first_stop, scan_count)):
+                        if first == last:
+                            continue
+                        raw = (
+                            datastore[0, position, channel, first:last].read().result()
+                        )
+                        calibrated = camera_correct(
+                            raw,
+                            camera_offset,
+                            camera_conversion,
+                            detector_gain_x=detector_gain_x,
+                        )
+                        signal_pixels += np.count_nonzero(calibrated >= threshold)
+                        del raw, calibrated
+                        # Prove the same full-volume criterion before reading the
+                        # remainder. Empty candidates still require all pixels.
+                        is_empty = signal_pixels / tile_pixels < min_signal_fraction
+                        if not is_empty:
+                            break
                     decisions[0, position, channel] = 0 if is_empty else 1
                     if not is_empty:
                         nonempty_count += 1

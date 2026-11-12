@@ -343,11 +343,10 @@ def estimate_illuminations(
                     get_darkfield=False,
                     sort_intensity=True,
                     working_size=list(working_shape),
+                    smoothness_flatfield=2.0,
                 )
 
                 with redirect_stdout(io.StringIO()):
-                    basic.autotune(fit_images)
-                    basic.smoothness_flatfield = 2.0
                     basic.fit(fit_images)
                 fitted_flatfield = _separable_residual_calibration(
                     np.asarray(basic.flatfield, dtype=np.float32),
