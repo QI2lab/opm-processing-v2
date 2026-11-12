@@ -210,6 +210,7 @@ def select_rois(
         Selected rectangles as level-zero y0, y1, x0, x1 bounds.
     """
     import napari
+    from napari.settings import get_settings
 
     root = open_group(source)
     metadata = root.ome_metadata()
@@ -325,7 +326,13 @@ def select_rois(
         "slice thickness. Draw YX rectangles, then close napari to export all Z, "
         "channels, and timepoints."
     )
-    napari.run()
+    settings = get_settings().application
+    confirm_close = settings.confirm_close_window
+    settings.confirm_close_window = False
+    try:
+        napari.run()
+    finally:
+        settings.confirm_close_window = confirm_close
     if errors:
         raise RuntimeError("Could not export the ROI overview") from errors[-1]
     return current_bounds()
