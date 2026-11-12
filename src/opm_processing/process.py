@@ -1704,8 +1704,6 @@ def process_skewed(
             rlgc,
         )
 
-        decon_chunk_state = RlgcChunkState(decon_crop_scan)
-
     max_z_factors_yx = (2, 4, 8, 16, 32)
     output_dir = (
         root_path.parent
@@ -2256,6 +2254,10 @@ def process_skewed(
                     f"{len(tile_completed_channels)} of {datastore.shape[2]} "
                     "channels complete."
                 )
+            if deconvolve:
+                # ROI widths can differ between source tiles. Plan anew for
+                # this tile, then reuse successful crops across its channels.
+                decon_chunk_state = RlgcChunkState(decon_crop_scan)
             for chan_idx in tqdm(
                 (
                     channel
