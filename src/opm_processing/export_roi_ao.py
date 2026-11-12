@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -82,6 +83,7 @@ def export_roi_ao(
         manifest["colormap"] = colormap
         # SJS publication plots use Matplotlib's image cmap and shared +/-2pi.
         norm = Normalize(-2 * np.pi, 2 * np.pi)
+        colorbar_path = None
         for record in records:
             result = AOOptimizationResult(
                 Path(record["result_path"]),
@@ -106,23 +108,27 @@ def export_roi_ao(
                 vmin=norm.vmin,
                 vmax=norm.vmax,
             )
-            figure = plt.figure(figsize=(1.4, 5))
-            try:
-                axis = figure.add_axes((0.1, 0.05, 0.3, 0.9))
-                bar = ColorbarBase(axis, cmap=mpl.colormaps[colormap], norm=norm)
-                bar.set_ticks([-2 * np.pi, -np.pi, 0, np.pi, 2 * np.pi])
-                bar.set_ticklabels(
-                    [r"$-2\pi$", r"$-\pi$", "$0$", r"$\pi$", r"$2\pi$"], fontsize=30
-                )
-                bar.set_label("rad.", rotation=270, labelpad=15, fontsize=30)
-                figure.savefig(
-                    output / colorbar_name,
-                    dpi=160,
-                    bbox_inches="tight",
-                    transparent=True,
-                )
-            finally:
-                plt.close(figure)
+            if colorbar_path is None:
+                figure = plt.figure(figsize=(1.4, 5))
+                try:
+                    axis = figure.add_axes((0.1, 0.05, 0.3, 0.9))
+                    bar = ColorbarBase(axis, cmap=mpl.colormaps[colormap], norm=norm)
+                    bar.set_ticks([-2 * np.pi, -np.pi, 0, np.pi, 2 * np.pi])
+                    bar.set_ticklabels(
+                        [r"$-2\pi$", r"$-\pi$", "$0$", r"$\pi$", r"$2\pi$"], fontsize=30
+                    )
+                    bar.set_label("rad.", rotation=270, labelpad=15, fontsize=30)
+                    figure.savefig(
+                        output / colorbar_name,
+                        dpi=160,
+                        bbox_inches="tight",
+                        transparent=True,
+                    )
+                finally:
+                    plt.close(figure)
+                colorbar_path = output / colorbar_name
+            else:
+                shutil.copyfile(colorbar_path, output / colorbar_name)
             record.update(
                 pupil=pupil_name,
                 colorbar=colorbar_name,
