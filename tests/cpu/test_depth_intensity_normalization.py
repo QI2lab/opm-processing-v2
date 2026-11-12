@@ -13,15 +13,16 @@ def test_normalization_matches_depths_and_preserves_xy_brightness(
 ):
     """Match attenuated copies while preserving threefold XY contrast."""
     monkeypatch.setattr("opm_processing.imageprocessing.tilefusion.USING_GPU", False)
-    specimen = aperiodic_registration_object((24, 64, 64), seed=31).astype(np.float32)
+    specimen = aperiodic_registration_object((24, 64, 64), seed=31).astype(np.uint16)
+    # Multiples of four keep both attenuated channels exactly representable.
+    specimen = specimen // 4 * 4
     arrays = []
-    attenuation_per_um = np.log((2.0, 4.0)) / 8.0
     for depth, xy_brightness in ((0, 1), (0, 3), (1, 1), (1, 3)):
         signal = specimen[:16] * xy_brightness
         channels = np.stack(
             (
-                signal * np.exp(-attenuation_per_um[0] * depth * 8),
-                signal * np.exp(-attenuation_per_um[1] * depth * 8),
+                signal // (2**depth),
+                signal // (4**depth),
                 np.zeros_like(signal),
             )
         )
@@ -43,23 +44,33 @@ def test_normalization_matches_depths_and_preserves_xy_brightness(
 
 def test_coverage_normalization_and_output_range(
     tile_fusion,
+    monkeypatch,
 ):
-    """Check saturation, floating-point range, and immutable source intensities."""
+    """Check uint16 saturation, coverage, and immutable source intensities."""
+    from opm_processing.imageprocessing import tilefusion
+
+    monkeypatch.setattr(tilefusion, "USING_GPU", False)
     fusion = tile_fusion([np.ones((2, 1, 1, 1), np.uint16)], [(0, 0, 0)])
     source = np.asarray([40000, 1000], dtype=np.uint16).reshape(2, 1, 1, 1)
     coverage = np.asarray([[0.5]], np.float32)
     corrected = fusion._normalize_coverage(source, coverage)
     np.testing.assert_array_equal(corrected.ravel(), (80000, 2000))
-    fusion.output_dtype = np.dtype(np.uint16)
     np.testing.assert_array_equal(
         fusion._cast_fusion_values(corrected).ravel(), (65535, 2000)
     )
-    fusion.output_dtype = np.dtype(np.float32)
-    assert fusion._cast_fusion_values(corrected) is corrected
-    fusion.output_dtype = np.dtype(np.uint16)
     unchanged = fusion._normalize_coverage(source, np.ones((1, 1), np.float32))
     assert fusion._cast_fusion_values(unchanged) is source
     np.testing.assert_array_equal(source.ravel(), (40000, 1000))
+    mapping, _ = tilefusion._depth_histogram_mapping(
+        np.array([10, 10, 30, 30], np.uint16),
+        np.array([100, 100, 200, 200], np.uint16),
+    )
+    fusion._depth_histogram_maps[0, 0] = mapping
+    # Unseen uint16 intensities interpolate; endpoints clamp.
+    values = np.array([0, 9, 20, 65535, 30], np.uint16).reshape(1, 1, 1, 5)
+    weights = np.array([1, 1, 1, 1, 0], np.float32).reshape(values.shape)
+    matched = fusion._match_fusion_depth(0, values, weights, channel=0)
+    np.testing.assert_array_equal(matched.ravel(), [100, 100, 150, 200, 0])
 
 
 @pytest.mark.parametrize("direct", [False, True])

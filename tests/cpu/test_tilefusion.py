@@ -336,7 +336,7 @@ def test_block_fusion_has_no_zero_weight_line_at_masked_wedge_boundary(
 
 @pytest.mark.parametrize("channels", [1, 2], ids=["zero-tile", "zero-channel"])
 def test_zero_channels_keep_single_contributors_and_blend_valid_overlap(
-    block_fusion, channels
+    block_fusion, channels, monkeypatch
 ):
     """Exclude absent channels while retaining independent weights for valid ones."""
     tiles = [
@@ -355,7 +355,16 @@ def test_zero_channels_keep_single_contributors_and_blend_valid_overlap(
         for tile in range(2)
         for channel in range(channels)
     }
+    reads = []
+    read = fusion._read_tile_volume
+
+    def observe_read(tile, *args, **kwargs):
+        reads.append(tile)
+        return read(tile, *args, **kwargs)
+
+    monkeypatch.setattr(fusion, "_read_tile_volume", observe_read)
     fusion._fuse_by_blocks()
+    assert sorted(reads) == list(range(channels))
     expected = np.broadcast_to(
         np.array([100, 150][:channels])[None, :, None, None, None],
         (1, channels, 1, 2, 4),
