@@ -50,6 +50,7 @@ preload_cuda_libraries()
 
 import cupy as cp
 from cupy import ElementwiseKernel
+from cupyx.scipy.fft import irfftn
 from cupyx.scipy.fft import next_fast_len as next_gpu_fft_size
 
 # -----------------------------------------------------------------------------
@@ -348,7 +349,7 @@ def fft_conv(
     """
     spectrum = cp.fft.rfftn(image)
     spectrum *= H
-    return cp.fft.irfftn(spectrum, s=shape).astype(cp.float32, copy=False)
+    return irfftn(spectrum, s=shape, overwrite_x=True).astype(cp.float32, copy=False)
 
 
 def _observed_region_slices(
@@ -1024,27 +1025,22 @@ def _iterate_rlgc(
                     log_prefix,
                     completed + 1,
                 )
-            if xp is np:
-                # Reuse dead buffers without changing float32 operation order.
-                # FFT crop size never changes the object, halves, or GC/KL rules.
-                denominator = predicted
-                np.add(denominator, variance, out=denominator)
-                np.maximum(denominator, np.float32(1e-12), out=denominator)
-                del predicted
-                split1 *= 2
-                split1 /= denominator
-                half1 = adjoint(split1)
-                del split1
-                half1 /= sensitivity
-                split2 *= 2
-                split2 /= denominator
-                half2 = adjoint(split2)
-                del split2
-                half2 /= sensitivity
-            else:
-                denominator = xp.maximum(predicted + variance, xp.float32(1e-12))
-                half1 = adjoint(2 * split1 / denominator) / sensitivity
-                half2 = adjoint(2 * split2 / denominator) / sensitivity
+            # Consume the prediction and halves after KL scoring, preserving
+            # float32 operation order without extra full-volume GPU buffers.
+            denominator = predicted
+            xp.add(denominator, variance, out=denominator)
+            xp.maximum(denominator, xp.float32(1e-12), out=denominator)
+            del predicted
+            split1 *= 2
+            split1 /= denominator
+            half1 = adjoint(split1)
+            del split1
+            half1 /= sensitivity
+            split2 *= 2
+            split2 /= denominator
+            half2 = adjoint(split2)
+            del split2
+            half2 /= sensitivity
             # Eq. (4): smooth the product of ADDITIVE object changes. The
             # spatially varying x**2 factor must be inside the blurring operator.
             half1 -= 1
@@ -1075,14 +1071,7 @@ def _iterate_rlgc(
                 )
                 if use_kl:
                     reason = None
-            if xp is np:
-                del denominator, ratio, consensus
-            else:
-                # These arrays belong only to this iteration. Keeping their
-                # bindings alive while the next split is allocated doubles the
-                # working set and can defeat scan-chunk allocation fallback.
-                del predicted, denominator, split1, split2
-                del ratio, consensus
+            del denominator, ratio, consensus
         else:
             denominator = xp.maximum(predicted + variance, xp.float32(1e-12))
             ratio = _full_data_update(
