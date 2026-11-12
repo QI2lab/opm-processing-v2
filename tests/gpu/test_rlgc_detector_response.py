@@ -544,13 +544,21 @@ def test_nonuniform_response_preserves_uniform_fluorescence(
     """Preserve known fluorescence while bounding actual per-chunk solver state."""
     solver = importlib.import_module("opm_processing.imageprocessing.rlgc")
     states = []
+    plan_keys = set()
     iterate = solver._iterate_rlgc
 
     def observe_state(observed, shape, *args, **kwargs):
         """Inspect real allocations and execute the unmodified numerical engine."""
-        states.append((observed.shape, shape))
+        cache = cupy_gpu.fft.config.get_plan_cache()
+        if states and shape != states[-1][1]:
+            assert plan_keys.isdisjoint(key for key, _ in cache)
         assert (cupy_gpu.get_array_module(observed) is np) == (storage == "host")
-        return iterate(observed, shape, *args, **kwargs)
+        result = iterate(observed, shape, *args, **kwargs)
+        states.append((observed.shape, shape))
+        # Keep keys alone: retaining plan objects would itself retain GPU memory.
+        plan_keys.clear()
+        plan_keys.update(key for key, _ in cache)
+        return result
 
     monkeypatch.setattr(solver, "_iterate_rlgc", observe_state)
 
@@ -592,6 +600,7 @@ def test_nonuniform_response_preserves_uniform_fluorescence(
     (successful_crop,) = successful_crops
     if gpu_budget is not None and scan_planes == 32 and crop_scan == 20:
         assert successful_crop < crop_scan
+        assert len({shape for _, shape in states}) > 1
     chunk_shape = (min(scan_planes, crop_scan + 2 * psf.shape[0]), *detector_shape)
     padding = solver._linear_fft_pad_width(chunk_shape, psf.shape)
     state_bound = tuple(n + sum(p) for n, p in zip(chunk_shape, padding, strict=True))

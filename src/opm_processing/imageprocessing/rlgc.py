@@ -1805,6 +1805,7 @@ def _shared_kl_chunks(
         range(len(layouts)), key=lambda i: math.prod(shapes[i]), reverse=True
     )
     common_stop = 0
+    previous_shape = None
     try:
         for index in tqdm(order, desc="decon KL", unit="chunk", leave=False):
             tile, start, stop, dest_start, dest_stop = layouts[index]
@@ -1824,6 +1825,12 @@ def _shared_kl_chunks(
                     dest_stop,
                     storage,
                 )
+            if shapes[index] != previous_shape:
+                # Cached FFT plans own device workspaces. Release the preceding
+                # shape before allocating edge-chunk plans; state is already in RAM.
+                with cp.cuda.Device(solver_options.get("gpu_id", 0)):
+                    clear_rlgc_caches(clear_memory_pool=True)
+                previous_shape = shapes[index]
             _rlgc_once(
                 crop,
                 psf,
@@ -1872,6 +1879,10 @@ def _shared_kl_chunks(
             else:
                 if state.iterations < common_stop:
                     state.accepted = state.provisional = None
+                    if shapes[index] != previous_shape:
+                        with cp.cuda.Device(solver_options.get("gpu_id", 0)):
+                            clear_rlgc_caches(clear_memory_pool=True)
+                        previous_shape = shapes[index]
                     result = _rlgc_once(
                         work[start:stop],
                         psf,
