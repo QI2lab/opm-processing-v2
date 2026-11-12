@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import mmap
+from contextlib import ExitStack
 from tempfile import TemporaryFile
 from typing import TYPE_CHECKING
 
 import numpy as np
+import psutil
 from PIL import Image
 from tqdm import tqdm
 
@@ -141,14 +143,17 @@ def export_roi_overview(
         renderer.window._qt_window.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen)
         renderer.show()
         get_qapp().processEvents()
-        # Temporary disk state bounds RAM and is removed even if rendering fails.
-        with (
-            renderer._layer_slicer.force_sync(),
-            TemporaryFile(dir=output.parent) as scratch,
-        ):
-            scratch.truncate(height * width * 4)
-            with mmap.mmap(scratch.fileno(), 0, access=mmap.ACCESS_WRITE) as mapping:
-                pixels = np.ndarray((height, width, 4), np.uint8, buffer=mapping)
+        with renderer._layer_slicer.force_sync():
+            with ExitStack() as buffers:
+                if height * width * 4 <= psutil.virtual_memory().available:
+                    pixels = np.empty((height, width, 4), np.uint8)
+                else:
+                    scratch = buffers.enter_context(TemporaryFile(dir=output.parent))
+                    scratch.truncate(height * width * 4)
+                    mapping = buffers.enter_context(
+                        mmap.mmap(scratch.fileno(), 0, access=mmap.ACCESS_WRITE)
+                    )
+                    pixels = np.ndarray((height, width, 4), np.uint8, buffer=mapping)
                 # A transposed/flipped view writes native blocks into the final
                 # orientation without resampling or copying the whole image.
                 native_pixels = pixels[
@@ -217,7 +222,7 @@ def export_roi_overview(
                         top = max(0, center_y - bar_height // 2)
                         pixels[top : min(height, top + bar_height), left:right] = color
                     image = Image.frombuffer(
-                        "RGBA", (width, height), mapping, "raw", "RGBA", 0, 1
+                        "RGBA", (width, height), pixels, "raw", "RGBA", 0, 1
                     )
                     try:
                         image.save(temporary, format="PNG")
