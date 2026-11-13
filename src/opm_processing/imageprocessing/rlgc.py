@@ -1064,7 +1064,7 @@ def _iterate_rlgc(
             else:
                 updated = filter_update(recon, ratio, consensus)
             if (use_kl or (limit <= 0 and max_delta <= 0)) and (
-                logger is None or not logger.isEnabledFor(logging.INFO)
+                logger is None or not logger.isEnabledFor(logging.DEBUG)
             ):
                 fraction, delta, reason = None, None, None
             else:
@@ -1094,7 +1094,7 @@ def _iterate_rlgc(
         if callback is not None:
             callback(completed, recon)
         if logger is not None:
-            logger.info(
+            logger.debug(
                 "%siteration=%d updated_fraction=%.6g max_relative_delta=%.6g",
                 log_prefix,
                 completed,
@@ -2027,7 +2027,7 @@ def rlgc(
         Chunked processing shows a decon progress bar. Zero emits no solver
         diagnostics. Set to 1 to report storage, FFT geometry, iterations and
         stopping reasons. An explicit logger opts into diagnostics with its own
-        logging controls.
+        logging controls; DEBUG includes consensus and change statistics.
     release_memory : bool, default=True
         If True, release CuPy memory pools and FFT caches before returning.
     logger : logging.Logger or None, default=None
