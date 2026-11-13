@@ -67,9 +67,14 @@ def test_empty_channel_options_preserve_physical_thresholds(threshold, fraction,
 
 @pytest.mark.parametrize("tile_shape", [(16, 16), (32, 32)])
 @pytest.mark.parametrize("dtype", [np.uint16, np.float32])
-def test_tiff_tiles_preserve_page_order_partial_edges_and_counts(tile_shape, dtype):
+def test_tiff_tiles_preserve_page_order_partial_edges_and_counts(
+    tile_shape, dtype, monkeypatch
+):
     """Read genuine TensorStore tiles without dropping padded-edge photon values."""
     source = np.arange(2 * 2 * 3 * 17 * 19, dtype=dtype).reshape(2, 2, 3, 17, 19)
+    if tile_shape == (16, 16):
+        memory = export_ome_tiff.psutil.virtual_memory()._replace(available=0)
+        monkeypatch.setattr(export_ome_tiff.psutil, "virtual_memory", lambda: memory)
     tiles = list(export_ome_tiff.image_tiles(ts.array(source), tile_shape))
     spatial = int(np.prod(np.ceil(np.asarray(source.shape[-2:]) / tile_shape)))
     assert len(tiles) == np.prod(source.shape[:3]) * spatial

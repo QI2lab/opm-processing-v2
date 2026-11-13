@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Annotated
 from uuid import uuid4
 
 import numpy as np
+import psutil
 import tifffile
 import typer
 from ome_types import from_xml
@@ -111,7 +112,7 @@ def resolve_export_image(source: Path) -> Path:
 def image_tiles(
     array: ts.TensorStore, tile_shape: tuple[int, int]
 ) -> Iterator[np.ndarray]:
-    """Read bounded YX tiles in TIFF page order, with Z varying fastest.
+    """Read source Z slabs once and yield YX tiles in TIFF page order.
 
     Parameters
     ----------
@@ -126,13 +127,19 @@ def image_tiles(
         One YX tile in TCZ page order, then raster YX tile order. Edge tiles
         retain their actual shape and are zero-padded by tifffile. Separate
         progress bars report timepoints, channels, and Z planes per channel.
+        Buffer source Z chunks when RAM permits; otherwise retain tile reads.
     """
     nt, nc, nz, ny, nx = array.shape
     ty, tx = tile_shape
+    z_step = min(nz, max(1, int(array.chunk_layout.read_chunk.shape[2] or 1)))
+    slab_bytes = z_step * ny * nx * np.dtype(array.dtype.numpy_dtype).itemsize
     for t in tqdm(range(nt), desc="export time", unit="timepoint", position=0):
         for c in tqdm(
             range(nc), desc="export channels", unit="channel", position=1, leave=False
         ):
+            # Compression workers may still retain views of the preceding slab.
+            buffered = 2 * slab_bytes <= psutil.virtual_memory().available
+            slab = None
             for z in tqdm(
                 range(nz),
                 desc=f"export planes (channel {c + 1}/{nc})",
@@ -140,13 +147,21 @@ def image_tiles(
                 position=2,
                 leave=False,
             ):
+                if buffered and z % z_step == 0:
+                    slab = None
+                    slab = array[t, c, z : min(z + z_step, nz)].read().result()
                 for y in range(0, ny, ty):
                     for x in range(0, nx, tx):
                         yield (
-                            array[t, c, z, y : min(y + ty, ny), x : min(x + tx, nx)]
+                            slab[z % z_step, y : min(y + ty, ny), x : min(x + tx, nx)]
+                            if buffered
+                            else array[
+                                t, c, z, y : min(y + ty, ny), x : min(x + tx, nx)
+                            ]
                             .read()
                             .result()
                         )
+            del slab
 
 
 def export_image(
