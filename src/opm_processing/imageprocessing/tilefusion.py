@@ -1118,12 +1118,13 @@ def _select_nearest_registration_pairs(
     positions_zyx: Sequence[Sequence[float]],
     tile_shape_zyx: Sequence[int] | Sequence[Sequence[int]],
     pixel_size_zyx: Sequence[float],
+    pairs: Sequence[tuple[int, int]],
     *,
     is_2d: bool = False,
 ) -> list[tuple[int, int]]:
     """Select a connected nearest-overlap graph for pairwise registration.
 
-    All geometric overlaps are found first. Within each connected component,
+    The caller supplies geometric overlaps. Within each connected component,
     the distance cutoff is the shortest one that still connects that component.
     Every overlap at or below that cutoff is retained, preserving useful cycles
     between face-adjacent tiles while dropping diagonal and farther redundant
@@ -1137,6 +1138,8 @@ def _select_nearest_registration_pairs(
         Common ZYX shape or one ZYX shape per tile, in voxels.
     pixel_size_zyx
         ZYX voxel spacing in physical units.
+    pairs
+        Geometric overlap pairs already selected by the caller.
     is_2d
         Ignore physical Z displacement for projection data.
 
@@ -1151,7 +1154,6 @@ def _select_nearest_registration_pairs(
 
     physical_shapes = tile_shapes * pixel_size
     edges_by_component: dict[int, list[tuple[float, int, int]]] = {}
-    pairs = _select_registration_pairs(positions, tile_shapes, pixel_size, is_2d=is_2d)
     components = _connected_tile_components(range(len(positions)), pairs)
     component_by_node = {
         node: index for index, component in enumerate(components) for node in component
@@ -1397,6 +1399,7 @@ def _infer_registration_limits(
             positions,
             shapes,
             spacing,
+            pairs,
             is_2d=is_2d,
         )
     )
@@ -1506,15 +1509,16 @@ def _select_registration_pairs(
     physical_shapes = tile_shapes * pixel_size
     selected = []
     for left in range(len(positions)):
-        for right in range(left + 1, len(positions)):
-            overlap = np.logical_and(
-                positions[left] < positions[right] + physical_shapes[right],
-                positions[right] < positions[left] + physical_shapes[left],
-            )
-            if is_2d:
-                overlap[0] = True
-            if np.all(overlap):
-                selected.append((left, right))
+        overlap = np.logical_and(
+            positions[left] < positions[left + 1 :] + physical_shapes[left + 1 :],
+            positions[left + 1 :] < positions[left] + physical_shapes[left],
+        )
+        if is_2d:
+            overlap[:, 0] = True
+        selected.extend(
+            (left, left + 1 + int(right))
+            for right in np.flatnonzero(np.all(overlap, axis=1))
+        )
     return selected
 
 
@@ -1895,6 +1899,8 @@ class TileFusion:
             raise ValueError("registration_retries must be nonnegative")
         self.registration_retries = int(registration_retries)
         self._registration_retry_count = 0
+        self._rejected_registration_links = {}
+        self._registration_pair_sampling = {}
         self._pair_registration_limits = {}
         self._is_2d = all(shape[0] == 1 for shape in self._tile_shapes)
         if self._automatic_registration_limits:
@@ -2653,14 +2659,8 @@ class TileFusion:
             # leave stale accepted or rejected data for the selected pair.
             for pair in pairs_to_register:
                 self.pairwise_metrics.pop(pair, None)
-                getattr(self, "_rejected_registration_links", {}).pop(pair, None)
-                getattr(self, "_registration_pair_sampling", {}).pop(pair, None)
-            self._rejected_registration_links = getattr(
-                self, "_rejected_registration_links", {}
-            )
-            self._registration_pair_sampling = getattr(
-                self, "_registration_pair_sampling", {}
-            )
+                self._rejected_registration_links.pop(pair, None)
+                self._registration_pair_sampling.pop(pair, None)
         selected_tiles = (
             None
             if pairs_to_register is None
@@ -2704,21 +2704,8 @@ class TileFusion:
         available_host_bytes = int(psutil.virtual_memory().available)
         read_workers = min(4, max(1, self._max_workers))
         device_buffers = _RegistrationDeviceBuffers(cp)
-        n_pos = int(self.position_dim)
-        tile_groups = getattr(
-            self,
-            "_tiles_by_time",
-            tuple(
-                tuple(range(t * n_pos, (t + 1) * n_pos))
-                for t in range(int(self.time_dim))
-            ),
-        )
-        all_tile_shapes = getattr(
-            self,
-            "_tile_shapes",
-            [(int(self.z_dim), int(self.y_dim), int(self.x_dim))]
-            * len(self._tile_positions),
-        )
+        tile_groups = self._tiles_by_time
+        all_tile_shapes = self._tile_shapes
 
         with ThreadPoolExecutor(max_workers=read_workers) as executor:
             for t, tile_indices in enumerate(tile_groups):
@@ -2728,19 +2715,20 @@ class TileFusion:
                     continue
                 positions = [self._tile_positions[index] for index in tile_indices]
                 tile_shapes = [all_tile_shapes[index] for index in tile_indices]
-                nearest_registration_pairs = set(
-                    _select_nearest_registration_pairs(
-                        positions,
-                        tile_shapes,
-                        self._pixel_size,
-                        is_2d=self._is_2d,
-                    )
-                )
                 registration_pairs = _select_registration_pairs(
                     positions,
                     tile_shapes,
                     self._pixel_size,
                     is_2d=self._is_2d,
+                )
+                nearest_registration_pairs = set(
+                    _select_nearest_registration_pairs(
+                        positions,
+                        tile_shapes,
+                        self._pixel_size,
+                        registration_pairs,
+                        is_2d=self._is_2d,
+                    )
                 )
                 candidates: dict[
                     tuple[int, int],
@@ -2834,11 +2822,7 @@ class TileFusion:
                     if not self._is_2d and boundary_axis == 0:
                         max_z = self._pair_registration_limits.get(
                             (i, j),
-                            getattr(
-                                self,
-                                "_initial_registration_shift_zyx",
-                                self.max_registration_shift_zyx,
-                            ),
+                            self._initial_registration_shift_zyx,
                         )[0]
                         if max_z > 0:
                             max_z += 2
@@ -3006,11 +2990,7 @@ class TileFusion:
 
                     max_shift = self._pair_registration_limits.get(
                         (i, j),
-                        getattr(
-                            self,
-                            "_initial_registration_shift_zyx",
-                            self.max_registration_shift_zyx,
-                        ),
+                        self._initial_registration_shift_zyx,
                     )
                     self._registration_pair_sampling[i, j] = df_zyx_eff
                     if self._is_2d:
@@ -3735,7 +3715,9 @@ class TileFusion:
             return source
         if dtype == np.dtype(np.float32):
             return source.astype(np.float32, copy=False)
-        return np.clip(source, 0, np.iinfo(np.uint16).max).astype(np.uint16, copy=False)
+        output = np.empty(source.shape, dtype=np.uint16)
+        np.clip(source, 0, np.iinfo(np.uint16).max, out=output, casting="unsafe")
+        return output
 
     def report_registration_connectivity(self) -> None:
         """Report overlapping tiles left in separate registration components.
@@ -3805,12 +3787,14 @@ class TileFusion:
         if not self._automatic_registration_limits:
             return set()
         expanded = set()
-        for pair, (correction, limits, score) in getattr(
-            self, "_rejected_registration_links", {}
-        ).items():
+        for pair, (
+            correction,
+            limits,
+            score,
+        ) in self._rejected_registration_links.items():
             if not math.isfinite(score) or score < self.threshold:
                 continue
-            sampling = getattr(self, "_registration_pair_sampling", {}).get(
+            sampling = self._registration_pair_sampling.get(
                 pair, self.downsample_factors
             )
             updated = list(self._pair_registration_limits.get(pair, limits))
@@ -4920,6 +4904,11 @@ class TileFusion:
             for t in range(n_t):
                 offsets_t: list[tuple[int, tuple[int, int, int]]] = []
                 for tile_index in tiles_by_time[t]:
+                    if not any(
+                        self._tile_channel_nonzero[tile_index, c]
+                        for c in range(int(self.channels))
+                    ):
+                        continue
                     z_um, y_um, x_um = self._tile_positions[tile_index]
                     oz = int(np.round((z_um - off_z_um) / dz_um))
                     oy = int(np.round((y_um - off_y_um) / dy_um))
@@ -4927,24 +4916,24 @@ class TileFusion:
                     offsets_t.append((tile_index, (oz, oy, ox)))
 
                 for z0, z1, block_y, block_x in block_layout:
+                    slab_tiles = [
+                        (tile, offset)
+                        for tile, offset in offsets_t
+                        if offset[0] + tile_shapes[tile][0] > z0 and offset[0] < z1
+                    ]
                     for y0 in range(0, pad_y, block_y):
                         y1 = min(y0 + block_y, pad_y)
+                        row_tiles = [
+                            (tile, offset)
+                            for tile, offset in slab_tiles
+                            if offset[1] + tile_shapes[tile][1] > y0 and offset[1] < y1
+                        ]
                         for x0 in range(0, pad_x, block_x):
                             x1 = min(x0 + block_x, pad_x)
                             overlapping = [
                                 (tile_index, offset)
-                                for tile_index, offset in offsets_t
-                                if any(
-                                    self._tile_channel_nonzero[
-                                        (tile_index, channel_index)
-                                    ]
-                                    for channel_index in range(int(self.channels))
-                                )
-                                and offset[0] + tile_shapes[tile_index][0] > z0
-                                and offset[0] < z1
-                                and offset[1] + tile_shapes[tile_index][1] > y0
-                                and offset[1] < y1
-                                and offset[2] + tile_shapes[tile_index][2] > x0
+                                for tile_index, offset in row_tiles
+                                if offset[2] + tile_shapes[tile_index][2] > x0
                                 and offset[2] < x1
                             ]
                             if not overlapping:

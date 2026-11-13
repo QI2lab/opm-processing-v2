@@ -125,6 +125,6 @@ def content_aware_fusion(
     content /= cp.where(total > 0, total, 1)
     content *= geometric
     total = content.sum(axis=0, keepdims=True)
-    content = cp.where(total > 0, content, geometric)
+    cp.copyto(content, geometric, where=~(total > 0))
     image *= content
     return cp.asnumpy(image.sum(axis=0)), cp.asnumpy(content.sum(axis=0))
