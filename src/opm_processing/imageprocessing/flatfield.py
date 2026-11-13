@@ -8,7 +8,6 @@ from contextlib import redirect_stdout
 from typing import TYPE_CHECKING
 
 import numpy as np
-from scipy.ndimage import gaussian_filter1d
 from tqdm import tqdm
 
 from opm_processing.cuda import preload_cuda_libraries
@@ -104,66 +103,6 @@ def _resize_image_stack(
     return resized[:, 0].cpu().numpy()
 
 
-def _separable_residual_calibration(
-    flatfield: np.ndarray,
-    observations: np.ndarray,
-) -> np.ndarray:
-    """Calibrate residual detector-coordinate gain on independent tile summaries.
-
-    Parameters
-    ----------
-    flatfield : np.ndarray
-        Fitted detector illumination profile.
-    observations : np.ndarray
-        Independent tile summaries used to estimate residual detector gain.
-
-    Returns
-    -------
-    np.ndarray
-        Mean-normalized float32 illumination with residual detector profiles applied.
-    """
-    if flatfield.shape != observations.shape[-2:] or not np.all(
-        np.isfinite(flatfield) & (flatfield > 0)
-    ):
-        raise ValueError("BaSiC returned an invalid illumination field")
-    corrected = observations / flatfield[np.newaxis, :, :]
-    residual = np.median(corrected, axis=0)
-    scale = np.median(residual)
-    if not np.isfinite(scale) or scale <= 0:
-        raise ValueError(
-            "Illumination samples do not constrain a positive detector response"
-        )
-    residual /= scale
-
-    sigma = max(4.0, observations.shape[-1] / 120.0)
-    x_profile = np.median(residual, axis=0)
-    x_profile = gaussian_filter1d(
-        x_profile,
-        sigma=sigma,
-        mode="nearest",
-    )
-    if not np.all(x_profile > 0):
-        raise ValueError("Illumination samples do not constrain every detector column")
-    x_profile /= np.mean(x_profile)
-
-    y_profile = np.median(
-        residual / x_profile[np.newaxis, :],
-        axis=1,
-    )
-    y_profile = gaussian_filter1d(
-        y_profile,
-        sigma=sigma,
-        mode="nearest",
-    )
-    if not np.all(y_profile > 0):
-        raise ValueError("Illumination samples do not constrain every detector row")
-    y_profile /= np.mean(y_profile)
-
-    calibrated = flatfield * y_profile[:, np.newaxis] * x_profile[np.newaxis, :]
-    calibrated /= np.mean(calibrated)
-    return calibrated.astype(np.float32, copy=False)
-
-
 def estimate_illuminations(
     datastore: ts.TensorStore | np.ndarray,
     camera_offset: float,
@@ -173,7 +112,7 @@ def estimate_illuminations(
     detector_gain_x: np.ndarray | None = None,
     signal_mask: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Estimate shared per-channel illumination as the maximum over stage Z.
+    """Fit shared per-channel illumination using samples from every stage depth.
 
     Parameters
     ----------
@@ -196,8 +135,8 @@ def estimate_illuminations(
     -------
     numpy.ndarray
         Dimensionless fields in CYX order without stage positions, or 1CYX order
-        when stage positions are supplied. Each channel is the pixelwise maximum
-        of the fitted stage-depth fields and is applied at every depth.
+        when stage positions are supplied. One BaSiC fit per channel uses all
+        selected depths and is applied at every depth.
 
     Raises
     ------
@@ -244,7 +183,6 @@ def estimate_illuminations(
     camera_shape = (datastore.shape[-2], datastore.shape[-1])
     working_shape = tuple(max(1, int(size) // 2) for size in camera_shape)
     n_channels = int(datastore.shape[2])
-    fitted_channels = np.zeros(n_channels, dtype=bool)
     if signal_mask is not None:
         signal_mask = np.asarray(signal_mask)
         if (
@@ -257,17 +195,15 @@ def estimate_illuminations(
         signal_mask = signal_mask > 0
 
     with tqdm(
-        total=len(position_groups) * n_channels,
+        total=n_channels,
         desc="illumination fitting",
         unit="channel",
         leave=False,
     ) as progress:
-        for stage_level_index, positions in enumerate(position_groups):
-            for chan_idx in range(n_channels):
-                progress.set_postfix(
-                    stage_level=stage_level_index,
-                    channel=chan_idx,
-                )
+        for chan_idx in range(n_channels):
+            progress.set_postfix(channel=chan_idx)
+            sample_indices = []
+            for positions in position_groups:
                 eligible_positions = (
                     positions
                     if signal_mask is None
@@ -277,107 +213,71 @@ def estimate_illuminations(
                         if signal_mask[0, position, chan_idx]
                     )
                 )
-                sample_indices = _flatfield_sample_indices(
-                    eligible_positions, datastore.shape[-3]
+                sample_indices.extend(
+                    _flatfield_sample_indices(eligible_positions, datastore.shape[-3])
                 )
-                if not sample_indices:
-                    # An excluded depth must not floor valid estimates from other depths.
-                    progress.update()
-                    continue
-                # One tile per depth is common for Z-only acquisitions. Collapsing
-                # its scan planes to one median leaves BaSiC without independent
-                # observations (and its baseline becomes a scalar). Keep the scan
-                # planes as samples in this case; retain tile summaries for mosaics.
-                single_tile = len(sample_indices) == 1
-                n_fit_images = (
-                    len(sample_indices[0][1]) if single_tile else len(sample_indices)
-                )
-                fit_images = np.empty(
-                    (n_fit_images, *working_shape),
-                    dtype=np.float32,
-                )
-                calibration_images = np.empty(
-                    (len(sample_indices), *working_shape), dtype=np.float32
-                )
-                for image_index, (pos_idx, scan_indices) in enumerate(sample_indices):
-                    selection = datastore[0, pos_idx, chan_idx, scan_indices, :, :]
-                    raw = (
-                        selection.read().result()
-                        if hasattr(selection, "read")
-                        else np.asarray(selection)
-                    )
-                    temp_images = camera_correct(
-                        raw,
-                        camera_offset,
-                        camera_conversion,
-                        detector_gain_x=detector_gain_x,
-                    )
-                    if not np.isfinite(temp_images).all():
-                        raise ValueError(
-                            "Illumination samples must contain finite calibrated intensities"
-                        )
-                    resized = _resize_image_stack(temp_images, working_shape)
-                    if single_tile:
-                        fit_images[:] = resized
-                    else:
-                        fit_images[image_index] = np.median(resized, axis=0)
-                    calibration_images[image_index] = np.percentile(
-                        resized,
-                        75,
-                        axis=0,
-                    )
-
-                fit_images = fit_images[np.any(fit_images > 0, axis=(1, 2))]
-                calibration_images = calibration_images[
-                    np.any(calibration_images > 0, axis=(1, 2))
-                ]
-                if not len(fit_images):
-                    progress.update()
-                    continue
-                if len(fit_images) < 2:
-                    raise ValueError(
-                        "Flatfield estimation requires at least two nonempty sampled images"
-                    )
-
-                basic = BaSiC(
-                    get_darkfield=False,
-                    sort_intensity=True,
-                    working_size=list(working_shape),
-                    smoothness_flatfield=2.0,
-                )
-
-                with redirect_stdout(io.StringIO()):
-                    basic.fit(fit_images)
-                fitted_flatfield = _separable_residual_calibration(
-                    np.asarray(basic.flatfield, dtype=np.float32),
-                    calibration_images,
-                )
-                depth_flatfield = _resize_image_stack(
-                    fitted_flatfield[np.newaxis, :, :],
-                    camera_shape,
-                )[0]
-                np.maximum(
-                    flatfields[0, chan_idx],
-                    depth_flatfield,
-                    out=flatfields[0, chan_idx],
-                )
-                fitted_channels[chan_idx] = True
-
-                del (
-                    basic,
-                    fitted_flatfield,
-                    depth_flatfield,
-                    fit_images,
-                    calibration_images,
-                )
-
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+            if not sample_indices:
+                flatfields[0, chan_idx] = 1.0
                 progress.update()
+                continue
+            # A lone tile must retain its scan frames as independent observations.
+            single_tile = len(sample_indices) == 1
+            n_fit_images = (
+                len(sample_indices[0][1]) if single_tile else len(sample_indices)
+            )
+            fit_images = np.empty((n_fit_images, *working_shape), dtype=np.float32)
+            for image_index, (pos_idx, scan_indices) in enumerate(sample_indices):
+                selection = datastore[0, pos_idx, chan_idx, scan_indices, :, :]
+                raw = (
+                    selection.read().result()
+                    if hasattr(selection, "read")
+                    else np.asarray(selection)
+                )
+                temp_images = camera_correct(
+                    raw,
+                    camera_offset,
+                    camera_conversion,
+                    detector_gain_x=detector_gain_x,
+                )
+                if not np.isfinite(temp_images).all():
+                    raise ValueError(
+                        "Illumination samples must contain finite calibrated intensities"
+                    )
+                resized = _resize_image_stack(temp_images, working_shape)
+                if single_tile:
+                    fit_images[:] = resized
+                else:
+                    fit_images[image_index] = np.median(resized, axis=0)
 
-    # Channels without signal at any depth receive no illumination correction.
-    flatfields[0, ~fitted_channels] = 1.0
+            fit_images = fit_images[np.any(fit_images > 0, axis=(1, 2))]
+            if not len(fit_images):
+                flatfields[0, chan_idx] = 1.0
+                progress.update()
+                continue
+            if len(fit_images) < 2:
+                raise ValueError(
+                    "Flatfield estimation requires at least two nonempty sampled images"
+                )
+            basic = BaSiC(
+                get_darkfield=False,
+                working_size=list(working_shape),
+                smoothness_flatfield=2.0,
+            )
+            with redirect_stdout(io.StringIO()):
+                basic.fit(fit_images)
+            fitted = np.asarray(basic.flatfield, dtype=np.float32)
+            if fitted.shape != working_shape or not np.all(
+                np.isfinite(fitted) & (fitted > 0)
+            ):
+                raise ValueError("BaSiC returned an invalid illumination field")
+            flatfields[0, chan_idx] = _resize_image_stack(
+                fitted[np.newaxis, :, :], camera_shape
+            )[0]
+            del basic, fitted, fit_images
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            progress.update()
     if not np.all(np.isfinite(flatfields) & (flatfields > 0)):
         raise ValueError(
             "Illumination could not be estimated over the complete detector"

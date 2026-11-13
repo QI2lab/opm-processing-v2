@@ -89,7 +89,7 @@ app = typer.Typer(pretty_exceptions_enable=False)
 app.pretty_exceptions_enable = False
 
 # Reject cached fields made before depth estimates shared one maximum field.
-FLATFIELD_SOFTWARE = "opm-processing/basicpy-stage-z-max-camera-contract-v12"
+FLATFIELD_SOFTWARE = "opm-processing/basicpy-shared-depth-camera-contract-v13"
 
 
 def progress_tile_groups(
