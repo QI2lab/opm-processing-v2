@@ -1278,6 +1278,14 @@ def _rlgc_once(
             padded_shape = tuple(
                 n + sum(p) for n, p in zip(fine_shape, pads, strict=True)
             )
+            geometry = (fine_shape, padded_shape)
+            previous = _optical_state.get("geometry")
+            if geometry != previous:
+                _optical_state.clear()
+                # Drop the previous FFT workspace before allocating a new shape.
+                if previous is not None and padded_shape != previous[1]:
+                    clear_rlgc_caches(clear_memory_pool=True)
+                _optical_state["geometry"] = geometry
             if storage == "host":
                 # Explicit host storage still needs room for this chunk's state
                 # and temporaries. The outer scan-chunk loop bounds this shape.
@@ -1836,15 +1844,13 @@ def _shared_kl_chunks(
         if observer is not None:
             observer(iteration, recon)
 
-    optical_state = {}
-    options = dict(solver_options, callback=on_update, _optical_state=optical_state)
+    options = dict(solver_options, callback=on_update, _optical_state={})
     # Allocate the largest optical working set first. Startup allocation fallback
     # remains available, but a later failure must never replay completed updates.
     order = sorted(
         range(len(layouts)), key=lambda i: math.prod(shapes[i]), reverse=True
     )
     common_stop = 0
-    previous_shape = None
     try:
         for index in tqdm(order, desc="decon KL", unit="chunk", leave=False):
             tile, start, stop, dest_start, dest_stop = layouts[index]
@@ -1864,18 +1870,6 @@ def _shared_kl_chunks(
                     dest_stop,
                     storage,
                 )
-            current_shape = (stop - start, shapes[index])
-            if current_shape != previous_shape:
-                release_plans = (
-                    bool(optical_state) and shapes[index] != previous_shape[1]
-                )
-                optical_state.clear()
-                # Cached FFT plans own device workspaces. Release the preceding
-                # shape before allocating edge-chunk plans; state is already in RAM.
-                if release_plans:
-                    with cp.cuda.Device(solver_options.get("gpu_id", 0)):
-                        clear_rlgc_caches(clear_memory_pool=True)
-                previous_shape = current_shape
             _rlgc_once(
                 crop,
                 psf,
@@ -1933,16 +1927,6 @@ def _shared_kl_chunks(
             else:
                 if state.iterations < common_stop:
                     state.accepted = state.provisional = None
-                    current_shape = (stop - start, shapes[index])
-                    if current_shape != previous_shape:
-                        release_plans = (
-                            bool(optical_state) and shapes[index] != previous_shape[1]
-                        )
-                        optical_state.clear()
-                        if release_plans:
-                            with cp.cuda.Device(solver_options.get("gpu_id", 0)):
-                                clear_rlgc_caches(clear_memory_pool=True)
-                        previous_shape = current_shape
                     result = _rlgc_once(
                         work[start:stop],
                         psf,
