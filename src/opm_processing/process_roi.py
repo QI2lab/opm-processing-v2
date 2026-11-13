@@ -145,6 +145,7 @@ def process_roi(
     output: Path | None = None,
     acquisition: AcquisitionMetadata | None = None,
     prepared_psfs: tuple[list[np.ndarray], dict | None] | None = None,
+    content_aware: bool = False,
 ) -> Path:
     """Process a napari-selected world-space ROI and fuse its cropped tiles.
 
@@ -182,6 +183,8 @@ def process_roi(
         Already inspected acquisition shared by a batch of ROI exports.
     prepared_psfs : tuple or None
         Channel kernels and optical settings returned by load_deconvolution_psfs.
+    content_aware : bool
+        Use GPU DCT-entropy weighting when fusing cropped overlaps.
 
 
     Returns
@@ -291,6 +294,7 @@ def process_roi(
         roi_selection=fusion_roi,
         multiscale_factors=(),
         resolution_multiples=((1, 1, 1),),
+        content_aware=content_aware,
     )
     fusion.run()
     fused_path = output_dir / f"{stem}_fused.ome.zarr"

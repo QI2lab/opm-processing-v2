@@ -6,6 +6,13 @@ Run fusion on completed processed tiles:
 uv run fuse "/path/to/processed" --registration-channel 2
 ```
 
+Add `--content-aware` to favor structured image content in overlaps using GPU
+DCT entropy multiplied by the existing feather weights. Channels are scored
+independently. Constant or equal-score regions retain feather blending;
+single-contributor regions retain the direct-copy path. This option is also
+available with `export-rois`. Depth histogram matching remains separate and
+keeps the same references and maps.
+
 ## Select the input
 
 Directory selection prefers `*_decon_deskewed.ome.zarr` when available and

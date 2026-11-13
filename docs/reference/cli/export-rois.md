@@ -30,6 +30,7 @@ when the acquisition and preview retain their names and relative layout.
 | `--ao-root PATH` | Saved AO grid directory for `--figures`; otherwise discover beside the raw acquisition or preview. |
 | `--ao-wavelength-nm FLOAT` | Explicit phase wavelength in nanometers when recorded AO illumination is missing or ambiguous. Requires `--figures`. |
 | `--flatfield-correction` | Reuse or estimate illumination correction. |
+| `--content-aware` | Use GPU DCT-entropy overlap fusion of processed ROI tiles; default disabled. |
 | `--save-float32` | Preserve fractional intensities; default uint16. |
 | `--z-downsample-level INTEGER` | Output Z binning factor; default 1. |
 | `--registration-channel INTEGER` | Required zero-based local registration channel. Use 0 for single-channel data. |

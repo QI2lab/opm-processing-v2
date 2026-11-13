@@ -82,6 +82,9 @@ def register_and_fuse(
         ),
     ] = True,
     require_gpu: bool = False,
+    content_aware: Annotated[
+        bool, typer.Option(help="Use GPU DCT-entropy weighting in tile overlaps.")
+    ] = False,
     regenerate_max_z: Annotated[
         bool,
         typer.Option(
@@ -153,6 +156,8 @@ def register_and_fuse(
         stay fixed.
     require_gpu : bool
         Retained for command compatibility; pair registration always requires CUDA.
+    content_aware : bool
+        Use GPU content-aware overlap fusion instead of geometric feathering alone.
     regenerate_max_z : bool
         Regenerate all maximum-Z pyramid levels from the existing fused image
         without registering or fusing tiles again.
@@ -181,7 +186,9 @@ def register_and_fuse(
             input_dir if output_dir is None else output_dir.expanduser().resolve()
         )
     else:
-        status = fusion_backend_status(max_workers=max_workers)
+        status = fusion_backend_status(
+            max_workers=max_workers, content_aware=content_aware
+        )
         if require_gpu:
             require_gpu_backend()
         print(
@@ -211,6 +218,7 @@ def register_and_fuse(
             roi_selection=None if roi is None else PhysicalRoi.read(roi),
             normalize_depth_intensity=normalize_depth_intensity,
             output_dir=output_dir,
+            content_aware=content_aware,
         )
         print(f"Fusion input: {tile_fuser.data}")
         print(f"Fusion output directory: {tile_fuser.output_dir}")

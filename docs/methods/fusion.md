@@ -104,13 +104,29 @@ coverage to the denominator. This avoids fading partly supported depth bins.
 Missing channels are excluded from that channel's accumulation. Camera-X padding
 has zero feather weight.
 
+With `--content-aware`, overlap samples are coverage-normalized before scoring.
+The GPU computes DCT entropy in 32-pixel cells, clamped to the overlap extent,
+using the [pinned multiview-stitcher implementation](https://github.com/multiview-stitcher/multiview-stitcher/blob/708fd8f96576e4e2934f1bc5d3e51e374c97de9f/src/multiview_stitcher/weights.py#L85):
+L2-normalized coefficients inside the L1 frequency cutoff of half the smallest
+cell dimension. Scores are shifted by their per-cell minimum across contributors,
+normalized, and linearly interpolated from cell centers. Constant cells have
+zero entropy, avoiding amplification of FFT roundoff. Content weights multiply
+geometric feather/coverage weights; zero totals fall back to geometric weights.
+The DCT lattice is anchored to the physical overlap, with neighboring-cell
+context for interpolation, so output-block boundaries do not reset the weights.
+ROIs still combine each depth before applying its histogram map, then content-blend
+the corrected layers. Source reads and direct-channel copies share the existing
+accumulator; the GPU calculation batches contributors and channels.
+
 ## Execution
 
 Registration requires CuPy/cuCIM. The scikit-image fallback applies only to
 depth histogram matching.
 Fusion uses threaded blocks and Numba CPU kernels with bounded memory and queued
-writes. Depth and coverage corrections retain source precision before the final
-output cast, including directly copied regions. Full-volume integer output clips
+writes. Content-aware fusion instead uses one GPU render worker, with block
+sizing that accounts for GPU working memory and DCT context. Depth and coverage
+corrections retain source precision before the final output cast, including
+directly copied regions. Full-volume integer output clips
 and truncates; maximum-projection
 fusion retains its rounding convention.
 

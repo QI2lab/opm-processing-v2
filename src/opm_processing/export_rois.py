@@ -392,6 +392,9 @@ def export_rois(
         ),
     ] = None,
     flatfield_correction: bool = False,
+    content_aware: Annotated[
+        bool, typer.Option(help="Use GPU DCT-entropy weighting in ROI overlaps.")
+    ] = False,
     save_float32: bool = False,
     z_downsample_level: Annotated[int, typer.Option(min=1)] = 1,
     decon_crop_scan: Annotated[int | None, typer.Option(min=1)] = None,
@@ -430,6 +433,8 @@ def export_rois(
         Phase display wavelength override in nanometers.
     flatfield_correction : bool
         Reuse or estimate a detector-response flatfield.
+    content_aware : bool
+        Use GPU content-aware fusion of the processed ROI tiles.
     save_float32 : bool
         Preserve float32 intensities instead of writing uint16.
     z_downsample_level : int
@@ -572,6 +577,7 @@ def export_rois(
             output=selection.parent,
             deconvolve=deconvolve,
             flatfield_correction=flatfield_correction,
+            content_aware=content_aware,
             save_float32=save_float32,
             z_downsample_level=z_downsample_level,
             decon_crop_scan=decon_crop_scan,
