@@ -340,21 +340,28 @@ def test_zero_channels_keep_single_contributors_and_blend_valid_overlap(
 ):
     """Exclude absent channels while retaining independent weights for valid ones."""
     tiles = [
-        np.full((channels, 1, 2, 4), 100, np.float32),
-        np.zeros((channels, 1, 2, 4), np.float32),
+        np.full((channels, 2, 2, 4), 100, np.uint16),
+        np.zeros((channels, 2, 2, 4), np.uint16),
     ]
     if channels == 2:
-        tiles[1][1] = 200
+        tiles[0][1, :, :, 2:] = 200
+        tiles[1][1] = tiles[0][1, :, :, ::-1]
     fusion = block_fusion(
         tiles,
-        [(0, 0, 0)] * 2,
-        (1, 2, 4),
+        [(0, 0, 0), (1, 0, 0)],
+        (3, 2, 4),
     )
     assert fusion._tile_channel_nonzero == {
         (tile, channel): tile == 0 or channel > 0
         for tile in range(2)
         for channel in range(channels)
     }
+    if channels == 2:
+        monkeypatch.setattr(tilefusion_module, "USING_GPU", False)
+        fusion.roi_selection = PhysicalRoi((0, 2, 0, 4), fusion.data, (0, 0), (1, 1))
+        fusion.unpadded_shape = (3, 2, 4)
+        np.testing.assert_array_equal(fusion._tile_depth_indices, [0, 1])
+        fusion.match_depth_histograms()
     reads = []
     read = fusion._read_tile_volume
 
@@ -364,11 +371,13 @@ def test_zero_channels_keep_single_contributors_and_blend_valid_overlap(
 
     monkeypatch.setattr(fusion, "_read_tile_volume", observe_read)
     fusion._fuse_by_blocks()
-    assert sorted(reads) == list(range(channels))
-    expected = np.broadcast_to(
-        np.array([100, 150][:channels])[None, :, None, None, None],
-        (1, channels, 1, 2, 4),
-    )
+    assert sorted(reads) == ([0] if channels == 1 else [0, 0, 1, 1])
+    expected = np.zeros((1, channels, 3, 2, 4), np.uint16)
+    expected[0, 0, :2] = 100
+    if channels == 2:
+        expected[0, 1, 0] = tiles[0][1, 0]
+        expected[0, 1, 1] = 150
+        expected[0, 1, 2] = tiles[1][1, 1]
     np.testing.assert_array_equal(fusion.fused_ts.read().result(), expected)
 
 

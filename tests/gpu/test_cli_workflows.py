@@ -80,6 +80,7 @@ def test_inspection_and_exports_process_simulated_acquisition(
         output_dir=output_dir,
         regenerate_max_z=True,
         max_workers=1,
+        normalize_depth_intensity=False,
     )
     assert not measurements
     fused_path = output_dir / "pipeline_fused.ome.zarr"

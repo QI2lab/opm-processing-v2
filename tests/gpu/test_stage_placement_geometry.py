@@ -35,7 +35,7 @@ def test_physical_stage_z_translation_preserves_registered_xy(
     process(
         root_path=path,
         deconvolve=False,
-        save_float32=True,
+        save_float32=False,
         crop_after_deskew=crop,
         **processing_options,
     )

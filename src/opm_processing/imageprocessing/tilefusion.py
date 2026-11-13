@@ -869,7 +869,7 @@ def _accumulate_tile_block(
         Source CZYX block. The feather-profile lengths select the crop extent;
         source offsets locate that crop without making a strided sub-volume.
     channel_present : numpy.ndarray
-        Boolean vector identifying channels that contain signal in this tile.
+        Boolean vector identifying channels participating in weighted blending.
     valid_zy : numpy.ndarray
         Metadata-derived fraction of valid interpolation samples per ZY bin,
         with shape (sub_dz, Y_tile). Boolean masks represent complete bins.
@@ -901,6 +901,7 @@ def _accumulate_tile_block(
     c_dim, _, _, _ = fused.shape
     sub_dz, y_sub, x_sub = len(z_weights), len(y_weights), len(x_weights)
     total = sub_dz * y_sub
+    first_channel = np.argmax(channel_present)
 
     for c in range(c_dim):
         if not channel_present[c]:
@@ -918,7 +919,7 @@ def _accumulate_tile_block(
             for x_i in range(x_sub):
                 gx = x_off + x_i
                 w_val = zy_weight * x_weights[x_i]
-                if weight.shape[0] != 1 or c == 0:
+                if weight.shape[0] != 1 or c == first_channel:
                     weight[weight_channel, gz, gy, gx] += w_val * coverage
                 fused[c, gz, gy, gx] += (
                     source[c, source_z + dz_i, source_y + y_i, source_x + x_i] * w_val
@@ -3520,26 +3521,43 @@ class TileFusion:
         upper = np.minimum((origins + shapes).max(axis=0), self.unpadded_shape)
         if np.any(upper <= lower):
             return np.empty(0, dtype=np.float32)
-        voxel_count = math.prod(int(value) for value in upper - lower)
-        if 16 * voxel_count > 0.8 * psutil.virtual_memory().available:
-            raise MemoryError("Insufficient RAM to combine a complete depth layer.")
-        bounds = tuple(
-            int(value) for pair in zip(lower, upper, strict=True) for value in pair
-        )
-        contributors = [
-            (tile, tuple(origin)) for tile, origin in zip(active, origins, strict=True)
-        ]
-        numerator, weights = self._accumulate_fusion_tiles(
-            bounds, contributors, channel
-        )
-        layer = (
-            numerator
-            if numerator.dtype == self.output_dtype
-            else np.empty(numerator.shape, dtype=self.output_dtype)
-        )
-        _normalize_block(numerator, weights, layer)
-        del numerator
-        values = layer[0][weights[0] > 0]
+        if len(active) == 1:
+            tile = active[0]
+            z, y, x = (
+                slice(int(start), int(stop))
+                for start, stop in zip(
+                    lower - origins[0], upper - origins[0], strict=True
+                )
+            )
+            coverage = self._tile_support_zy[tile][z, y]
+            source = self._read_tile_volume(
+                tile, slice(channel, channel + 1), z, y, x, dtype=None
+            )
+            layer = self._cast_fusion_values(self._normalize_coverage(source, coverage))
+            valid = (coverage[..., None] > 0) & (self._tile_profiles[tile][2][x] > 0)
+            values = layer[0][valid]
+        else:
+            voxel_count = math.prod(int(value) for value in upper - lower)
+            if 16 * voxel_count > 0.8 * psutil.virtual_memory().available:
+                raise MemoryError("Insufficient RAM to combine a complete depth layer.")
+            bounds = tuple(
+                int(value) for pair in zip(lower, upper, strict=True) for value in pair
+            )
+            contributors = [
+                (tile, tuple(origin))
+                for tile, origin in zip(active, origins, strict=True)
+            ]
+            numerator, weights = self._accumulate_fusion_tiles(
+                bounds, contributors, channel
+            )
+            layer = (
+                numerator
+                if numerator.dtype == self.output_dtype
+                else np.empty(numerator.shape, dtype=self.output_dtype)
+            )
+            _normalize_block(numerator, weights, layer)
+            del numerator
+            values = layer[0][weights[0] > 0]
         if np.issubdtype(values.dtype, np.floating) and not np.isfinite(values).all():
             raise ValueError(
                 "Nonfinite processed intensities in depth histogram matching."
@@ -4285,7 +4303,6 @@ class TileFusion:
         values: np.ndarray,
         weights: np.ndarray,
         channel: int | None = None,
-        skip_channels: Sequence[int] = (),
     ) -> np.ndarray:
         """Apply a saved depth map to normalized CZYX pixels, preserving padding.
 
@@ -4299,8 +4316,6 @@ class TileFusion:
             Positive weights identify measured pixels; one channel may broadcast.
         channel : int or None
             Acquisition channel represented by a single-channel input.
-        skip_channels : sequence of int
-            Channels already rendered directly from their sole contributor.
 
         Returns
         -------
@@ -4310,8 +4325,6 @@ class TileFusion:
         maps = self._depth_histogram_maps
         channels = range(int(self.channels)) if channel is None else (channel,)
         for index, source_channel in enumerate(channels):
-            if source_channel in skip_channels:
-                continue
             mapping = maps.get((tile, source_channel))
             if mapping is None:
                 continue
@@ -4366,10 +4379,21 @@ class TileFusion:
             )
             for p, _ in contributors
         ]
-        fused = np.zeros((len(channels), z1 - z0, y1 - y0, x1 - x0), np.float32)
+        blending = direct is None or any(
+            flags[c]
+            for flags in channel_flags
+            for c in range(len(channels))
+            if c not in direct
+        )
+        fused = np.zeros(
+            (len(channels) if blending else 0, z1 - z0, y1 - y0, x1 - x0),
+            np.float32,
+        )
         weight = np.zeros(
             (
-                1 if all(np.all(flags) for flags in channel_flags) else len(channels),
+                (1 if all(np.all(flags) for flags in channel_flags) else len(channels))
+                if blending
+                else 0,
                 *fused.shape[1:],
             ),
             np.float32,
@@ -4429,7 +4453,10 @@ class TileFusion:
                                 p, pixels.astype(np.float32, copy=True), valid, c
                             )
                     destination[:] = self._cast_fusion_values(pixels)[0]
+                    present[c] = False
                     del pixels
+            if not np.any(present):
+                continue
             if match_tile:
                 source *= coverage[None, :, :, None]
             _accumulate_tile_block(
@@ -4549,6 +4576,15 @@ class TileFusion:
                 for c, tiles in enumerate(active_channels)
                 if len(tiles) == 1
             }
+            blend_channels = [
+                c for c, tiles in enumerate(active_channels) if len(tiles) > 1
+            ]
+            if not blend_channels:
+                self._accumulate_fusion_tiles(
+                    region, region_contributors, direct=direct
+                )
+                direct_regions += 1
+                continue
             if match_roi_layers:
                 depth_contributors: dict[
                     int, list[tuple[int, tuple[int, int, int]]]
@@ -4577,16 +4613,18 @@ class TileFusion:
                     layer, layer_weight = self._accumulate_fusion_tiles(
                         region, layer_contributors, direct=direct
                     )
-                    _normalize_block(layer, layer_weight, layer)
-                    layer = self._match_fusion_depth(
-                        layer_contributors[0][0],
-                        layer,
-                        layer_weight,
-                        skip_channels=tuple(direct),
-                    )
-                    layer *= layer_weight
-                    fused += layer
-                    weight += layer_weight
+                    for c in blend_channels:
+                        weight_channel = 0 if layer_weight.shape[0] == 1 else c
+                        weights = layer_weight[weight_channel : weight_channel + 1]
+                        values = layer[c : c + 1]
+                        _normalize_block(values, weights, values)
+                        self._match_fusion_depth(
+                            layer_contributors[0][0], values, weights, channel=c
+                        )
+                        values *= weights
+                        fused[c : c + 1] += values
+                        if weight.shape[0] != 1 or c == blend_channels[0]:
+                            weight[0 if weight.shape[0] == 1 else c] += weights[0]
                     del layer, layer_weight
             else:
                 fused, weight = self._accumulate_fusion_tiles(
@@ -4594,14 +4632,13 @@ class TileFusion:
                 )
 
             if direct:
-                for c in range(int(self.channels)):
-                    if c not in direct:
-                        weight_channel = 0 if weight.shape[0] == 1 else c
-                        _normalize_block(
-                            fused[c : c + 1],
-                            weight[weight_channel : weight_channel + 1],
-                            region_output[c : c + 1],
-                        )
+                for c in blend_channels:
+                    weight_channel = 0 if weight.shape[0] == 1 else c
+                    _normalize_block(
+                        fused[c : c + 1],
+                        weight[weight_channel : weight_channel + 1],
+                        region_output[c : c + 1],
+                    )
             elif output.dtype == np.dtype(np.float32):
                 _normalize_block(fused, weight, fused)
                 region_output[:] = fused
