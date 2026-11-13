@@ -178,6 +178,7 @@ def block_fusion(tile_fusion):
         max_in_flight_writes=1,
         fusion_ram_fraction=1,
         chunk_shape_yx=None,
+        content_aware=False,
     ):
         """Build a fusion operator from prescribed pixels, support and geometry."""
         fusion = tile_fusion(
@@ -188,6 +189,7 @@ def block_fusion(tile_fusion):
             max_in_flight_writes=max_in_flight_writes,
             fusion_ram_fraction=fusion_ram_fraction,
             chunk_shape_yx=shape[1:] if chunk_shape_yx is None else chunk_shape_yx,
+            content_aware=content_aware,
         )
         fusion.offset_um, fusion.padded_shape = (0, 0, 0), shape
         fusion.output_dtype = np.dtype(output_dtype)

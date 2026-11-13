@@ -2,7 +2,7 @@
 2D/3D tile fusion for qi2lab OPM data.
 
 This module implements CuPy/cuCIM registration and Numba-accelerated
-feather-weighted CPU fusion of TPCZYX stacks.
+feather-weighted fusion of TPCZYX stacks, optionally with GPU DCT content weights.
 
 Pipeline summary
 ----------------
@@ -17,7 +17,7 @@ Pipeline summary
 Notes
 -----
 - The output store layout is (t, c, z, y, x).
-- Registration requires CuPy/cuCIM; fusion is performed on CPU using Numba kernels.
+- Registration requires CuPy/cuCIM; feather fusion uses Numba, content weights use CuPy.
 """
 
 from __future__ import annotations
@@ -149,6 +149,7 @@ def _default_fusion_workers() -> int:
 
 def fusion_backend_status(
     max_workers: int | None = None,
+    content_aware: bool = False,
 ) -> dict[str, str | bool | int | None]:
     """Return observable registration and fusion backend information.
 
@@ -156,6 +157,8 @@ def fusion_backend_status(
     ----------
     max_workers : int | None
         Concurrent fusion workers, or None for the available-memory default.
+    content_aware : bool
+        Select GPU DCT-entropy fusion with one GPU render worker.
 
     Returns
     -------
@@ -166,8 +169,10 @@ def fusion_backend_status(
     return {
         "gpu_registration": USING_GPU,
         "registration_backend": "cupy/cucim",
-        "fusion_backend": "threaded-blocks/numba-cpu",
-        "fusion_workers": workers,
+        "fusion_backend": "cupy/dct-entropy"
+        if content_aware
+        else "threaded-blocks/numba-cpu",
+        "fusion_workers": 1 if content_aware else workers,
         "gpu_error": None if GPU_IMPORT_ERROR is None else repr(GPU_IMPORT_ERROR),
     }
 
@@ -1554,6 +1559,7 @@ class TileFusion:
         registration_retries: int = 2,
         output_dir: str | Path | None = None,
         registration_context_limit_zyx: tuple[int, int, int] | None = None,
+        content_aware: bool = False,
     ) -> None:
         """Initialize registration and fusion for a processed acquisition.
 
@@ -1623,6 +1629,8 @@ class TileFusion:
             Maximum search supported by a preplanned ROI read context. Clamp
             per-pair automatic limits and retries to this ceiling without
             changing their geometry-based allowances.
+        content_aware : bool
+            Weight overlaps by GPU DCT entropy and geometric feathering.
 
         Returns
         -------
@@ -1646,6 +1654,9 @@ class TileFusion:
             max_workers = _default_fusion_workers()
         if max_workers < 1:
             raise ValueError("max_workers must be at least 1")
+        self.content_aware = bool(content_aware)
+        if self.content_aware:
+            require_gpu_backend()
         self._max_workers = int(max_workers)
         self._source_cache_bytes = min(
             4 * 1024**3,
@@ -4191,6 +4202,7 @@ class TileFusion:
                     self.processing_state.path, Path(output_path)
                 ),
                 "opm_processing_coordinates": {"version": STAGE_COORDINATE_VERSION},
+                "opm_processing_fusion": {"content_aware": self.content_aware},
             },
             chunks=codec_chunks,
             writer="tensorstore",
@@ -4228,7 +4240,9 @@ class TileFusion:
         available = int(psutil.virtual_memory().available)
         budget = max(1, int(available * self.fusion_ram_fraction))
         concurrent_buffers = max(
-            1, int(self._max_workers) + int(self.max_in_flight_writes)
+            1,
+            (1 if self.content_aware else self._max_workers)
+            + self.max_in_flight_writes,
         )
         buffer_bytes = 40 if self._depth_histogram_maps else 16
         bytes_per_voxel = buffer_bytes * max(1, int(self.channels))
@@ -4268,7 +4282,9 @@ class TileFusion:
         available = int(psutil.virtual_memory().available)
         budget = max(1, int(available * self.fusion_ram_fraction))
         concurrent_buffers = max(
-            1, int(self._max_workers) + int(self.max_in_flight_writes)
+            1,
+            (1 if self.content_aware else self._max_workers)
+            + self.max_in_flight_writes,
         )
         per_block_budget = max(1, budget // concurrent_buffers)
 
@@ -4276,25 +4292,38 @@ class TileFusion:
         # weights while combining depths. TensorStore has a separate cache limit.
         buffer_bytes = 40 if self._depth_histogram_maps else 16
         bytes_per_voxel = buffer_bytes * max(1, int(self.channels))
+        halo = 0
+        align_y, align_x = self.chunk_y, self.chunk_x
+        if self.content_aware:
+            # Eight neighboring tiles, twelve float32 work arrays, one GPU worker.
+            # Include lattice alignment and interpolation context at both ends.
+            per_block_budget = min(
+                per_block_budget,
+                int(cp.cuda.runtime.memGetInfo()[0] * self.fusion_ram_fraction),
+            )
+            bytes_per_voxel = 384 * self.channels
+            z_depth = min(self.z_dim, z_depth + 128)
+            halo = 128
+            align_y, align_x = min(32, align_y), min(32, align_x)
         max_xy_pixels = max(
             1,
             per_block_budget // (max(1, z_depth) * bytes_per_voxel),
         )
         aspect = float(y_size) / float(max(1, x_size))
-        block_y = max(1, int(np.sqrt(max_xy_pixels * aspect)))
+        block_y = max(1, int(np.sqrt(max_xy_pixels * aspect)) - halo)
         block_y = min(y_size, block_y, int(self.chunk_y) * 8)
         block_x = min(
             x_size,
-            max(1, max_xy_pixels // block_y),
+            max(1, max_xy_pixels // (block_y + halo) - halo),
             int(self.chunk_x) * 8,
         )
 
-        block_y = max(min(y_size, int(self.chunk_y)), block_y)
-        block_x = max(min(x_size, int(self.chunk_x)), block_x)
-        if block_y >= self.chunk_y:
-            block_y = max(self.chunk_y, (block_y // self.chunk_y) * self.chunk_y)
-        if block_x >= self.chunk_x:
-            block_x = max(self.chunk_x, (block_x // self.chunk_x) * self.chunk_x)
+        block_y = max(min(y_size, align_y), block_y)
+        block_x = max(min(x_size, align_x), block_x)
+        if block_y >= align_y:
+            block_y = max(align_y, (block_y // align_y) * align_y)
+        if block_x >= align_x:
+            block_x = max(align_x, (block_x // align_x) * align_x)
         return int(block_y), int(block_x)
 
     def _match_fusion_depth(
@@ -4346,6 +4375,7 @@ class TileFusion:
         channel: int | None = None,
         match_depth: bool = False,
         direct: dict[int, tuple[int, np.ndarray]] | None = None,
+        content_aware: bool = False,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Accumulate processed tiles with the production feather/coverage kernel.
 
@@ -4363,6 +4393,9 @@ class TileFusion:
         direct : dict or None
             Sole-contributor channels mapped to (tile, destination view). Write
             their direct results during the first read to preserve exact casts.
+        content_aware : bool
+            Use batched GPU DCT entropy for the supplied overlap. The caller
+            supplies aligned context; depth-histogram estimation stays geometric.
 
         Returns
         -------
@@ -4385,21 +4418,43 @@ class TileFusion:
             for c in range(len(channels))
             if c not in direct
         )
+        content_channels = (
+            [
+                c
+                for c in range(len(channels))
+                if (not direct or c not in direct)
+                and any(flags[c] for flags in channel_flags)
+            ]
+            if content_aware
+            else []
+        )
         fused = np.zeros(
-            (len(channels) if blending else 0, z1 - z0, y1 - y0, x1 - x0),
+            (
+                len(channels) if blending and not content_channels else 0,
+                z1 - z0,
+                y1 - y0,
+                x1 - x0,
+            ),
             np.float32,
         )
         weight = np.zeros(
             (
                 (1 if all(np.all(flags) for flags in channel_flags) else len(channels))
-                if blending
+                if blending and not content_channels
                 else 0,
                 *fused.shape[1:],
             ),
             np.float32,
         )
         maps = self._depth_histogram_maps
-        for (p, (oz, oy, ox)), present in zip(contributors, channel_flags, strict=True):
+        if content_channels:
+            samples = np.zeros(
+                (len(contributors), len(content_channels), *fused.shape[1:]), np.float32
+            )
+            geometric = np.zeros_like(samples)
+        for view, ((p, (oz, oy, ox)), present) in enumerate(
+            zip(contributors, channel_flags, strict=True)
+        ):
             if not np.any(present):
                 continue
             shape = self._tile_shapes[p]
@@ -4457,6 +4512,26 @@ class TileFusion:
                     del pixels
             if not np.any(present):
                 continue
+            if content_channels:
+                pixels = (
+                    source if match_tile else self._normalize_coverage(source, coverage)
+                )
+                selection = (
+                    view,
+                    slice(None),
+                    slice(gz0 - z0, gz1 - z0),
+                    slice(gy0 - y0, gy1 - y0),
+                    slice(gx0 - x0, gx1 - x0),
+                )
+                np.take(pixels, content_channels, axis=0, out=samples[selection])
+                geometric[selection] = (
+                    present[content_channels, None, None, None]
+                    * coverage[None, :, :, None]
+                    * z_weights[None, :, None, None]
+                    * y_weights[None, None, :, None]
+                    * x_weights[None, None, None, :]
+                )
+                continue
             if match_tile:
                 source *= coverage[None, :, :, None]
             _accumulate_tile_block(
@@ -4472,7 +4547,90 @@ class TileFusion:
                 gy0 - y0,
                 gx0 - x0,
             )
+        if content_channels:
+            from opm_processing.imageprocessing.content_fusion import (
+                content_aware_fusion,
+            )
+
+            numerator, denominator = content_aware_fusion(samples, geometric)
+            if len(content_channels) == len(channels):
+                return numerator, denominator
+            fused = np.zeros((len(channels), *fused.shape[1:]), np.float32)
+            fused[content_channels] = numerator
+            weight = np.zeros_like(fused)
+            weight[content_channels] = denominator
         return fused, weight
+
+    def _render_content_overlap(
+        self,
+        region: tuple[int, int, int, int, int, int],
+        contributors: Sequence[tuple[int, tuple[int, int, int]]],
+        blend_channels: list[int],
+    ) -> np.ndarray:
+        """Render aligned DCT cells with interpolation context across output blocks."""
+        # Anchor the DCT lattice to this physical overlap, never to output chunks.
+        lower = np.max([origin for _, origin in contributors], axis=0)
+        upper = np.min(
+            [np.asarray(origin) + self._tile_shapes[p] for p, origin in contributors],
+            axis=0,
+        )
+        start, stop = np.asarray(region[::2]), np.asarray(region[1::2])
+        size = np.minimum(32, upper - lower)
+        first = np.maximum(lower, lower + ((start - lower) // size - 1) * size)
+        last = np.minimum(upper, lower + ((stop - lower + size - 1) // size + 1) * size)
+        bounds = tuple(int(v) for pair in zip(first, last, strict=True) for v in pair)
+        output = np.zeros((self.channels, *(last - first)), np.float32)
+        direct = {
+            c: (tiles[0], output[c])
+            for c in range(self.channels)
+            if len(
+                tiles := [
+                    p for p, _ in contributors if self._tile_channel_nonzero[p, c]
+                ]
+            )
+            == 1
+        }
+        groups = {}
+        match_layers = (
+            bool(self._depth_histogram_maps) and self.roi_selection is not None
+        )
+        for contributor in contributors:
+            depth = int(self._tile_depth_indices[contributor[0]]) if match_layers else 0
+            groups.setdefault(depth, []).append(contributor)
+        layers, weights = [], []
+        selected = (
+            slice(None) if len(blend_channels) == self.channels else blend_channels
+        )
+        for group in groups.values():
+            values, weight = self._accumulate_fusion_tiles(
+                bounds,
+                group,
+                match_depth=True,
+                direct=direct,
+                content_aware=len(group) > 1,
+            )
+            if not values.size:
+                continue
+            _normalize_block(values, weight, values)
+            if match_layers:
+                values = self._match_fusion_depth(group[0][0], values, weight)
+            layers.append(values[selected])
+            weights.append(np.broadcast_to(weight, values.shape)[selected])
+        if len(layers) > 1:
+            from opm_processing.imageprocessing.content_fusion import (
+                content_aware_fusion,
+            )
+
+            values, weight = content_aware_fusion(np.stack(layers), np.stack(weights))
+            _normalize_block(values, weight, values)
+        else:
+            values = layers[0]
+        output[selected] = values
+        crop = tuple(
+            slice(int(a - b), int(c - b))
+            for a, b, c in zip(start, first, stop, strict=True)
+        )
+        return self._cast_fusion_values(output[(slice(None), *crop)])
 
     def _render_fusion_block(
         self,
@@ -4584,6 +4742,12 @@ class TileFusion:
                     region, region_contributors, direct=direct
                 )
                 direct_regions += 1
+                continue
+            if self.content_aware:
+                region_output[:] = self._render_content_overlap(
+                    region, region_contributors, blend_channels
+                )
+                blended_regions += 1
                 continue
             if match_roi_layers:
                 depth_contributors: dict[
@@ -4733,7 +4897,7 @@ class TileFusion:
             leave=False,
             unit="chunk",
         )
-        render_workers = max(1, int(self._max_workers))
+        render_workers = 1 if self.content_aware else max(1, int(self._max_workers))
         pending_renders: set[Future[Any]] = set()
 
         def collect_rendered(done: set[Future[Any]]) -> None:
