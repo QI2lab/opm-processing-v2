@@ -27,6 +27,7 @@ when the acquisition and preview retain their names and relative layout.
 | `--deconvolve / --no-deconvolve` | Crop raw tiles with PSF and registration margins, then deconvolve and deskew; default disabled. |
 | `--tiff` | Also export compressed OME-BigTIFF; retain final OME-Zarr. |
 | `--figures` | Save JPEGli `roi_overview.jpg` at quality 100 using napari's display settings, with unnumbered outlines and a scale bar. Images are isotropically reduced to at most 65,500 pixels per side. Both AO pupil types are exported automatically. |
+| `--ao-grid` | Add white dashed acquisition-polygon boundaries and nine equal-area Grid-AO cells, with filled stars at intended cell centers, to the full overview. Implies `--figures`; uses the shared SJS geometry. |
 | `--ao-root PATH` | Saved AO grid directory; otherwise discover beside the raw acquisition or preview. |
 | `--ao-wavelength-nm FLOAT` | Explicit phase wavelength in nanometers when recorded AO illumination is missing or ambiguous. |
 | `--flatfield-correction` | Reuse or estimate illumination correction. |
@@ -44,6 +45,7 @@ when the acquisition and preview retain their names and relative layout.
 ```bash
 uv run export-rois "/path/to/processed" --registration-channel 1 --deconvolve --tiff
 uv run export-rois "/path/to/processed" --registration-channel 1 --figures
+uv run export-rois "/path/to/processed" --registration-channel 1 --ao-grid --resume
 ```
 
 See the [ROI guide](../../guides/roi.md) for selection, output layout, metadata,

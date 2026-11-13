@@ -191,6 +191,8 @@ def select_rois(
     *,
     figure_path: Path | None = None,
     saved_rois: list[PhysicalRoi] | None = None,
+    ao_grid: bool = False,
+    ao_root: Path | None = None,
 ) -> list[tuple[int, int, int, int]]:
     """Use napari's image transform to obtain level-zero data coordinates.
 
@@ -208,6 +210,10 @@ def select_rois(
         Save a JPEGli overview using the chosen napari channel display.
     saved_rois : list of PhysicalRoi or None
         Existing physical rectangles to display read-only when adding a missing figure.
+    ao_grid : bool
+        Add the approved acquisition-polygon grid to the overview.
+    ao_root : pathlib.Path or None
+        Explicit AO result root for the optional grid overlay.
 
     Returns
     -------
@@ -314,7 +320,13 @@ def select_rois(
                         if bounds:
                             typer.echo("Exporting JPEGli ROI overview...")
                             export_roi_overview(
-                                viewer, layers, source, bounds, figure_path
+                                viewer,
+                                layers,
+                                source,
+                                bounds,
+                                figure_path,
+                                ao_grid=ao_grid,
+                                ao_root=ao_root,
                             )
                     except Exception as error:
                         errors.append(error)
@@ -379,6 +391,12 @@ def export_rois(
             help="Also save a JPEGli ROI overview; both AO pupil types export automatically."
         ),
     ] = False,
+    ao_grid: Annotated[
+        bool,
+        typer.Option(
+            help="Add the saved acquisition polygon, equal-area Grid-AO lines and intended-center stars to the overview; implies --figures."
+        ),
+    ] = False,
     ao_root: Annotated[
         Path | None,
         typer.Option(help="Saved AO grid directory; default automatic discovery."),
@@ -425,6 +443,8 @@ def export_rois(
         Export OME-TIFF in addition to the final OME-Zarr image.
     figures : bool
         Also save a JPEGli overview. Both AO pupil types export automatically.
+    ao_grid : bool
+        Add the approved acquisition-polygon grid and intended stars to the overview.
     ao_root : pathlib.Path or None
         Explicit saved AO grid directory when automatic discovery is insufficient.
     ao_wavelength_nm : float or None
@@ -452,6 +472,7 @@ def export_rois(
     workers : int
         TIFF compression workers.
     """
+    figures = figures or ao_grid
     source = resolve_roi_source(root_path)
     footprints = projection_tile_footprints(source)
     if not footprints:
@@ -485,12 +506,12 @@ def export_rois(
         if saved_manifest != manifest_path:
             for name, target in zip(manifest["rois"], selections, strict=True):
                 PhysicalRoi.read(saved_manifest.parent / name).write(target)
-        if figures and not overview_path.is_file():
+        if figures:
             old_overview = saved_manifest.parent / overview_path.name
             legacy_overview = overview_path.with_suffix(".png")
             if not legacy_overview.is_file():
                 legacy_overview = saved_manifest.parent / legacy_overview.name
-            if old_overview.is_file():
+            if not overview_path.is_file() and old_overview.is_file():
                 destination.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(old_overview, overview_path)
                 if old_overview.with_suffix(".json").is_file():
@@ -498,36 +519,57 @@ def export_rois(
                         old_overview.with_suffix(".json"),
                         overview_path.with_suffix(".json"),
                     )
-            elif legacy_overview.is_file():
-                from PIL import Image
-
-                from opm_processing.roi_figures import write_roi_overview
-
-                destination.mkdir(parents=True, exist_ok=True)
-                # Our own saved PNG can exceed PIL's image-size safeguard.
-                pixel_limit = Image.MAX_IMAGE_PIXELS
-                try:
-                    Image.MAX_IMAGE_PIXELS = None
-                    image = Image.open(legacy_overview)
-                finally:
-                    Image.MAX_IMAGE_PIXELS = pixel_limit
-                with image:
-                    write_roi_overview(
-                        image,
-                        overview_path,
-                        json.loads(legacy_overview.with_suffix(".json").read_text()),
-                    )
-            else:
+            if not overview_path.is_file() and not legacy_overview.is_file():
                 select_rois(
                     source,
                     tuple(open_image_array(resolve_export_image(source)).shape),
                     figure_path=overview_path,
                     saved_rois=[PhysicalRoi.read(path) for path in selections],
+                    ao_grid=ao_grid,
+                    ao_root=ao_root,
                 )
+            elif not overview_path.is_file() or ao_grid:
+                from PIL import Image
+
+                from opm_processing.roi_figures import write_roi_overview
+
+                destination.mkdir(parents=True, exist_ok=True)
+                saved = json.loads(
+                    (overview_path if overview_path.is_file() else legacy_overview)
+                    .with_suffix(".json")
+                    .read_text()
+                )
+                if not overview_path.is_file() or (
+                    ao_grid and not saved.get("ao_grid")
+                ):
+                    if ao_grid:
+                        from opm_processing.dataio.ao_grid import read_ao_grid
+
+                        saved["ao_grid"] = read_ao_grid(
+                            source, saved["time_index"], ao_root
+                        )
+                    input_path = (
+                        legacy_overview if legacy_overview.is_file() else overview_path
+                    )
+                    # These saved overviews can exceed PIL's image-size safeguard.
+                    pixel_limit = Image.MAX_IMAGE_PIXELS
+                    try:
+                        Image.MAX_IMAGE_PIXELS = None
+                        image = Image.open(input_path)
+                    finally:
+                        Image.MAX_IMAGE_PIXELS = pixel_limit
+                    with image:
+                        write_roi_overview(image, overview_path, saved)
     else:
         shape = tuple(open_image_array(resolve_export_image(source)).shape)
         bounds = select_rois(
-            source, shape, figure_path=overview_path if figures else None
+            source,
+            shape,
+            **(
+                {"figure_path": overview_path, "ao_grid": ao_grid, "ao_root": ao_root}
+                if figures
+                else {}
+            ),
         )
         if not bounds:
             typer.echo("No ROIs selected; no files exported.")

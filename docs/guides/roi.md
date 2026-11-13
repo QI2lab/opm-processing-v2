@@ -91,7 +91,7 @@ outputs are retained.
 `--figures` also saves `roi_overview.jpg` beside the ROI folders. It retains
 the displayed timepoint and napari's visible channel order,
 colors, contrast, gamma and blending. Rendering uses the native maximum-Z
-projection. The complete annotated image is then isotropically reduced with
+projection. The tissue and ROI annotations are then isotropically reduced with
 Lanczos resampling when its longest side exceeds 65,500 pixels, JPEGli's encoder
 limit. ROI outlines scale with the tissue.
 The JPEG uses JPEGli quality 100 without chroma subsampling. Displayed
@@ -104,6 +104,19 @@ dimensions, reduction factor and original source-pixel ROI coordinates.
 Native blocks are rendered with napari and assembled in RAM, or temporary disk
 space beside the output when RAM is insufficient (four bytes per native pixel).
 JPEGli currently requires the Windows imagecodecs build.
+
+Add `--ao-grid` to draw the approved Grid-AO layout on the full overview alongside
+the ROI boxes. This option implies `--figures`. White dashed lines follow the
+registered acquisition-selection polygon and split it into nine equal-area
+cells; filled white stars mark their intended area centroids. This uses the same
+geometry functions as the SJS plotting script. The outline comes from the saved
+acquisition polygon, rather than intensity segmentation or a tile bounding box.
+The full-Z overview uses the first AO depth and the latest saved plan at or before
+the displayed timepoint. Rotation, flips, JPEG downscaling and the 2 mm scale bar
+remain calibrated. The sidecar records the polygon, cells and marker provenance.
+On resume, an existing overview can receive the grid without rerendering tissue;
+a saved PNG is used as the background when available. `--ao-root` also applies
+to this overlay. Missing polygon/AO metadata is reported instead of inventing a grid.
 
 AO figures are exported automatically, including when calling `process_roi`
 directly; `--figures` is needed only for the tissue overview. Each ROI folder

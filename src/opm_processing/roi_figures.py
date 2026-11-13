@@ -25,6 +25,79 @@ if TYPE_CHECKING:
     from napari.layers import Image as ImageLayer
 
 
+def draw_ao_grid(image: Image.Image, metadata: dict, grid: dict) -> None:
+    """Draw the approved polygon grid in the overview's rotated pixel frame.
+
+    Parameters
+    ----------
+    image : PIL.Image.Image
+        Display-mapped overview at its final output dimensions.
+    metadata : dict
+        Native display dimensions, axis permutation, flips and physical sampling.
+    grid : dict
+        Registered acquisition polygon, clipped dividers and intended star centers.
+    """
+    from matplotlib.path import Path as PolygonPath
+    from PIL import ImageDraw
+
+    projection = grid["projection"]
+    origin = np.asarray(projection["native_origin_yx_um"])
+    spacing = np.asarray(projection["native_scale_yx_um"])
+    native_shape = np.asarray(metadata.get("native_shape_yx", metadata["shape_yx"]))
+    axes = metadata["display_axes_yx"]
+    signs = np.asarray(metadata["display_axis_signs"])
+    ratio = np.asarray(image.size[::-1]) / native_shape
+    output_spacing = (
+        np.asarray(metadata["pixel_size_yx_um"])
+        * metadata["shape_yx"]
+        / np.asarray(image.size[::-1])
+    )
+
+    def pixels(world_yx: np.ndarray | list) -> np.ndarray:
+        source = (np.asarray(world_yx) - origin) / spacing
+        display = source[..., axes]
+        display = np.where(signs > 0, display, native_shape - 1 - display)
+        return ((display + 0.5) * ratio - 0.5)[..., ::-1]
+
+    # Preserve the already rendered scale bar above the added grid strokes.
+    right, center_y = 0.94 * image.width, 0.93 * image.height
+    half_height = metadata["scale_bar_thickness_um"] * 5 / 6 / output_spacing[0]
+    bar_bounds = (
+        max(0, int(right - metadata["scale_bar_um"] / output_spacing[1]) - 4),
+        max(0, int(center_y - half_height) - 4),
+        min(image.width, int(right) + 5),
+        min(image.height, int(center_y + half_height) + 5),
+    )
+    bar = image.crop(bar_bounds)
+    draw = ImageDraw.Draw(image)
+    width = max(1, round(10.0 / float(np.sqrt(np.prod(output_spacing)))))
+    for start, stop in np.asarray(grid["grid"]["segments_yx_um"]):
+        length = float(np.linalg.norm(stop - start))
+        direction = (stop - start) / length
+        for first in np.arange(0, length, 90.0):
+            endpoints = pixels(
+                [
+                    start + direction * first,
+                    start + direction * min(first + 60.0, length),
+                ]
+            )
+            draw.line([tuple(point) for point in endpoints], fill="white", width=width)
+    star = PolygonPath.unit_regular_star(5, innerCircle=(3 - np.sqrt(5)) / 2).vertices
+    offsets = 100.0 * np.column_stack((-star[:, 1], star[:, 0]))
+    for center in grid["stars"]:
+        vertices = pixels(np.asarray(center["world_yx_um"]) + offsets)
+        draw.polygon([tuple(point) for point in vertices], fill="white")
+    image.paste(bar, bar_bounds)
+    bar.close()
+    grid["style"] = {
+        "line_width_um": 10.0,
+        "dash_um": 60.0,
+        "gap_um": 30.0,
+        "star_diameter_um": 200.0,
+        "color": "white",
+    }
+
+
 def write_roi_overview(image: Image.Image, output: Path, metadata: dict) -> None:
     """Scale an annotated RGBA overview and write a JPEGli JPEG.
 
@@ -45,6 +118,8 @@ def write_roi_overview(image: Image.Image, output: Path, metadata: dict) -> None
     rendered = image.resize(size, Image.Resampling.LANCZOS) if scale < 1 else image
     jpeg = output.with_suffix(".tmp.jpg")
     try:
+        if metadata.get("ao_grid"):
+            draw_ao_grid(rendered, metadata, metadata["ao_grid"])
         tqdm.write(f"Writing JPEGli overview: {size[0]} x {size[1]} pixels")
         jpeg.write_bytes(
             jpegli_encode(
@@ -68,9 +143,11 @@ def write_roi_overview(image: Image.Image, output: Path, metadata: dict) -> None
         **metadata,
         "shape_yx": list(size[::-1]),
         "native_shape_yx": metadata.get("native_shape_yx", list(image.size[::-1])),
-        "overview_scale": metadata.get("overview_scale", 1.0) * scale,
+        "overview_scale": (
+            metadata.get("overview_scale", 1.0) * size[0] / metadata["shape_yx"][1]
+        ),
         "pixel_size_yx_um": (
-            np.asarray(metadata["pixel_size_yx_um"]) * image.size[::-1] / size[::-1]
+            np.asarray(metadata["pixel_size_yx_um"]) * metadata["shape_yx"] / size[::-1]
         ).tolist(),
         "jpeg": {
             "encoder": "jpegli",
@@ -89,6 +166,9 @@ def export_roi_overview(
     source: Path,
     bounds: list[tuple[int, int, int, int]],
     output: Path,
+    *,
+    ao_grid: bool = False,
+    ao_root: Path | None = None,
 ) -> None:
     """Render at native resolution, then write a scaled JPEGli overview.
 
@@ -104,6 +184,10 @@ def export_roi_overview(
         ROI rectangles on the native pixel grid, ordered y0, y1, x0, x1.
     output : pathlib.Path
         JPEG path. Adjacent JSON records display and scale.
+    ao_grid : bool
+        Add the approved equal-area Grid-AO cells, intended stars and boundary.
+    ao_root : pathlib.Path or None
+        Explicit saved AO results root, otherwise discover beside the acquisition.
     """
     import napari
     from napari.qt import get_qapp
@@ -185,6 +269,11 @@ def export_roi_overview(
             for options in settings
         ),
     )
+    grid = None
+    if ao_grid:
+        from opm_processing.dataio.ao_grid import read_ao_grid
+
+        grid = read_ao_grid(source, timepoint, ao_root)
     output.parent.mkdir(parents=True, exist_ok=True)
     renderer = napari.Viewer(show=False)
     renderer.canvas.background_color_override = viewer.canvas.background_color
@@ -225,6 +314,8 @@ def export_roi_overview(
             for channel, options in zip(channels, settings, strict=True)
         ],
     }
+    if grid is not None:
+        metadata["ao_grid"] = grid
     try:
         # Qt initializes the OpenGL framebuffer on show, even for offscreen use.
         renderer.window._qt_window.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen)
