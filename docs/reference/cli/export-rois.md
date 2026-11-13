@@ -26,7 +26,7 @@ when the acquisition and preview retain their names and relative layout.
 | `--output PATH` | Destination; default `roi_exports` beside the preview. With resume, a new destination can reuse selections from that default directory without copying processed data. |
 | `--deconvolve / --no-deconvolve` | Crop raw tiles with PSF and registration margins, then deconvolve and deskew; default disabled. |
 | `--tiff` | Also export compressed OME-BigTIFF; retain final OME-Zarr. |
-| `--figures` | Save `roi_overview.png` and JPEGli `roi_overview.jpg` using napari's display settings, with unnumbered outlines and a scale bar. Both use the same isotropic reduction to at most 65,500 pixels per side. Both AO pupil types are exported automatically. |
+| `--figures` | Save JPEGli `roi_overview.jpg` at quality 100 using napari's display settings, with unnumbered outlines and a scale bar. Images are isotropically reduced to at most 65,500 pixels per side. Both AO pupil types are exported automatically. |
 | `--ao-root PATH` | Saved AO grid directory; otherwise discover beside the raw acquisition or preview. |
 | `--ao-wavelength-nm FLOAT` | Explicit phase wavelength in nanometers when recorded AO illumination is missing or ambiguous. |
 | `--flatfield-correction` | Reuse or estimate illumination correction. |

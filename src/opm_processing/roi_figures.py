@@ -26,14 +26,14 @@ if TYPE_CHECKING:
 
 
 def write_roi_overview(image: Image.Image, output: Path, metadata: dict) -> None:
-    """Scale an annotated RGBA overview once and write PNG and JPEGli JPEG.
+    """Scale an annotated RGBA overview and write a JPEGli JPEG.
 
     Parameters
     ----------
     image : PIL.Image.Image
         Rendered tissue, ROI outlines and scale bar in the final orientation.
     output : pathlib.Path
-        PNG destination; the JPEG uses the same stem with a .jpg suffix.
+        JPEG destination, with display metadata written beside it as JSON.
     metadata : dict
         Display settings, pixel spacing and native source-pixel ROI coordinates.
     """
@@ -43,12 +43,9 @@ def write_roi_overview(image: Image.Image, output: Path, metadata: dict) -> None
     scale = min(1.0, 65500 / max(image.size))
     size = tuple(max(1, round(value * scale)) for value in image.size)
     rendered = image.resize(size, Image.Resampling.LANCZOS) if scale < 1 else image
-    png = output.with_suffix(".tmp.png")
     jpeg = output.with_suffix(".tmp.jpg")
     try:
-        tqdm.write(f"Writing PNG overview: {size[0]} x {size[1]} pixels")
-        rendered.save(png, format="PNG", compress_level=1)
-        tqdm.write("Writing JPEG overview with JPEGli")
+        tqdm.write(f"Writing JPEGli overview: {size[0]} x {size[1]} pixels")
         jpeg.write_bytes(
             jpegli_encode(
                 np.asarray(rendered),
@@ -60,15 +57,13 @@ def write_roi_overview(image: Image.Image, output: Path, metadata: dict) -> None
             )
         )
     except BaseException:
-        png.unlink(missing_ok=True)
         jpeg.unlink(missing_ok=True)
         raise
     finally:
         if rendered is not image:
             rendered.close()
     # Keep completed temporary files if Windows cannot replace an open image.
-    png.replace(output)
-    jpeg.replace(output.with_suffix(".jpg"))
+    jpeg.replace(output)
     metadata = {
         **metadata,
         "shape_yx": list(size[::-1]),
@@ -95,7 +90,7 @@ def export_roi_overview(
     bounds: list[tuple[int, int, int, int]],
     output: Path,
 ) -> None:
-    """Render at native resolution, then write scaled PNG and JPEGli overviews.
+    """Render at native resolution, then write a scaled JPEGli overview.
 
     Parameters
     ----------
@@ -108,7 +103,7 @@ def export_roi_overview(
     bounds : list of tuple
         ROI rectangles on the native pixel grid, ordered y0, y1, x0, x1.
     output : pathlib.Path
-        PNG path; a JPEG is also written. Adjacent JSON records display and scale.
+        JPEG path. Adjacent JSON records display and scale.
     """
     import napari
     from napari.qt import get_qapp

@@ -88,12 +88,12 @@ These are lossless zlib-compressed OME-BigTIFF files with global origins,
 per-plane positions, channel metadata, and processing provenance. OME-Zarr
 outputs are retained.
 
-`--figures` also saves `roi_overview.png` and `roi_overview.jpg` beside the ROI
-folders. Both retain the displayed timepoint and napari's visible channel order,
+`--figures` also saves `roi_overview.jpg` beside the ROI folders. It retains
+the displayed timepoint and napari's visible channel order,
 colors, contrast, gamma and blending. Rendering uses the native maximum-Z
 projection. The complete annotated image is then isotropically reduced with
 Lanczos resampling when its longest side exceeds 65,500 pixels, JPEGli's encoder
-limit. Both files have the same dimensions; ROI outlines scale with the tissue.
+limit. ROI outlines scale with the tissue.
 The JPEG uses JPEGli quality 100 without chroma subsampling. Displayed
 90-degree rotations and flips are preserved. White dashed
 ROI outlines have no numbers (20 µm stroke, 20 µm dashes, 10 µm gaps). A horizontal
@@ -140,7 +140,7 @@ an older selection has no overview, `--figures` reopens its fixed rectangles so
 you can choose channels and contrast without redrawing. A new output directory
 reuses the existing overview when available. The overview JSON records its
 display settings and scale-bar length.
-An existing PNG-only overview is resized and paired with a JPEG without
+An existing PNG-only overview is resized and converted to JPEG without
 rerendering the tissue or reopening napari.
 
 Rerun the same command to reuse saved selections and compatible completed
