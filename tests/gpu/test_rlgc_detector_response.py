@@ -13,7 +13,7 @@ from scipy.special import kl_div
 @pytest.mark.integration
 @pytest.mark.parametrize(
     "mosaic_acquisition",
-    [("stage", 1.2, 0.001, "whole")],
+    [("stage", 1.2, 0.001, "tiled")],
     indirect=True,
 )
 def test_roi_deconvolves_recorded_sampling(
@@ -96,7 +96,7 @@ def test_roi_deconvolves_recorded_sampling(
         / grid.scale_transform.scale[-2]
     )
     source_x = (case.expectation.shape[-1] - 1) // 2
-    bounds = (center - 16, center + 16, source_x - 32, source_x + 32)
+    bounds = (center - 256, center + 256, source_x - 32, source_x + 32)
     monkeypatch.setattr(
         export_rois, "select_rois", lambda source, shape, figure_path=None: [bounds]
     )
@@ -111,6 +111,7 @@ def test_roi_deconvolves_recorded_sampling(
     rendered = []
     raw_crops = []
     pending_cores = []
+    delivered_cores = completed_cores = 0
     open_raw = processing.open_acquisition_datastore
     generate_psfs = export_rois.load_deconvolution_psfs
     deconvolve = solver.rlgc
@@ -152,13 +153,19 @@ def test_roi_deconvolves_recorded_sampling(
         consume = kwargs["on_reconstructed_chunk"]
 
         def observe_core(core, start, stop):
+            nonlocal delivered_cores
+            delivered_cores += 1
             pending_cores.append((start, stop, id(core)))
             consume(core, start, stop)
+            assert completed_cores >= delivered_cores - 1
 
         stages.append("deconvolve")
         result = deconvolve(*args, **dict(kwargs, on_reconstructed_chunk=observe_core))
         assert result is None
-        predictions.append(production_forward_predictions[-1])
+        measured = production_forward_predictions[-1]
+        assert len(measured["chunks"]) > 1
+        assert all(record["shared"] for record in measured["chunks"])
+        predictions.append(measured)
         return result
 
     def observe_writer(shape, target, theta, distance, *args, **kwargs):
@@ -171,11 +178,12 @@ def test_roi_deconvolves_recorded_sampling(
         next_plane = 0
 
         def observe_deskew(core, start, stop):
-            nonlocal next_plane
+            nonlocal next_plane, completed_cores
             assert start == next_plane
             assert core.shape == (stop - start, *shape[1:])
             assert pending_cores.pop(0) == (start, stop, id(core))
             result = consume(core, start, stop)
+            completed_cores += 1
             next_plane = stop
             if stop == shape[0]:
                 stages.append("deskew")
@@ -231,6 +239,8 @@ def test_roi_deconvolves_recorded_sampling(
             "--tiff",
             "--decon-verbose",
             "0",
+            "--decon-crop-scan",
+            "64",
         ],
     )
     if result.exception:
@@ -244,6 +254,7 @@ def test_roi_deconvolves_recorded_sampling(
     assert stages[2:-1] == ["deconvolve", "deskew"] * len(seeds)
     assert stages[-1] == "registration"
     assert not pending_cores
+    assert delivered_cores == completed_cores
     assert len(seeds) == 2 and measurements
     # The stage fixture records the first acquisition position and positive
     # scan step. Reordering starts at its final acquired plane: image Y is
@@ -401,6 +412,7 @@ def test_roi_deconvolves_recorded_sampling(
         "deconvolve": True,
         "save_float32": True,
         "z_downsample_level": 1,
+        "decon_crop_scan": 64,
         "resume": True,
     }
     before = len(production_forward_predictions)
