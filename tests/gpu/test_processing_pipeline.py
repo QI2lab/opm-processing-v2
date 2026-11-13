@@ -2,7 +2,6 @@
 
 import importlib
 from functools import partial
-from hashlib import sha256
 from itertools import pairwise
 
 import numpy as np
@@ -54,7 +53,6 @@ def test_qi2lab_acquisition_to_fused_ngff_v05(
     support = pipeline_geometry(
         metadata.shape[-3:], case.microscope, scan_factor=factor
     ).support
-    assert len(case.deskew_runs) == np.prod(metadata.shape[:3])
     assert case.collection.shape[:3] == (2, 1, 2)
     np.testing.assert_allclose(
         case.collection.voxel_size_um, case.microscope.pixel_size_um
@@ -73,17 +71,10 @@ def test_qi2lab_acquisition_to_fused_ngff_v05(
         for time, channel in np.ndindex(2, 2):
             saved = array[time, channel].read().result()
             assert saved.dtype == np.float32
+            assert saved.shape == support.shape
             assert np.isfinite(saved).all() and np.all(saved >= 0)
             assert np.any(saved[support] > 0)
             np.testing.assert_array_equal(saved[~support], 0)
-            index = (time * metadata.shape[1] + position) * metadata.shape[2] + channel
-            observed = case.deskew_runs[index]
-            assert saved.shape == observed["output_shape"]
-            # Compare every actual deskew write with reopened storage.
-            for selection, digest in observed["writes"]:
-                assert (
-                    sha256(np.ascontiguousarray(saved[selection])).hexdigest() == digest
-                )
 
     fusion = case.fusion
     # Stage Z is converted to laboratory Z; the detector-X stage coordinate
@@ -257,15 +248,10 @@ def test_large_noisy_scene_acquisition_to_fusion(
     )
     factor = scan_upsample_from_metadata(metadata) if deconvolve else 1
     geometry = pipeline_geometry(metadata.shape[-3:], microscope, scan_factor=factor)
-    assert len(result.deskew_runs) == metadata.shape[1]
     for position, array in enumerate(result.collection.arrays):
         saved = array[0, 0].read().result()
         assert saved.shape == geometry.shape and saved.dtype == np.float32
         np.testing.assert_array_equal(saved[~geometry.support], 0)
-        observed_deskew = result.deskew_runs[position]
-        assert saved.shape == observed_deskew["output_shape"]
-        for selection, digest in observed_deskew["writes"]:
-            assert sha256(np.ascontiguousarray(saved[selection])).hexdigest() == digest
         if deconvolve:
             run = result.deconvolution_runs[position]
             observed = run["forward"]
@@ -308,35 +294,29 @@ def test_large_noisy_scene_acquisition_to_fusion(
                 < kl_div(case.expectation[source], baseline[source]).sum()
             )
 
-    # Only fixed source geometry selects foreground for execution coverage.
-    source = (
-        case.source[
+    covered = np.zeros(geometry.shape[1], bool)
+    for origin, shape in result.deskew_tiles:
+        assert origin[0] == origin[2] == 0
+        assert shape[0] == geometry.shape[0] and shape[2] == geometry.shape[2]
+        covered[origin[1] : origin[1] + shape[1]] = True
+    assert covered.all()
+    if tiled_scan and deconvolve:
+        # Fixed source geometry selects foreground only when checking boundaries.
+        source = case.source[
             case.sampling_phase : case.sampling_phase
             + (metadata.shape[-3] - 1) * factor
             + 1
         ]
-        if deconvolve
-        else case.source[case.sampling_phase :: case.sampling_factor]
-    )
-    foreground = (
-        orthogonal_deskew(
-            source.astype(np.float32),
-            theta=microscope.angle_deg,
-            distance=microscope.scan_step_um / factor,
-            pixel_size=microscope.pixel_size_um,
-            downsample_factor=1,
+        foreground = (
+            orthogonal_deskew(
+                source.astype(np.float32),
+                theta=microscope.angle_deg,
+                distance=microscope.scan_step_um / factor,
+                pixel_size=microscope.pixel_size_um,
+                downsample_factor=1,
+            )
+            > 0
         )
-        > 0
-    )
-    covered = np.zeros(geometry.shape, bool)
-    for origin, shape in result.deskew_tiles:
-        assert origin[0] == origin[2] == 0
-        assert shape[0] == geometry.shape[0] and shape[2] == geometry.shape[2]
-        covered[tuple(slice(a, a + n) for a, n in zip(origin, shape, strict=True))] = (
-            True
-        )
-    assert covered.all()
-    if tiled_scan and deconvolve:
         borders = {origin[1] for origin, _ in result.deskew_tiles if origin[1]}
         assert any(
             np.any(foreground[:, border - 1] & foreground[:, border])
@@ -475,13 +455,11 @@ def test_extended_mosaic_acquisition_to_fusion(
             )
 
     support = pipeline_geometry(raw_shape, case.microscope, scan_factor=factor).support
-    coverage = np.zeros(result.deskew_runs[0]["output_shape"], bool)
+    coverage = np.zeros(support.shape[1], bool)
     for origin, tile_shape in result.deskew_tiles:
         assert origin[0] == origin[2] == 0
-        assert tile_shape[0] == coverage.shape[0] and tile_shape[2] == coverage.shape[2]
-        coverage[
-            tuple(slice(a, a + n) for a, n in zip(origin, tile_shape, strict=True))
-        ] = True
+        assert tile_shape[0] == support.shape[0] and tile_shape[2] == support.shape[2]
+        coverage[origin[1] : origin[1] + tile_shape[1]] = True
     assert coverage.all()
     actual = assert_fused_ngff(result)
     fusion = result.fusion

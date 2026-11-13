@@ -77,7 +77,6 @@ from opm_processing.imageprocessing.maxtilefusion import MaxTileFusion
 from opm_processing.imageprocessing.opmtools import (
     deskew_shape_estimator,
     interpolate_rows,
-    orthogonal_deskew,
 )
 
 if TYPE_CHECKING:
@@ -372,43 +371,6 @@ def write_processed_channel(target: Any, value: np.ndarray | np.generic) -> bool
     return bool(np.any(formatted))
 
 
-def write_checkpointed_roi_channel(
-    target: Any,
-    value: np.ndarray | np.generic,
-    state: ProcessingState,
-    output_path: Path,
-    channel_key: tuple[int, int, int],
-    *,
-    is_zero: bool,
-) -> bool:
-    """Finish a cropped channel write before recording it as resumable.
-
-    Parameters
-    ----------
-    target : Any
-        Writable TensorStore selection for one cropped output channel.
-    value : numpy.ndarray or np.generic
-        Channel image or scalar fill value to write before checkpointing.
-    state : ProcessingState
-        Durable processing journal receiving the completed-channel checkpoint.
-    output_path : pathlib.Path
-        Processed store identified by this checkpoint or processing run.
-    channel_key : tuple[int, int, int]
-        Source time, position, and channel indices, in that order.
-    is_zero : bool
-        Record that this channel contains no signal.
-
-    Returns
-    -------
-    bool
-        Whether the channel contains nonzero persisted values. Its checkpoint
-        is recorded only after the channel write finishes successfully.
-    """
-    has_signal = write_processed_channel(target, value)
-    state.complete_channel(output_path, *channel_key, is_zero=is_zero or not has_signal)
-    return has_signal
-
-
 def queue_position_pyramid_writes(
     collection: PositionCollection,
     position: int,
@@ -531,88 +493,68 @@ def deskew_channel_writer(
         first, last = max(next_y, y0), min(end_y, y1)
         available = psutil.virtual_memory().available
         if first < last:
-            full_bytes = math.prod(full_shape) * (4 if save_float32 else 6)
-            if start == 0 and end == input_shape[0] and full_bytes <= available:
-                deskewed = orthogonal_deskew(
+            stops = (last,)
+            if (last - first) * row_bytes > available:
+                # Ryomen traverses acquired scan only. The final
+                # interval also owns the camera-footprint tail.
+                extra_rows = max(
+                    0,
+                    full_shape[1] - math.ceil(input_shape[0] * step_pixels),
+                )
+                crop_scan = math.floor(
+                    (available // row_bytes - extra_rows - 2) / step_pixels
+                )
+                if crop_scan < 1:
+                    raise MemoryError(
+                        "Deskew requires RAM for one scan interval and its interpolation support"
+                    )
+                stops = [
+                    last
+                    if destination[-3].stop == source.shape[0]
+                    else min(
+                        last,
+                        math.ceil(
+                            (source_start + destination[-3].stop - 1) * step_pixels
+                        ),
+                    )
+                    for _, _, destination in Slicer(
+                        source,
+                        crop_size=(crop_scan, *source.shape[1:]),
+                        overlap=(0, 0, 0),
+                        pad=False,
+                    )
+                ]
+            for stop_y in stops:
+                if stop_y <= first:
+                    continue
+                deskewed = np.zeros(
+                    (full_shape[0], stop_y - first, x1 - x0), np.float32
+                )
+                interpolate_rows(
                     source,
-                    theta=theta,
-                    distance=distance,
-                    pixel_size=pixel_size,
-                    downsample_factor=downsample_factor,
-                )[:, y0:y1, x0:x1]
-                has_signal |= write_processed_channel(target[:, : y1 - y0], deskewed)
+                    deskewed,
+                    full_shape[1] - full_pad_y,
+                    final_nz,
+                    theta,
+                    distance,
+                    pixel_size,
+                    downsample_factor,
+                    True,
+                    (0, first, x0),
+                    source_scan_origin=source_start,
+                    source_scan_count=input_shape[0],
+                )
+                selection = slice(first - y0, stop_y - y0)
+                has_signal |= write_processed_channel(target[:, selection], deskewed)
                 if projection is not None:
                     np.max(
                         deskewed,
                         axis=0,
                         keepdims=True,
-                        out=projection[:, : y1 - y0],
+                        out=projection[:, selection],
                     )
-            else:
-                stops = (last,)
-                if (last - first) * row_bytes > available:
-                    # Ryomen traverses acquired scan only. The final
-                    # interval also owns the camera-footprint tail.
-                    extra_rows = max(
-                        0,
-                        full_shape[1] - math.ceil(input_shape[0] * step_pixels),
-                    )
-                    crop_scan = math.floor(
-                        (available // row_bytes - extra_rows - 2) / step_pixels
-                    )
-                    if crop_scan < 1:
-                        raise MemoryError(
-                            "Deskew requires RAM for one scan interval and its interpolation support"
-                        )
-                    stops = [
-                        last
-                        if destination[-3].stop == source.shape[0]
-                        else min(
-                            last,
-                            math.ceil(
-                                (source_start + destination[-3].stop - 1) * step_pixels
-                            ),
-                        )
-                        for _, _, destination in Slicer(
-                            source,
-                            crop_size=(crop_scan, *source.shape[1:]),
-                            overlap=(0, 0, 0),
-                            pad=False,
-                        )
-                    ]
-                for stop_y in stops:
-                    if stop_y <= first:
-                        continue
-                    deskewed = np.zeros(
-                        (full_shape[0], stop_y - first, x1 - x0), np.float32
-                    )
-                    interpolate_rows(
-                        source,
-                        deskewed,
-                        full_shape[1] - full_pad_y,
-                        final_nz,
-                        theta,
-                        distance,
-                        pixel_size,
-                        downsample_factor,
-                        True,
-                        (0, first, x0),
-                        source_scan_origin=source_start,
-                        source_scan_count=input_shape[0],
-                    )
-                    selection = slice(first - y0, stop_y - y0)
-                    has_signal |= write_processed_channel(
-                        target[:, selection], deskewed
-                    )
-                    if projection is not None:
-                        np.max(
-                            deskewed,
-                            axis=0,
-                            keepdims=True,
-                            out=projection[:, selection],
-                        )
-                    first = stop_y
-                    del deskewed
+                first = stop_y
+                del deskewed
         next_y = end_y
         if end < input_shape[0] and end_y < y1:
             tail_start = max(
@@ -2419,13 +2361,11 @@ def process_skewed(
                             ts_store[pos_idx][t_idx, chan_idx].write(zero_value)
                         )
                     else:
-                        write_checkpointed_roi_channel(
-                            ts_store[roi_series_index][0, chan_idx],
-                            zero_value,
-                            processing_state,
-                            output_path,
-                            channel_key,
-                            is_zero=True,
+                        ts_store[roi_series_index][0, chan_idx].write(
+                            zero_value
+                        ).result()
+                        processing_state.complete_channel(
+                            output_path, *channel_key, is_zero=True
                         )
                     if max_projection:
                         ts_max_writes.extend(
@@ -2504,13 +2444,11 @@ def process_skewed(
                             ts_store[pos_idx][t_idx, chan_idx].write(zero_value)
                         )
                     else:
-                        write_checkpointed_roi_channel(
-                            ts_store[roi_series_index][0, chan_idx],
-                            zero_value,
-                            processing_state,
-                            output_path,
-                            channel_key,
-                            is_zero=True,
+                        ts_store[roi_series_index][0, chan_idx].write(
+                            zero_value
+                        ).result()
+                        processing_state.complete_channel(
+                            output_path, *channel_key, is_zero=True
                         )
                     if max_projection:
                         ts_max_writes.extend(

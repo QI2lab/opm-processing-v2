@@ -199,45 +199,6 @@ def test_resume_readers_require_matching_shape_dtype_and_pyramid(
         np.testing.assert_array_equal(output.arrays[0].read().result(), case.pixels)
 
 
-@pytest.mark.parametrize("is_zero", [False, True])
-@pytest.mark.parametrize("fail_write", [False, True])
-def test_channel_checkpoint_requires_a_successful_write(
-    processing_state, tmp_path, is_zero, fail_write
-):
-    """Retain channel pixels and record completion only after the write succeeds."""
-    from opm_processing.process import write_checkpointed_roi_channel
-
-    path = tmp_path / "output.ome.zarr"
-    processing_state.initialize_run(path, configuration={}, overwrite=True)
-    target = ts.array(np.zeros((2, 3, 4), np.uint16))
-    if fail_write:
-        readonly = ts.open(target.spec(), read=True, write=False).result()
-        with pytest.raises(ValueError, match="does not support writing"):
-            write_checkpointed_roi_channel(
-                readonly,
-                0 if is_zero else 17,
-                processing_state,
-                path,
-                (0, 0, 0),
-                is_zero=is_zero,
-            )
-        assert processing_state.completed_channels(path) == set()
-    else:
-        write_checkpointed_roi_channel(
-            target,
-            0 if is_zero else 17,
-            processing_state,
-            path,
-            (0, 0, 0),
-            is_zero=is_zero,
-        )
-        np.testing.assert_array_equal(target.read().result(), 0 if is_zero else 17)
-        assert processing_state.completed_channels(path) == {(0, 0, 0)}
-        assert processing_state.zero_channels(path) == (
-            {(0, 0, 0)} if is_zero else set()
-        )
-
-
 @pytest.mark.parametrize("zero", [False, True])
 @pytest.mark.parametrize("method", ["stride", "block_mean"])
 @pytest.mark.parametrize("dtype", [np.uint16, np.float32])

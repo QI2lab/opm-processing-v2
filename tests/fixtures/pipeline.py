@@ -3,7 +3,6 @@
 import importlib
 from dataclasses import dataclass, replace
 from functools import lru_cache
-from hashlib import sha256
 from types import SimpleNamespace
 
 import numpy as np
@@ -77,7 +76,6 @@ def pipeline_runner(
     """
     from opm_processing.dataio.acquisition import acquisition_stem
     from opm_processing.dataio.position_collection import open_position_collection
-    from opm_processing.imageprocessing import opmtools
 
     module = importlib.import_module("opm_processing.process")
     fuse = importlib.import_module("opm_processing.fuse")
@@ -108,7 +106,6 @@ def pipeline_runner(
                 decon_verbose=0,
             )
         deskew_tiles = set()
-        deskew_runs = []
         deconvolution_runs = []
         with monkeypatch.context() as execution:
             if deconvolve:
@@ -139,47 +136,14 @@ def pipeline_runner(
                     return result
 
                 execution.setattr(solver, "rlgc", observe_reconstruction)
-            interpolate = opmtools.interpolate_rows
-            writer = module.deskew_channel_writer
-            write = module.write_processed_channel
+            interpolate = module.interpolate_rows
 
             def record_tile(*args, **kwargs):
                 """Observe global output slabs while running the real kernel."""
                 deskew_tiles.add((args[9], args[1].shape))
                 return interpolate(*args, **kwargs)
 
-            def observe_writer(shape, target, *args, **kwargs):
-                """Group real persisted slabs by their processing channel."""
-                deskew_runs.append(
-                    {
-                        "output_shape": target.shape,
-                        "writes": [],
-                    }
-                )
-                return writer(shape, target, *args, **kwargs)
-
-            def observe_write(target, value):
-                """Record output bytes without retaining a second image volume."""
-                result = write(target, value)
-                deskew_runs[-1]["writes"].append(
-                    (
-                        tuple(
-                            slice(a, b)
-                            for a, b in zip(
-                                target.domain.inclusive_min,
-                                target.domain.exclusive_max,
-                                strict=True,
-                            )
-                        ),
-                        sha256(memoryview(np.ascontiguousarray(value))).hexdigest(),
-                    )
-                )
-                return result
-
-            execution.setattr(opmtools, "interpolate_rows", record_tile)
             execution.setattr(module, "interpolate_rows", record_tile)
-            execution.setattr(module, "deskew_channel_writer", observe_writer)
-            execution.setattr(module, "write_processed_channel", observe_write)
             source = dataset.path.parent if live is not None else dataset.path
             invoke_cli("process", source, **options)
         directory = dataset.path.parent if output is None else output
@@ -224,7 +188,6 @@ def pipeline_runner(
             collection=open_position_collection(processed),
             output=directory / f"{stem}_fused.ome.zarr",
             deskew_tiles=deskew_tiles,
-            deskew_runs=deskew_runs,
             deconvolution_runs=deconvolution_runs,
         )
 

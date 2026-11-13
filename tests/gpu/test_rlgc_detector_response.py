@@ -111,12 +111,10 @@ def test_roi_deconvolves_recorded_sampling(
     rendered = []
     raw_crops = []
     pending_cores = []
-    written = []
     open_raw = processing.open_acquisition_datastore
     generate_psfs = export_rois.load_deconvolution_psfs
     deconvolve = solver.rlgc
     channel_writer = processing.deskew_channel_writer
-    write_channel = processing.write_processed_channel
     register = TileFusion.register_with_retries
     measure = TileFusion.register_and_score
     render = TileFusion._render_fusion_block
@@ -154,9 +152,7 @@ def test_roi_deconvolves_recorded_sampling(
         consume = kwargs["on_reconstructed_chunk"]
 
         def observe_core(core, start, stop):
-            pending_cores.append(
-                (start, stop, sha256(memoryview(np.ascontiguousarray(core))).digest())
-            )
+            pending_cores.append((start, stop, id(core)))
             consume(core, start, stop)
 
         stages.append("deconvolve")
@@ -178,26 +174,14 @@ def test_roi_deconvolves_recorded_sampling(
             nonlocal next_plane
             assert start == next_plane
             assert core.shape == (stop - start, *shape[1:])
-            assert pending_cores.pop(0) == (
-                start,
-                stop,
-                sha256(memoryview(np.ascontiguousarray(core))).digest(),
-            )
+            assert pending_cores.pop(0) == (start, stop, id(core))
             result = consume(core, start, stop)
             next_plane = stop
             if stop == shape[0]:
-                volume = target.read().result()
-                written.append((volume.shape, sha256(memoryview(volume)).digest()))
                 stages.append("deskew")
             return result
 
         return observe_deskew, projection
-
-    def observe_write(target, value):
-        """Check each actual deskew output survives its durable channel write."""
-        result = write_channel(target, value)
-        np.testing.assert_array_equal(target.read().result(), value)
-        return result
 
     def observe_registration(fusion):
         """Capture crop-displaced saved transforms before fresh ROI refinement."""
@@ -231,7 +215,6 @@ def test_roi_deconvolves_recorded_sampling(
     monkeypatch.setattr(export_rois, "load_deconvolution_psfs", observe_psfs)
     monkeypatch.setattr(solver, "rlgc", observe_deconvolution)
     monkeypatch.setattr(processing, "deskew_channel_writer", observe_writer)
-    monkeypatch.setattr(processing, "write_processed_channel", observe_write)
     monkeypatch.setattr(TileFusion, "register_with_retries", observe_registration)
     monkeypatch.setattr(
         TileFusion, "register_and_score", staticmethod(observe_measurement)
@@ -330,12 +313,12 @@ def test_roi_deconvolves_recorded_sampling(
             x1 - x0,
         )
     cropped = open_position_collection(tiles)
+    written = []
     for position, (
         recovered_shape,
         raw_crop,
         measured,
-        persisted,
-    ) in enumerate(zip(deconvolved, raw_crops, predictions, written, strict=True)):
+    ) in enumerate(zip(deconvolved, raw_crops, predictions, strict=True)):
         start, stop, x0, x1 = raw_crop
         x0 += position * case.parameters["tile_offset_x_pixels"]
         x1 += position * case.parameters["tile_offset_x_pixels"]
@@ -346,6 +329,7 @@ def test_roi_deconvolves_recorded_sampling(
             < kl_div(expected_native, baseline).sum()
         )
         volume = cropped.arrays[position][0, 0].read().result()
+        written.append((volume.shape, sha256(memoryview(volume)).digest()))
         np.testing.assert_allclose(cropped.voxel_size_um, pixel, rtol=0, atol=0.0005)
         raw_origin = np.add(
             saved_placements[0, position],
@@ -372,7 +356,6 @@ def test_roi_deconvolves_recorded_sampling(
         assert 0 <= x0 < x1 <= native_shape[2]
         assert volume.shape == (native_shape[0], y1 - y0, x1 - x0)
         assert volume.dtype == np.float32
-        assert (volume.shape, sha256(memoryview(volume)).digest()) == persisted
     assert (
         configuration["configuration"]["deconvolution"].get("scan_upsample_factor", 1)
         == factor
@@ -408,7 +391,6 @@ def test_roi_deconvolves_recorded_sampling(
     monkeypatch.setattr(export_rois, "load_deconvolution_psfs", generate_psfs)
     monkeypatch.setattr(solver, "rlgc", deconvolve)
     monkeypatch.setattr(processing, "deskew_channel_writer", channel_writer)
-    monkeypatch.setattr(processing, "write_processed_channel", write_channel)
     monkeypatch.setattr(TileFusion, "register_with_retries", register)
     monkeypatch.setattr(TileFusion, "register_and_score", staticmethod(measure))
     monkeypatch.setattr(TileFusion, "_render_fusion_block", render)

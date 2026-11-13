@@ -250,17 +250,13 @@ def test_large_noisy_deskew_preserves_scientific_bounds_across_tiles(
     if layout == "tiled":
         assert len(visits) > 1 and slicers == [len(visits)]
         np.testing.assert_array_equal(tiled, whole)
-        covered = np.zeros(tiled.shape, bool)
+        covered = np.zeros(tiled.shape[1], bool)
         foreground = orthogonal_deskew(source.astype(np.float32), **geometry) > 0
         for origin, shape, source_shape in visits:
             assert origin[0] == origin[2] == 0
             assert shape[0] == tiled.shape[0] and shape[2] == tiled.shape[2]
             assert source_shape[1:] == data.shape[1:]
-            selection = tuple(
-                slice(start, start + size)
-                for start, size in zip(origin, shape, strict=True)
-            )
-            covered[selection] = True
+            covered[origin[1] : origin[1] + shape[1]] = True
         assert covered.all()
         borders = sorted({origin[1] for origin, _shape, _source in visits if origin[1]})
         assert any(
