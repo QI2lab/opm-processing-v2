@@ -1,4 +1,4 @@
-"""Native-resolution ROI overviews rendered with the selected napari display."""
+"""ROI overviews rendered with the selected napari display."""
 
 from __future__ import annotations
 
@@ -16,11 +16,76 @@ from tqdm import tqdm
 from opm_processing.dataio.position_collection import open_image_array
 from opm_processing.export_ome_tiff import resolve_export_image
 
+JPEG_QUALITY = 100
+
 if TYPE_CHECKING:
     from pathlib import Path
 
     from napari import Viewer
     from napari.layers import Image as ImageLayer
+
+
+def write_roi_overview(image: Image.Image, output: Path, metadata: dict) -> None:
+    """Scale an annotated RGBA overview once and write PNG and JPEGli JPEG.
+
+    Parameters
+    ----------
+    image : PIL.Image.Image
+        Rendered tissue, ROI outlines and scale bar in the final orientation.
+    output : pathlib.Path
+        PNG destination; the JPEG uses the same stem with a .jpg suffix.
+    metadata : dict
+        Display settings, pixel spacing and native source-pixel ROI coordinates.
+    """
+    from imagecodecs import JPEGLI, jpegli_encode
+
+    # JPEGli's shipped encoder rejects dimensions above 65500, including 65535.
+    scale = min(1.0, 65500 / max(image.size))
+    size = tuple(max(1, round(value * scale)) for value in image.size)
+    rendered = image.resize(size, Image.Resampling.LANCZOS) if scale < 1 else image
+    png = output.with_suffix(".tmp.png")
+    jpeg = output.with_suffix(".tmp.jpg")
+    try:
+        tqdm.write(f"Writing PNG overview: {size[0]} x {size[1]} pixels")
+        rendered.save(png, format="PNG", compress_level=1)
+        tqdm.write("Writing JPEG overview with JPEGli")
+        jpeg.write_bytes(
+            jpegli_encode(
+                np.asarray(rendered),
+                level=JPEG_QUALITY,
+                colorspace=JPEGLI.CS.EXT_RGBA,
+                subsampling="444",
+                optimize=False,
+                progressive=False,
+            )
+        )
+    except BaseException:
+        png.unlink(missing_ok=True)
+        jpeg.unlink(missing_ok=True)
+        raise
+    finally:
+        if rendered is not image:
+            rendered.close()
+    # Keep completed temporary files if Windows cannot replace an open image.
+    png.replace(output)
+    jpeg.replace(output.with_suffix(".jpg"))
+    metadata = {
+        **metadata,
+        "shape_yx": list(size[::-1]),
+        "native_shape_yx": metadata.get("native_shape_yx", list(image.size[::-1])),
+        "overview_scale": metadata.get("overview_scale", 1.0) * scale,
+        "pixel_size_yx_um": (
+            np.asarray(metadata["pixel_size_yx_um"]) * image.size[::-1] / size[::-1]
+        ).tolist(),
+        "jpeg": {
+            "encoder": "jpegli",
+            "quality": JPEG_QUALITY,
+            "subsampling": "444",
+        },
+    }
+    output.with_suffix(".json").write_text(
+        json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
+    )
 
 
 def export_roi_overview(
@@ -30,7 +95,7 @@ def export_roi_overview(
     bounds: list[tuple[int, int, int, int]],
     output: Path,
 ) -> None:
-    """Write a native PNG without allocating a full-image GPU framebuffer.
+    """Render at native resolution, then write scaled PNG and JPEGli overviews.
 
     Parameters
     ----------
@@ -43,7 +108,7 @@ def export_roi_overview(
     bounds : list of tuple
         ROI rectangles on the native pixel grid, ordered y0, y1, x0, x1.
     output : pathlib.Path
-        Overview PNG path. Its adjacent JSON records display and scale settings.
+        PNG path; a JPEG is also written. Adjacent JSON records display and scale.
     """
     import napari
     from napari.qt import get_qapp
@@ -110,7 +175,7 @@ def export_roi_overview(
     if len(set(axes)) != 2 or not np.allclose(
         linear, orientation * spacing[:, None], rtol=0, atol=1e-7
     ):
-        raise ValueError("Native PNG export supports 90-degree rotations and flips")
+        raise ValueError("Overview export supports 90-degree rotations and flips")
     signs = orientation[np.arange(2), axes]
     height, width = np.asarray((source_height, source_width))[axes].tolist()
     source_spacing = spacing[np.argsort(axes)]
@@ -126,7 +191,6 @@ def export_roi_overview(
         ),
     )
     output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.with_suffix(".tmp.png")
     renderer = napari.Viewer(show=False)
     renderer.canvas.background_color_override = viewer.canvas.background_color
     rendered_layers = [
@@ -138,6 +202,34 @@ def export_roi_overview(
         )
         for options in settings
     ]
+    metadata = {
+        "source_path": str(source),
+        "shape_yx": [height, width],
+        "source_shape_yx": [source_height, source_width],
+        "time_index": timepoint,
+        "pixel_size_yx_um": spacing.tolist(),
+        "display_axes_yx": axes.tolist(),
+        "display_axis_signs": signs.tolist(),
+        "scale_bar_um": float(length_um),
+        "scale_bar_thickness_um": bar_thickness_um,
+        "roi_line_width_um": line_width_um,
+        "roi_dash_um": dash_um,
+        "roi_gap_um": gap_um,
+        "roi_bounds_coordinate_system": "source pixel grid",
+        "roi_bounds_yx_pixels": bounds,
+        "channels": [
+            {
+                **options,
+                "channel_index": channel,
+                "colormap": {
+                    "name": options["colormap"].name,
+                    "colors": options["colormap"].colors.tolist(),
+                    "controls": options["colormap"].controls.tolist(),
+                },
+            }
+            for channel, options in zip(channels, settings, strict=True)
+        ],
+    }
     try:
         # Qt initializes the OpenGL framebuffer on show, even for offscreen use.
         renderer.window._qt_window.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen)
@@ -225,50 +317,10 @@ def export_roi_overview(
                         "RGBA", (width, height), pixels, "raw", "RGBA", 0, 1
                     )
                     try:
-                        image.save(temporary, format="PNG")
+                        write_roi_overview(image, output, metadata)
                     finally:
                         image.close()
                 finally:
                     del native_pixels, pixels
-    except BaseException:
-        temporary.unlink(missing_ok=True)
-        raise
     finally:
         renderer.close()
-    # Retain a completed PNG if Windows cannot replace an image open in a viewer.
-    temporary.replace(output)
-    output.with_suffix(".json").write_text(
-        json.dumps(
-            {
-                "source_path": str(source),
-                "shape_yx": [height, width],
-                "source_shape_yx": [source_height, source_width],
-                "time_index": timepoint,
-                "pixel_size_yx_um": spacing.tolist(),
-                "display_axes_yx": axes.tolist(),
-                "display_axis_signs": signs.tolist(),
-                "scale_bar_um": float(length_um),
-                "scale_bar_thickness_um": bar_thickness_um,
-                "roi_line_width_um": line_width_um,
-                "roi_dash_um": dash_um,
-                "roi_gap_um": gap_um,
-                "roi_bounds_coordinate_system": "source pixel grid",
-                "roi_bounds_yx_pixels": bounds,
-                "channels": [
-                    {
-                        **options,
-                        "channel_index": channel,
-                        "colormap": {
-                            "name": options["colormap"].name,
-                            "colors": options["colormap"].colors.tolist(),
-                            "controls": options["colormap"].controls.tolist(),
-                        },
-                    }
-                    for channel, options in zip(channels, settings, strict=True)
-                ],
-            },
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
-    )

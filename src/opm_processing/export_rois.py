@@ -205,7 +205,7 @@ def select_rois(
     shape : tuple of int
         Level-zero image dimensions, ending in YX.
     figure_path : pathlib.Path or None
-        Save a native-resolution overview using the chosen napari channel display.
+        Save PNG and JPEG overviews using the chosen napari channel display.
     saved_rois : list of PhysicalRoi or None
         Existing physical rectangles to display read-only when adding a missing figure.
 
@@ -302,7 +302,7 @@ def select_rois(
             exporting = False
 
             def eventFilter(self, watched: QObject, event: QEvent) -> bool:
-                """Capture the native overview on close without swallowing errors."""
+                """Capture the overview on close without swallowing errors."""
                 if event.type() == QEvent.Type.Close and self.exporting:
                     event.ignore()
                     return True
@@ -312,7 +312,7 @@ def select_rois(
                     try:
                         bounds = current_bounds()
                         if bounds:
-                            typer.echo("Exporting native-resolution ROI overview...")
+                            typer.echo("Exporting PNG and JPEGli ROI overviews...")
                             export_roi_overview(
                                 viewer, layers, source, bounds, figure_path
                             )
@@ -376,7 +376,7 @@ def export_rois(
     figures: Annotated[
         bool,
         typer.Option(
-            help="Also save a native PNG ROI overview; both AO pupil types export automatically."
+            help="Also save PNG and JPEGli ROI overviews; both AO pupil types export automatically."
         ),
     ] = False,
     ao_root: Annotated[
@@ -424,7 +424,7 @@ def export_rois(
     tiff : bool
         Export OME-TIFF in addition to the final OME-Zarr image.
     figures : bool
-        Also save a native PNG overview. Both AO pupil types export automatically.
+        Also save PNG and JPEGli overviews. Both AO pupil types export automatically.
     ao_root : pathlib.Path or None
         Explicit saved AO grid directory when automatic discovery is insufficient.
     ao_wavelength_nm : float or None
@@ -490,6 +490,11 @@ def export_rois(
             if old_overview.is_file():
                 destination.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(old_overview, overview_path)
+                if old_overview.with_suffix(".jpg").is_file():
+                    shutil.copy2(
+                        old_overview.with_suffix(".jpg"),
+                        overview_path.with_suffix(".jpg"),
+                    )
                 if old_overview.with_suffix(".json").is_file():
                     shutil.copy2(
                         old_overview.with_suffix(".json"),
@@ -501,6 +506,24 @@ def export_rois(
                     tuple(open_image_array(resolve_export_image(source)).shape),
                     figure_path=overview_path,
                     saved_rois=[PhysicalRoi.read(path) for path in selections],
+                )
+        if figures and not overview_path.with_suffix(".jpg").is_file():
+            from PIL import Image
+
+            from opm_processing.roi_figures import write_roi_overview
+
+            # This is our own saved overview, whose native size may exceed PIL's limit.
+            pixel_limit = Image.MAX_IMAGE_PIXELS
+            try:
+                Image.MAX_IMAGE_PIXELS = None
+                image = Image.open(overview_path)
+            finally:
+                Image.MAX_IMAGE_PIXELS = pixel_limit
+            with image:
+                write_roi_overview(
+                    image,
+                    overview_path,
+                    json.loads(overview_path.with_suffix(".json").read_text()),
                 )
     else:
         shape = tuple(open_image_array(resolve_export_image(source)).shape)
