@@ -19,32 +19,6 @@ from tests.simulation.camera import digitize
 pytestmark = pytest.mark.unit
 
 
-def test_scan_chunk_planner_accounts_for_all_channels_and_reuses_crop(
-    cupy_gpu, monkeypatch
-):
-    """Plan from all optical supports once, without allocating a camera volume."""
-    solver = importlib.import_module("opm_processing.imageprocessing.rlgc")
-    shape = (10000, 256, 1900)
-    psfs = ((3, 15, 9), (45, 3, 21))
-    padding = solver._axis_linear_fft_padding
-    calls = []
-
-    def observe_padding(length, support, **kwargs):
-        """Record optical support while executing the actual padding calculation."""
-        calls.append((length, support))
-        return padding(length, support, **kwargs)
-
-    monkeypatch.setattr(solver, "_axis_linear_fft_padding", observe_padding)
-    state = solver.RlgcChunkState()
-    first = state.determine_once(shape, psfs)
-    assert 1 <= first < shape[0]
-    assert calls[:2] == [(256, 15), (1900, 21)]
-    assert {support for _, support in calls[2:]} == {45}
-    count = len(calls)
-    assert state.determine_once(shape, psfs) == first
-    assert len(calls) == count
-
-
 @pytest.mark.parametrize(
     "invalid,message",
     [

@@ -495,115 +495,11 @@ def split_kl_scores(
     return tuple(_kl_div_into(predicted, half, scratch) for half in (split1, split2))
 
 
-def determine_rlgc_crop_scan(
-    image_shape: tuple[int, int, int],
-    psf_shapes: list[tuple[int, ...]] | tuple[tuple[int, ...], ...],
-    gpu_id: int = 0,
-    memory_fraction: float = 0.8,
-) -> int:
-    """Choose the largest scan crop estimated to fit available GPU memory.
-
-    The estimate includes scan processing halos, linear-convolution padding,
-    FFT workspaces, solver state, and iteration temporaries. All channel PSFs
-    are considered so the returned crop can be reused across channels.
-
-    Parameters
-    ----------
-    image_shape : tuple[int, int, int]
-        Unpadded input shape in scan, camera-Y, camera-X order.
-    psf_shapes : list[tuple[int, ...]] or tuple[tuple[int, ...], ...]
-        Shapes of every PSF that will be used during processing.
-    gpu_id : int, default=0
-        CUDA device used by RLGC.
-    memory_fraction : float, default=0.8
-        Fraction of currently free device memory available to the solver.
-
-    Returns
-    -------
-    int
-        Retained scan-axis crop size.
-    """
-    if len(image_shape) != 3 or any(int(size) < 1 for size in image_shape):
-        raise ValueError(f"Expected a positive scan-Y-X shape, got {image_shape}")
-    if not psf_shapes:
-        raise ValueError("At least one PSF shape is required")
-    if not 0 < memory_fraction < 1:
-        raise ValueError("memory_fraction must be between 0 and 1")
-
-    normalized_psf_shapes = [
-        (1, *shape) if len(shape) == 2 else tuple(int(size) for size in shape)
-        for shape in psf_shapes
-    ]
-    if any(len(shape) != 3 for shape in normalized_psf_shapes):
-        raise ValueError("PSF shapes must be two- or three-dimensional")
-    psf_shape = tuple(
-        max(shape[axis] for shape in normalized_psf_shapes) for axis in range(3)
-    )
-
-    cp.cuda.Device(gpu_id).use()
-    free_bytes, _ = cp.cuda.runtime.memGetInfo()
-    memory_budget = int(free_bytes * memory_fraction)
-
-    # Reserve optical state, OTFs, FFT workspaces, split/reduction temporaries
-    # and optional detector-response buffers, before memory_fraction is applied.
-    estimated_bytes_per_voxel = 26 * np.dtype(np.float32).itemsize
-    scan_size, camera_y, camera_x = (int(size) for size in image_shape)
-    pad_y = _axis_linear_fft_padding(camera_y, psf_shape[1])
-    pad_x = _axis_linear_fft_padding(camera_x, psf_shape[2])
-    padded_y = camera_y + sum(pad_y)
-    padded_x = camera_x + sum(pad_x)
-
-    for retained_scan in range(scan_size, 0, -1):
-        if retained_scan == scan_size:
-            processing_scan = scan_size
-        else:
-            processing_scan = min(
-                scan_size,
-                retained_scan + 2 * psf_shape[0],
-            )
-        pad_scan = _axis_linear_fft_padding(processing_scan, psf_shape[0])
-        padded_scan = processing_scan + sum(pad_scan)
-        estimated_bytes = padded_scan * padded_y * padded_x * estimated_bytes_per_voxel
-        if estimated_bytes <= memory_budget:
-            return retained_scan
-    return 1
-
-
 @dataclass
 class RlgcChunkState:
-    """Store one process-local scan crop and reuse it across deconvolutions."""
+    """Reuse an allocation-tested scan crop across one tile's channels."""
 
     crop_scan: int | None = None
-
-    def determine_once(
-        self,
-        image_shape: tuple[int, int, int],
-        psf_shapes: list[tuple[int, ...]] | tuple[tuple[int, ...], ...],
-        gpu_id: int = 0,
-    ) -> int:
-        """Determine the crop only when this state has no stored value.
-
-        Parameters
-        ----------
-        image_shape : tuple[int, int, int]
-            Input image dimensions in scan, camera-Y, camera-X order.
-        psf_shapes : list[tuple[int, ...]] | tuple[tuple[int, ...], ...]
-            Point-spread function dimensions for the processed channels.
-        gpu_id : int
-            CUDA device index used for reconstruction or memory estimation.
-
-        Returns
-        -------
-        int
-            Shared retained scan size selected from the image and channel PSF dimensions.
-        """
-        if self.crop_scan is None:
-            self.crop_scan = determine_rlgc_crop_scan(
-                image_shape,
-                psf_shapes,
-                gpu_id=gpu_id,
-            )
-        return self.crop_scan
 
 
 def _split_observed_counts(
@@ -968,9 +864,7 @@ def _iterate_rlgc(
     # extra live array before the first update so allocation fallback happens
     # before any completed work, through the caller's actual CUDA allocator.
     rollback_reserve = (
-        xp.empty_like(recon)
-        if xp is cp and _checkpoint is not None and use_kl and completed == 0
-        else None
+        xp.empty_like(recon) if xp is cp and use_kl and completed == 0 else None
     )
     pause_after_update = False
     reason = "max_iterations"
@@ -1555,9 +1449,9 @@ def _gpu_memory_budget(gpu_id: int) -> Iterator[None]:
     Yields
     ------
     None
-        Device state and FFT workspaces use at most 80 percent of available
-        physical memory, including this process's reusable allocations. Respect
-        a caller's tighter limit and restore it on success or failure. This makes
+        Device state and FFT workspaces use the available physical memory,
+        including this process's reusable allocations. Respect a caller's tighter
+        limit and restore it on success or failure. This makes
         allocation fallback effective on systems that otherwise spill into shared
         GPU memory instead of raising an allocation error.
     """
@@ -1565,7 +1459,7 @@ def _gpu_memory_budget(gpu_id: int) -> Iterator[None]:
         pool = cp.get_default_memory_pool()
         original_limit = pool.get_limit()
         free_bytes, total_bytes = cp.cuda.runtime.memGetInfo()
-        budget = max(1, int(0.8 * min(total_bytes, free_bytes + pool.total_bytes())))
+        budget = max(1, min(total_bytes, free_bytes + pool.total_bytes()))
         if original_limit:
             budget = min(budget, original_limit)
         pool.set_limit(size=budget)
@@ -2008,10 +1902,10 @@ def rlgc(
     gpu_id : int, default=0
         CUDA device ID to use.
     crop_scan : int or None, default=None
-        Requested retained scan-axis tile size. If None, determine a crop from
-        current free GPU memory and this PSF. Values at least as large as the
-        reconstructed scan-axis length select full-frame processing. Refined
-        scans round retained extents to at least one acquired scan interval.
+        Requested retained scan-axis tile size. None attempts the full scan
+        and uses actual allocation failures to reduce it. Values at least as
+        large as the reconstructed scan-axis length select full-frame processing.
+        Refined scans round retained extents to at least one acquired scan interval.
     safe_mode : bool, default=True
         Retained for compatibility. The reference KL rule always requires both
         halves to worsen; this wrapper option has no effect.
@@ -2103,14 +1997,7 @@ def rlgc(
         solver_options.get("scan_upsample_factor", 1)
     ) + 1
     if crop_scan is None:
-        if image_arr.ndim == 2:
-            crop_scan = 1
-        else:
-            crop_scan = determine_rlgc_crop_scan(
-                (image_scan, *image_arr.shape[-2:]),
-                [tuple(int(size) for size in np.asarray(psf).shape)],
-                gpu_id=gpu_id,
-            )
+        crop_scan = image_scan
     if fallback_step_scan is not None and fallback_step_scan < 1:
         raise ValueError("fallback_step_scan must be at least 1")
     min_crop_scan = 1

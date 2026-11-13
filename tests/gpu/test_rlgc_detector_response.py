@@ -523,7 +523,7 @@ def test_tiled_consensus_recovers_known_blurred_object(
         (32, (256, 256), 20, "gpu", None, None),
         (32, (256, 256), 20, "host", None, None),
         (32, (256, 256), 20, "gpu", 128 * 1024**2, "isolated"),
-        (32, (256, 256), 20, "gpu", 128 * 1024**2, "default"),
+        (32, (256, 256), None, "gpu", 128 * 1024**2, "default"),
     ],
     ids=[
         "single-plane",
@@ -620,10 +620,13 @@ def test_nonuniform_response_preserves_uniform_fluorescence(
     assert written == truth.shape[0]
     np.testing.assert_allclose(restored, truth, rtol=2e-6, atol=2e-3)
     (successful_crop,) = successful_crops
-    if gpu_budget is not None and scan_planes == 32 and crop_scan == 20:
-        assert successful_crop < crop_scan
+    if gpu_budget is not None:
+        assert successful_crop < (scan_planes if crop_scan is None else crop_scan)
         assert len({shape for _, shape in states}) > 1
-    chunk_shape = (min(scan_planes, crop_scan + 2 * psf.shape[0]), *detector_shape)
+    chunk_shape = (
+        min(scan_planes, successful_crop + 2 * psf.shape[0]),
+        *detector_shape,
+    )
     padding = solver._linear_fft_pad_width(chunk_shape, psf.shape)
     state_bound = tuple(n + sum(p) for n, p in zip(chunk_shape, padding, strict=True))
     # Short inputs can fit one haloed chunk. Larger inputs must still use

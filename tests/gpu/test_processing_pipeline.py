@@ -1,7 +1,6 @@
 """Complete acquisition processing scenarios using production numerical operators."""
 
 import importlib
-from functools import partial
 from itertools import pairwise
 
 import numpy as np
@@ -373,7 +372,7 @@ def test_extended_mosaic_acquisition_to_fusion(
     monkeypatch,
     tmp_path,
 ):
-    """Check realistic camera fields, automatic chunks and independent mosaic truth."""
+    """Check realistic camera fields, scan chunks and independent mosaic truth."""
     case = mosaic_acquisition
     parameters = case.parameters
     raw_shape = case.dataset.raw_data.shape[-3:]
@@ -397,17 +396,11 @@ def test_extended_mosaic_acquisition_to_fusion(
                 return operator
 
             resources.setattr(solver, "_Convolution", observe_layout)
-            if case.tiled:
-                resources.setattr(
-                    solver,
-                    "determine_rlgc_crop_scan",
-                    partial(solver.determine_rlgc_crop_scan, memory_fraction=0.6),
-                )
         result = pipeline_runner(
             case.dataset,
             deconvolve=deconvolve,
             blend=tuple(parameters["blend_pixels_zyx"]),
-            crop_scan=None if case.tiled else shape[0],
+            crop_scan=shape[0] // 4 if case.tiled else None,
             output=tmp_path / "processed",
             fusion_chunk=tuple(parameters["fusion_chunk_shape_yx"]),
         )
@@ -418,7 +411,7 @@ def test_extended_mosaic_acquisition_to_fusion(
         fine_data = pipeline_optical_data(native_step, mosaic=True, tiled=case.tiled)
         source_mask = fine_data.source_mask[phase : phase + shape[0]]
         if case.tiled:
-            assert result.options["decon_crop_scan"] is None
+            assert result.options["decon_crop_scan"] == shape[0] // 4
         for position, run in enumerate(result.deconvolution_runs):
             observed = run["forward"]
             chunks = sorted(

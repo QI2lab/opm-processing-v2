@@ -1501,8 +1501,8 @@ def process(
     eager_mode : bool
         Legacy compatibility option; reference KL stopping requires both halves.
     decon_crop_scan : int or None
-        Retained scan-plane chunk size for 3D deconvolution; None calibrates it
-        automatically.
+        Retained scan-plane chunk size for 3D deconvolution; None attempts the
+        full scan, reducing it only after an actual GPU allocation failure.
     decon_gpu_id : int
         Zero-based CUDA device index used by the deconvolution solver.
     decon_verbose : int
@@ -1718,8 +1718,8 @@ def process_skewed(
         Start-inclusive, stop-exclusive position selection; None processes all
         positions.
     decon_crop_scan : int or None
-        Retained scan-plane chunk size for 3D deconvolution; None calibrates it
-        automatically.
+        Retained scan-plane chunk size for 3D deconvolution; None attempts the
+        full scan, reducing it only after an actual GPU allocation failure.
     decon_gpu_id : int
         Zero-based CUDA device index used by the deconvolution solver.
     decon_verbose : int
@@ -2335,8 +2335,8 @@ def process_skewed(
                     "channels complete."
                 )
             if deconvolve:
-                # ROI widths can differ between source tiles. Plan anew for
-                # this tile, then reuse successful crops across its channels.
+                # Start with the full scan for each tile; reuse successful
+                # allocation fallback across its channels.
                 decon_chunk_state = RlgcChunkState(decon_crop_scan)
             for chan_idx in tqdm(
                 (
@@ -2517,11 +2517,6 @@ def process_skewed(
                 # released before allocating deskew output or parked RLGC state.
                 del raw_data, camera_calibrated_data, camera_corrected_data
                 if deconvolve:
-                    effective_crop_scan = decon_chunk_state.determine_once(
-                        fine_shape,
-                        [tuple(int(size) for size in psf.shape) for psf in psfs],
-                        gpu_id=decon_gpu_id,
-                    )
                     # One pending CPU chunk overlaps the next GPU continuation.
                     # Waiting before submission bounds retained source buffers.
                     with ThreadPoolExecutor(max_workers=1) as deskew_worker:
@@ -2544,7 +2539,7 @@ def process_skewed(
                         rlgc(
                             deskew_input,
                             np.asarray(psfs[chan_idx]),
-                            crop_scan=effective_crop_scan,
+                            crop_scan=decon_chunk_state.crop_scan,
                             gpu_id=decon_gpu_id,
                             verbose=decon_verbose,
                             fallback_step_scan=decon_fallback_step_scan,
