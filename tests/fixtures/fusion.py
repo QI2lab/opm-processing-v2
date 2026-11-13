@@ -392,7 +392,7 @@ def projection_fusion(tmp_path):
     """Share projection geometry and native TensorStore arrays for chunk tests."""
     from opm_processing.imageprocessing.maxtilefusion import MaxTileFusion
 
-    def create(tiles, positions, shape, *, chunk_size=3):
+    def create(tiles, positions, shape, *, chunk_size=3, zero_channels=None):
         """Build a bounded projection fuser from explicit TCZYX camera data."""
         fusion = MaxTileFusion(
             ts_dataset=tuple(ts.array(tile) for tile in tiles),
@@ -403,6 +403,7 @@ def projection_fusion(tmp_path):
             chunk_size=chunk_size,
             padding_multiple=1,
             reverse_stage_y=False,
+            zero_channels=zero_channels,
         )
         assert fusion.fused_shape == shape
         return fusion

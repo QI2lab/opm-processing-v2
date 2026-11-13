@@ -204,8 +204,10 @@ def test_max_projection_fusion_is_chunked_and_sparse(projection_fusion, dtype, v
     np.testing.assert_allclose(fusion.fused_ts.read().result(), expected)
 
 
+@pytest.mark.parametrize("zero_channels", [None, {(0, 1, 0)}])
 def test_zero_max_projection_tile_does_not_reduce_weighted_fusion(
     projection_fusion,
+    zero_channels,
 ) -> None:
     """Exclude a globally zero projection channel from its neighbor's weights."""
     tile_shape = (3, 4)
@@ -217,6 +219,7 @@ def test_zero_max_projection_tile_does_not_reduce_weighted_fusion(
         ((0, 0), (0, 0)),
         tile_shape,
         chunk_size=4,
+        zero_channels=zero_channels,
     )
 
     fusion.fuse_tiles()

@@ -2589,7 +2589,9 @@ def process_skewed(
                 zero_channels=tile_zero_channels,
             )
             if max_projection:
-                processing_state.complete_tile(max_z_output_path, t_idx, pos_idx)
+                processing_state.complete_tile(
+                    max_z_output_path, t_idx, pos_idx, zero_channels=tile_zero_channels
+                )
 
     del ts_store
     if create_fused_max_projection:
@@ -2637,6 +2639,7 @@ def process_skewed(
                 None if pos_range is None else range(pos_range[0], pos_range[1])
             ),
             source_collection=max_z_output_path,
+            zero_channels=zero_channels,
             time_interval_s=max_z_collection.time_interval_s,
             reverse_stage_z=not stage_z_flipped,
             opm_angle_deg=opm_tilt_deg,
@@ -3068,6 +3071,7 @@ def process_projection(
             if pos_range is None
             else range(pos_range[0], pos_range[1]),
             source_collection=output_path,
+            zero_channels=zero_channels,
             spatial_offsets_zyx_um=np.zeros((len(tile_positions), 3)),
             output_path=fused_output_path,
             pixel_size=np.asarray((pixel_size_um, pixel_size_um), dtype=np.float32),
