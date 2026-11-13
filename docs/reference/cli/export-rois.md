@@ -26,9 +26,9 @@ when the acquisition and preview retain their names and relative layout.
 | `--output PATH` | Destination; default `roi_exports` beside the preview. With resume, a new destination can reuse selections from that default directory without copying processed data. |
 | `--deconvolve / --no-deconvolve` | Crop raw tiles with PSF and registration margins, then deconvolve and deskew; default disabled. |
 | `--tiff` | Also export compressed OME-BigTIFF; retain final OME-Zarr. |
-| `--figures` | Save a full-resolution `roi_overview.png` using napari's visible channels, colors and contrast, with unnumbered outlines and a scale bar. Save the dominant AO pupil and separate phase colorbar in each ROI folder. |
-| `--ao-root PATH` | Saved AO grid directory for `--figures`; otherwise discover beside the raw acquisition or preview. |
-| `--ao-wavelength-nm FLOAT` | Explicit phase wavelength in nanometers when recorded AO illumination is missing or ambiguous. Requires `--figures`. |
+| `--figures` | Also save a full-resolution `roi_overview.png` using napari's visible channels, colors and contrast, with unnumbered outlines and a scale bar. Both AO pupil types are exported automatically. |
+| `--ao-root PATH` | Saved AO grid directory; otherwise discover beside the raw acquisition or preview. |
+| `--ao-wavelength-nm FLOAT` | Explicit phase wavelength in nanometers when recorded AO illumination is missing or ambiguous. |
 | `--flatfield-correction` | Reuse or estimate illumination correction. |
 | `--content-aware` | Use GPU DCT-entropy overlap fusion of processed ROI tiles; default disabled. |
 | `--save-float32` | Preserve fractional intensities; default uint16. |

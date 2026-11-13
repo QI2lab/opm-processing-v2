@@ -146,6 +146,7 @@ def process_roi(
     acquisition: AcquisitionMetadata | None = None,
     prepared_psfs: tuple[list[np.ndarray], dict | None] | None = None,
     content_aware: bool = False,
+    export_ao: bool = True,
 ) -> Path:
     """Process a napari-selected world-space ROI and fuse its cropped tiles.
 
@@ -185,6 +186,9 @@ def process_roi(
         Channel kernels and optical settings returned by load_deconvolution_psfs.
     content_aware : bool
         Use GPU DCT-entropy weighting when fusing cropped overlaps.
+    export_ao : bool
+        Export total and accumulated Grid-AO pupils automatically. Batch exports
+        prepare these together beforehand and disable this repeated work.
 
 
     Returns
@@ -241,6 +245,10 @@ def process_roi(
         else context_dir / f"{stem}_roi"
     )
     output_dir.mkdir(parents=True, exist_ok=True)
+    if export_ao:
+        from opm_processing.export_roi_ao import export_roi_ao
+
+        export_roi_ao(acquisition, roi, output_dir)
 
     processing_roi, registration_limits = roi_with_registration_context(
         roi, acquisition, z_downsample_level

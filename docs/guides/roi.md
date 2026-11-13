@@ -99,8 +99,20 @@ shears are rejected because they require resampling.
 Native blocks are rendered with napari and assembled using temporary disk space
 beside the output (four bytes per image pixel), without a downsampled copy.
 
-Each ROI folder receives separate `ao_pupil_t###_z###.png` and
-`ao_colorbar_t###_z###.png` files for each applicable acquisition time and AO depth.
+AO figures are exported automatically, including when calling `process_roi`
+directly; `--figures` is needed only for the tissue overview. Each ROI folder
+receives, for every applicable acquisition time and AO depth:
+
+- `ao_pupil_t###_z###.png`: total correction relative to the saved startup mirror reference.
+- `ao_pupil_grid_contribution_t###_z###.png`: accumulated Grid-AO changes relative
+  to that grid position's starting state at the first saved AO time and depth.
+- `ao_pupil_comparison_t###_z###.png`: the two pupils side by side.
+- `ao_colorbar_t###_z###.png`: the shared phase colorbar for both views.
+
+The original starting reference is retained at every depth, including when its
+tiles do not intersect the ROI. Both pupils use the same linear phase limits of
+±2π. Their coefficient vectors and reference paths are recorded in `ao_corrections.json`.
+
 The selected correction covers the largest area within the requested ROI;
 overlapping tiles assigned to the same correction count only once. Recorded tile
 assignments in `ao_grid_geometry.json` take precedence and are checked against

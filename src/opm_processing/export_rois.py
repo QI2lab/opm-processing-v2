@@ -376,14 +376,12 @@ def export_rois(
     figures: Annotated[
         bool,
         typer.Option(
-            help="Save a native PNG ROI overview and dominant AO pupil/colorbar images."
+            help="Also save a native PNG ROI overview; both AO pupil types export automatically."
         ),
     ] = False,
     ao_root: Annotated[
         Path | None,
-        typer.Option(
-            help="Saved AO grid directory for --figures; default automatic discovery."
-        ),
+        typer.Option(help="Saved AO grid directory; default automatic discovery."),
     ] = None,
     ao_wavelength_nm: Annotated[
         float | None,
@@ -426,7 +424,7 @@ def export_rois(
     tiff : bool
         Export OME-TIFF in addition to the final OME-Zarr image.
     figures : bool
-        Save a native PNG overview and per-ROI dominant AO correction images.
+        Also save a native PNG overview. Both AO pupil types export automatically.
     ao_root : pathlib.Path or None
         Explicit saved AO grid directory when automatic discovery is insufficient.
     ao_wavelength_nm : float or None
@@ -454,8 +452,6 @@ def export_rois(
     workers : int
         TIFF compression workers.
     """
-    if not figures and (ao_root is not None or ao_wavelength_nm is not None):
-        raise typer.BadParameter("AO figure options require --figures")
     source = resolve_roi_source(root_path)
     footprints = projection_tile_footprints(source)
     if not footprints:
@@ -538,28 +534,27 @@ def export_rois(
         temporary = manifest_path.with_suffix(".tmp")
         temporary.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         temporary.replace(manifest_path)
-    if figures:
-        from opm_processing.dataio.ao_results import read_ao_layers
-        from opm_processing.export_roi_ao import export_roi_ao
+    from opm_processing.dataio.ao_results import read_ao_layers
+    from opm_processing.export_roi_ao import export_roi_ao
 
-        ao_layers = read_ao_layers(acquisition, source, ao_root)
-        colorbar_path = None
-        for selection in selections:
-            report = export_roi_ao(
-                acquisition,
-                PhysicalRoi.read(selection),
-                selection.parent,
-                ao_root=ao_root,
-                wavelength_nm=ao_wavelength_nm,
-                ao_layers=ao_layers,
-                colorbar_path=colorbar_path,
+    ao_layers = read_ao_layers(acquisition, source, ao_root)
+    colorbar_path = None
+    for selection in selections:
+        report = export_roi_ao(
+            acquisition,
+            PhysicalRoi.read(selection),
+            selection.parent,
+            ao_root=ao_root,
+            wavelength_nm=ao_wavelength_nm,
+            ao_layers=ao_layers,
+            colorbar_path=colorbar_path,
+        )
+        if report["status"] == "unavailable":
+            typer.echo(
+                f"AO figures unavailable for {selection.parent.name}: {report['reason']}"
             )
-            if report["status"] == "unavailable":
-                typer.echo(
-                    f"AO figures unavailable for {selection.parent.name}: {report['reason']}"
-                )
-            elif colorbar_path is None:
-                colorbar_path = selection.parent / report["corrections"][0]["colorbar"]
+        elif colorbar_path is None:
+            colorbar_path = selection.parent / report["corrections"][0]["colorbar"]
     prepared_psfs = (
         load_deconvolution_psfs(
             acquisition,
@@ -588,6 +583,7 @@ def export_rois(
             prepared_psfs=prepared_psfs,
             registration_channel=registration_channel,
             resume=resume,
+            export_ao=False,
         )
         typer.echo(f"Created {result}")
         if tiff:
