@@ -538,6 +538,7 @@ def export_rois(
         from opm_processing.export_roi_ao import export_roi_ao
 
         ao_layers = read_ao_layers(acquisition, source, ao_root)
+        colorbar_path = None
         for selection in selections:
             report = export_roi_ao(
                 acquisition,
@@ -546,11 +547,14 @@ def export_rois(
                 ao_root=ao_root,
                 wavelength_nm=ao_wavelength_nm,
                 ao_layers=ao_layers,
+                colorbar_path=colorbar_path,
             )
             if report["status"] == "unavailable":
                 typer.echo(
                     f"AO figures unavailable for {selection.parent.name}: {report['reason']}"
                 )
+            elif colorbar_path is None:
+                colorbar_path = selection.parent / report["corrections"][0]["colorbar"]
     prepared_psfs = (
         load_deconvolution_psfs(
             acquisition,

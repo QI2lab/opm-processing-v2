@@ -30,6 +30,7 @@ def export_roi_ao(
     ao_root: Path | None = None,
     wavelength_nm: float | None = None,
     ao_layers: dict | None = None,
+    colorbar_path: Path | None = None,
 ) -> dict[str, Any]:
     """Save full final requested correction phases with saved-plan provenance.
 
@@ -47,6 +48,8 @@ def export_roi_ao(
         Optional display wavelength override; otherwise use recorded AO illumination.
     ao_layers : dict or None
         Saved AO plans shared by the current ROI batch.
+    colorbar_path : pathlib.Path or None
+        Fixed publication colorbar already rendered for this ROI batch.
 
     Returns
     -------
@@ -86,7 +89,6 @@ def export_roi_ao(
         manifest["colormap"] = colormap
         # SJS publication plots use Matplotlib's image cmap and shared +/-2pi.
         norm = Normalize(-2 * np.pi, 2 * np.pi)
-        colorbar_path = None
         for record in records:
             result = AOOptimizationResult(
                 Path(record["result_path"]),
