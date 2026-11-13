@@ -2208,7 +2208,7 @@ class TileFusion:
             - 3D: (Z, Y, X) for int channel, or (C, Z, Y, X) for slice channels.
             - 2D: normalized to (C, 1, Y, X).
         """
-        if getattr(self, "_variable_roi_tiles", False):
+        if self._variable_roi_tiles:
             t_idx = 0
             pos_idx = tile_idx
         else:
@@ -2820,7 +2820,7 @@ class TileFusion:
                     )
                     context_z = None
                     if not self._is_2d and boundary_axis == 0:
-                        max_z = getattr(self, "_pair_registration_limits", {}).get(
+                        max_z = self._pair_registration_limits.get(
                             (i, j),
                             getattr(
                                 self,
@@ -2992,7 +2992,7 @@ class TileFusion:
                             support[..., -1] = False
                         support_masks.append(support)
 
-                    max_shift = getattr(self, "_pair_registration_limits", {}).get(
+                    max_shift = self._pair_registration_limits.get(
                         (i, j),
                         getattr(
                             self,
@@ -3401,8 +3401,6 @@ class TileFusion:
             array or scalar
                 Effective per-axis sampling of the registration pair.
             """
-            if not hasattr(self, "_tile_shapes"):
-                return (1, 1, 1)
             offset = np.rint(
                 (np.asarray(self._tile_positions[j]) - self._tile_positions[i])
                 / self._pixel_size
@@ -3419,8 +3417,8 @@ class TileFusion:
             separation = np.abs(offset) / np.minimum(
                 self._tile_shapes[i], self._tile_shapes[j]
             )
-            limit = getattr(self, "_pair_registration_limits", {}).get(
-                (i, j), getattr(self, "max_registration_shift_zyx", (0, 0, 0))
+            limit = self._pair_registration_limits.get(
+                (i, j), self.max_registration_shift_zyx
             )[0]
             if not self._is_2d and int(np.argmax(separation)) == 0 and limit > 0:
                 return (1, *sampling[1:])
@@ -3703,7 +3701,7 @@ class TileFusion:
             Returns the original array when its dtype already matches the output.
             The input array is never modified.
         """
-        dtype = getattr(self, "output_dtype", np.dtype(np.uint16))
+        dtype = self.output_dtype
         if source.dtype == dtype:
             return source
         if dtype == np.dtype(np.float32):
@@ -3775,7 +3773,7 @@ class TileFusion:
         set of tuple of int
             Pairs whose limits increased and whose measurements must be replaced.
         """
-        if not getattr(self, "_automatic_registration_limits", False):
+        if not self._automatic_registration_limits:
             return set()
         expanded = set()
         for pair, (correction, limits, score) in getattr(
@@ -3792,7 +3790,7 @@ class TileFusion:
                     peak = abs(correction[axis])
                     margin = max(2, sampling[axis], math.ceil(0.05 * peak))
                     updated[axis] = max(updated[axis], int(peak + margin))
-            context_limit = getattr(self, "_registration_context_limit_zyx", None)
+            context_limit = self._registration_context_limit_zyx
             if context_limit is not None:
                 updated = [
                     min(value, ceiling)
@@ -3946,7 +3944,7 @@ class TileFusion:
         dict
             Output-affecting registration settings fingerprinted in the processing journal.
         """
-        context_limit = getattr(self, "_registration_context_limit_zyx", None)
+        context_limit = self._registration_context_limit_zyx
         return {
             "coordinates": STAGE_COORDINATE_VERSION,
             "channel_index": self.channel_to_use,
@@ -3964,14 +3962,8 @@ class TileFusion:
             "score": ("retained-full-resolution-grid-ssim-supported-window-v8"),
             "downsample_factors_zyx": list(self.downsample_factors),
             "ssim_window": self.ssim_window,
-            "max_registration_shift_zyx": list(
-                getattr(
-                    self,
-                    "_initial_registration_shift_zyx",
-                    self.max_registration_shift_zyx,
-                )
-            ),
-            "registration_retries": getattr(self, "registration_retries", 2),
+            "max_registration_shift_zyx": list(self._initial_registration_shift_zyx),
+            "registration_retries": self.registration_retries,
             **(
                 {"registration_context_limit_zyx": list(context_limit)}
                 if context_limit is not None
@@ -3980,24 +3972,20 @@ class TileFusion:
             "retry_policy": "selective-pairs-and-global-measured-peak-5pct-2px-bin-v3",
             "shift_limits_policy": (
                 "recorded-overlap-contextual-depth-actual-support-per-pair-v4"
-                if getattr(self, "_automatic_registration_limits", False)
+                if self._automatic_registration_limits
                 else "explicit"
             ),
             "pair_shift_limits": {
-                f"{left},{right}": list(limits)
-                for (left, right), limits in getattr(
-                    self,
-                    "_initial_pair_registration_limits",
-                    getattr(self, "_pair_registration_limits", {}),
-                ).items()
+                f"{i},{j}": list(limits)
+                for (i, j), limits in self._initial_pair_registration_limits.items()
             },
             "threshold": self.threshold,
             "roi_bounds_yx_um": (
                 None
-                if getattr(self, "roi_selection", None) is None
+                if self.roi_selection is None
                 else list(self.roi_selection.bounds_yx_um)
             ),
-            "roi_position_indices": list(getattr(self, "_source_position_indices", ())),
+            "roi_position_indices": list(self._source_position_indices),
             "zero_registration_tiles": [
                 tile_index
                 for tile_index in range(len(self._tile_positions))
@@ -4072,7 +4060,7 @@ class TileFusion:
                 self._tile_positions, self._tile_shapes, strict=False
             )
         )
-        if getattr(self, "roi_selection", None) is not None:
+        if self.roi_selection is not None:
             roi_y0, roi_y1, roi_x0, roi_x1 = self.roi_selection.bounds_yx_um
             min_y, max_y = float(roi_y0), float(roi_y1)
             min_x, max_x = float(roi_x0), float(roi_x1)
@@ -4155,14 +4143,14 @@ class TileFusion:
                         max(1, (y0 + factor - 1) // factor),
                         max(1, (x0 + factor - 1) // factor),
                     ),
-                    getattr(self, "output_dtype", np.dtype(np.uint16)),
+                    self.output_dtype,
                 )
             )
 
         image = tczyx_image_metadata(
             spatial_scales,
             spatial_origins,
-            time_interval_s=getattr(self, "time_interval_s", None),
+            time_interval_s=self.time_interval_s,
             name="fused",
         )
         # Keep storage chunks shallow enough for interactive plane viewing.
@@ -4181,12 +4169,8 @@ class TileFusion:
             image,
             specs,
             extra_attributes={
-                **(
-                    processing_state_image_attributes(
-                        self.processing_state.path, Path(output_path)
-                    )
-                    if hasattr(self, "processing_state")
-                    else {}
+                **processing_state_image_attributes(
+                    self.processing_state.path, Path(output_path)
                 ),
                 "opm_processing_coordinates": {"version": STAGE_COORDINATE_VERSION},
             },
@@ -4659,18 +4643,8 @@ class TileFusion:
             )
 
         n_t = int(self.time_dim)
-        n_pos = int(self.position_dim)
-        tiles_by_time = getattr(
-            self,
-            "_tiles_by_time",
-            tuple(tuple(range(t * n_pos, (t + 1) * n_pos)) for t in range(n_t)),
-        )
-        common_shape = (int(self.z_dim), int(self.y_dim), int(self.x_dim))
-        tile_shapes = getattr(
-            self,
-            "_tile_shapes",
-            [common_shape] * len(self._tile_positions),
-        )
+        tiles_by_time = self._tiles_by_time
+        tile_shapes = self._tile_shapes
 
         z_step = int(self.write_block_shape[2])
         pad_z, pad_y, pad_x = (
@@ -4948,7 +4922,7 @@ class TileFusion:
                     slice(x0, x1),
                 ].write(
                     down[: z1 - z0, : y1 - y0, : x1 - x0].astype(
-                        getattr(self, "output_dtype", np.dtype(np.uint16)),
+                        self.output_dtype,
                         copy=False,
                     )
                 ).result()
