@@ -49,7 +49,7 @@ dependencies = [
 processing = [
     "basicpy @ git+https://github.com/QI2lab/BaSiCPy.git@main",
     "cmap",
-    "imagecodecs",
+    "imagecodecs>=2026.11.11",
     "matplotlib",
     "napari[pyqt]",
     "napari-ome-zarr>=0.9.0",
