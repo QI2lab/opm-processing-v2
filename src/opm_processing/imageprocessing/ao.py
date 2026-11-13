@@ -101,13 +101,12 @@ def phase_from_modal_coeff(
     xx, yy = np.meshgrid(axis, axis)
     radius = np.hypot(xx, yy)
     theta = np.arctan2(yy, xx)
+    radial = np.minimum(radius, 1)
     values = np.zeros_like(radius)
     for coefficient, index in zip(coefficients, indices, strict=True):
         if coefficient:
             n, m = WAVEKIT_MODE_NM[index - 1]
-            values += coefficient * zernike_nm(
-                n, m, np.minimum(radius, 1), theta, norm=norm
-            )
+            values += coefficient * zernike_nm(n, m, radial, theta, norm=norm)
     pupil = np.ma.array(values, mask=radius > 1)
     if out in {"coefficients", "opd", "meters"}:
         return pupil
