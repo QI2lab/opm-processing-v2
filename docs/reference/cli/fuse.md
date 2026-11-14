@@ -7,20 +7,21 @@ prefers deconvolved, deskewed data.
 | Option | Description |
 | --- | --- |
 | `--registration-channel VALUE` | Select the zero-based registration channel; default 0. |
-| `--output-dir PATH` | Write fused volume and maximum-Z OME-Zarrs here; registration and depth-gain records stay beside the processed input. |
+| `--output-dir PATH` | Write fused volume and maximum-Z OME-Zarrs here; registration and depth-normalization records stay beside the processed input. |
 | `--max-registration-shift-zyx Z Y X` | Override correction limits read from recorded acquisition overlaps and bounded by tile geometry. |
 | `--registration-retries VALUE` | Remeasure pairs with expanded automatic limits and refit the entire graph; default 2, 0 disables. Explicit shift limits stay fixed. |
 | `--registration-threshold VALUE` | Minimum overlap similarity; default 0.7. |
 | `--blend-pixels Z Y X` | Set edge blending widths; default 20 600 400. |
+| `--content-aware` | Multiply feather weights by GPU DCT-entropy content weights in overlaps; default disabled. |
 | `--downsample-factors Z Y X` | Set registration sampling factors; default 3 5 5. |
 | `--ssim-window VALUE` | Set the overlap similarity window; default 15. |
-| `--no-normalize-depth-intensity` | Disable brightness matching across depths; XY brightness differences are retained. |
+| `--no-normalize-depth-intensity` | Disable histogram matching to the first acquired depth at each physical XY footprint, or across combined cropped depth layers for ROIs. |
 | `--roi PATH` | Restrict fusion to a saved ROI. |
 | `--regenerate-max-z` | Recreate maximum-Z images from existing fused data. |
 | `--require-gpu` | Require CUDA registration. |
 | `--chunk-shape-yx Y X` | Set fusion block dimensions; default 1024 1024. |
 | `--fusion-ram-fraction VALUE` | Set available RAM fraction for fusion; default 0.4. |
-| `--max-workers VALUE` | Set CPU fusion workers; default up to eight physical cores. |
+| `--max-workers VALUE` | Set CPU fusion workers; default up to eight physical cores. Content-aware fusion uses one GPU render worker. |
 | `--max-in-flight-writes VALUE` | Limit queued block writes; default 2. |
 | `--optimization-rel-threshold VALUE` | Set the registration outlier multiplier; default 0.5. |
 | `--optimization-abs-threshold VALUE` | Set the minimum registration residual cutoff; default 1.5. |

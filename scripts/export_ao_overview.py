@@ -252,7 +252,7 @@ def main() -> None:
             f"Output is not empty; select a new directory or use --overwrite: {output}"
         )
     output.mkdir(parents=True, exist_ok=True)
-    phase_source = Path(__file__).with_name("ao_wavekit_phase.py").resolve()
+    phase_source = Path(phase_from_modal_coeff.__code__.co_filename).resolve()
     manifest = {
         "ao_results": str(ao_root),
         "timepoint": args.timepoint,

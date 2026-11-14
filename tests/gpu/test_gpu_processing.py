@@ -213,7 +213,21 @@ def test_rlgc_empty_image_remains_empty(cupy_gpu, crop_scan, camera_value, monke
     monkeypatch.setattr(rlgc, "clear_rlgc_caches", observe_cleanup)
     observed = np.full((11, 12, 16), camera_value, dtype=np.float32)
     psf = np.ones((3, 3), dtype=np.float32)
-    restored = rlgc.rlgc(observed, psf, crop_scan=crop_scan)
+    restored = np.empty_like(observed)
+    written = 0
+
+    def collect_chunk(core, start, stop):
+        """Consume the solver's empty owned cores without missing scan planes."""
+        nonlocal written
+        assert start == written
+        restored[start:stop] = core
+        written = stop
+
+    result = rlgc.rlgc(
+        observed, psf, crop_scan=crop_scan, on_reconstructed_chunk=collect_chunk
+    )
+    assert result is None
+    assert written == observed.shape[0]
     np.testing.assert_array_equal(restored, np.zeros_like(observed))
     assert len(cleanups) == 1
     pool = cupy_gpu.get_default_memory_pool()

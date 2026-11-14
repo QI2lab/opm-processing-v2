@@ -19,32 +19,6 @@ from tests.simulation.camera import digitize
 pytestmark = pytest.mark.unit
 
 
-def test_scan_chunk_planner_accounts_for_all_channels_and_reuses_crop(
-    cupy_gpu, monkeypatch
-):
-    """Plan from all optical supports once, without allocating a camera volume."""
-    solver = importlib.import_module("opm_processing.imageprocessing.rlgc")
-    shape = (10000, 256, 1900)
-    psfs = ((3, 15, 9), (45, 3, 21))
-    padding = solver._axis_linear_fft_padding
-    calls = []
-
-    def observe_padding(length, support, **kwargs):
-        """Record optical support while executing the actual padding calculation."""
-        calls.append((length, support))
-        return padding(length, support, **kwargs)
-
-    monkeypatch.setattr(solver, "_axis_linear_fft_padding", observe_padding)
-    state = solver.RlgcChunkState()
-    first = state.determine_once(shape, psfs)
-    assert 1 <= first < shape[0]
-    assert calls[:2] == [(256, 15), (1900, 21)]
-    assert {support for _, support in calls[2:]} == {45}
-    count = len(calls)
-    assert state.determine_once(shape, psfs) == first
-    assert len(calls) == count
-
-
 @pytest.mark.parametrize(
     "invalid,message",
     [
@@ -504,9 +478,12 @@ def test_tiled_gc_recovers_noisy_extended_objects_without_rl_noise(
     boundaries = {stop for _, stop in retained if stop < source.shape[0]}
     if crop_scan is not None:
         ((crop, overlap, count),) = slicers
+        assert iterations == max(record["first_kl_stop"] for record in chunks)
         assert count >= 3 and 3 <= len(chunks) <= count
         assert crop[0] < observed.shape[0]
-        assert crop[1:] == observed.shape[1:] and overlap[0] > 0
+        # Ryomen plans scan coordinates on a 1x1 proxy; the solver still
+        # receives full camera YX, checked against its actual observations below.
+        assert crop[1:] == (1, 1) and overlap[0] > 0
         assert retained[0][0] == 0 and retained[-1][1] == source.shape[0]
         assert all(left[1] == right[0] for left, right in pairwise(retained))
         assert sum(source[b - 1].any() and source[b].any() for b in boundaries) >= 2
@@ -528,8 +505,13 @@ def test_tiled_gc_recovers_noisy_extended_objects_without_rl_noise(
                     (crop[0], *observed.shape[1:]), psf.shape
                 )
                 assert object_scan <= crop[0] + sum(pads[0])
+                assert record["observed_shape"][1:] == tuple(
+                    size + sum(pad)
+                    for size, pad in zip(observed.shape[1:], pads[1:], strict=True)
+                )
             else:
                 assert record["observed_shape"][0] <= crop[0] + 1
+                assert record["observed_shape"][1:] == observed.shape[1:]
                 assert object_scan <= crop[0] * factor + 1
             assert record["object_shape"][1:] == record["observed_shape"][1:]
     # Nearest acquired samples on either side, including every refined-grid

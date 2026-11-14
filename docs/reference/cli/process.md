@@ -11,13 +11,14 @@ Measured PSFs must be sampled at the inferred reconstruction spacing.
 
 | Option | Description |
 | --- | --- |
+| `--batch` | Recursively process raw acquisitions beneath the parent directory, in sorted folder order. Other options apply to every acquisition. Zarr contents and processed stores are excluded. |
 | `--deconvolve` | Apply RLGC deconvolution before deskewing. |
 | `--flatfield-correction` | Include illumination in the deconvolution measurement model, or divide calibrated data by it when deconvolution is disabled. |
 | `--save-float32` | Preserve fractional intensities in float32 output. |
 | `--skip-empty-below VALUE` | Zero channel tiles with insufficient signal above this intensity. |
 | `--skip-empty-min-signal-fraction VALUE` | Required fraction above the cutoff; default 0.01. |
 | `--resume` | Continue compatible completed tiles. If omitted, partial outputs offer Resume / Overwrite / Cancel (default: Cancel); completed outputs are overwritten. |
-| `--output PATH` | Set the output directory. |
+| `--output PATH` | Set the output directory. In batch mode, preserve each acquisition folder's path beneath this directory. |
 | `--live PATH` | Process during acquisition using a supplied CYX illumination TIFF; pass the acquisition directory. |
 | `--live-wait` | Wait for successful live completion and all raw tiles, then process offline. Combine with `--flatfield-correction` to estimate missing illumination. Mutually exclusive with `--live`; pass the acquisition directory. |
 | `--time-range START STOP` | Select timepoints. |
@@ -37,6 +38,16 @@ Measured PSFs must be sampled at the inferred reconstruction spacing.
 ```bash
 uv run process "/path/to/acquisition" --deconvolve --flatfield-correction
 ```
+
+Process every acquisition beneath a parent directory with the same options:
+
+```bash
+uv run process "/path/to/parent" --batch --deconvolve --flatfield-correction --resume
+```
+
+Add `--output "/path/to/processed"` to mirror the source folder tree there.
+Runs are sequential and stop on the first processing error. Resume and partial
+output prompts behave as in a single-acquisition run.
 
 Start before acquisition finishes, without a precomputed illumination file:
 

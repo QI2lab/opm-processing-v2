@@ -121,50 +121,6 @@ def _registered_projection_context(
     return state, processed_path, registration
 
 
-def _registered_tile_footprints(path: Path) -> tuple[dict[str, Any], ...]:
-    """Derive registered YX footprints from state plus standard OME metadata.
-
-    Parameters
-    ----------
-    path : Path
-        Registered maximum-Z fusion image whose source tile footprints are read.
-
-    Returns
-    -------
-    tuple[dict[str, Any], ...]
-        Registered tile origins, physical YX bounds, and source time/position indices.
-    """
-    state, processed_path, registration = _registered_projection_context(path)
-    if state.roi_series(processed_path):
-        raise ValueError("ROI selection requires a full-acquisition fusion")
-    collection = open_position_collection(processed_path)
-    pixel_y, pixel_x = collection.voxel_size_um[-2:]
-    footprints = []
-    for tile in registration["tiles"]:
-        position_index = int(tile["position_index"])
-        time_index = int(tile["time_index"])
-        origin = tuple(float(value) for value in tile["origin_zyx_um"])
-        tile_shape = collection.arrays[position_index].shape
-        footprints.append(
-            {
-                "time_index": time_index,
-                "position_index": position_index,
-                "origin_zyx_um": list(round_spatial_values(origin)),
-                "bounds_yx_um": list(
-                    round_spatial_values(
-                        (
-                            origin[1],
-                            origin[1] + int(tile_shape[-2]) * pixel_y,
-                            origin[2],
-                            origin[2] + int(tile_shape[-1]) * pixel_x,
-                        )
-                    )
-                ),
-            }
-        )
-    return tuple(footprints)
-
-
 def projection_tile_footprints(path: str | Path) -> tuple[dict[str, Any], ...]:
     """Read the raw-tile placement represented by a maximum-Z preview.
 
@@ -196,22 +152,41 @@ def projection_tile_footprints(path: str | Path) -> tuple[dict[str, Any], ...]:
         and (state.path.parent / record["max_projection_path"]).resolve() == source
     ]
     if registrations and projection.get("placement") != "stage":
-        footprints = _registered_tile_footprints(source)
         processed = state.registered_output_for_max_projection(source)
+        if state.roi_series(processed):
+            raise ValueError("ROI selection requires a full-acquisition fusion")
         collection = open_position_collection(processed)
         _, crop_offsets = _local_coordinate_offsets(collection, acquisition)
-        return tuple(
-            {
-                **tile,
-                "raw_origin_zyx_um": list(
-                    round_spatial_values(
-                        np.asarray(tile["origin_zyx_um"])
-                        - np.asarray(crop_offsets[int(tile["position_index"])])
-                    )
-                ),
-            }
-            for tile in footprints
-        )
+        pixel_y, pixel_x = collection.voxel_size_um[-2:]
+        footprints = []
+        for tile in state.registration(processed)["tiles"]:
+            position = int(tile["position_index"])
+            origin = np.asarray(tile["origin_zyx_um"], dtype=float)
+            shape = collection.arrays[position].shape
+            footprints.append(
+                {
+                    "time_index": int(tile["time_index"]),
+                    "position_index": position,
+                    "origin_zyx_um": list(round_spatial_values(origin)),
+                    "raw_origin_zyx_um": list(
+                        round_spatial_values(
+                            np.asarray(round_spatial_values(origin))
+                            - crop_offsets[position]
+                        )
+                    ),
+                    "bounds_yx_um": list(
+                        round_spatial_values(
+                            (
+                                origin[1],
+                                origin[1] + int(shape[-2]) * pixel_y,
+                                origin[2],
+                                origin[2] + int(shape[-1]) * pixel_x,
+                            )
+                        )
+                    ),
+                }
+            )
+        return tuple(footprints)
 
     if suffix == suffixes[0]:
         candidates = (

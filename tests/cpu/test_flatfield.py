@@ -10,7 +10,6 @@ from opm_processing.imageprocessing.camera import (
 )
 from opm_processing.imageprocessing.flatfield import (
     _flatfield_sample_indices,
-    _separable_residual_calibration,
     estimate_illuminations,
 )
 
@@ -178,13 +177,3 @@ def test_invalid_illumination_calibration_is_rejected(option, value):
     options = {"camera_offset": 100, "camera_conversion": 1, option: value}
     with pytest.raises(ValueError):
         estimate_illuminations(np.full((1, 1, 1, 3, 5, 7), 120, np.uint16), **options)
-
-
-@pytest.mark.unit
-@pytest.mark.parametrize("level", (0, -1, np.nan))
-def test_nonpositive_or_nonfinite_fits_are_rejected(level):
-    """Prevent unusable fitted fields from entering residual calibration."""
-    with pytest.raises(ValueError, match="invalid illumination field"):
-        _separable_residual_calibration(
-            np.full((5, 7), level, np.float32), np.ones((3, 5, 7), np.float32)
-        )

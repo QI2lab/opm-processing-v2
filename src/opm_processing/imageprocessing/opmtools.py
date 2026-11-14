@@ -41,7 +41,6 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 from numba import njit, prange
-from ryomen import Slicer
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -363,7 +362,7 @@ def deskew_coverage(
 
 @njit(inline="always")
 def deskew_sample(
-    data: np.ndarray, x: int, geometry: tuple, gain: np.float32
+    data: np.ndarray, x: int, geometry: tuple, gain: np.float32, scan_origin: int = 0
 ) -> np.float32:
     """Interpolate one pixel from a previously located source quartet.
 
@@ -377,6 +376,8 @@ def deskew_sample(
         Source indices and weights returned by ``deskew_row``.
     gain : np.float32
         Photon-volume gain, ``2 / step`` at the supported 30-degree angle.
+    scan_origin : int
+        Global scan index of the first resident source plane.
 
     Returns
     -------
@@ -386,6 +387,7 @@ def deskew_sample(
     valid, before, rb, ra, a, b, c, d = geometry
     if not valid:
         return np.float32(0)
+    before -= scan_origin
     value = (
         a * data[before + 1, ra + 1, x]
         + b * data[before + 1, ra, x]
@@ -395,7 +397,7 @@ def deskew_sample(
     return np.float32(np.maximum(value, np.float32(0)))
 
 
-@njit(parallel=True)
+@njit(parallel=True, nogil=True)
 def interpolate_rows(
     data: ArrayLike,
     output: np.ndarray,
@@ -407,6 +409,8 @@ def interpolate_rows(
     downsample_factor: int = 2,
     zero_initialized: bool = True,
     output_origin: tuple[int, int, int] = (0, 0, 0),
+    source_scan_origin: int = 0,
+    source_scan_count: int = 0,
 ) -> np.ndarray:
     """Parallelize orthogonal interpolation over independent output rows.
 
@@ -431,7 +435,10 @@ def interpolate_rows(
         case; otherwise write every row, including padding and empty support.
     output_origin : tuple[int, int, int]
         Global averaged-Z, Y and X indices of the output window's first voxel.
-        Source data and unpadded dimensions always describe the full input volume.
+        Unpadded dimensions describe the complete input volume.
+    source_scan_origin, source_scan_count : int
+        Resident source window's first global scan index and complete scan count.
+        Zero count uses the resident array's scan length.
 
     Returns
     -------
@@ -445,6 +452,8 @@ def interpolate_rows(
     into the output row, preserving the existing incomplete-Z-bin convention.
     """
     planes, ny, nx = data.shape
+    if source_scan_count:
+        planes = source_scan_count
     nz, padded_y, padded_x = output.shape
     z_origin, y_origin, x_origin = output_origin
     valid_x = min(padded_x, max(0, nx - x_origin))
@@ -477,7 +486,7 @@ def interpolate_rows(
                 continue
             for x in range(valid_x):
                 output[z_local, y_local, x] = deskew_sample(
-                    data, x + x_origin, g0, gain
+                    data, x + x_origin, g0, gain, source_scan_origin
                 )
         elif downsample_factor == 2:
             g1 = deskew_row(
@@ -487,8 +496,8 @@ def interpolate_rows(
                 continue
             for x in range(valid_x):
                 total = np.float32(
-                    deskew_sample(data, x + x_origin, g0, gain)
-                    + deskew_sample(data, x + x_origin, g1, gain)
+                    deskew_sample(data, x + x_origin, g0, gain, source_scan_origin)
+                    + deskew_sample(data, x + x_origin, g1, gain, source_scan_origin)
                 )
                 output[z_local, y_local, x] = total / np.float32(2)
         else:
@@ -503,7 +512,7 @@ def interpolate_rows(
                 if geometry[0]:
                     for x in range(valid_x):
                         output[z_local, y_local, x] += deskew_sample(
-                            data, x + x_origin, geometry, gain
+                            data, x + x_origin, geometry, gain, source_scan_origin
                         )
             for x in range(valid_x):
                 output[z_local, y_local, x] /= np.float32(downsample_factor)
@@ -523,10 +532,9 @@ def orthogonal_deskew(
     downsample_factor: int = 2,
     *,
     zero_initialized: bool = True,
-    tile_shape: tuple[int, int, int] | None = None,
     out: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Deskew oblique data on one global grid, optionally writing output tiles.
+    """Deskew a resident oblique volume on one global grid.
 
     Parameters
     ----------
@@ -548,14 +556,9 @@ def orthogonal_deskew(
     zero_initialized : bool
         Use a zero-filled internal allocation; False explicitly writes every voxel.
         Supplied output buffers always receive explicit writes.
-    tile_shape : tuple[int, int, int] or None
-        Maximum averaged-Z, Y and X output tile dimensions. None evaluates the
-        full output at once. All tiles use the same global interpolation grid.
     out : numpy.ndarray or None
         Optional writable float32 output array with the exact deskewed shape.
-        NumPy views and memory-mapped arrays are supported. A memory map together
-        with tile_shape bounds resident output storage; input data stays available
-        as a full volume. The buffer must not overlap the source data.
+        The buffer must not overlap the source data.
 
     Returns
     -------
@@ -579,13 +582,6 @@ def orthogonal_deskew(
     final_nz = int(np.ceil(data.shape[1] * np.sin(np.radians(theta))))
     final_ny = shape[1] - pad_y
     shape = tuple(shape)
-    if tile_shape is None:
-        tile_shape = shape
-    if len(tile_shape) != 3 or any(
-        value < 1 or int(value) != value for value in tile_shape
-    ):
-        raise ValueError("Deskew tile_shape must contain three positive integers")
-    tile_shape = tuple(int(value) for value in tile_shape)
     if out is not None:
         if (
             not isinstance(out, np.ndarray)
@@ -601,23 +597,16 @@ def orthogonal_deskew(
     else:
         out = (np.zeros if zero_initialized else np.empty)(shape, np.float32)
     target = out[::-1] if reverse_deskewed_z else out
-    for tile, source, destination in Slicer(
-        target, crop_size=tile_shape, overlap=(0, 0, 0), pad=False
-    ):
-        # Ryomen shifts a final crop backward instead of shortening it. Every
-        # crop therefore uses its actual global origin, including repeated
-        # boundary samples, and receives explicit writes before placement.
-        interpolate_rows(
-            data,
-            tile,
-            final_ny,
-            final_nz,
-            theta,
-            distance,
-            pixel_size,
-            downsample_factor,
-            False,
-            tuple(axis.start for axis in destination[-3:]),
-        )
-        target[destination] = tile[source]
+    interpolate_rows(
+        data,
+        target,
+        final_ny,
+        final_nz,
+        theta,
+        distance,
+        pixel_size,
+        downsample_factor,
+        zero_initialized,
+        (0, 0, 0),
+    )
     return out

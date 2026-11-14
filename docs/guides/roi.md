@@ -56,10 +56,23 @@ registration and fusion, including when the preview was already registered.
 The final image is cropped to the requested physical XY bounds. Single-position
 ROIs are assembled across time without measuring pairwise registration links.
 `--flatfield-correction` enables the same illumination handling as `process`.
+ROIs share the flatfield beside the preview's linked processing journal, falling
+back to the raw acquisition directory when no journal is available. A missing
+field is estimated from the full acquisition; ROI-local fields are ignored.
 Deconvolution is disabled unless `--deconvolve` is supplied.
 `--registration-channel` is required and uses zero-based indices; choose 0 for
 single-channel data. Saved full-volume transforms, displaced for the raw and
 deskew crops, initialize the local registration.
+
+Contributing tiles are combined by acquisition depth inside the ROI, using
+recorded stage positions to identify layers. For each channel and timepoint,
+each combined cropped depth layer is histogram-matched to the first acquired
+layer of that ROI, after flatfield correction, optional deconvolution, and
+deskewing. Geometric padding is excluded; valid zero-intensity pixels are
+retained. cuCIM is preferred, with scikit-image used when GPU memory is
+insufficient. An unexpectedly missing first acquired layer raises an error.
+Matching provenance is saved in `<stem>_depth_histograms.json`. Processed
+source stacks remain unchanged.
 
 ## Outputs and resume
 
@@ -74,6 +87,74 @@ The default Z binning factor is one; `--z-downsample-level` changes it explicitl
 These are lossless zlib-compressed OME-BigTIFF files with global origins,
 per-plane positions, channel metadata, and processing provenance. OME-Zarr
 outputs are retained.
+
+`--figures` also saves `roi_overview.jpg` beside the ROI folders. It retains
+the displayed timepoint and napari's visible channel order,
+colors, contrast, gamma and blending. Rendering uses the native maximum-Z
+projection. The tissue and ROI annotations are then isotropically reduced with
+Lanczos resampling when its longest side exceeds 65,500 pixels, JPEGli's encoder
+limit. ROI outlines scale with the tissue.
+The JPEG uses JPEGli quality 100 without chroma subsampling. Displayed
+90-degree rotations and flips are preserved. White dashed
+ROI outlines have no numbers (20 µm stroke, 20 µm dashes, 10 µm gaps). A horizontal
+2 mm scale bar with an 80 µm white stroke and black backing is drawn after rotation,
+using the displayed horizontal pixel spacing. Arbitrary-angle rotations and
+shears are rejected. The sidecar JSON records the output pixel spacing, native
+dimensions, reduction factor and original source-pixel ROI coordinates.
+Native blocks are rendered with napari and assembled in RAM, or temporary disk
+space beside the output when RAM is insufficient (four bytes per native pixel).
+JPEGli currently requires the Windows imagecodecs build.
+
+Add `--ao-grid` to draw the approved Grid-AO layout on the full overview alongside
+the ROI boxes. This option implies `--figures`. White dashed lines follow the
+registered acquisition-selection polygon and split it into nine equal-area
+cells; filled white stars mark their intended area centroids. This uses the same
+geometry functions as the SJS plotting script. The outline comes from the saved
+acquisition polygon, rather than intensity segmentation or a tile bounding box.
+The full-Z overview uses the first AO depth and the latest saved plan at or before
+the displayed timepoint. Rotation, flips, JPEG downscaling and the 2 mm scale bar
+remain calibrated. The sidecar records the polygon, cells and marker provenance.
+On resume, an existing overview can receive the grid without rerendering tissue;
+a saved PNG is used as the background when available. `--ao-root` also applies
+to this overlay. Missing polygon/AO metadata is reported instead of inventing a grid.
+
+AO figures are exported automatically, including when calling `process_roi`
+directly; `--figures` is needed only for the tissue overview. Each ROI folder
+receives, for every applicable acquisition time and AO depth:
+
+- `ao_pupil_t###_z###.png`: total correction relative to the saved startup mirror reference.
+- `ao_pupil_grid_contribution_t###_z###.png`: accumulated Grid-AO changes relative
+  to that grid position's starting state at the first saved AO time and depth.
+- `ao_pupil_comparison_t###_z###.png`: the two pupils side by side.
+- `ao_colorbar_t###_z###.png`: the shared phase colorbar for both views.
+
+The original starting reference is retained at every depth, including when its
+tiles do not intersect the ROI. Both pupils use the same linear phase limits of
+±2π. Their coefficient vectors and reference paths are recorded in `ao_corrections.json`.
+
+The selected correction covers the largest area within the requested ROI;
+overlapping tiles assigned to the same correction count only once. Recorded tile
+assignments in `ao_grid_geometry.json` take precedence and are checked against
+the raw stage coordinates. ROI exports and AO tissue overlays share the same
+assignment reader and match source coordinates after rounding micrometers to
+three decimal places. Older acquisitions without that file use their saved
+stage plans; this historical assignment is identified as inferred in
+`ao_corrections.json`. Invalid recorded assignments are rejected without falling
+back to inference. The pupil uses the full final coefficient state, including
+the inherited starting correction, with the validated WaveKit basis and SJS
+publication colors and linear phase limits of ±2π. Phase is evaluated at the
+recorded AO illumination wavelength. Use `--ao-wavelength-nm` when older metadata
+does not identify that wavelength, and `--ao-root` when AO results are elsewhere.
+Missing AO results are reported without preventing ROI processing; inconsistent
+plans or ambiguous wavelengths require correction before processing continues.
+
+On resume, existing overview images retain the original napari appearance. If
+an older selection has no overview, `--figures` reopens its fixed rectangles so
+you can choose channels and contrast without redrawing. A new output directory
+reuses the existing overview when available. The overview JSON records its
+display settings and scale-bar length.
+An existing PNG-only overview is resized and converted to JPEG without
+rerendering the tissue or reopening napari.
 
 Rerun the same command to reuse saved selections and compatible completed
 checkpoints without reopening napari. Local registration checkpoints belong to

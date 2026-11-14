@@ -3,7 +3,6 @@
 import importlib
 from dataclasses import dataclass, replace
 from functools import lru_cache
-from hashlib import sha256
 from types import SimpleNamespace
 
 import numpy as np
@@ -77,7 +76,6 @@ def pipeline_runner(
     """
     from opm_processing.dataio.acquisition import acquisition_stem
     from opm_processing.dataio.position_collection import open_position_collection
-    from opm_processing.imageprocessing import opmtools
 
     module = importlib.import_module("opm_processing.process")
     fuse = importlib.import_module("opm_processing.fuse")
@@ -108,7 +106,6 @@ def pipeline_runner(
                 decon_verbose=0,
             )
         deskew_tiles = set()
-        deskew_runs = []
         deconvolution_runs = []
         with monkeypatch.context() as execution:
             if deconvolve:
@@ -117,40 +114,36 @@ def pipeline_runner(
 
                 def observe_reconstruction(*args, **kwargs):
                     """Observe real reconstruction shapes and acquired predictions."""
+                    consume = kwargs["on_reconstructed_chunk"]
+                    output_shape = None
+
+                    def observe_core(core, start, end):
+                        nonlocal output_shape
+                        assert start == (0 if output_shape is None else output_shape[0])
+                        output_shape = (end, *core.shape[1:])
+                        return consume(core, start, end)
+
+                    kwargs["on_reconstructed_chunk"] = observe_core
                     result = reconstruct(*args, **kwargs)
+                    assert result is None
                     deconvolution_runs.append(
                         {
                             "input_shape": args[0].shape,
-                            "output_shape": result.shape,
+                            "output_shape": output_shape,
                             "forward": production_forward_predictions[-1],
                         }
                     )
                     return result
 
                 execution.setattr(solver, "rlgc", observe_reconstruction)
-            interpolate = opmtools.interpolate_rows
-            deskew = module.orthogonal_deskew
+            interpolate = module.interpolate_rows
 
-            def record_tile(*args):
-                """Record actual global output tiles while running the real kernel."""
-                deskew_tiles.add((args[-1], args[1].shape))
-                return interpolate(*args)
+            def record_tile(*args, **kwargs):
+                """Observe global output slabs while running the real kernel."""
+                deskew_tiles.add((args[9], args[1].shape))
+                return interpolate(*args, **kwargs)
 
-            def observe_deskew(*args, **kwargs):
-                """Record actual output bytes before production persists them."""
-                result = deskew(*args, **kwargs)
-                assert result.dtype == np.float32 and result.flags.c_contiguous
-                deskew_runs.append(
-                    {
-                        "output_shape": result.shape,
-                        "tile_shape": kwargs["tile_shape"],
-                        "pixel_sha256": sha256(memoryview(result)).hexdigest(),
-                    }
-                )
-                return result
-
-            execution.setattr(opmtools, "interpolate_rows", record_tile)
-            execution.setattr(module, "orthogonal_deskew", observe_deskew)
+            execution.setattr(module, "interpolate_rows", record_tile)
             source = dataset.path.parent if live is not None else dataset.path
             invoke_cli("process", source, **options)
         directory = dataset.path.parent if output is None else output
@@ -195,7 +188,6 @@ def pipeline_runner(
             collection=open_position_collection(processed),
             output=directory / f"{stem}_fused.ome.zarr",
             deskew_tiles=deskew_tiles,
-            deskew_runs=deskew_runs,
             deconvolution_runs=deconvolution_runs,
         )
 

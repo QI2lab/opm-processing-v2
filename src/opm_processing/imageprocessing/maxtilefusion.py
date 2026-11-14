@@ -264,6 +264,7 @@ def regenerate_fused_max_projection(
                 .result()
             )
             slab_max = np.max(slab, axis=0)
+            del slab
             if projection is None:
                 projection = slab_max
             else:
@@ -362,6 +363,7 @@ class MaxTileFusion:
         time_interval_s: float | None = None,
         source_collection: str | Path | None = None,
         spatial_offsets_zyx_um: Sequence[Sequence[float]] | None = None,
+        zero_channels: set[tuple[int, int, int]] | None = None,
     ) -> None:
         """Initialize maximum-projection fusion with a bounded source chunk cache.
 
@@ -405,6 +407,9 @@ class MaxTileFusion:
             tile geometry when multiple processed collections exist.
         spatial_offsets_zyx_um : sequence of sequence of float or None
             Per-tile local NGFF offsets, including scan endpoint and deskew crop.
+        zero_channels : set of tuple[int, int, int] or None
+            Known empty source time/position/channel keys from processing. None
+            detects them from pixels; a supplied set avoids rereading every tile.
 
         Returns
         -------
@@ -460,6 +465,7 @@ class MaxTileFusion:
         self.source_position_indices = tuple(
             int(value) for value in source_position_indices
         )
+        self.zero_channels = zero_channels
         self.output_path = Path(output_path)
         self.source_collection = (
             None
@@ -610,7 +616,7 @@ class MaxTileFusion:
             factor for factor in (1, 2, 4, 8, 16, 32) if factor <= min(self.fused_shape)
         )
         self.multiscale_factors_yx = factors
-        interval_s = getattr(self, "time_interval_s", None)
+        interval_s = self.time_interval_s
         t_origin = (
             0
             if self.time_range is None or interval_s is None
@@ -742,18 +748,28 @@ class MaxTileFusion:
         zero_channel_count = 0
         for source_time in source_times:
             for tile_idx in range(len(self.ts_dataset)):
-                tile = np.asarray(
-                    self.ts_dataset[tile_idx][
-                        source_time,
-                        :,
-                        0,
-                        self.pad_y : self.pad_y + self.tile_shape[0],
-                        self.pad_x : self.pad_x + self.tile_shape[1],
-                    ]
-                    .read()
-                    .result()
-                )
-                present = np.any(tile != 0, axis=(-2, -1))
+                if self.zero_channels is None:
+                    tile = np.asarray(
+                        self.ts_dataset[tile_idx][
+                            source_time,
+                            :,
+                            0,
+                            self.pad_y : self.pad_y + self.tile_shape[0],
+                            self.pad_x : self.pad_x + self.tile_shape[1],
+                        ]
+                        .read()
+                        .result()
+                    )
+                    present = np.any(tile != 0, axis=(-2, -1))
+                    del tile
+                else:
+                    present = np.asarray(
+                        [
+                            (source_time, self.source_position_indices[tile_idx], c)
+                            not in self.zero_channels
+                            for c in range(self.channels)
+                        ]
+                    )
                 tile_channel_nonzero[(source_time, tile_idx)] = present
                 zero_channel_count += int(np.count_nonzero(~present))
         if zero_channel_count:
