@@ -13,7 +13,8 @@ path remains a fallback when raw data is stored separately.
 
 | Option | Description |
 | --- | --- |
-| `--output PATH` | Set the output root. |
+| `--batch` | Recursively export full `*_decon_deskewed.ome.zarr` stores beneath a parent directory. Skips plain deskewed and maximum-Z stores. Combine with `--video` for movies. |
+| `--output PATH` | Set the output root. Batch mode mirrors acquisition folder paths beneath it. |
 | `--acquisition PATH` | Supply raw acquisition metadata for timestamps. |
 | `--scale-bar-um VALUE` | Set scale bar length in micrometers; default automatic. |
 | `--timepoints START STOP` | Select timepoints; contrast stays fixed to timepoint 0. |
@@ -28,5 +29,16 @@ path remains a fallback when raw data is stored separately.
 ```bash
 uv run export-projections "/path/to/acquisition" --timepoints 100 200 --depth-color --video
 ```
+
+Generate projection movies for every deconvolved acquisition beneath a parent:
+
+```bash
+uv run export-projections "/path/to/parent" --batch --video
+```
+
+Options such as `--timepoints`, `--fps`, `--depth-color`, and `--workers` apply to
+every store. Acquisition metadata is resolved separately for each store. Exports
+run sequentially and stop on the first error. Without `--output`, each folder
+receives its normal `projection_frames` directory.
 
 Append `--help` to list all options and defaults.

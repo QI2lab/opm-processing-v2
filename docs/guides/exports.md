@@ -73,6 +73,16 @@ The zero-based stop is exclusive. This exports and encodes timepoints 100 throug
 199 using their original acquisition timestamps. Movie encoding follows TIFF
 export; existing TIFFs outside the selected range remain on disk.
 
+For projection movies from all deconvolved acquisitions beneath a parent folder:
+
+```bash
+uv run export-projections "/path/to/parent" --batch --video
+```
+
+Batch mode uses each folder's full `*_decon_deskewed.ome.zarr` data and the same
+CLI options. Add `--output` to mirror the acquisition folder tree beneath another
+output root.
+
 Encode an existing dataset's TIFF sequences instead:
 
 ```bash

@@ -26,18 +26,20 @@ app = typer.Typer(pretty_exceptions_enable=False)
 SUFFIX = "_deskewed.ome.zarr"
 
 
-def find_datasets(path: Path) -> list[Path]:
+def find_datasets(path: Path, *, batch: bool = False) -> list[Path]:
     """Resolve full deskewed data, preferring deconvolution when available.
 
     Parameters
     ----------
     path : Path
         Acquisition root containing its full deconvolved/deskewed store.
+    batch : bool
+        Recursively select full deconvolved/deskewed stores beneath a parent.
 
     Returns
     -------
     list[Path]
-        Single full deskewed store selected for projection export.
+        Selected full deskewed store, or deconvolved stores in batch mode.
     """
     path = path.expanduser().resolve()
 
@@ -45,6 +47,22 @@ def find_datasets(path: Path) -> list[Path]:
         raise ValueError(
             "Pass the acquisition root directory containing the processed OME-Zarr store."
         )
+
+    if batch:
+        datasets = []
+        for directory, folders, _files in path.walk():
+            datasets.extend(
+                directory / name
+                for name in sorted(folders)
+                if name.endswith("_decon" + SUFFIX)
+                and not name.endswith("_max_z_decon" + SUFFIX)
+            )
+            folders[:] = sorted(name for name in folders if not name.endswith(".zarr"))
+        if not datasets:
+            raise ValueError(
+                f"No full deconvolved/deskewed OME-Zarr stores beneath {path}"
+            )
+        return datasets
 
     datasets = sorted(
         p
@@ -782,7 +800,7 @@ def export_projections(
     root_path: Annotated[
         Path,
         typer.Argument(
-            help="Acquisition root directory containing the deconvolved/deskewed OME-Zarr store."
+            help="Acquisition directory, or a parent directory with --batch."
         ),
     ],
     output: Annotated[
@@ -841,12 +859,19 @@ def export_projections(
             help="Render START STOP timepoints (zero-based, STOP exclusive). Default: all. Contrast stays fixed to dataset timepoint 0."
         ),
     ] = None,
+    batch: Annotated[
+        bool,
+        typer.Option(
+            "--batch",
+            help="Recursively export full decon_deskewed stores beneath ROOT_PATH. Combine with --video for movies.",
+        ),
+    ] = False,
 ) -> None:
     """Export annotated, physically scaled XY/XZ/YZ TIFFs for every timepoint.
 
     Parameters
     ----------
-    root_path : Annotated[Path, typer.Argument(help='Acquisition root directory containing the deconvolved/deskewed OME-Zarr store.')]
+    root_path : Annotated[Path, typer.Argument(help='Acquisition directory, or a parent directory with --batch.')]
         Acquisition or processed-output directory selected by the caller.
     output : Annotated[Path | None, typer.Option(help='Output root; defaults to projection_frames beside the stores.')]
         Directory or file receiving the generated images and figures.
@@ -870,13 +895,22 @@ def export_projections(
         Maximum number of concurrent timepoint reads and renders.
     timepoints : Annotated[tuple[int, int] | None, typer.Option(help='Render START STOP timepoints (zero-based, STOP exclusive). Default: all. Contrast stays fixed to dataset timepoint 0.')]
         Half-open timepoint range for export, or an iterator of scheduled indices.
+    batch : bool
+        Recursively export deconvolved/deskewed stores using the same options.
+        With --output, preserve each acquisition folder's relative path.
     """
-    datasets = find_datasets(root_path)
+    root_path = root_path.expanduser().resolve()
+    datasets = find_datasets(root_path, batch=batch)
 
-    for dataset in datasets:
+    for index, dataset in enumerate(datasets, 1):
+        if batch:
+            typer.echo(f"Batch projections {index}/{len(datasets)}: {dataset}")
+        destination = output or dataset.parent / "projection_frames"
+        if batch and output is not None:
+            destination = output / dataset.parent.relative_to(root_path)
         export_dataset(
             dataset,
-            output or dataset.parent / "projection_frames",
+            destination,
             acquisition_for(dataset, acquisition),
             scale_bar_um,
             video=video,
