@@ -1462,13 +1462,23 @@ def process(
             help="Confirmed hardware plane period in milliseconds for legacy acquisitions.",
         ),
     ] = None,
+    batch: Annotated[
+        bool,
+        typer.Option(
+            "--batch",
+            help="Recursively process raw acquisitions beneath ROOT_PATH with these options.",
+        ),
+    ] = False,
 ) -> None:
     """Process an OPM acquisition using its recorded scan and camera calibration.
 
     Parameters
     ----------
     root_path : pathlib.Path
-        Raw acquisition store, or its containing directory for live processing.
+        Raw acquisition store, its containing directory, or a batch parent directory.
+    batch : bool
+        Recursively process acquisition stores in sorted folder order. Output
+        paths preserve the source directory tree beneath --output when supplied.
     plane_period_ms : float or None
         Confirmed hardware trigger period for missing legacy timing metadata.
         Recorded periods cannot be overridden. Exposure is not used as a period.
@@ -1532,6 +1542,43 @@ def process(
         Processed images and durable checkpoints are written to the output
         directory.
     """
+    if batch:
+        options = locals().copy()
+        options["batch"] = False
+        parent = root_path.expanduser().resolve()
+        if not parent.is_dir() or parent.name.endswith(".zarr"):
+            raise typer.BadParameter(
+                "--batch requires a parent directory of acquisitions"
+            )
+        acquisitions = []
+        for directory, folders, _files in parent.walk():
+            stores = sorted(
+                directory / name for name in folders if name.endswith(".zarr")
+            )
+            # Never traverse pixel chunks or internal position groups.
+            folders[:] = sorted(name for name in folders if not name.endswith(".zarr"))
+            for store in stores:
+                if not (
+                    (store / "zarr.json").is_file() or (store / ".zattrs").is_file()
+                ):
+                    continue
+                if (store / ".zarray").is_file() and not (store / ".zgroup").is_file():
+                    continue
+                if "opm_v2" in open_group(store).attrs:
+                    acquisitions.append(store)
+        if not acquisitions:
+            raise typer.BadParameter(f"No raw OPM acquisitions found beneath {parent}")
+        for index, store in enumerate(acquisitions, 1):
+            typer.echo(f"Batch acquisition {index}/{len(acquisitions)}: {store}")
+            options["root_path"] = store
+            options["output"] = (
+                output / store.parent.relative_to(parent)
+                if output is not None
+                else None
+            )
+            process(**options)
+        return
+
     skip_empty_below, skip_empty_min_signal_fraction = validate_empty_tile_options(
         skip_empty_below,
         skip_empty_min_signal_fraction,

@@ -10,6 +10,17 @@ native planar acquisitions follow the planar processing path.
 uv run process "/path/to/acquisition" --deconvolve --flatfield-correction --output "/path/to/processed"
 ```
 
+To process acquisitions recursively beneath a parent folder, add `--batch`:
+
+```bash
+uv run process "/path/to/parent" --batch --deconvolve --flatfield-correction --resume
+```
+
+The same options apply to each acquisition in sorted folder order. Runs are
+sequential, and traversal skips Zarr contents and processed stores. With
+`--output`, the source folder tree is mirrored beneath the output directory;
+otherwise each acquisition uses its normal output location.
+
 Camera calibration runs before optional illumination correction and
 deconvolution. `--flatfield-correction` estimates or reuses illumination fields.
 For each channel, one BaSiC fit uses sampled tiles from every acquisition depth.
