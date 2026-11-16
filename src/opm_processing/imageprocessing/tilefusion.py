@@ -97,6 +97,7 @@ phase_cross_correlation: Any
 sobel_filter: Any
 shift_filter: Any
 minimum_filter: Any
+fft_correlate: Any
 
 xp: Any | None = None
 
@@ -111,12 +112,10 @@ try:
     from cucim.skimage.registration import (
         phase_cross_correlation as _pcc,  # type: ignore
     )
-    from cucim.skimage.registration._masked_phase_cross_correlation import (
-        cross_correlate_masked as masked_cross_correlation,
-    )
     from cupyx.scipy.ndimage import minimum_filter as _minimum_filter  # type: ignore
     from cupyx.scipy.ndimage import shift as _shift  # type: ignore
     from cupyx.scipy.ndimage import sobel as _sobel  # type: ignore
+    from cupyx.scipy.signal import correlate as _fft_correlate  # type: ignore
 
     cp = _cp
     xp = _cp
@@ -126,6 +125,7 @@ try:
     sobel_filter = _sobel
     shift_filter = _shift
     minimum_filter = _minimum_filter
+    fft_correlate = _fft_correlate
     ssim_cuda = _ssim_gpu
     USING_GPU = cp.cuda.runtime.getDeviceCount() > 0
 except Exception as error:
@@ -690,14 +690,6 @@ def _masked_registration_peak(
     array-like or None
         Nonperiodic displacement, or None when no informative peak exists.
     """
-    correlation = masked_cross_correlation(
-        fixed,
-        moving,
-        *masks,
-        mode="full",
-        axes=tuple(range(fixed.ndim)),
-        overlap_ratio=0.5,
-    )
     center = np.asarray(moving.shape) - 1
     extent = (
         center
@@ -709,7 +701,58 @@ def _masked_registration_peak(
         slice(int(lo), int(hi + 1))
         for lo, hi in zip(start, center + extent, strict=True)
     )
-    allowed = correlation[slices]
+    # Padfield's six moments do not need six simultaneous complex spectra.
+    # Public real-valued FFT correlation halves each spectrum, and evaluating
+    # the moments in sequence bounds the padded workspace within one pair.
+    fixed_mask, moving_mask = (mask.astype(xp.float32) for mask in masks)
+    fixed = xp.where(masks[0], fixed, xp.float32(0))
+    moving = xp.where(masks[1], moving, xp.float32(0))
+    eps = xp.finfo(fixed.dtype).eps
+
+    overlap = fft_correlate(fixed_mask, moving_mask, mode="full", method="fft")
+    xp.rint(overlap, out=overlap)
+    xp.maximum(overlap, eps, out=overlap)
+    maximum_overlap = float(xp.max(overlap))
+    allowed_overlap = overlap[slices].copy()
+
+    fixed_sum = fft_correlate(fixed, moving_mask, mode="full", method="fft")
+    allowed_fixed_sum = fixed_sum[slices].copy()
+    fixed_variance = fft_correlate(
+        xp.square(fixed), moving_mask, mode="full", method="fft"
+    )
+    xp.square(fixed_sum, out=fixed_sum)
+    fixed_sum /= overlap
+    fixed_variance -= fixed_sum
+    xp.maximum(fixed_variance, 0, out=fixed_variance)
+    del fixed_sum
+
+    moving_sum = fft_correlate(fixed_mask, moving, mode="full", method="fft")
+    allowed_moving_sum = moving_sum[slices].copy()
+    moving_variance = fft_correlate(
+        fixed_mask, xp.square(moving), mode="full", method="fft"
+    )
+    xp.square(moving_sum, out=moving_sum)
+    moving_sum /= overlap
+    moving_variance -= moving_sum
+    xp.maximum(moving_variance, 0, out=moving_variance)
+    del moving_sum, overlap, fixed_mask, moving_mask
+
+    # Preserve the upstream tolerance and overlap threshold over *all* lags,
+    # even though only physically permitted lags need a final NCC score.
+    fixed_variance *= moving_variance
+    xp.sqrt(fixed_variance, out=fixed_variance)
+    tolerance = 1e3 * eps * float(xp.max(fixed_variance))
+    denominator = fixed_variance[slices].copy()
+    del fixed_variance, moving_variance
+
+    cross_product = fft_correlate(fixed, moving, mode="full", method="fft")
+    numerator = cross_product[slices].copy()
+    del cross_product, fixed, moving
+    numerator -= allowed_fixed_sum * allowed_moving_sum / allowed_overlap
+    allowed = xp.zeros_like(numerator)
+    xp.divide(numerator, denominator, out=allowed, where=denominator > tolerance)
+    xp.clip(allowed, -1, 1, out=allowed)
+    allowed[allowed_overlap < 0.5 * maximum_overlap] = 0
     peak = xp.max(allowed)
     if not bool(xp.isfinite(peak)) or float(peak) <= 0:
         return None
