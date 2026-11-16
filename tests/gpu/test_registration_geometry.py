@@ -9,94 +9,11 @@ from opm_processing.imageprocessing.tilefusion import (
     TileFusion,
     _aligned_registration_views,
     _infer_registration_limits,
-    _masked_registration_peak,
     _refine_depth_candidate,
     _ssim,
 )
 
 pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("cupy_gpu")]
-
-
-@pytest.mark.parametrize("shape", [(31, 43), (11, 31, 43)])
-def test_masked_peak_matches_full_normalized_correlation(
-    cupy_gpu, aperiodic_registration_object, shape
-):
-    """Preserve bounded Padfield peaks and caller pixels with different supports."""
-    from skimage.registration._masked_phase_cross_correlation import (
-        cross_correlate_masked,
-    )
-
-    shift = np.array((1, -3, 4)[-len(shape) :])
-    field_shape = tuple(np.array(shape) + np.abs(shift))
-    truth = aperiodic_registration_object(
-        (1, *field_shape) if len(shape) == 2 else field_shape, seed=821
-    ).astype(np.float32)
-    if len(shape) == 2:
-        truth = truth[0]
-    fixed, moving = [
-        truth[
-            tuple(
-                slice(int(start), int(start + length))
-                for start, length in zip(starts, shape, strict=True)
-            )
-        ].copy()
-        for starts in (np.maximum(0, -shift), np.maximum(0, shift))
-    ]
-    masks = [np.ones(shape, bool), np.ones(shape, bool)]
-    masks[0][..., :3, :] = False
-    masks[1][..., -4:, :] = False
-    limits = np.abs(shift) + 2
-    reference = cross_correlate_masked(
-        fixed.copy(),
-        moving.copy(),
-        *masks,
-        mode="full",
-        axes=tuple(range(len(shape))),
-        overlap_ratio=0.5,
-    )
-    center = np.array(shape) - 1
-    allowed = tuple(
-        slice(int(lo), int(hi + 1))
-        for lo, hi in zip(center - limits, center + limits, strict=True)
-    )
-    expected = (
-        np.array(
-            np.unravel_index(np.argmax(reference[allowed]), reference[allowed].shape)
-        )
-        - limits
-    )
-    np.testing.assert_array_equal(expected, shift)
-    device_fixed, device_moving = map(cupy_gpu.asarray, (fixed, moving))
-    measured = _masked_registration_peak(
-        device_fixed, device_moving, tuple(map(cupy_gpu.asarray, masks)), limits
-    )
-    np.testing.assert_array_equal(cupy_gpu.asnumpy(measured), shift)
-    np.testing.assert_array_equal(cupy_gpu.asnumpy(device_fixed), fixed)
-    np.testing.assert_array_equal(cupy_gpu.asnumpy(device_moving), moving)
-
-
-def test_masked_peak_fits_bounded_gpu_workspace(
-    cupy_gpu, aperiodic_registration_object
-):
-    """Register a known overlap under a real 512-MiB CUDA allocation limit."""
-    field = aperiodic_registration_object((24, 384, 128), seed=822).astype(np.float32)
-    pool = cupy_gpu.get_default_memory_pool()
-    plans = cupy_gpu.fft.config.get_plan_cache()
-    plans.clear()
-    pool.free_all_blocks()
-    previous_limit = pool.get_limit()
-    pool.set_limit(size=min(previous_limit or 512 * 2**20, 512 * 2**20))
-    try:
-        fixed, moving = (cupy_gpu.asarray(field) for _ in range(2))
-        masks = tuple(cupy_gpu.ones(field.shape, bool) for _ in range(2))
-        measured = _masked_registration_peak(fixed, moving, masks, (3, 9, 7))
-        np.testing.assert_array_equal(cupy_gpu.asnumpy(measured), (0, 0, 0))
-        assert pool.total_bytes() <= 512 * 2**20
-        del fixed, moving, masks, measured
-    finally:
-        plans.clear()
-        pool.free_all_blocks()
-        pool.set_limit(size=previous_limit)
 
 
 @pytest.mark.parametrize("shape", [(17, 19), (7, 17, 19)])

@@ -97,7 +97,6 @@ phase_cross_correlation: Any
 sobel_filter: Any
 shift_filter: Any
 minimum_filter: Any
-next_gpu_fft_size: Any
 
 xp: Any | None = None
 
@@ -112,7 +111,6 @@ try:
     from cucim.skimage.registration import (
         phase_cross_correlation as _pcc,  # type: ignore
     )
-    from cupyx.scipy.fft import next_fast_len as _next_gpu_fft_size  # type: ignore
     from cupyx.scipy.ndimage import minimum_filter as _minimum_filter  # type: ignore
     from cupyx.scipy.ndimage import shift as _shift  # type: ignore
     from cupyx.scipy.ndimage import sobel as _sobel  # type: ignore
@@ -125,7 +123,6 @@ try:
     sobel_filter = _sobel
     shift_filter = _shift
     minimum_filter = _minimum_filter
-    next_gpu_fft_size = _next_gpu_fft_size
     ssim_cuda = _ssim_gpu
     USING_GPU = cp.cuda.runtime.getDeviceCount() > 0
 except Exception as error:
@@ -659,128 +656,6 @@ def _bounded_phase_correlation_peak(
     return xp.asarray(
         [signed_coordinates[axis][index] for axis, index in enumerate(peak_index)],
         dtype=xp.float32,
-    )
-
-
-def _masked_registration_peak(
-    fixed: Any,
-    moving: Any,
-    masks: tuple[Any, Any],
-    max_shift: Sequence[float] | None,
-) -> Any:
-    """Find the nonperiodic normalized-correlation peak within physical limits.
-
-    The masks describe acquisition support. Padfield normalization subtracts
-    means and computes variance on each translation's common supported samples.
-    Search the allowed lags rather than discard an out-of-range global maximum.
-
-    Parameters
-    ----------
-    fixed : array-like
-        Reference intensity patch.
-    moving : array-like
-        Moving patch on the same grid.
-    masks : tuple of array-like
-        Reference and moving support masks.
-    max_shift : sequence of float or None
-        Maximum permitted correction on each patch axis.
-
-    Returns
-    -------
-    array-like or None
-        Nonperiodic displacement, or None when no informative peak exists.
-    """
-    center = np.asarray(moving.shape) - 1
-    extent = (
-        center
-        if max_shift is None
-        else np.minimum(center, np.floor(max_shift).astype(int))
-    )
-    start = center - extent
-    slices = tuple(
-        slice(int(lo), int(hi + 1))
-        for lo, hi in zip(start, center + extent, strict=True)
-    )
-    full_shape = tuple(
-        a + b - 1 for a, b in zip(fixed.shape, moving.shape, strict=True)
-    )
-    fft_shape = tuple(next_gpu_fft_size(length, real=True) for length in full_shape)
-    full_slices = tuple(slice(0, length) for length in full_shape)
-    reverse = (slice(None, None, -1),) * fixed.ndim
-
-    def correlate(a: Any, b: Any) -> Any:
-        """Evaluate a real FFT correlation without loading experimental signal APIs.
-
-        Parameters
-        ----------
-        a, b : array-like
-            Real-valued fields on the fixed and moving grids.
-
-        Returns
-        -------
-        array-like
-            Full linear correlation in ascending lag order.
-        """
-        spectrum = xp.fft.rfftn(a, s=fft_shape)
-        moving_spectrum = xp.fft.rfftn(b[reverse], s=fft_shape)
-        spectrum *= moving_spectrum
-        del moving_spectrum
-        return xp.fft.irfftn(spectrum, s=fft_shape)[full_slices]
-
-    # Padfield's six moments do not need six simultaneous complex spectra.
-    # Real-valued FFT correlation halves each spectrum, and evaluating the
-    # moments in sequence bounds the padded workspace within one pair.
-    fixed_mask, moving_mask = (mask.astype(xp.float32) for mask in masks)
-    fixed = xp.where(masks[0], fixed, xp.float32(0))
-    moving = xp.where(masks[1], moving, xp.float32(0))
-    eps = xp.finfo(fixed.dtype).eps
-
-    overlap = correlate(fixed_mask, moving_mask)
-    xp.rint(overlap, out=overlap)
-    xp.maximum(overlap, eps, out=overlap)
-    maximum_overlap = float(xp.max(overlap))
-    allowed_overlap = overlap[slices].copy()
-
-    fixed_sum = correlate(fixed, moving_mask)
-    allowed_fixed_sum = fixed_sum[slices].copy()
-    fixed_variance = correlate(xp.square(fixed), moving_mask)
-    xp.square(fixed_sum, out=fixed_sum)
-    fixed_sum /= overlap
-    fixed_variance -= fixed_sum
-    xp.maximum(fixed_variance, 0, out=fixed_variance)
-    del fixed_sum
-
-    moving_sum = correlate(fixed_mask, moving)
-    allowed_moving_sum = moving_sum[slices].copy()
-    moving_variance = correlate(fixed_mask, xp.square(moving))
-    xp.square(moving_sum, out=moving_sum)
-    moving_sum /= overlap
-    moving_variance -= moving_sum
-    xp.maximum(moving_variance, 0, out=moving_variance)
-    del moving_sum, overlap, fixed_mask, moving_mask
-
-    # Preserve the upstream tolerance and overlap threshold over *all* lags,
-    # even though only physically permitted lags need a final NCC score.
-    fixed_variance *= moving_variance
-    xp.sqrt(fixed_variance, out=fixed_variance)
-    tolerance = 1e3 * eps * float(xp.max(fixed_variance))
-    denominator = fixed_variance[slices].copy()
-    del fixed_variance, moving_variance
-
-    cross_product = correlate(fixed, moving)
-    numerator = cross_product[slices].copy()
-    del cross_product, fixed, moving
-    numerator -= allowed_fixed_sum * allowed_moving_sum / allowed_overlap
-    allowed = xp.zeros_like(numerator)
-    xp.divide(numerator, denominator, out=allowed, where=denominator > tolerance)
-    xp.clip(allowed, -1, 1, out=allowed)
-    allowed[allowed_overlap < 0.5 * maximum_overlap] = 0
-    peak = xp.max(allowed)
-    if not bool(xp.isfinite(peak)) or float(peak) <= 0:
-        return None
-    maxima = xp.stack(xp.nonzero(allowed == peak), axis=1)
-    return xp.mean(maxima, axis=0).astype(xp.float32) - xp.asarray(
-        extent, dtype=xp.float32
     )
 
 
@@ -2563,33 +2438,6 @@ class TileFusion:
             score = -math.inf
 
         if masks is not None and registration_axis is not None:
-            # Periodic phase peaks can align crop edges instead of anatomy.
-            # Padfield's nonperiodic normalized correlation uses the known
-            # acquisition support for both centering and normalization. Keep
-            # original intensities for that calculation, and use the same SSIM
-            # gate as the other proposals. Thin/ambiguous Z still goes through
-            # the contextual axial-contrast checks in the caller.
-            tolerance = 4 * xp.finfo(xp.float32).eps
-            valid_masks = tuple(mask >= 1 - tolerance for mask in masks)
-            if all(bool(xp.any(mask)) for mask in valid_masks):
-                masked_shift = _masked_registration_peak(
-                    arr1,
-                    unmodified_moving,
-                    valid_masks,
-                    max_shift,
-                )
-                if (
-                    masked_shift is not None
-                    and bool(xp.all(xp.isfinite(masked_shift)))
-                    and (
-                        max_shift is None
-                        or bool(xp.all(xp.abs(masked_shift) <= limits))
-                    )
-                ):
-                    masked_score = score_shift(masked_shift)
-                    if masked_score > score:
-                        shift_apply, score = masked_shift, masked_score
-
             if shift_apply is not None:
                 # Nominal stage placement is also a physically valid candidate.
                 # Do not manufacture a correction when a measured proposal
@@ -4025,7 +3873,7 @@ class TileFusion:
             "overlap_roi": "depth-context-lateral-fallback-axial-contrast-refinement-v4",
             "downsample": ("upstream-block-reduce-with-adaptive-zyx-ssim-support-v2"),
             "phase_registration": (
-                "phase-original-intensities-periodic-aliases-upstream-normalization-v13"
+                "upstream-phase-edge-without-full-masked-correlation-v14"
             ),
             "score": ("retained-full-resolution-grid-ssim-supported-window-v8"),
             "downsample_factors_zyx": list(self.downsample_factors),
