@@ -58,6 +58,11 @@ jobs:
           python -m pip install --no-deps --editable .
           python -m pip install --no-deps "opm-v2 @ git+https://github.com/QI2lab/opm-v2@ae059d962835520bf2c1b37edbb335bf5e617b23"
 
+      - name: Require working CUDA registration backend
+        if: contains(inputs.profile, 'gpu')
+        run: >-
+          python -c "from opm_processing.imageprocessing.tilefusion import require_gpu_backend; require_gpu_backend()"
+
       - name: CPU science cases
         if: inputs.profile == 'cpu-science'
         run: >-

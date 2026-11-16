@@ -797,53 +797,6 @@ def _refine_depth_candidate(
     return best, _registration_similarity(fixed, matched, best, win_size, masks, 0)
 
 
-class _RegistrationDeviceBuffers:
-    """Grow-only reusable CuPy staging buffers for a registration pair."""
-
-    def __init__(self, cupy_module: Any) -> None:
-        """Create reusable GPU registration transfer buffers.
-
-        Parameters
-        ----------
-        cupy_module : Any
-            Initialized CuPy module used for allocation and asynchronous host transfers.
-        """
-        self._cupy = cupy_module
-        self._buffers: list[Any | None] = [None, None]
-        self._dtypes: list[np.dtype[Any] | None] = [None, None]
-
-    def _stage_one(self, index: int, host: np.ndarray) -> Any:
-        """Copy an overlap patch into one reusable GPU staging buffer.
-
-        Parameters
-        ----------
-        index : int
-            Tile or registration-link index used by this calculation.
-        host : np.ndarray
-            Host overlap patch copied into the staging buffer.
-
-        Returns
-        -------
-        Any
-            Device overlap array populated by the host transfer.
-        """
-        contiguous = np.ascontiguousarray(host)
-        dtype = contiguous.dtype
-        required = int(contiguous.size)
-        buffer = self._buffers[index]
-        if (
-            buffer is None
-            or self._dtypes[index] != dtype
-            or int(buffer.size) < required
-        ):
-            buffer = self._cupy.empty(required, dtype=dtype)
-            self._buffers[index] = buffer
-            self._dtypes[index] = dtype
-        view = buffer[:required].reshape(contiguous.shape)
-        view.set(contiguous)
-        return view
-
-
 @njit(nogil=True)
 def _accumulate_tile_block(
     fused: np.ndarray,
@@ -2703,9 +2656,170 @@ class TileFusion:
             df_zyx_base = (1, df_zyx_base[1], df_zyx_base[2])
         available_host_bytes = int(psutil.virtual_memory().available)
         read_workers = min(4, max(1, self._max_workers))
-        device_buffers = _RegistrationDeviceBuffers(cp)
+        # Deconvolution and earlier pairs may have cached large FFT workspaces.
+        fft_plan_cache = cp.fft.config.get_plan_cache()
+        fft_plan_cache.clear()
+        cp.get_default_memory_pool().free_all_blocks()
+        cp.get_default_pinned_memory_pool().free_all_blocks()
         tile_groups = self._tiles_by_time
         all_tile_shapes = self._tile_shapes
+
+        def register_pair(
+            spec: tuple[Any, ...],
+            patch_i: np.ndarray,
+            patch_j: np.ndarray,
+            max_shift: tuple[int, int, int],
+        ) -> tuple[Sequence[float], float]:
+            """Upload, downsample and measure one pair with local GPU arrays.
+
+            Parameters
+            ----------
+            spec : tuple
+                Pair geometry, sampling, and optional axial context.
+            patch_i, patch_j : numpy.ndarray
+                Full-resolution host overlaps read at the pair bounds.
+            max_shift : tuple[int, int, int]
+                Maximum full-resolution correction for this pair.
+
+            Returns
+            -------
+            tuple
+                Sampled ZYX correction and its structural similarity.
+            """
+            (
+                _i_pos,
+                _j_pos,
+                i,
+                j,
+                bounds_i,
+                bounds_j,
+                df_zyx_eff,
+                thin_z_overlap,
+                registration_axis,
+                _pair_bytes,
+                context_z,
+            ) = spec
+            reduce_block = df_zyx_eff
+            if self._is_2d:
+                patch_i = np.asarray(patch_i)[0, 0]
+                patch_j = np.asarray(patch_j)[0, 0]
+                reduce_block = df_zyx_eff[1:]
+            # Upload only this pair's overlaps. Let the full-resolution inputs
+            # leave scope as soon as their GPU reductions finish.
+            g1 = block_reduce(
+                xp.asarray(patch_i), block_size=reduce_block, func=xp.mean
+            )
+            g2 = block_reduce(
+                xp.asarray(patch_j), block_size=reduce_block, func=xp.mean
+            )
+            support_masks = []
+            for tile, bounds in ((i, bounds_i), (j, bounds_j)):
+                support = (
+                    self._tile_support_zy[tile][slice(*bounds[0]), slice(*bounds[1])]
+                    > 0
+                )
+                support = block_reduce(
+                    xp.asarray(support),
+                    block_size=df_zyx_eff[:2],
+                    func=xp.min,
+                )
+                if self._is_2d:
+                    support = support[0]
+                support = xp.broadcast_to(support[..., None], g1.shape).copy()
+                if (bounds[2][1] - bounds[2][0]) % df_zyx_eff[2]:
+                    support[..., -1] = False
+                support_masks.append(support)
+
+            self._registration_pair_sampling[i, j] = df_zyx_eff
+            if self._is_2d:
+                max_shift_ds = (
+                    max_shift[1] / df_zyx_eff[1],
+                    max_shift[2] / df_zyx_eff[2],
+                )
+            else:
+                max_shift_ds = tuple(
+                    limit / factor
+                    for limit, factor in zip(max_shift, df_zyx_eff, strict=False)
+                )
+            legacy_g1, legacy_g2 = g1, g2
+            legacy_masks = tuple(support_masks)
+            if context_z is not None:
+                legacy_g1, legacy_g2 = _aligned_registration_views(
+                    g1, g2, (context_z, 0, 0)
+                )
+                legacy_masks = _aligned_registration_views(
+                    *legacy_masks, (context_z, 0, 0)
+                )
+            shift_ds, score = self.register_and_score(
+                legacy_g1,
+                legacy_g2,
+                win_size=sw,
+                max_shift=max_shift_ds,
+                allow_bounded_peak=not thin_z_overlap,
+                registration_axis=registration_axis,
+                support_masks=legacy_masks,
+                shift_sampling=(df_zyx_eff[1:] if self._is_2d else df_zyx_eff),
+            )
+            if context_z is not None:
+                lateral_allowed = all(
+                    abs(value) <= limit
+                    for value, limit in zip(shift_ds[1:], max_shift_ds[1:], strict=True)
+                )
+                refined = xp.asarray((context_z + shift_ds[0], *shift_ds[1:]))
+                if lateral_allowed:
+                    refined, score = _refine_depth_candidate(
+                        g1,
+                        g2,
+                        tuple(support_masks),
+                        context_z,
+                        shift_ds[1:],
+                        int(max_shift_ds[0]),
+                        sw,
+                    )
+                if not lateral_allowed or score < th:
+                    # A large depth error can leave too little matching
+                    # anatomy in the nominal crop to seed XY reliably.
+                    # Try the same phase estimator on the wider context.
+                    context_seed, _ = self.register_and_score(
+                        g1,
+                        g2,
+                        win_size=sw,
+                        # Contextual Z includes the nominal slab
+                        # displacement. Lateral limits remain correction
+                        # limits and must also guide periodic unwrapping.
+                        max_shift=(
+                            g1.shape[0] - 1,
+                            *max_shift_ds[1:],
+                        ),
+                        allow_bounded_peak=False,
+                        registration_axis=0,
+                        support_masks=tuple(support_masks),
+                        shift_sampling=df_zyx_eff,
+                    )
+                    if all(
+                        abs(value) <= limit
+                        for value, limit in zip(
+                            context_seed[1:], max_shift_ds[1:], strict=True
+                        )
+                    ):
+                        alternative, alternative_score = _refine_depth_candidate(
+                            g1,
+                            g2,
+                            tuple(support_masks),
+                            context_z,
+                            context_seed[1:],
+                            int(max_shift_ds[0]),
+                            sw,
+                        )
+                        if math.isfinite(alternative_score) and (
+                            not lateral_allowed or alternative_score > score
+                        ):
+                            refined, score = alternative, alternative_score
+                refined = cp.asnumpy(refined)
+                refined = np.asarray(refined, dtype=np.float64)
+                refined[0] -= context_z
+                shift_ds = refined
+            return shift_ds, score
 
         with ThreadPoolExecutor(max_workers=read_workers) as executor:
             for t, tile_indices in enumerate(tile_groups):
@@ -2950,143 +3064,19 @@ class TileFusion:
                     patch_i = future_i.result()
                     patch_j = future_j.result()
 
-                    if self._is_2d:
-                        patch_i = np.asarray(patch_i)[0, 0]
-                        patch_j = np.asarray(patch_j)[0, 0]
-                        reduce_block = df_zyx_eff[1:]
-                    else:
-                        reduce_block = df_zyx_eff
-                    staged_i = device_buffers._stage_one(0, np.asarray(patch_i))
-                    staged_j = device_buffers._stage_one(1, np.asarray(patch_j))
-                    g1 = block_reduce(
-                        staged_i,
-                        block_size=reduce_block,
-                        func=xp.mean,
-                    )
-                    g2 = block_reduce(
-                        staged_j,
-                        block_size=reduce_block,
-                        func=xp.mean,
-                    )
-                    support_masks = []
-                    for tile, bounds in ((i, bounds_i), (j, bounds_j)):
-                        support = (
-                            self._tile_support_zy[tile][
-                                slice(*bounds[0]), slice(*bounds[1])
-                            ]
-                            > 0
-                        )
-                        support = block_reduce(
-                            xp.asarray(support),
-                            block_size=df_zyx_eff[:2],
-                            func=xp.min,
-                        )
-                        if self._is_2d:
-                            support = support[0]
-                        support = xp.broadcast_to(support[..., None], g1.shape).copy()
-                        if (bounds[2][1] - bounds[2][0]) % df_zyx_eff[2]:
-                            support[..., -1] = False
-                        support_masks.append(support)
-
                     max_shift = self._pair_registration_limits.get(
-                        (i, j),
-                        self._initial_registration_shift_zyx,
+                        (i, j), self._initial_registration_shift_zyx
                     )
-                    self._registration_pair_sampling[i, j] = df_zyx_eff
-                    if self._is_2d:
-                        max_shift_ds = (
-                            max_shift[1] / df_zyx_eff[1],
-                            max_shift[2] / df_zyx_eff[2],
+                    try:
+                        shift_ds, score = register_pair(
+                            spec, patch_i, patch_j, max_shift
                         )
-                    else:
-                        max_shift_ds = tuple(
-                            limit / factor
-                            for limit, factor in zip(
-                                max_shift, df_zyx_eff, strict=False
-                            )
-                        )
-                    legacy_g1, legacy_g2 = g1, g2
-                    legacy_masks = tuple(support_masks)
-                    if context_z is not None:
-                        legacy_g1, legacy_g2 = _aligned_registration_views(
-                            g1, g2, (context_z, 0, 0)
-                        )
-                        legacy_masks = _aligned_registration_views(
-                            *legacy_masks, (context_z, 0, 0)
-                        )
-                    shift_ds, score = self.register_and_score(
-                        legacy_g1,
-                        legacy_g2,
-                        win_size=sw,
-                        max_shift=max_shift_ds,
-                        allow_bounded_peak=not thin_z_overlap,
-                        registration_axis=registration_axis,
-                        support_masks=legacy_masks,
-                        shift_sampling=(df_zyx_eff[1:] if self._is_2d else df_zyx_eff),
-                    )
-                    if context_z is not None:
-                        lateral_allowed = all(
-                            abs(value) <= limit
-                            for value, limit in zip(
-                                shift_ds[1:], max_shift_ds[1:], strict=True
-                            )
-                        )
-                        refined = xp.asarray((context_z + shift_ds[0], *shift_ds[1:]))
-                        if lateral_allowed:
-                            refined, score = _refine_depth_candidate(
-                                g1,
-                                g2,
-                                tuple(support_masks),
-                                context_z,
-                                shift_ds[1:],
-                                int(max_shift_ds[0]),
-                                sw,
-                            )
-                        if not lateral_allowed or score < th:
-                            # A large depth error can leave too little matching
-                            # anatomy in the nominal crop to seed XY reliably.
-                            # Try the same phase estimator on the wider context.
-                            context_seed, _ = self.register_and_score(
-                                g1,
-                                g2,
-                                win_size=sw,
-                                # Contextual Z includes the nominal slab
-                                # displacement. Lateral limits remain correction
-                                # limits and must also guide periodic unwrapping.
-                                max_shift=(
-                                    g1.shape[0] - 1,
-                                    *max_shift_ds[1:],
-                                ),
-                                allow_bounded_peak=False,
-                                registration_axis=0,
-                                support_masks=tuple(support_masks),
-                                shift_sampling=df_zyx_eff,
-                            )
-                            if all(
-                                abs(value) <= limit
-                                for value, limit in zip(
-                                    context_seed[1:], max_shift_ds[1:], strict=True
-                                )
-                            ):
-                                alternative, alternative_score = (
-                                    _refine_depth_candidate(
-                                        g1,
-                                        g2,
-                                        tuple(support_masks),
-                                        context_z,
-                                        context_seed[1:],
-                                        int(max_shift_ds[0]),
-                                        sw,
-                                    )
-                                )
-                                if math.isfinite(alternative_score) and (
-                                    not lateral_allowed or alternative_score > score
-                                ):
-                                    refined, score = alternative, alternative_score
-                        refined = cp.asnumpy(refined)
-                        refined = np.asarray(refined, dtype=np.float64)
-                        refined[0] -= context_z
-                        shift_ds = refined
+                    finally:
+                        # Pair arrays have left scope before releasing FFT plans
+                        # and allocator scratch, including failed measurements.
+                        fft_plan_cache.clear()
+                        cp.get_default_memory_pool().free_all_blocks()
+                        cp.get_default_pinned_memory_pool().free_all_blocks()
                     progress.update()
                     shift_ds_array = np.asarray(shift_ds, dtype=np.float64)
                     if not math.isfinite(score) or not np.all(
