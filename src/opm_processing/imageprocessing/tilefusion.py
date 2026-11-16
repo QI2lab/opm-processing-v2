@@ -97,7 +97,7 @@ phase_cross_correlation: Any
 sobel_filter: Any
 shift_filter: Any
 minimum_filter: Any
-fft_correlate: Any
+next_gpu_fft_size: Any
 
 xp: Any | None = None
 
@@ -112,10 +112,10 @@ try:
     from cucim.skimage.registration import (
         phase_cross_correlation as _pcc,  # type: ignore
     )
+    from cupyx.scipy.fft import next_fast_len as _next_gpu_fft_size  # type: ignore
     from cupyx.scipy.ndimage import minimum_filter as _minimum_filter  # type: ignore
     from cupyx.scipy.ndimage import shift as _shift  # type: ignore
     from cupyx.scipy.ndimage import sobel as _sobel  # type: ignore
-    from cupyx.scipy.signal import correlate as _fft_correlate  # type: ignore
 
     cp = _cp
     xp = _cp
@@ -125,7 +125,7 @@ try:
     sobel_filter = _sobel
     shift_filter = _shift
     minimum_filter = _minimum_filter
-    fft_correlate = _fft_correlate
+    next_gpu_fft_size = _next_gpu_fft_size
     ssim_cuda = _ssim_gpu
     USING_GPU = cp.cuda.runtime.getDeviceCount() > 0
 except Exception as error:
@@ -701,36 +701,58 @@ def _masked_registration_peak(
         slice(int(lo), int(hi + 1))
         for lo, hi in zip(start, center + extent, strict=True)
     )
+    full_shape = tuple(
+        a + b - 1 for a, b in zip(fixed.shape, moving.shape, strict=True)
+    )
+    fft_shape = tuple(next_gpu_fft_size(length, real=True) for length in full_shape)
+    full_slices = tuple(slice(0, length) for length in full_shape)
+    reverse = (slice(None, None, -1),) * fixed.ndim
+
+    def correlate(a: Any, b: Any) -> Any:
+        """Evaluate a real FFT correlation without loading experimental signal APIs.
+
+        Parameters
+        ----------
+        a, b : array-like
+            Real-valued fields on the fixed and moving grids.
+
+        Returns
+        -------
+        array-like
+            Full linear correlation in ascending lag order.
+        """
+        spectrum = xp.fft.rfftn(a, s=fft_shape)
+        moving_spectrum = xp.fft.rfftn(b[reverse], s=fft_shape)
+        spectrum *= moving_spectrum
+        del moving_spectrum
+        return xp.fft.irfftn(spectrum, s=fft_shape)[full_slices]
+
     # Padfield's six moments do not need six simultaneous complex spectra.
-    # Public real-valued FFT correlation halves each spectrum, and evaluating
-    # the moments in sequence bounds the padded workspace within one pair.
+    # Real-valued FFT correlation halves each spectrum, and evaluating the
+    # moments in sequence bounds the padded workspace within one pair.
     fixed_mask, moving_mask = (mask.astype(xp.float32) for mask in masks)
     fixed = xp.where(masks[0], fixed, xp.float32(0))
     moving = xp.where(masks[1], moving, xp.float32(0))
     eps = xp.finfo(fixed.dtype).eps
 
-    overlap = fft_correlate(fixed_mask, moving_mask, mode="full", method="fft")
+    overlap = correlate(fixed_mask, moving_mask)
     xp.rint(overlap, out=overlap)
     xp.maximum(overlap, eps, out=overlap)
     maximum_overlap = float(xp.max(overlap))
     allowed_overlap = overlap[slices].copy()
 
-    fixed_sum = fft_correlate(fixed, moving_mask, mode="full", method="fft")
+    fixed_sum = correlate(fixed, moving_mask)
     allowed_fixed_sum = fixed_sum[slices].copy()
-    fixed_variance = fft_correlate(
-        xp.square(fixed), moving_mask, mode="full", method="fft"
-    )
+    fixed_variance = correlate(xp.square(fixed), moving_mask)
     xp.square(fixed_sum, out=fixed_sum)
     fixed_sum /= overlap
     fixed_variance -= fixed_sum
     xp.maximum(fixed_variance, 0, out=fixed_variance)
     del fixed_sum
 
-    moving_sum = fft_correlate(fixed_mask, moving, mode="full", method="fft")
+    moving_sum = correlate(fixed_mask, moving)
     allowed_moving_sum = moving_sum[slices].copy()
-    moving_variance = fft_correlate(
-        fixed_mask, xp.square(moving), mode="full", method="fft"
-    )
+    moving_variance = correlate(fixed_mask, xp.square(moving))
     xp.square(moving_sum, out=moving_sum)
     moving_sum /= overlap
     moving_variance -= moving_sum
@@ -745,7 +767,7 @@ def _masked_registration_peak(
     denominator = fixed_variance[slices].copy()
     del fixed_variance, moving_variance
 
-    cross_product = fft_correlate(fixed, moving, mode="full", method="fft")
+    cross_product = correlate(fixed, moving)
     numerator = cross_product[slices].copy()
     del cross_product, fixed, moving
     numerator -= allowed_fixed_sum * allowed_moving_sum / allowed_overlap
