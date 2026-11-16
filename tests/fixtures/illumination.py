@@ -262,8 +262,8 @@ def illumination_observations(
         fields /= fields.mean(axis=(1, 2), keepdims=True)
         fields = np.broadcast_to(fields[None], (positions, channels, height, width))
     else:
-        fields = np.stack((1 + 0.25 * x + 0.1 * y, 1 - 0.2 * x + 0.15 * y))
-        fields = np.repeat(fields[:, None], channels, axis=1)
+        field = 1 + 0.25 * x + 0.1 * y
+        fields = np.broadcast_to(field, (positions, channels, height, width))
         detector_x = None
     microscope = microscope_parameters
     camera = microscope.camera
@@ -299,7 +299,7 @@ def illumination_observations(
     envelopes = [None] * channels
     for channel in range(channels):
         if eligible[:, channel].any():
-            expected[channel] = fields[eligible[:, channel], channel].max(axis=0)
+            expected[channel] = fields[eligible[:, channel], channel][0]
         for position in range(positions):
             # Form and digitize one real camera view before retaining its bytes
             # on disk. The full acquisition still reaches the opm-v2 writer.

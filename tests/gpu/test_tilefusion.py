@@ -1,11 +1,86 @@
 """GPU registration of physical tile overlaps and stored acquisition workflows."""
 
+import weakref
+
 import numpy as np
 import pytest
 
 from opm_processing.imageprocessing import tilefusion as tilefusion_module
 
 pytestmark = [pytest.mark.unit, pytest.mark.usefixtures("cupy_gpu")]
+
+
+@pytest.mark.parametrize("planar", [False, True])
+@pytest.mark.parametrize("blank", [False, True])
+def test_registration_releases_each_pairs_gpu_arrays_and_fft_workspace(
+    cupy_gpu,
+    registration_pair,
+    aperiodic_registration_object,
+    monkeypatch,
+    planar,
+    blank,
+):
+    """Release accepted and rejected pairs before processing the next overlap."""
+    shape = (1 if planar else 19, 71, 145)
+    truth = aperiodic_registration_object(shape, seed=482).astype(np.float32)
+    volumes = [
+        truth[..., start:stop].copy() for start, stop in ((0, 65), (40, 110), (80, 145))
+    ]
+    if blank:
+        volumes[1].fill(0)
+    fusion = registration_pair(
+        volumes,
+        [(0, 0, x) for x in (0, 40, 80)],
+        spacing=(1, 1, 1),
+        sampling=(3, 2, 2),
+        ssim_window=3,
+        max_registration_shift_zyx=(0 if planar else 3, 6, 6),
+    )
+    pool = cupy_gpu.get_default_memory_pool()
+    plans = cupy_gpu.fft.config.get_plan_cache()
+    plans.clear()
+    pool.free_all_blocks()
+    # Cleanup must preserve GPU arrays owned by the caller.
+    sentinel = cupy_gpu.arange(17, dtype=cupy_gpu.float32)
+    baseline = pool.used_bytes()
+    pair_arrays = []
+    reductions = 0
+    reduce = tilefusion_module.block_reduce
+
+    def observe_reduce(image, *args, **kwargs):
+        """Observe the real GPU reductions without retaining their allocations."""
+        nonlocal reductions
+        assert isinstance(image, cupy_gpu.ndarray)
+        if kwargs.get("func") is cupy_gpu.mean:
+            overlap_shape = (shape[0], shape[1], 25 if reductions < 2 else 30)
+            assert image.shape == (overlap_shape[1:] if planar else overlap_shape)
+            if reductions % 2 == 0:
+                assert all(reference() is None for reference in pair_arrays), (
+                    "Previous registration overlap is still on the GPU"
+                )
+                assert plans.get_curr_size() == 0
+                assert pool.free_bytes() == 0
+            result = reduce(image, *args, **kwargs)
+            pair_arrays.extend((weakref.ref(image), weakref.ref(result)))
+            reductions += 1
+            return result
+        return reduce(image, *args, **kwargs)
+
+    monkeypatch.setattr(tilefusion_module, "block_reduce", observe_reduce)
+    fusion.refine_tile_positions_with_cross_correlation()
+    assert reductions == 4  # Two differently shaped physical overlaps.
+    assert all(reference() is None for reference in pair_arrays)
+    assert plans.get_curr_size() == 0
+    assert pool.used_bytes() == baseline
+    assert pool.total_bytes() == baseline
+    np.testing.assert_array_equal(cupy_gpu.asnumpy(sentinel), np.arange(17))
+    if blank:
+        assert fusion.pairwise_metrics == {}
+    else:
+        assert set(fusion.pairwise_metrics) == {(0, 1), (1, 2)}
+        for metric in fusion.pairwise_metrics.values():
+            np.testing.assert_array_equal(metric[:3], (0, 0, 0))
+            assert metric[3] == pytest.approx(1)
 
 
 @pytest.mark.parametrize("half_width", [1, 3, 5])

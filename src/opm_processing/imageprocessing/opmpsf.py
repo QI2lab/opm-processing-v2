@@ -496,8 +496,7 @@ def generate_skewed_psf(
         raise ValueError("grid_oversampling must be a positive integer")
     samples = int(samples)
     x, y, _ = get_skewed_coords(roi_skewed_size, dc, dstage, theta)
-    center = camera_grid_center(roi_skewed_size, dc, dstage, theta_deg)
-    x, y = x - center[2], y - center[1]
+    x, y = x - x.mean(), y - y.mean()
     dxy = dc * np.cos(theta) / samples
     dz = dc * np.sin(theta) / samples
     # Cover the complete pixel footprints, with one Z guard plane on each side.

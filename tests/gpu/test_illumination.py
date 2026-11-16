@@ -28,7 +28,7 @@ pytestmark = pytest.mark.usefixtures("torch_gpu")
 def test_fit_samples_preserve_calibration_and_depth_groups(
     illumination_fit_case, topology, decision
 ):
-    """Keep time-zero photon units and odd detector dimensions through fit preparation."""
+    """Keep time-zero camera units and every selected depth in one fit per channel."""
     case = illumination_fit_case
     mask = None
     selected = np.arange(len(case.levels))
@@ -49,9 +49,8 @@ def test_fit_samples_preserve_calibration_and_depth_groups(
     )
     expected_levels = [
         np.median(case.levels[selected, channel], axis=1)
-        if topology == "tiles"
-        else case.levels[position, channel]
-        for position in (selected if topology == "depths" else (0,))
+        if len(selected) > 1
+        else case.levels[selected[0], channel]
         for channel in range(2)
     ]
     for images, levels in zip(case.calls, expected_levels, strict=True):
@@ -67,7 +66,7 @@ def test_fit_samples_preserve_calibration_and_depth_groups(
 
 @pytest.mark.unit
 @pytest.mark.parametrize(
-    "illumination_observations", ("maximum", "masked", "tiles"), indirect=True
+    "illumination_observations", ("depths", "masked", "tiles"), indirect=True
 )
 def test_real_estimator_predicts_known_detector_illumination(illumination_observations):
     """Estimate identifiable fields within a predefined absolute camera accuracy target."""

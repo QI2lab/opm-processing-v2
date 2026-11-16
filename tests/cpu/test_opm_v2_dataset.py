@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from opm_processing.dataio.position_collection import (
+    create_position_collection,
     open_image_array,
     open_position_collection,
 )
@@ -16,6 +17,66 @@ from opm_processing.process import format_processed_output
 from tests.simulation.camera import digitize
 
 pytestmark = pytest.mark.integration
+
+
+@pytest.mark.parametrize("separate_output", [False, True])
+def test_batch_processes_nested_acquisitions_with_shared_options(
+    opm_v2_projection_zarr,
+    opm_v2_acquisition_factory,
+    tmp_path,
+    invoke_cli,
+    separate_output,
+):
+    """Process writer-backed acquisitions recursively, preserving options and folders."""
+    first = opm_v2_projection_zarr
+    second = opm_v2_acquisition_factory(
+        first.raw_data, name="second", mode="projection"
+    )
+    parent = tmp_path / "batch"
+    sources = []
+    for dataset, relative in zip(
+        (first, second), ("first", "second/nested"), strict=True
+    ):
+        directory = parent / relative
+        directory.mkdir(parents=True)
+        sources.append(dataset.path.rename(directory / "raw.ome.zarr"))
+    create_position_collection(
+        parent / "second" / "unrelated_fused.ome.zarr",
+        (1, 1, 1, 1, 4, 4),
+        (1, 1, 1),
+    )
+    destination = tmp_path / "processed" if separate_output else None
+    # A second invocation exercises discovery beside completed processed stores.
+    for _ in range(2):
+        invoke_cli(
+            "process",
+            parent,
+            batch=True,
+            output=destination,
+            resume=True,
+            save_float32=True,
+            time_range=(1, 2),
+        )
+    expected = camera_correct(
+        first.raw_data[1, 0, :, 0],
+        first.metadata.camera_offset,
+        first.metadata.camera_conversion,
+    )
+    for source in sources:
+        directory = (
+            destination / source.parent.relative_to(parent)
+            if separate_output
+            else source.parent
+        )
+        output = directory / "raw_projection.ome.zarr"
+        actual = open_position_collection(output).arrays[0].read().result()
+        assert actual.dtype == np.float32
+        np.testing.assert_array_equal(actual[0], 0)
+        np.testing.assert_array_equal(actual[1, :, 0], expected)
+        state = ProcessingState.read(directory / "raw.processing.json")
+        assert state.source_path() == source.resolve()
+        assert state.completed_tiles(output) == {(1, 0)}
+        assert state.run(output)["configuration"]["selection"]["time"] == [1, 2]
 
 
 @pytest.mark.parametrize(

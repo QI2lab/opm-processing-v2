@@ -45,7 +45,7 @@ viewer workflow from a standard ImageJ hyperstack.
 | --- | --- |
 | Unexpected fusion source | Read the selected path printed by `fuse`; pass the store explicitly. |
 | Disconnected registration groups | Check overlap signal, channel selection, and correction limits. |
-| Visible depth seams | Review registered placement, depth gains, and geometric support. |
+| Visible depth seams | Review registered placement, depth histogram matching, and geometric support. |
 | Resume rejects the run | Use the original settings and matching journal, or explicitly restart. |
 | ROI cannot open | Create a maximum-Z preview with `process` and retain its raw source and journal. |
 | CUDA registration unavailable | Check GPU installation; `--require-gpu` reports failure instead of falling back. |

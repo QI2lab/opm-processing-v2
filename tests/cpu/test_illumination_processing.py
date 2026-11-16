@@ -75,7 +75,7 @@ def test_processing_uses_existing_flatfield_with_separate_output(
 def test_shared_flatfield_round_trips_and_is_reused_at_multiple_depths(
     tmp_path: Path, channels
 ):
-    """The saved maximum field is reused unchanged for every stage depth."""
+    """The saved shared field is reused unchanged for every stage depth."""
     from opm_processing.process import (
         load_or_estimate_flatfield,
         read_current_flatfield,
@@ -106,8 +106,15 @@ def test_shared_flatfield_round_trips_and_is_reused_at_multiple_depths(
 
 
 @pytest.mark.unit
-def test_old_per_depth_flatfield_is_not_reused(tmp_path):
-    """Replace obsolete depth-specific fields with the shared-depth estimator."""
+@pytest.mark.parametrize(
+    "software,depths",
+    [
+        ("opm-processing/basicpy-stage-depth-camera-contract-v10", 2),
+        ("opm-processing/basicpy-stage-z-max-camera-contract-v12", 1),
+    ],
+)
+def test_obsolete_flatfield_estimators_are_not_reused(tmp_path, software, depths):
+    """Refresh depth-specific and maximum-of-depth-fits calibration caches."""
     from tifffile import imwrite
 
     from opm_processing.process import read_current_flatfield
@@ -115,10 +122,10 @@ def test_old_per_depth_flatfield_is_not_reused(tmp_path):
     path = tmp_path / "old-flatfield.ome.tif"
     imwrite(
         path,
-        np.ones((2, 1, 8, 12), dtype=np.float32),
+        np.ones((depths, 1, 8, 12), dtype=np.float32),
         photometric="minisblack",
         metadata={"axes": "ZCYX"},
-        software="opm-processing/basicpy-stage-depth-camera-contract-v10",
+        software=software,
     )
     assert read_current_flatfield(path, (1, 1, 8, 12)) is None
 

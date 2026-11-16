@@ -29,11 +29,10 @@ def test_weighted_fusion_rows_preserve_masks_offsets_and_output_range(
 ):
     """Preserve known affine samples, channel masks and scalar weighted counts."""
     case = weighted_fusion_case
-    for source, pixels, channels, gains in zip(
+    for source, pixels, channels in zip(
         (case.first, case.second),
         case.source_views,
         case.present,
-        case.depth_gains,
         strict=True,
     ):
         tilefusion_module._accumulate_tile_block(
@@ -49,11 +48,10 @@ def test_weighted_fusion_rows_preserve_masks_offsets_and_output_range(
             2,
             3,
             *case.source_origin,
-            gains,
         )
     # Both views have the same prescribed feather weights. Their normalized
     # mixture has closed-form scalar values: at the first location, a real
-    # black pixel and ten corrected photons give five, not ten. The other
+    # black pixel and ten photons give five, not ten. The other
     # channels exercise absent contributors and a value above uint16 range.
     np.testing.assert_array_equal(
         case.accumulated[:, 1, 2, 3],
@@ -206,8 +204,10 @@ def test_max_projection_fusion_is_chunked_and_sparse(projection_fusion, dtype, v
     np.testing.assert_allclose(fusion.fused_ts.read().result(), expected)
 
 
+@pytest.mark.parametrize("zero_channels", [None, {(0, 1, 0)}])
 def test_zero_max_projection_tile_does_not_reduce_weighted_fusion(
     projection_fusion,
+    zero_channels,
 ) -> None:
     """Exclude a globally zero projection channel from its neighbor's weights."""
     tile_shape = (3, 4)
@@ -219,6 +219,7 @@ def test_zero_max_projection_tile_does_not_reduce_weighted_fusion(
         ((0, 0), (0, 0)),
         tile_shape,
         chunk_size=4,
+        zero_channels=zero_channels,
     )
 
     fusion.fuse_tiles()
@@ -338,30 +339,48 @@ def test_block_fusion_has_no_zero_weight_line_at_masked_wedge_boundary(
 
 @pytest.mark.parametrize("channels", [1, 2], ids=["zero-tile", "zero-channel"])
 def test_zero_channels_keep_single_contributors_and_blend_valid_overlap(
-    block_fusion, channels
+    block_fusion, channels, monkeypatch
 ):
     """Exclude absent channels while retaining independent weights for valid ones."""
     tiles = [
-        np.full((channels, 1, 2, 4), 100, np.float32),
-        np.zeros((channels, 1, 2, 4), np.float32),
+        np.full((channels, 2, 2, 4), 100, np.uint16),
+        np.zeros((channels, 2, 2, 4), np.uint16),
     ]
     if channels == 2:
-        tiles[1][1] = 200
+        tiles[0][1, :, :, 2:] = 200
+        tiles[1][1] = tiles[0][1, :, :, ::-1]
     fusion = block_fusion(
         tiles,
-        [(0, 0, 0)] * 2,
-        (1, 2, 4),
+        [(0, 0, 0), (1, 0, 0)],
+        (3, 2, 4),
     )
     assert fusion._tile_channel_nonzero == {
         (tile, channel): tile == 0 or channel > 0
         for tile in range(2)
         for channel in range(channels)
     }
+    if channels == 2:
+        monkeypatch.setattr(tilefusion_module, "USING_GPU", False)
+        fusion.roi_selection = PhysicalRoi((0, 2, 0, 4), fusion.data, (0, 0), (1, 1))
+        fusion.unpadded_shape = (3, 2, 4)
+        np.testing.assert_array_equal(fusion._tile_depth_indices, [0, 1])
+        fusion.match_depth_histograms()
+    reads = []
+    read = fusion._read_tile_volume
+
+    def observe_read(tile, *args, **kwargs):
+        reads.append(tile)
+        return read(tile, *args, **kwargs)
+
+    monkeypatch.setattr(fusion, "_read_tile_volume", observe_read)
     fusion._fuse_by_blocks()
-    expected = np.broadcast_to(
-        np.array([100, 150][:channels])[None, :, None, None, None],
-        (1, channels, 1, 2, 4),
-    )
+    assert sorted(reads) == ([0] if channels == 1 else [0, 0, 1, 1])
+    expected = np.zeros((1, channels, 3, 2, 4), np.uint16)
+    expected[0, 0, :2] = 100
+    if channels == 2:
+        expected[0, 1, 0] = tiles[0][1, 0]
+        expected[0, 1, 1] = 150
+        expected[0, 1, 2] = tiles[1][1, 1]
     np.testing.assert_array_equal(fusion.fused_ts.read().result(), expected)
 
 
@@ -382,7 +401,6 @@ def test_fusion_is_independent_of_blocks_and_workers(
         block_shape=[1, 1, *block_shape],
         output_dtype=np.dtype(dtype),
         profiles=case.profiles,
-        depth_gains=case.gains,
         time_indices=(0, 0, 0, 1, 1, 1),
         chunk_shape_yx=block_shape[1:],
         max_workers=workers,

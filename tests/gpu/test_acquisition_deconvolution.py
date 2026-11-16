@@ -74,21 +74,19 @@ def test_as_acquired_combined_channel_deconvolution(
         open_acquisition_datastore(metadata).read().result(), dataset.raw_data
     )
     deskewed = []
-    deskew = processing.orthogonal_deskew
+    deskew = processing.deskew_channel_writer
 
-    def observe(*args, **kwargs):
-        """Observe actual refined input and output bytes before persistence."""
-        assert args[0].shape == (
+    def observe(shape, target, theta, distance, *args, **kwargs):
+        """Observe the actual refined grid passed to the production deskewer."""
+        assert shape == (
             (observed.raw.shape[0] - 1) * 3 + 1,
             *observed.raw.shape[1:],
         )
-        assert kwargs["distance"] == pytest.approx(0.4)
-        result = deskew(*args, **kwargs)
-        assert result.dtype == np.float32 and result.flags.c_contiguous
-        deskewed.append((result.shape, sha256(memoryview(result)).hexdigest()))
-        return result
+        assert distance == pytest.approx(0.4)
+        deskewed.append(target.shape)
+        return deskew(shape, target, theta, distance, *args, **kwargs)
 
-    monkeypatch.setattr(processing, "orthogonal_deskew", observe)
+    monkeypatch.setattr(processing, "deskew_channel_writer", observe)
     invoke_cli(
         "process",
         dataset.path,
@@ -99,7 +97,7 @@ def test_as_acquired_combined_channel_deconvolution(
         decon_crop_scan=12,
     )
     assert dict(open_group(dataset.path).attrs) == original_attributes
-    ((shape, digest),) = deskewed
+    (shape,) = deskewed
     measured = production_forward_predictions[-1]
     # Sparse progress is measured against the actual production initializer,
     # with both predictions evaluated on the acquired camera planes.
@@ -122,7 +120,6 @@ def test_as_acquired_combined_channel_deconvolution(
         expected_shape
     )
     assert np.isfinite(saved).all() and np.all(saved >= 0)
-    assert sha256(memoryview(saved[0, 0])).hexdigest() == digest
     np.testing.assert_allclose(
         collection.voxel_size_um, microscope.pixel_size_um, rtol=0, atol=0.0005
     )

@@ -31,7 +31,7 @@ uv run fuse "/path/to/acquisition" --registration-channel 0
 The channel index is zero-based. Choose a channel with signal in neighboring
 tile overlaps. Directory selection prefers deconvolved, deskewed data and prints
 the selected input. The result includes a registered fused volume and maximum-Z
-projection. See [fusion](../guides/fusion.md) for registration and depth gains.
+projection. See [fusion](../guides/fusion.md) for registration and depth normalization.
 
 ## View or export
 

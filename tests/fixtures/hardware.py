@@ -81,6 +81,7 @@ def production_forward_predictions(monkeypatch, request):
                 "object_shape": shape,
                 "updates": [],
                 "shared": kwargs.get("_checkpoint") is not None,
+                "first_kl_stop": None,
             },
         )
         entry["visits"] += 1
@@ -137,6 +138,8 @@ def production_forward_predictions(monkeypatch, request):
             *args,
             **dict(kwargs, callback=observe_update),
         )
+        if state is not None:
+            entry["first_kl_stop"] = state.first_kl_stop
         if state is None:
             values = forward(result)[region][owned]
             entry["final"] = (
@@ -183,6 +186,7 @@ def production_forward_predictions(monkeypatch, request):
                     "object_shape",
                     "updates",
                     "shared",
+                    "first_kl_stop",
                 )
             }
             for entry in run["chunks"].values()

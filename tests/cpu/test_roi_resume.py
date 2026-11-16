@@ -28,7 +28,7 @@ def test_roi_resumes_at_last_durable_channel(
     output = run.output_dir / "sample_deskewed.ome.zarr"
     state_path = run.output_dir / "sample.processing.json"
     real_complete = ProcessingState.complete_channel
-    real_write = run.process.write_checkpointed_roi_channel
+    real_write = run.process.write_processed_channel
     channels = run.truth.pixels.shape[2]
     stop_key = (
         (0, 2, channels - 1) if interruption == "after_final_channel" else (0, 2, 0)
@@ -43,19 +43,18 @@ def test_roi_resumes_at_last_durable_channel(
         if key == stop_key:
             raise KeyboardInterrupt
 
-    def failing_write(target, value, state, path, key, **kwargs):
+    def failing_write(target, value):
         """Inject a partial write failure before the channel checkpoint."""
-        if key == stop_key:
+        completed = ProcessingState.read(state_path).completed_channels(output)
+        if completed == {(0, 1, channel) for channel in range(channels)}:
             # Leave a partial channel and fail the write future before checkpointing.
-            run.process.write_processed_channel(target[:1], value[:1])
+            real_write(target[:1], value[:1])
             readonly = ts.open(target.spec(), read=True, write=False).result()
-            return real_write(readonly, value, state, path, key, **kwargs)
-        return real_write(target, value, state, path, key, **kwargs)
+            return real_write(readonly, value)
+        return real_write(target, value)
 
     if interruption == "during_write":
-        monkeypatch.setattr(
-            run.process, "write_checkpointed_roi_channel", failing_write
-        )
+        monkeypatch.setattr(run.process, "write_processed_channel", failing_write)
         expected_error = ValueError
     else:
         monkeypatch.setattr(ProcessingState, "complete_channel", checkpoint)
@@ -89,7 +88,7 @@ def test_roi_resumes_at_last_durable_channel(
             changed[0, position, channel]
         ).result()
     monkeypatch.setattr(ProcessingState, "complete_channel", real_complete)
-    monkeypatch.setattr(run.process, "write_checkpointed_roi_channel", real_write)
+    monkeypatch.setattr(run.process, "write_processed_channel", real_write)
     run.process.process_skewed(run.source, **run.options, resume=True)
 
     resumed = open_position_collection(output)

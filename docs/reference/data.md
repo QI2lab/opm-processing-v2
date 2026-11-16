@@ -45,7 +45,7 @@ or to the directory supplied with `process --output`.
 | `<stem>_max_z_fused.ome.zarr` | Registered fused maximum-Z multiscale image |
 | `<stem>_flatfield.ome.tif` | Estimated illumination fields, when requested |
 | `<stem>.processing.json` | Processing configuration, completion, source path, and registration state |
-| `<stem>_depth_intensity_gains.json` | Fitted gains and depth-normalization provenance |
+| `<stem>_depth_histograms.json` | Depth histogram-matching provenance |
 | `<stem>_roi.json` | Saved physical ROI selection |
 | `<stem>_roi/` | Default ROI processing destination |
 
@@ -53,7 +53,7 @@ Native planar acquisitions use their planar output naming convention. Inspect
 the command's printed destination and journal to identify its output stores.
 
 `fuse --output-dir` places the fused volume and registered maximum-Z stores in
-another folder or drive. Registration and the depth-intensity gain report
+another folder or drive. Registration and the depth-normalization report
 remain beside the processed input. External fused stores include an
 `opm_processing.processing_state` link to that journal, using a relative path
 when possible and an absolute path for cross-drive access. The link contains

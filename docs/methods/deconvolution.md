@@ -97,7 +97,7 @@ Here `acquisition` is returned by `inspect_acquisition`; `calibrated_data` and
 | `read_noise` | RMS in the same units as `image`; default `0` selects no read noise. |
 | `detector_response` | Optional positive YX illumination/sensitivity response, broadcast over scan planes. Pass the image before dividing by this response; default `None`. |
 | `gpu_id` | CUDA device index; default `0`. |
-| `crop_scan` | Retained scan-chunk length in reconstruction planes; default `None` estimates it from free GPU memory. KL-enabled tiling parks chunks in RAM and continues them to one shared iteration budget. |
+| `crop_scan` | Retained scan-chunk length in reconstruction planes; default `None` attempts the full scan and reduces it only after an actual allocation failure. Successful sizes are reused across a tile's channels. KL-enabled tiling parks chunks in RAM and continues them to one shared iteration budget. |
 | `fallback_step_scan` | Tile reduction after allocation failure; default reduces the length by one quarter. Shared-KL runs allow fallback only before any completed update. |
 | `rng_seed` | Seed for fresh half-image splits; default `42`. |
 | `verbose` | Progress bars show chunk visits. Diagnostics are off by default (`0`); set `1` for chunk geometry, iterations and stopping reasons. |
@@ -197,14 +197,18 @@ This is distinct from a pooled whole-volume KL
 divergence. Haloed reconstruction checkpoints, owned rollback cores and the actual
 random-generator state are parked in system RAM. Each chunk is visited at most
 twice, continuing only missing updates without replaying completed iterations.
+Acquisition processing consumes finalized cores in scan order, deskewing and
+writing each core while the GPU continues the next one. It does not assemble a
+second full reconstruction. The array API still returns the complete volume
+unless `on_reconstructed_chunk` is supplied.
 GPU working memory remains bounded by the active chunk; RAM checkpoint storage
 grows with the number and extent of overlapping chunks. Initialization and random
 halves remain per chunk, so tiled and whole-volume reconstructions need not match.
 
 Before allocating checkpoints, the solver checks available RAM for their total
 storage, output and workspace. Insufficient RAM raises an error. Device allocations
-are limited to 80 percent of available physical GPU memory, respecting tighter
-caller limits. In shared-KL runs, startup allocation failure can reduce the scan
+are limited to available physical GPU memory, respecting tighter caller limits.
+In shared-KL runs, startup allocation failure can reduce the scan
 chunk, but an allocation failure after a completed update is reported without
 restarting the reconstruction. FFT plans and device allocations are reused between chunks and
 released after the volume. NumPy and CuPy random generators need not produce

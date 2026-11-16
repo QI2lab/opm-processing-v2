@@ -10,14 +10,25 @@ native planar acquisitions follow the planar processing path.
 uv run process "/path/to/acquisition" --deconvolve --flatfield-correction --output "/path/to/processed"
 ```
 
+To process acquisitions recursively beneath a parent folder, add `--batch`:
+
+```bash
+uv run process "/path/to/parent" --batch --deconvolve --flatfield-correction --resume
+```
+
+The same options apply to each acquisition in sorted folder order. Runs are
+sequential, and traversal skips Zarr contents and processed stores. With
+`--output`, the source folder tree is mirrored beneath the output directory;
+otherwise each acquisition uses its normal output location.
+
 Camera calibration runs before optional illumination correction and
 deconvolution. `--flatfield-correction` estimates or reuses illumination fields.
-For each channel, the correction is the pixelwise maximum of the estimated
-stage-Z fields and is shared across all depths and timepoints. This prevents
-sample-free camera regions at one depth from imposing a separate correction
-on that depth. Depths excluded by signal selection do not contribute; channels
-without selected signal use a unity field. Saved flatfields contain one field
-per channel. Cached fields from the older per-depth estimator are re-estimated.
+For each channel, one BaSiC fit uses sampled tiles from every acquisition depth.
+The resulting detector field is shared across depths and timepoints. Tissue
+structure is not applied as an additional residual correction. Depths excluded
+by signal selection do not contribute; channels without selected signal use a
+unity field. Saved flatfields contain one field per channel. Cached fields from
+older estimators are re-estimated.
 
 To launch processing before acquisition finishes without a precomputed
 illumination file, add `--live-wait` alongside `--flatfield-correction` and

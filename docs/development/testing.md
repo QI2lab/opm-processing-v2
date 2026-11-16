@@ -34,7 +34,6 @@ of those components against the same original physical truth.
 | RL updates, consensus, KL and continuation | Focused GPU RLGC units; scalar FFT/KL operators in `test_gpu_processing.py` |
 | Count splitting | GPU `test_photon_splitting.py` |
 | Detector response and allocation fallback | GPU `test_rlgc_detector_response.py` units |
-| Automatic chunk planning and cached crop selection | GPU `test_rlgc_physics.py` planner unit |
 | Deskew interpolation and boundaries | CPU `test_opmtools.py`, including eight noisy physical cases |
 | Illumination estimation and sample selection | GPU `test_illumination.py` |
 | Pair correlation, aliases and retries | GPU registration units; CPU registration units own geometry and graph solving |

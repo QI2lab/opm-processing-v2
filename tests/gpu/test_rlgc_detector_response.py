@@ -13,7 +13,7 @@ from scipy.special import kl_div
 @pytest.mark.integration
 @pytest.mark.parametrize(
     "mosaic_acquisition",
-    [("stage", 1.2, 0.001, "whole")],
+    [("stage", 1.2, 0.001, "tiled")],
     indirect=True,
 )
 def test_roi_deconvolves_recorded_sampling(
@@ -96,8 +96,10 @@ def test_roi_deconvolves_recorded_sampling(
         / grid.scale_transform.scale[-2]
     )
     source_x = (case.expectation.shape[-1] - 1) // 2
-    bounds = (center - 16, center + 16, source_x - 32, source_x + 32)
-    monkeypatch.setattr(export_rois, "select_rois", lambda source, shape: [bounds])
+    bounds = (center - 256, center + 256, source_x - 32, source_x + 32)
+    monkeypatch.setattr(
+        export_rois, "select_rois", lambda source, shape, figure_path=None: [bounds]
+    )
     processing = importlib.import_module("opm_processing.process")
     solver = importlib.import_module("opm_processing.imageprocessing.rlgc")
     stages = []
@@ -108,13 +110,12 @@ def test_roi_deconvolves_recorded_sampling(
     measurements = []
     rendered = []
     raw_crops = []
-    deskewed = []
-    written = []
+    pending_cores = []
+    delivered_cores = completed_cores = 0
     open_raw = processing.open_acquisition_datastore
-    generate_psfs = processing.load_deconvolution_psfs
+    generate_psfs = export_rois.load_deconvolution_psfs
     deconvolve = solver.rlgc
-    deskew = processing.orthogonal_deskew
-    write_channel = processing.write_checkpointed_roi_channel
+    channel_writer = processing.deskew_channel_writer
     register = TileFusion.register_with_retries
     measure = TileFusion.register_and_score
     render = TileFusion._render_fusion_block
@@ -149,42 +150,46 @@ def test_roi_deconvolves_recorded_sampling(
         )
         assert args[0].shape[1] == case.dataset.raw_data.shape[-2]
         assert args[0].size < np.prod(case.dataset.raw_data.shape[-3:])
-        result = deconvolve(*args, **kwargs)
-        deconvolved.append(
-            (result.shape, sha256(memoryview(np.ascontiguousarray(result))).digest())
-        )
-        predictions.append(production_forward_predictions[-1])
+        consume = kwargs["on_reconstructed_chunk"]
+
+        def observe_core(core, start, stop):
+            nonlocal delivered_cores
+            delivered_cores += 1
+            pending_cores.append((start, stop, id(core)))
+            consume(core, start, stop)
+            assert completed_cores >= delivered_cores - 1
+
         stages.append("deconvolve")
+        result = deconvolve(*args, **dict(kwargs, on_reconstructed_chunk=observe_core))
+        assert result is None
+        measured = production_forward_predictions[-1]
+        assert len(measured["chunks"]) > 1
+        assert all(record["shared"] for record in measured["chunks"])
+        predictions.append(measured)
         return result
 
-    def observe_deskew(data, *args, **kwargs):
-        """Verify deskew receives the reconstruction just returned by RLGC."""
-        assert (
-            data.shape,
-            sha256(memoryview(np.ascontiguousarray(data))).digest(),
-        ) == deconvolved[-1]
-        assert kwargs["distance"] == pytest.approx(0.4)
-        result = deskew(data, *args, **kwargs)
-        assert not deskewed
-        deskewed.append(result)
-        stages.append("deskew")
-        return result
+    def observe_writer(shape, target, theta, distance, *args, **kwargs):
+        """Verify the production deskewer consumes every finalized core unchanged."""
+        assert distance == pytest.approx(0.4)
+        consume, projection = channel_writer(
+            shape, target, theta, distance, *args, **kwargs
+        )
+        deconvolved.append(shape)
+        next_plane = 0
 
-    def observe_write(target, value, state, path, key, **kwargs):
-        """Check the actual deskew crop, then release it after its durable write."""
-        record = next(
-            record
-            for record in state.roi_series(path)
-            if (record["time_index"], record["position_index"]) == key[:2]
-        )
-        y0, y1, x0, x1 = record["deskew_crop_yx"]
-        actual = deskewed.pop()
-        np.testing.assert_array_equal(value, actual[:, y0:y1, x0:x1])
-        result = write_channel(target, value, state, path, key, **kwargs)
-        written.append(
-            (value.shape, sha256(memoryview(np.ascontiguousarray(value))).digest())
-        )
-        return result
+        def observe_deskew(core, start, stop):
+            nonlocal next_plane, completed_cores
+            assert start == next_plane
+            assert core.shape == (stop - start, *shape[1:])
+            assert pending_cores.pop(0) == (start, stop, id(core))
+            result = consume(core, start, stop)
+            completed_cores += 1
+            next_plane = stop
+            if stop == shape[0]:
+                stages.append("deskew")
+            return result
+
+        return observe_deskew, projection
 
     def observe_registration(fusion):
         """Capture crop-displaced saved transforms before fresh ROI refinement."""
@@ -215,10 +220,9 @@ def test_roi_deconvolves_recorded_sampling(
         return result
 
     monkeypatch.setattr(processing, "open_acquisition_datastore", observe_raw)
-    monkeypatch.setattr(processing, "load_deconvolution_psfs", observe_psfs)
+    monkeypatch.setattr(export_rois, "load_deconvolution_psfs", observe_psfs)
     monkeypatch.setattr(solver, "rlgc", observe_deconvolution)
-    monkeypatch.setattr(processing, "orthogonal_deskew", observe_deskew)
-    monkeypatch.setattr(processing, "write_checkpointed_roi_channel", observe_write)
+    monkeypatch.setattr(processing, "deskew_channel_writer", observe_writer)
     monkeypatch.setattr(TileFusion, "register_with_retries", observe_registration)
     monkeypatch.setattr(
         TileFusion, "register_and_score", staticmethod(observe_measurement)
@@ -235,6 +239,8 @@ def test_roi_deconvolves_recorded_sampling(
             "--tiff",
             "--decon-verbose",
             "0",
+            "--decon-crop-scan",
+            "64",
         ],
     )
     if result.exception:
@@ -244,9 +250,11 @@ def test_roi_deconvolves_recorded_sampling(
     state = ProcessingState.read(directory / "mosaic.processing.json")
     tiles = directory / "mosaic_decon_deskewed.ome.zarr"
     configuration = state.run(tiles)
-    assert stages[:2] == ["raw", "psfs"]
+    assert stages[:2] == ["psfs", "raw"]
     assert stages[2:-1] == ["deconvolve", "deskew"] * len(seeds)
     assert stages[-1] == "registration"
+    assert not pending_cores
+    assert delivered_cores == completed_cores
     assert len(seeds) == 2 and measurements
     # The stage fixture records the first acquisition position and positive
     # scan step. Reordering starts at its final acquired plane: image Y is
@@ -291,7 +299,7 @@ def test_roi_deconvolves_recorded_sampling(
             atol=1e-6,
         )
     factor = round(case.microscope.scan_step_um / 0.4)
-    for index, ((record, _seed), (recovered_shape, _digest), actual_input) in enumerate(
+    for index, ((record, _seed), recovered_shape, actual_input) in enumerate(
         zip(seeds, deconvolved, raw_crops, strict=True)
     ):
         start, stop, x0, x1 = record["skewed_bounds_sx"]
@@ -316,12 +324,12 @@ def test_roi_deconvolves_recorded_sampling(
             x1 - x0,
         )
     cropped = open_position_collection(tiles)
+    written = []
     for position, (
-        (recovered_shape, _digest),
+        recovered_shape,
         raw_crop,
         measured,
-        persisted,
-    ) in enumerate(zip(deconvolved, raw_crops, predictions, written, strict=True)):
+    ) in enumerate(zip(deconvolved, raw_crops, predictions, strict=True)):
         start, stop, x0, x1 = raw_crop
         x0 += position * case.parameters["tile_offset_x_pixels"]
         x1 += position * case.parameters["tile_offset_x_pixels"]
@@ -332,6 +340,7 @@ def test_roi_deconvolves_recorded_sampling(
             < kl_div(expected_native, baseline).sum()
         )
         volume = cropped.arrays[position][0, 0].read().result()
+        written.append((volume.shape, sha256(memoryview(volume)).digest()))
         np.testing.assert_allclose(cropped.voxel_size_um, pixel, rtol=0, atol=0.0005)
         raw_origin = np.add(
             saved_placements[0, position],
@@ -358,7 +367,6 @@ def test_roi_deconvolves_recorded_sampling(
         assert 0 <= x0 < x1 <= native_shape[2]
         assert volume.shape == (native_shape[0], y1 - y0, x1 - x0)
         assert volume.dtype == np.float32
-        assert (volume.shape, sha256(memoryview(volume)).digest()) == persisted
     assert (
         configuration["configuration"]["deconvolution"].get("scan_upsample_factor", 1)
         == factor
@@ -391,10 +399,9 @@ def test_roi_deconvolves_recorded_sampling(
     assert settings["read_noise"] == microscope.camera.read_noise_e
     assert settings["psf_parameters"] is not None and settings["psf_sha256"] is None
     monkeypatch.setattr(processing, "open_acquisition_datastore", open_raw)
-    monkeypatch.setattr(processing, "load_deconvolution_psfs", generate_psfs)
+    monkeypatch.setattr(export_rois, "load_deconvolution_psfs", generate_psfs)
     monkeypatch.setattr(solver, "rlgc", deconvolve)
-    monkeypatch.setattr(processing, "orthogonal_deskew", deskew)
-    monkeypatch.setattr(processing, "write_checkpointed_roi_channel", write_channel)
+    monkeypatch.setattr(processing, "deskew_channel_writer", channel_writer)
     monkeypatch.setattr(TileFusion, "register_with_retries", register)
     monkeypatch.setattr(TileFusion, "register_and_score", staticmethod(measure))
     monkeypatch.setattr(TileFusion, "_render_fusion_block", render)
@@ -405,6 +412,7 @@ def test_roi_deconvolves_recorded_sampling(
         "deconvolve": True,
         "save_float32": True,
         "z_downsample_level": 1,
+        "decon_crop_scan": 64,
         "resume": True,
     }
     before = len(production_forward_predictions)
@@ -515,7 +523,7 @@ def test_tiled_consensus_recovers_known_blurred_object(
         (32, (256, 256), 20, "gpu", None, None),
         (32, (256, 256), 20, "host", None, None),
         (32, (256, 256), 20, "gpu", 128 * 1024**2, "isolated"),
-        (32, (256, 256), 20, "gpu", 128 * 1024**2, "default"),
+        (32, (256, 256), None, "gpu", 128 * 1024**2, "default"),
     ],
     ids=[
         "single-plane",
@@ -544,18 +552,37 @@ def test_nonuniform_response_preserves_uniform_fluorescence(
     """Preserve known fluorescence while bounding actual per-chunk solver state."""
     solver = importlib.import_module("opm_processing.imageprocessing.rlgc")
     states = []
+    plan_keys = set()
     iterate = solver._iterate_rlgc
 
     def observe_state(observed, shape, *args, **kwargs):
         """Inspect real allocations and execute the unmodified numerical engine."""
-        states.append((observed.shape, shape))
+        cache = cupy_gpu.fft.config.get_plan_cache()
+        if states and shape != states[-1][1]:
+            assert plan_keys.isdisjoint(key for key, _ in cache)
         assert (cupy_gpu.get_array_module(observed) is np) == (storage == "host")
-        return iterate(observed, shape, *args, **kwargs)
+        result = iterate(observed, shape, *args, **kwargs)
+        states.append((observed.shape, shape))
+        # Keep keys alone: retaining plan objects would itself retain GPU memory.
+        plan_keys.clear()
+        plan_keys.update(key for key, _ in cache)
+        return result
 
     monkeypatch.setattr(solver, "_iterate_rlgc", observe_state)
 
     case = uniform_response_case
     response, truth, psf, measured = case.response, case.truth, case.psf, case.measured
+    restored = np.empty_like(truth)
+    written = 0
+
+    def collect_chunk(core, start, stop):
+        """Consume actual finalized cores and require complete ordered coverage."""
+        nonlocal written
+        assert start == written
+        assert core.shape == (stop - start, *truth.shape[1:])
+        restored[start:stop] = core
+        written = stop
+
     successful_crops = []
     pool = (
         cupy_gpu.get_default_memory_pool()
@@ -574,7 +601,7 @@ def test_nonuniform_response_preserves_uniform_fluorescence(
     )
     try:
         with allocator:
-            restored = solver.rlgc(
+            result = solver.rlgc(
                 measured,
                 psf,
                 crop_scan=crop_scan,
@@ -582,17 +609,24 @@ def test_nonuniform_response_preserves_uniform_fluorescence(
                 verbose=0,
                 storage=storage,
                 on_successful_crop_scan=successful_crops.append,
+                on_reconstructed_chunk=collect_chunk,
             )
     finally:
         if pool is not None:
             assert pool.get_limit() == gpu_budget
             pool.free_all_blocks()
             pool.set_limit(size=original_limit)
+    assert result is None
+    assert written == truth.shape[0]
     np.testing.assert_allclose(restored, truth, rtol=2e-6, atol=2e-3)
     (successful_crop,) = successful_crops
-    if gpu_budget is not None and scan_planes == 32 and crop_scan == 20:
-        assert successful_crop < crop_scan
-    chunk_shape = (min(scan_planes, crop_scan + 2 * psf.shape[0]), *detector_shape)
+    if gpu_budget is not None:
+        assert successful_crop < (scan_planes if crop_scan is None else crop_scan)
+        assert len({shape for _, shape in states}) > 1
+    chunk_shape = (
+        min(scan_planes, successful_crop + 2 * psf.shape[0]),
+        *detector_shape,
+    )
     padding = solver._linear_fft_pad_width(chunk_shape, psf.shape)
     state_bound = tuple(n + sum(p) for n, p in zip(chunk_shape, padding, strict=True))
     # Short inputs can fit one haloed chunk. Larger inputs must still use
